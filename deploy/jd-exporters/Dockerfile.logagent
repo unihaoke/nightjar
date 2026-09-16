@@ -1,0 +1,21 @@
+# 日志上报 Agent 镜像（jd → nightjar /api/hooks/logs）
+#
+# 必须在构建期装好 curl：jd-log-agent 只连 internal 网络 jd-nightjar，
+# 容器运行时没有出网能力，运行期 apk add 必然失败。
+#
+# 构建上下文为 deploy/jd-exporters/：
+#   docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml \
+#     --profile logs build jd-log-agent
+
+FROM alpine:3.20
+
+RUN apk add --no-cache curl
+
+COPY log-shipper.sh /shipper/log-shipper.sh
+RUN chmod +x /shipper/log-shipper.sh
+
+# 非 root 运行；日志卷以只读方式挂载，Agent 只需读取
+RUN addgroup -S mwops && adduser -S -G mwops mwops
+USER mwops
+
+ENTRYPOINT ["/bin/sh", "/shipper/log-shipper.sh"]

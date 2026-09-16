@@ -1,0 +1,44 @@
+# =============================================================================
+# jd 接入 nightjar · 只做「网络打通」的最小 overlay
+#
+# 它不新增任何容器、不改动任何服务的镜像/配置/端口，只把 mysql / redis / prometheus
+# 加进跨项目专用网络 jd-nightjar 并起别名，用途：
+#
+#   1. 只想让 nightjar 的 TCP 健康探测（3306 / 6379）通过，但不想启用 Exporter；
+#   2. 与 docker-compose.exporters-only.yml（方案 B）叠加使用，补齐方案 B 缺失的探测能力。
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd-link.yml up -d
+#   # 与方案 B 叠加
+#   docker compose -f docker-compose.yml \
+#     -f deploy/jd-exporters/docker-compose.jd-link.yml \
+#     -f deploy/jd-exporters/docker-compose.exporters-only.yml up -d
+#
+# ⚠️ jd-nightjar 必须是 internal 网络（docker network create --internal），
+#    否则 mysql / redis 会因为多了一张非 internal 网卡而重新获得出网路由，
+#    数据面隔离就失效了。start.sh 会自动以 --internal 创建。
+# =============================================================================
+
+services:
+  mysql:
+    networks:
+      jd-nightjar:
+        aliases:
+          - jd-mysql
+
+  redis:
+    networks:
+      jd-nightjar:
+        aliases:
+          - jd-redis
+
+  prometheus:
+    networks:
+      jd-nightjar:
+        aliases:
+          - jd-prometheus
+
+networks:
+  jd-nightjar:
+    external: true
+    name: ${JD_NIGHTJAR_NETWORK:-jd-nightjar}

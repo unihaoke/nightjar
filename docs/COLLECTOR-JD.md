@@ -1,215 +1,167 @@
 # jd 项目接入本平台 · 操作文档
 
-> 接入对象：[gitee.com/unihao/jd](https://gitee.com/unihao/jd)（面试题库 / AI 模拟面试演练系统）
-> 本文档基于该仓库 `master` 分支的实际文件内容编写（`docker-compose.yml`、`backend/src/main/resources/application*.yml`、`backend/Dockerfile`、`monitoring/prometheus/prometheus.yml`）。
+> 接入对象：**jd（Java 高级开发面试复习工具）** —— Spring Boot 3.2 / Java 21 / MySQL 8 / Redis 7 / 自带 Prometheus + Grafana。
+>
+> 本文基于两个仓库的实际代码编写，涉及平台侧的契约都标注了源码位置，便于核对。
 
 ---
 
-## 1. 该项目现状（先读，决定接入策略）
+## 1. 接入前必须知道的四件事
 
-### 1.1 技术栈与端口（来自其 `docker-compose.yml`）
-
-| 服务 | 镜像 | 容器名 | 宿主机端口 | 说明 |
-|------|------|--------|-----------|------|
-| mysql | mysql:8.0 | interview-mysql | 3306 | 库名 `interview_review`，root/`DB_PASS` |
-| redis | redis:7-alpine | interview-redis | 6379 | **无密码**；`--maxmemory-policy allkeys-lru`；仅 Agent 面试会话缓存用，可用 `AGENT_INTERVIEW_REDIS_ENABLED=false` 关闭 |
-| backend | 自建（Temurin 21） | interview-backend | 8541 → 8080 | Spring Boot；健康检查 `/api/health` |
-| frontend | 自建 Nginx | interview-frontend | 8542 → 80 | Vue 3 |
-| prometheus | prom/prometheus:v2.54.1 | interview-prometheus | **9090** | 抓后端 `/actuator/prometheus` |
-| grafana | grafana/grafana:11.2.2 | interview-grafana | 3000（compose 中定义） | 可视化 |
-
-网络：`interview-net`（bridge）。
-
-### 1.2 关键结论：三件事已经具备、两件事缺失
-
-| 结论 | 依据 |
-|------|------|
-| ✅ **已有 Prometheus** | compose 已含 `prometheus:9090`，可直接作为平台的指标数据源 |
-| ✅ **后端已暴露应用指标** | `application.yml` 中 `management.endpoints.web.exposure.include: health,info,prometheus`、`management.prometheus.metrics.export.enabled: true`，抓取路径 `/actuator/prometheus`，job 名 `interview-backend` |
-| ✅ **GC 日志已落盘** | Dockerfile 的 `JAVA_OPTS` 含 `-Xlog:gc*,gc+age=trace:file=/app/data/gc.log:...` |
-| ❌ **没有中间件 Exporter** | `monitoring/prometheus/prometheus.yml` 只有 `interview-backend` 与 `prometheus` 两个 job，**没有 redis_exporter / mysqld_exporter** |
-| ❌ **没有应用错误日志文件** | 只有 `logging.level` 配置，日志走 stdout；compose 未挂载日志目录 |
-
-**因此本平台目前能直接采到的是应用指标，采不到 MySQL / Redis 的中间件指标。** 接入的核心工作就是**补齐两个 Exporter**（见第 3 节），其余（平台纳管、告警、AI 诊断）都是平台侧配置。
-
-> 概念澄清：平台的「统一监控」管理**中间件指标**（Redis 内存、MySQL 连接数等）；
-> jd 的 `/actuator/prometheus` 是**应用指标**（HTTP QPS、JVM 等）。两者互补，但**不能互相替代**——
-> 想诊断「MySQL 慢查询」必须要有 mysqld-exporter。
-
-### 1.3 可被纳管的中间件实例（2 个）
-
-| 实例名（建议） | 类型 | 环境 | 分组 | 地址 |
-|----------------|------|------|------|------|
-| `jd-mysql` | mysql | dev | interview | `mysql:3306`（容器内）/ `<宿主机IP>:3306` |
-| `jd-redis` | redis | dev | interview | `redis:6379` |
-
-> 注意：jd 的 MySQL 用户是 `root`，平台要求**最小权限只读账号**。平台侧纳管时请填新建的
-> `exporter` 账号，不要填 root（平台不会用它做协议级连接，但仍应遵循最小权限原则）。
-
-### 1.4 顺带一个高价值用法
-
-jd 自带**故障演练场景**（`sandbox/scenario/impl/`）：`RedisFaultScenario`、`MySqlSlowScenario`、
-`GcLeakScenario`、`DeadlockScenario`、`DubboRpcScenario`。
-这些场景会真实制造「Redis 异常 / MySQL 慢查询 / GC 泄漏 / 死锁」。
-接入后你可以**用这些场景当作本平台的 AI 诊断验证集**：先触发场景 → 等平台采到异常指标并告警
-→ 让 AI 诊断 → 与预期根因对比。这比人工造数据可靠得多。
+| # | 结论 | 依据 |
+|---|------|------|
+| 1 | **平台会用 TCP 直连被管实例** | `internal/service/middleware.go:probe()` 对 `host:port` 做 `DialContext`，超时 3s。连不通 → `status=0`、`LastMessage="连接失败…"`，但**不影响指标查询与 AI 诊断** |
+| 2 | **指标靠 `instance_name` 标签定位** | `internal/monitor/profile.go:buildSelector()`：填了 `prom_instance` 就用 `instance="..."`，否则用 `instance_name="<实例名>"`。**两个字段不要同时填**，否则 `instance_name` 会被忽略 |
+| 3 | **`instance_name` 必须由 Prometheus relabel 产生** | `mysqld_exporter` 不带实例名；`oliver006/redis_exporter` **没有 `SERVICE_NAME` 这个 flag**（只有 `REDIS_ADDR`/`REDIS_PASSWORD`/…），早期靠该环境变量上报 `instance_name` 的做法是无效的。两个 job 都必须写 `relabel_configs` |
+| 4 | **`mw_type` 只能是 7 类之一** | `internal/service/middleware.go`：redis / kafka / mysql / pg / es / nginx / rabbitmq。jd 能纳管的是 `mysql` 与 `redis` |
 
 ---
 
-## 2. 总体接入路径
+## 2. 网络隔离模型（核心）
+
+两个栈各有自己的 compose 网络，接入时**不共享整张网**，只开一个专用的 internal 互联网络。
 
 ```
-jd 项目的 MySQL/Redis ──▶ 新增 Exporter ──▶ jd 的 Prometheus(9090) ──▶ 平台（纳管 + 告警 + AI 诊断）
-                                              ▲
-                                   本文档第 3 节补的就是这一段
+┌──────────────────────── 宿主 ────────────────────────┐
+│  :8542 前端   :3000 Grafana          :8000 nightjar Web│
+└───────┬───────────────────────────────────────┬───────┘
+        │                                       │
+┌───────┴────────────── jd ─────────────────────┼────────────────────┐
+│                                               │                    │
+│  jd-edge (bridge)      jd-app (bridge)        │   jd-obs (bridge)  │
+│   frontend              frontend ↔ backend ───┼──▶ prometheus:9090 │
+│   grafana ────────────────────────────────────┼──▶ grafana         │
+│                         backend 经此出网调 LLM │   (仅 127.0.0.1)   │
+│                              │                │        │           │
+│                              ▼                │        │           │
+│  jd-data (internal，无出网、无宿主端口)         │        │           │
+│   mysql:3306   redis:6379   backend            │        │           │
+│   mysqld-exporter   redis-exporter ◀───────────┼────────┘           │
+│        │                                       │                    │
+└────────┼───────────────────────────────────────┼────────────────────┘
+         │                                       │
+         │   jd-nightjar（internal，跨项目专用）   │
+         │   jd 侧：jd-mysql / jd-redis / jd-prometheus / jd-log-agent
+         │                                       │
+         └───────────────▶ mwops-backend ◀───────┘
+                           （nightjar，见 deploy/compose.jd-link.yml）
 ```
 
-三条路径，按你的偏好选一条：
+**跨栈可见面只有三个端点**：
 
-| 方案 | 做法 | 适用 |
+| 方向 | 端点 | 用途 |
 |------|------|------|
-| **A. 复用 jd 的 Prometheus**（推荐） | 给 jd 的 compose 追加载两个 Exporter，并替换 Prometheus 抓取配置 | jd 用 MySQL profile 正常启动 |
-| **B. 独立起 Exporter + 独立 Prometheus** | 不动 jd 任何文件，平台侧多一个数据源（9190） | 不想改 jd；或 jd 用 SQLite profile（无 mysql 服务） |
-| **C. 完全独立自建** | 自己在别的机器上部署 Exporter 与 Prometheus | 生产环境、jd 与平台不同机 |
+| nightjar → jd | `jd-prometheus:9090` | 指标查询（`prometheus.base_url`） |
+| nightjar → jd | `jd-mysql:3306`、`jd-redis:6379` | TCP 健康探测 |
+| jd → nightjar | `mwops-backend:8080/api/hooks/logs` | 日志上报 |
+
+nightjar **看不到** jd 的 frontend / grafana / backend 出网链路；jd 的 MySQL / Redis **不向宿主发布任何端口**（改造前是 `0.0.0.0:3306` / `:6379` 全暴露）。
+
+> ⚠️ `jd-nightjar` **必须是 internal 网络**。若它是普通桥接网，jd 的 mysql / redis 会因为多了一张非 internal 网卡而重新获得默认路由，数据面隔离即失效。
+> `jd/start.sh` 会自动以 `docker network create --internal` 创建，并在检测到非 internal 时告警。
 
 ---
 
-## 3. 操作步骤
+## 3. jd 侧改动清单
 
-### 3.0 前置：确认 jd 已启动
+| 文件 | 作用 |
+|------|------|
+| `docker-compose.yml` | **改造**：四网分区（jd-edge / jd-app / jd-data[internal] / jd-obs）；MySQL、Redis 取消宿主端口映射；Redis 开启 `requirepass`；后端日志落盘到 `backend-logs` 卷；Prometheus 只绑 `127.0.0.1` |
+| `.env.example` | 新增：统一环境变量（含 `REDIS_PASSWORD`、`MYSQL_EXPORTER_PASSWORD`、`JD_NIGHTJAR_NETWORK`、`NIGHTJAR_URL`、`NIGHTJAR_HOOK_TOKEN`） |
+| `backend/src/main/resources/logback-spring.xml` | 新增：`interview-review.log` 全量 + `error.log` 仅 ERROR，供平台日志 Agent 采集 |
+| `backend/Dockerfile` | GC 日志路径改为 `/app/data/logs/gc.log`（落进 `backend-logs` 卷） |
+| `deploy/jd-exporters/docker-compose.jd.yml` | **改造**：Exporter 只入数据面 `jd-data`；mysql/redis/prometheus 追加 `jd-nightjar` 与别名；新增 `jd-log-agent`（profile=`logs`）；mysqld-exporter 改用 `DATA_SOURCE_NAME` 注入口令 |
+| `deploy/jd-exporters/prometheus-jd.yml` | **修复**：两个 job 统一用 `relabel_configs` 写 `instance_name` |
+| `deploy/jd-exporters/docker-compose.jd-link.yml` | 新增：只做网络打通的最小 overlay |
+| `deploy/jd-exporters/log-shipper.sh`、`Dockerfile.logagent`、`agent.yaml` | 新增：日志上报（简易 shell 版 + 镜像构建 + 官方 Agent 配置模板） |
+| `start.sh` | 新增 `nightjar` / `nightjar-logs` / `nightjar-initdb` / `link` / `restore` / `exporters-only` |
 
-```bash
-cd <jd 项目目录>
-docker compose ps
-curl -sf http://localhost:8541/api/health && echo "jd backend OK"
-curl -sf http://localhost:9090/-/healthy && echo "jd prometheus OK"
-```
+> 路径约束：overlay 里的 bind mount 是相对**项目目录**解析的，资产必须落在 `<jd项目根>/deploy/jd-exporters/`。
+>
+> 网络重命名影响：`interview-net` 已拆成 `jd-*`，已有部署请先 `docker compose down` 再启动。
 
-### 3.1 方案 A：复用 jd 的 Prometheus（推荐）
+---
 
-**第 1 步**：把本仓库的 `deploy/jd-exporters/` 整个目录拷到 **jd 项目根目录的 `deploy/` 下**：
+## 4. 操作步骤
 
-```bash
-cp -r <本仓库>/deploy/jd-exporters <jd 项目目录>/deploy/
-```
-
-> ⚠️ 路径位置有约束：compose 中的 bind mount 是相对**项目目录**解析的，两个 override 文件都
-> 引用 `./deploy/jd-exporters/...`。因此必须落在 `<jd项目根>/deploy/jd-exporters/`，
-> 否则会报 `bind source path does not exist`。
-> 若你确实想放在别处，请相应修改 override 文件里的路径，或用软链接：
-> `ln -s <实际路径> <jd项目根>/deploy/jd-exporters`。
-
-**第 2 步**：为 MySQL 创建只读监控账号。二选一：
-
-- **空数据卷首次启动**（最省事）：`01-monitor-user.sql` 会被 MySQL 自动执行，无需额外操作；
-- **已有数据卷**（不能删数据）：手工执行一次
-
-  ```bash
-  docker exec -i interview-mysql mysql -uroot -p"$DB_PASS" -e "
-    CREATE USER IF NOT EXISTS 'exporter'@'%' IDENTIFIED WITH mysql_native_password BY 'exporter_change_me';
-    GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%';
-    FLUSH PRIVILEGES;"
-  ```
-
-  > MySQL 8.0 要求 `mysql_native_password`，否则 mysqld-exporter 会报认证失败。
-  > 若你的 MySQL 是 8.4+（该插件默认禁用），改用 `caching_sha2_password` 并给 exporter 加
-  > `--mysqld.username/--mysqld.password` 参数，或先 `SHOW VARIABLES LIKE 'default_authentication_plugin'` 确认支持情况。
-
-**第 3 步**：追加启动（**不改动 jd 原有 service 定义，只追加**）：
-
-```bash
-docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml up -d
-```
-
-**第 4 步**：验证指标已进 Prometheus：
-
-```bash
-# Redis 指标（应有 redis_memory_used_bytes 等）
-curl -s 'http://localhost:9090/api/v1/query' \
-  --data-urlencode 'query=redis_memory_used_bytes{job="middleware-exporter-redis"}' | head -c 400
-
-# MySQL 指标（应有 mysql_global_status_threads_connected 等）
-curl -s 'http://localhost:9090/api/v1/query' \
-  --data-urlencode 'query=mysql_global_status_threads_connected{job="middleware-exporter-mysql"}' | head -c 400
-```
-
-### 3.2 方案 B：独立启动（不动 jd 文件 / jd 用 SQLite）
+### 4.0 前置
 
 ```bash
 cd <jd 项目目录>
-# 0) 同样需要先把资产放到 <jd项目根>/deploy/jd-exporters/（见 3.1 第 1 步的路径约束）
+cp .env.example .env
+# 必改：JWT_SECRET、DB_PASS、REDIS_PASSWORD、MYSQL_EXPORTER_PASSWORD
+# 且 MYSQL_EXPORTER_PASSWORD 必须与 deploy/jd-exporters/init/01-monitor-user.sql 里的 BY '<口令>' 一致
+```
 
-# 1) 确认 jd 的网络名（默认按目录名推导为 jd_interview-net）
-docker network ls | grep interview
+### 4.1 jd 侧（方案 A，推荐）
 
-# 2) 若网络名不同，通过环境变量覆盖
-JD_NETWORK=<实际网络名> docker compose \
+```bash
+# 首次启动（会自动创建 internal 网络 jd-nightjar）
+./start.sh nightjar
+# 等价于
+docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml up -d --build
+
+# MySQL 数据卷已存在（非首次启动）时，补建只读监控账号
+./start.sh nightjar-initdb
+
+# 可选：启用日志上报
+./start.sh nightjar-logs
+```
+
+验证 Exporter 已被抓取（Prometheus 只绑 127.0.0.1，需在容器内 curl）：
+
+```bash
+docker run --rm --network jd_jd-data curlimages/curl:8.10.1 \
+  -s http://redis-exporter:9121/metrics | grep -E '^redis_(up|memory_used_bytes)'
+docker run --rm --network jd_jd-data curlimages/curl:8.10.1 \
+  -s http://mysqld-exporter:9104/metrics | grep -E '^mysql_(up|global_status_threads_connected)'
+```
+
+### 4.2 jd 侧（方案 B，不动原生 Prometheus 配置）
+
+```bash
+./start.sh exporters-only
+# 需要 TCP 探测时叠加网络 overlay
+docker compose -f docker-compose.yml \
+  -f deploy/jd-exporters/docker-compose.jd-link.yml \
   -f deploy/jd-exporters/docker-compose.exporters-only.yml up -d
-
-# 3) 创建 MySQL 只读监控账号（一次性容器，执行后退出）
-docker compose -f deploy/jd-exporters/docker-compose.exporters-only.yml \
-  --profile initdb run --rm mysql-monitor-user
 ```
 
-该方案会起一个**独立的 Prometheus（端口 9190）**，平台侧把 `prometheus.base_url`
-指向 `http://<宿主机IP>:9190` 即可（见 3.4），与 jd 自带的 9090 互不干扰。
+方案 B 的 Prometheus 别名为 `jd-prometheus`，端口 `9190`。
 
-> 若 jd 用 SQLite profile（没有 `mysql` 服务），步骤 3 会失败——此时跳过即可，只接入 Redis：
-> 方案 B 的 Exporter 端口是映射到宿主机的，`mysqld-exporter` 会因连不上 MySQL 而重启，
-> 可用 `docker compose -f ... up -d redis-exporter` 只启动需要的那个。
-
-### 3.3 平台侧：纳管两个实例
-
-登录平台 → **中间件纳管 → 新增实例**，按下表填写（**标签字段务必一致，否则查不到数据**）：
-
-**实例一：jd-mysql**
-
-| 字段 | 值 | 说明 |
-|------|-----|------|
-| 实例名称 | `jd-mysql` | 必须等于 Prometheus 中的 `instance_name` |
-| 中间件类型 | MySQL | 决定用哪套指标画像 |
-| 连接地址 / 端口 | `mysql` / `3306`（或宿主机 IP） | 仅用于 TCP 健康探测 |
-| 监控账号 / 密码 | `exporter` / `exporter_change_me` | 只读账号，AES-256-GCM 加密存储 |
-| 环境 | `dev` | 决定数据权限与审批强制 |
-| 分组 | `interview` | 建议按项目分组 |
-| Prometheus job | `middleware-exporter-mysql` | 精确匹配 |
-| Prometheus instance | `mysqld-exporter:9104` | 可选，最精确 |
-| **配置（config）** | 见 3.5 | **直接影响 AI 诊断质量** |
-
-**实例二：jd-redis**
-
-| 字段 | 值 |
-|------|-----|
-| 实例名称 | `jd-redis` |
-| 中间件类型 | Redis |
-| 连接地址 / 端口 | `redis` / `6379` |
-| 监控账号 / 密码 | 留空（jd 的 Redis 无密码） |
-| 环境 / 分组 | `dev` / `interview` |
-| Prometheus job | `middleware-exporter-redis` |
-| Prometheus instance | `redis-exporter:9121` |
-
-### 3.4 平台侧：指向数据源
-
-```yaml
-# <本平台>/configs/config.yaml，或环境变量 MWOPS_PROMETHEUS_BASE_URL
-prometheus:
-  base_url: http://<jd宿主机IP>:9090     # 方案 A
-  # base_url: http://<jd宿主机IP>:9190   # 方案 B
-  exporter_job_prefix: middleware-exporter
-```
+### 4.3 nightjar 侧
 
 ```bash
-docker compose up -d backend     # 重启平台后端使配置生效
+cd <nightjar 项目目录>
+cp .env.example .env
+# 必改：JWT_SECRET、ADMIN_PASSWORD、DB_PASSWORD、REDIS_PASSWORD、HOOK_TOKEN
+# 接入相关：JD_NIGHTJAR_NETWORK=jd-nightjar、MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090
+
+docker compose -f docker-compose.yml -f deploy/compose.jd-link.yml up -d --build
 ```
 
-验证：平台「统一监控」页应能看到 `jd-mysql` / `jd-redis` 的指标；
-若显示「内置模拟器」= 没连上；若有指标但值异常 = 标签没匹配上（回到 3.3 核对）。
+> 启动顺序：先起 jd（它负责创建 `jd-nightjar`），再起 nightjar。
+> 若 nightjar 报 `network jd-nightjar not found`，说明 jd 侧还没执行 `./start.sh nightjar`。
 
-### 3.5 平台侧：填写 config（让 AI 有据可依）
+### 4.4 平台纳管两个实例
 
-在实例的「配置」字段填入 jd 的实际运行参数（这些会进入 AI 诊断上下文，使其能引用证据而非推测）：
+**中间件纳管 → 新增实例**，按下表填写：
 
-**jd-mysql 的 config**：
+| 字段 | jd-mysql | jd-redis |
+|------|----------|----------|
+| 实例名称 | `jd-mysql` | `jd-redis` |
+| 中间件类型 | `mysql` | `redis` |
+| 连接地址 | `jd-mysql` | `jd-redis` |
+| 端口 | `3306` | `6379` |
+| 监控账号 / 密码 | `exporter` / 与 `MYSQL_EXPORTER_PASSWORD` 一致 | 留空或填 `REDIS_PASSWORD`（探测只做 TCP，口令仅存档） |
+| 环境 / 分组 | `dev` / `interview` | `dev` / `interview` |
+| Prometheus job | `middleware-exporter-mysql` | `middleware-exporter-redis` |
+| **Prometheus instance** | **留空** | **留空** |
+| 配置（config） | 见 4.5 | 见 4.5 |
+
+> **`Prometheus instance` 务必留空**。填了之后 `buildSelector` 会改用 `instance="..."` 而忽略 `instance_name`，导致查不到数据。
+
+`jd-mysql` 的 config：
 
 ```json
 {
@@ -221,59 +173,51 @@ docker compose up -d backend     # 重启平台后端使配置生效
 }
 ```
 
-**jd-redis 的 config**：
+`jd-redis` 的 config：
 
 ```json
 {
   "maxmemory-policy": "allkeys-lru",
   "appendonly": "yes",
-  "requirepass": "none",
-  "usage": "Agent 面试会话缓存（AgentInterviewSessionService）；可用 AGENT_INTERVIEW_REDIS_ENABLED=false 关闭",
+  "requirepass": "enabled",
+  "usage": "Agent 面试会话缓存（AgentInterviewSessionService）；AGENT_INTERVIEW_REDIS_ENABLED=false 可关闭",
   "note": "沙箱场景 RedisFaultScenario 会制造 Redis 异常"
 }
 ```
 
-### 3.6 平台侧：配置告警规则
-
-jd 是开发/演练环境，建议用能触发但不过度打扰的阈值：
-
-| 实例 | 指标 | 操作符 | 阈值 | 级别 | 说明 |
-|------|------|--------|------|------|------|
-| jd-mysql | `threads_connected` | `>` | 50 | warning | 演练环境连接数偏低，50 即可预警 |
-| jd-mysql | `slow_queries` | `>` | 1 | warning | 触发 MySqlSlowScenario 后应立刻命中 |
-| jd-redis | `memory_usage_percent` | `>` | 60 | warning | 演练环境内存占用小，60% 足够敏感 |
-| jd-redis | `evicted_keys` | `>` | 0 | warning | 触发淘汰即说明容量有问题 |
-
-> 平台规则的阈值是你自己填的，与指标画像的默认阈值（面向生产）无关。
-
-### 3.7 平台侧：日志与 GC 接入（可选但推荐）
-
-分三种情况，**没有一种能同时拿到应用错误日志且零侵入**，请按需选择：
-
-| 目标 | 是否零侵入 | 做法与限制 |
-|------|-----------|-----------|
-| **GC 日志** | ✅ 零侵入 | GC 日志已写到容器内 `/app/data/gc.log`（`VOLUME /app/data`）。但它是**命名卷**不是宿主目录，Agent 无法直接 tail；需在 compose 里把 `./backend/data:/app/data` 改成 bind mount，再让宿主机上的 Agent 采集该目录 |
-| **应用 ERROR 日志 + 堆栈** | ❌ 需改 jd | 默认日志只输出 stdout。要拿到异常堆栈需二者之一：① 给 jd 加 file appender 写 `/app/data/app.log` 后按上一条采集；② 在 jd 的全局异常处理器里 POST 到平台 `/api/hooks/logs`（jd 已有 `AgentInterviewController` 等入口，可仿照） |
-| **不修改 jd 的折中** | ✅ 零侵入 | 用 `docker logs` 定时抓取：写个 cron 脚本把 `docker logs --since` 的输出投给平台 Hook。**只能做规则/关键词级聚合，无法拿到完整上下文**，适合先用起来 |
-
-日志上报命令（参见平台 `docs/COLLECTOR.md` 第 6 节，或用现成脚本）：
+### 4.5 平台侧：数据源与令牌
 
 ```bash
-# 用平台提供的示例脚本把 jd 容器日志投给平台
-docker logs --since 5m interview-backend 2>&1 \
-  | grep -E 'ERROR|Exception' > /tmp/jd-error.log
-powershell -ExecutionPolicy Bypass -File scripts\hook-log-report.ps1 \
-  -LogFile /tmp/jd-error.log -Service interview-backend -BaseUrl http://<平台IP>:8000
+# <nightjar>/.env
+MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090
+HOOK_TOKEN=<随机串>
 ```
 
-### 3.8 平台侧：（可选）登记仓库映射与出网白名单
+对应 jd 侧 `.env` 的 `NIGHTJAR_HOOK_TOKEN` 必须与 `HOOK_TOKEN` 相同。
+若 `HOOK_TOKEN` 留空，平台侧 Hook 不鉴权（仅测试用）。
 
-若要使用「AI 代码分析」（把堆栈定位到源码），在平台 **服务器与仓库** 中登记：
+### 4.6 平台侧：告警规则
+
+jd 是开发/演练环境，用能触发但不过度打扰的阈值：
+
+| 实例 | 指标 | 操作符 | 阈值 | 级别 |
+|------|------|--------|------|------|
+| jd-mysql | `threads_connected` | `>` | 50 | warning |
+| jd-mysql | `slow_queries` | `>` | 1 | warning |
+| jd-redis | `memory_usage_percent` | `>` | 60 | warning |
+| jd-redis | `evicted_keys` | `>` | 0 | warning |
+
+### 4.7 平台侧：日志与代码分析（可选）
+
+日志链路已打通：jd 的 `error.log` / `gc.log` → `jd-log-agent` → `POST /api/hooks/logs`。
+契约见 `internal/service/logalert.go:LogReport`（`service` / `level` / `message` 必填，`timestamp` 需 RFC3339）。
+
+若要使用「AI 代码分析」，在 **服务器与仓库** 中登记：
 
 ```json
 {
   "service_name": "interview-review-backend",
-  "repo_url": "https://gitee.com/unihao/jd.git",
+  "repo_url": "<jd 仓库地址>",
   "branch": "master",
   "local_path": "/data/repos/jd",
   "language": "java",
@@ -281,58 +225,57 @@ powershell -ExecutionPolicy Bypass -File scripts\hook-log-report.ps1 \
 }
 ```
 
-出网白名单默认**关闭**（合规优先）。仅当你确认「允许把堆栈与代码片段发送到第三方 AI」时，
-再把 `interview-review-backend` 加入平台 `security.outbound_whitelist` 并置 `allow_third_party=true`。
-否则代码分析走本地检索 + 本地 LLM（若已配置）。
+出网白名单默认关闭。确认允许把堆栈与代码片段发给第三方 AI 后，再把
+`interview-review-backend` 加入 `security.outbound_whitelist` 并置 `allow_third_party=true`；
+否则代码分析走本地检索 + 本地 LLM。
 
 ---
 
-## 4. 验证清单
-
-按顺序执行，每步都应有明确输出：
+## 5. 验证清单
 
 ```bash
-# ① Exporter 自身有数据
-curl -s http://localhost:9121/metrics | grep -E '^redis_(up|memory_used_bytes)'
-curl -s http://localhost:9104/metrics | grep -E '^mysql_(up|global_status_threads_connected)'
+# ① 互联网络存在且是 internal
+docker network inspect jd-nightjar --format '{{.Internal}}'   # 期望 true
 
-# ② Prometheus 抓到了（工作 A/B 分别用 9090 / 9190）
-curl -s 'http://localhost:9090/api/v1/targets' | grep -o '"job":"middleware-exporter-[a-z]*"'
-curl -s 'http://localhost:9090/api/v1/query' \
-  --data-urlencode 'query=redis_memory_used_bytes{instance_name="jd-redis"}'
+# ② nightjar 能解析到 jd 的别名并连通
+docker exec mwops-backend sh -c 'getent hosts jd-prometheus && getent hosts jd-mysql'
 
-# ③ 平台采到了（换成你的 JWT 与实例 ID）
-curl -s -H "Authorization: Bearer $TOKEN" http://<平台IP>:8000/api/metrics/<实例ID> | head -c 500
+# ③ Prometheus 抓到了（在 jd 的 prometheus 容器里查）
+docker exec interview-prometheus wget -qO- \
+  'http://localhost:9090/api/v1/query?query=redis_memory_used_bytes{instance_name="jd-redis"}'
 
-# ④ 触发演练场景，验证告警与 AI 诊断
-#    在 jd 前端「沙箱」页选择 RedisFault / MySqlSlow 场景运行
-#    随后在平台「告警中心」应看到告警，点「AI 诊断」查看结构化结论
-```
+# ④ 平台采到（换上你的 JWT 与实例 ID）
+curl -s -H "Authorization: Bearer $TOKEN" http://<平台>:8000/api/metrics/<实例ID>
 
-平台侧全链路冒烟：
+# ⑤ 端到端：jd 前端「沙箱」跑 RedisFault / MySqlSlow 场景
+#    → 平台「告警中心」出现告警 → 点「AI 诊断」看结构化结论
 
-```powershell
+# 平台侧全链路冒烟
 powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1 -BaseUrl http://127.0.0.1:8000
 ```
 
 ---
 
-## 5. 常见问题
+## 6. 常见问题
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
-| mysqld-exporter 启动即退出 / 报认证失败 | MySQL 8 认证插件或账号未创建 | 用 `mysql_native_password` 建号；确认 `GRANT PROCESS, REPLICATION CLIENT, SELECT` |
-| `Can't connect to MySQL server on 'mysql'` | Exporter 与 MySQL 不在同一网络，或用了 SQLite profile（无 mysql 服务） | 方案 A 需 MySQL profile；否则改用方案 B（host 用容器名 `jd-mysql-db`） |
-| 平台显示「内置模拟器」 | 平台 `prometheus.base_url` 未配置或不通 | 配置并重启平台后端；确认平台容器能访问 jd 宿主机 9090/9190 |
-| 有指标但值为空 / `unknown` | `instance_name` 与纳管实例名不一致 | 实例名必须等于 `jd-redis` / `jd-mysql`（见 `prometheus-jd.yml` 的标签与 relabel） |
-| Redis 指标全无 | jd 的 Redis 被关闭（`AGENT_INTERVIEW_REDIS_ENABLED=false`） | 打开该开关，或该实例确实不纳管 |
-| 平台查询超时 | 跨主机访问 Prometheus 被防火墙拦截 | 放通平台 → jd 宿主机 9090/9190 |
-| 找不到 `interview-net` | jd 的网络名前缀是目录名 | `docker network ls` 查实际名，用 `JD_NETWORK=` 覆盖 |
+| `network jd-nightjar not found` | jd 侧未执行 `./start.sh nightjar` | 先起 jd，再起 nightjar |
+| 平台显示「内置模拟器」 | `MWOPS_PROMETHEUS_BASE_URL` 不通 | 确认填的是 `http://jd-prometheus:9090`；在 nightjar 后端容器内 `getent hosts jd-prometheus` |
+| 有实例但指标为空 | `instance_name` 标签缺失 | 两个 job 都已用 relabel 写入；确认 `prom_job` 精确匹配且 **`prom_instance` 留空** |
+| Redis 指标全无 | Redis 已鉴权但 Exporter 没传口令 | `docker-compose.jd.yml` 的 `REDIS_PASSWORD` 需与 jd 的 `REDIS_PASSWORD` 一致 |
+| 实例状态「连接失败」 | TCP 探测不通 | 方案 A 填 `jd-mysql` / `jd-redis`；方案 B 需叠加 `docker-compose.jd-link.yml` |
+| mysqld-exporter 认证失败 | MySQL 8 认证插件或账号未建 | 用 `mysql_native_password` 建号并 `GRANT PROCESS, REPLICATION CLIENT, SELECT` |
+| 日志上报 401 | `HOOK_TOKEN` 与 jd 的 `NIGHTJAR_HOOK_TOKEN` 不一致 | 两边改成同一串 |
+| 找不到 `jd_jd-data` 网络 | compose 项目名前缀不同 | `docker network ls \| grep jd-data`，用 `JD_DATA_NETWORK=` 覆盖 |
+| 后端起不来，报 Redis `NOAUTH` | `REDIS_PASSWORD` 为空 | `--requirepass ""` 与 Spring 空口令冲突，口令必须非空 |
+| 日志 Agent 起不来 / 报 curl 缺失 | 镜像构建期没装上依赖 | 用 `Dockerfile.logagent` 构建（`./start.sh nightjar-logs`）；容器只连 internal 网，运行期无法 `apk add` |
+| 日志 Agent 读不到日志 | 日志文件权限 | Agent 以非 root 运行，依赖 logback 生成文件的 644 权限；必要时临时去掉 `Dockerfile.logagent` 的 `USER mwops` |
 
 ---
 
-## 6. 一句话总结
+## 7. 一句话总结
 
-jd 已经帮你把 Prometheus 和后端指标准备好了，**你只需要补两个 Exporter（Redis、MySQL）+ 建一个只读监控账号**，
-然后在平台纳管 `jd-redis` / `jd-mysql` 两个实例、把 `prometheus.base_url` 指过去即可。
-之后可直接用 jd 自带的故障演练场景（Redis 故障 / MySQL 慢查询 / GC 泄漏 / 死锁）来验证平台的告警与 AI 诊断效果。
+jd 已经有 Prometheus 与后端指标，缺的是**中间件 Exporter、网络分区和日志落盘**。
+本轮补上之后，两个栈之间只留一条 internal 专用网和三个必要端点：
+nightjar 查指标、探活、收日志；jd 的数据库零宿主暴露、数据面零出网。

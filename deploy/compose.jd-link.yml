@@ -1,0 +1,41 @@
+# =============================================================================
+# nightjar ⇄ jd 专用互联 overlay
+#
+# 作用：把 nightjar 的后端加入 jd 创建的 internal 网络 jd-nightjar，从而具备三条
+#       最小必要通路，且**仅**这三条：
+#
+#   1. mwops-backend → jd-prometheus:9090     查询中间件指标（prometheus.base_url）
+#   2. mwops-backend → jd-mysql:3306          纳管实例 TCP 健康探测（service/middleware.go:probe）
+#                    → jd-redis:6379
+#   3. jd 的日志 Agent → mwops-backend:8080    POST /api/hooks/logs
+#
+# 为什么不是把两个栈丢进同一张大网：
+#   jd 的 frontend / grafana / backend 出网链路完全不暴露给 nightjar；
+#   jd 的 MySQL / Redis 也依旧不向宿主机发布端口。跨栈可见面只有上面三个端点。
+#
+# 前置：jd 侧已执行 ./start.sh nightjar（该脚本会以 --internal 创建 jd-nightjar）。
+#       网络不存在时本文件会启动失败——这是有意的，避免退化成非隔离的普通桥接网。
+#
+# 用法（在 nightjar 项目根目录执行）：
+#   cp .env.example .env        # 至少设置 JWT_SECRET / ADMIN_PASSWORD / HOOK_TOKEN
+#   docker compose -f docker-compose.yml -f deploy/compose.jd-link.yml up -d --build
+#
+# 随后在 nightjar 的 .env 里设置：
+#   MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090
+#   MWOPS_HOOK_TOKEN=<与 jd 的 NIGHTJAR_HOOK_TOKEN 相同>
+# =============================================================================
+
+services:
+  backend:
+    environment:
+      # 覆盖 docker-compose.yml 里的值：直接走专用互联网络访问 jd 的 Prometheus
+      MWOPS_PROMETHEUS_BASE_URL: ${MWOPS_PROMETHEUS_BASE_URL:-http://jd-prometheus:9090}
+    networks:
+      - mwops
+      - jd-nightjar
+
+networks:
+  # jd 侧创建的 internal 网络，本文件以 external 方式引用（不负责创建）
+  jd-nightjar:
+    external: true
+    name: ${JD_NIGHTJAR_NETWORK:-jd-nightjar}
