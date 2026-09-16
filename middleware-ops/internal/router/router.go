@@ -58,6 +58,9 @@ func New(opt Options) *gin.Engine {
 	// 健康检查与自身指标（无需认证）。
 	engine.GET("/healthz", h.Health)
 	engine.GET("/metrics", h.Metrics)
+	// 集成中心的服务发现（Prometheus http_sd_configs 拉取，公开接口）。
+	// 只暴露被管实例地址与标签，不含口令；需要鉴权时设置 integration.sd_token。
+	engine.GET("/api/sd/integrations", h.IntegrationServiceDiscovery)
 
 	api := engine.Group("/api")
 
@@ -86,6 +89,21 @@ func New(opt Options) *gin.Engine {
 		instances.POST("/:id/health", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.HealthMiddleware)
 	}
 
+	// 集成中心（对齐云厂商控制台的一键集成）：页面选组件 → 填参数 → 自动暴露指标。
+	// 与「中间件纳管」共用权限点：集成产物本身就是一个纳管实例。
+	integrations := api.Group("/integrations")
+	integrations.Use(mw.Auth(opt.Deps.Auth, cfg))
+	{
+		integrations.GET("/overview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.IntegrationOverview)
+		integrations.GET("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.ListIntegrations)
+		integrations.GET("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.GetIntegration)
+		integrations.POST("/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewIntegration)
+		integrations.POST("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateIntegration)
+		integrations.PUT("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.UpdateIntegration)
+		integrations.POST("/:id/apply", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.ApplyIntegration)
+		integrations.DELETE("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.DeleteIntegration)
+	}
+
 	// 统一监控（4.2）：全部 L0。
 	metricsGroup := api.Group("/metrics")
 	metricsGroup.Use(mw.Auth(opt.Deps.Auth, cfg), mw.RequirePerm(opt.Deps.Auth, service.PermMonitorRead))
@@ -94,6 +112,8 @@ func New(opt Options) *gin.Engine {
 		metricsGroup.GET("/compare", h.CompareMetrics)
 		metricsGroup.GET("/:id", h.GetMetrics)
 		metricsGroup.GET("/:id/history", h.GetMetricsHistory)
+		// 接入自检：纳管后"看不到监控"时先看这里，而不是靠猜。
+		metricsGroup.GET("/:id/diagnose", h.DiagnoseMetrics)
 	}
 
 	// AI 诊断中心（4.3）：L0。

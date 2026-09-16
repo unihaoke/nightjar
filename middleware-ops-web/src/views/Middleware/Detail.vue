@@ -5,7 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { aiApi, alertApi, middlewareApi, metricsApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { Alert, AlertRule, Metric, MetricSnapshot, MiddlewareInstance } from '@/api/types'
+import type { Alert, AlertRule, DiagnoseResult, Metric, MetricSnapshot, MiddlewareInstance } from '@/api/types'
 import MetricChart from '@/components/MetricChart.vue'
 import StatCard from '@/components/StatCard.vue'
 import { alertLevelLabels, alertStatusLabels, envLabels, envTagType, formatNumber, formatTime, horizonLabels, mwTypeLabels } from '@/utils/format'
@@ -108,6 +108,24 @@ function goDiagnose(): void {
   void router.push({ name: 'ai-diagnose', query: { instance_id: String(instanceID.value) } })
 }
 
+const diagnoseVisible = ref(false)
+const diagnosing = ref(false)
+const diagnose = ref<DiagnoseResult | null>(null)
+
+/** 接入自检：把选择器、job 抓取状态与排查建议一次摊开。 */
+async function handleDiagnose(): Promise<void> {
+  diagnosing.value = true
+  diagnoseVisible.value = true
+  try {
+    diagnose.value = await metricsApi.diagnose(instanceID.value)
+  } catch (error) {
+    diagnose.value = null
+    toastError(error)
+  } finally {
+    diagnosing.value = false
+  }
+}
+
 /** 确认告警。 */
 async function ackAlert(alert: Alert): Promise<void> {
   try {
@@ -157,6 +175,7 @@ onMounted(load)
         <el-button :icon="'Refresh'" size="small" @click="load">刷新</el-button>
         <el-button type="primary" size="small" :icon="'MagicStick'" @click="goDiagnose">AI 诊断</el-button>
         <el-button size="small" @click="handleHealth">健康探测</el-button>
+        <el-button size="small" :loading="diagnosing" @click="handleDiagnose">接入自检</el-button>
       </div>
     </div>
 
@@ -303,6 +322,62 @@ onMounted(load)
         </li>
       </ul>
     </div>
+
+    <!-- 接入自检：纳管后"看不到监控/日志"时先看这里 -->
+    <el-dialog v-model="diagnoseVisible" title="接入自检" width="720px">
+      <div v-if="diagnose" class="diagnose">
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="实例">{{ diagnose.instance_name }}（{{ diagnose.mw_type }}）</el-descriptions-item>
+          <el-descriptions-item label="连接地址">{{ diagnose.host }}:{{ diagnose.port }}</el-descriptions-item>
+          <el-descriptions-item label="数据源">
+            <el-tag size="small" :type="diagnose.monitor_kind === 'prometheus' ? 'success' : 'warning'">
+              {{ diagnose.monitor_kind === 'prometheus' ? 'Prometheus' : '内置模拟器' }}
+            </el-tag>
+            <el-tag class="ml" size="small" :type="diagnose.prometheus_healthy ? 'success' : 'danger'">
+              {{ diagnose.prometheus_healthy ? '健康' : '不可达' }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="命中指标">
+            {{ diagnose.matched }} / {{ diagnose.total }}
+          </el-descriptions-item>
+          <el-descriptions-item label="PromQL 选择器" :span="2">
+            <span class="mono">{{ diagnose.selector || '-' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="job 抓取状态" :span="2">
+            <span v-if="diagnose.job_up === null">Prometheus 中不存在该 job（抓取配置未生效）</span>
+            <span v-else-if="diagnose.job_up === 1">up = 1（Exporter 已被抓取）</span>
+            <span v-else>up = 0（target 抓取失败）</span>
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <el-alert v-if="diagnose.note" class="mt" type="info" :closable="false" show-icon :title="diagnose.note" />
+
+        <h4 class="diag-title">建议</h4>
+        <ul class="diag-list">
+          <li v-for="(hint, index) in diagnose.hints" :key="index">{{ hint }}</li>
+          <li v-if="diagnose.hints.length === 0">指标链路正常，无需处理。</li>
+        </ul>
+
+        <h4 class="diag-title">日志链路（与中间件实例无关）</h4>
+        <ul class="diag-list">
+          <li v-for="(item, index) in diagnose.log_checklist" :key="`log-${index}`">{{ item }}</li>
+        </ul>
+
+        <h4 class="diag-title">逐条指标</h4>
+        <div class="table-scroll">
+          <el-table :data="diagnose.metrics" size="small" max-height="240">
+            <el-table-column prop="display_name" label="指标" width="120" />
+            <el-table-column label="命中" width="80">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.matched ? 'success' : 'info'">{{ row.matched ? '是' : '否' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="expr" label="PromQL" min-width="320" show-overflow-tooltip />
+          </el-table>
+        </div>
+      </div>
+      <div v-else v-loading="diagnosing" class="diag-loading" />
+    </el-dialog>
   </div>
 </template>
 
@@ -326,6 +401,31 @@ onMounted(load)
 .note {
   margin: 8px 0 0;
   font-size: 11.5px;
+}
+
+.ml {
+  margin-left: 6px;
+}
+
+.diag-loading {
+  min-height: 160px;
+}
+
+.diag-title {
+  margin: 16px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.diag-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.8;
+}
+
+.diagnose .mt {
+  margin-top: 12px;
 }
 
 .metrics-grid {

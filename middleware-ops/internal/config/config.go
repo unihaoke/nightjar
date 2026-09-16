@@ -12,18 +12,19 @@ import (
 
 // Config 是平台全部配置的根结构。
 type Config struct {
-	App        AppConfig        `mapstructure:"app"`
-	Server     ServerConfig     `mapstructure:"server"`
-	Database   DatabaseConfig   `mapstructure:"database"`
-	Redis      RedisConfig      `mapstructure:"redis"`
-	JWT        JWTConfig        `mapstructure:"jwt"`
-	Security   SecurityConfig   `mapstructure:"security"`
-	AIEngine   AIEngineConfig   `mapstructure:"ai_engine"`
-	Prometheus PrometheusConfig `mapstructure:"prometheus"`
-	Notify     NotifyConfig     `mapstructure:"notify"`
-	Guardrail  GuardrailConfig  `mapstructure:"guardrail"`
-	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
-	Log        LogConfig        `mapstructure:"log"`
+	App         AppConfig         `mapstructure:"app"`
+	Server      ServerConfig      `mapstructure:"server"`
+	Database    DatabaseConfig    `mapstructure:"database"`
+	Redis       RedisConfig       `mapstructure:"redis"`
+	JWT         JWTConfig         `mapstructure:"jwt"`
+	Security    SecurityConfig    `mapstructure:"security"`
+	AIEngine    AIEngineConfig    `mapstructure:"ai_engine"`
+	Prometheus  PrometheusConfig  `mapstructure:"prometheus"`
+	Integration IntegrationConfig `mapstructure:"integration"`
+	Notify      NotifyConfig      `mapstructure:"notify"`
+	Guardrail   GuardrailConfig   `mapstructure:"guardrail"`
+	Scheduler   SchedulerConfig   `mapstructure:"scheduler"`
+	Log         LogConfig         `mapstructure:"log"`
 }
 
 // AppConfig 应用元信息。
@@ -172,6 +173,43 @@ type PrometheusConfig struct {
 	Retention time.Duration `mapstructure:"retention"`
 	// ExporterJobPrefix 为 PromQL 标签匹配前缀。
 	ExporterJobPrefix string `mapstructure:"exporter_job_prefix"`
+}
+
+// IntegrationConfig 是「集成中心」参数（对齐云厂商控制台的一键集成能力）。
+//
+// 工作方式：集成中心把「Exporter 部署信息 + Prometheus 抓取标签」渲染成产物，
+// 抓取目标同时以两种形式对外提供：
+//
+//  1. HTTP 服务发现（主通道）：GET /api/sd/integrations，Prometheus 用
+//     http_sd_configs 周期性拉取，因此新增集成**不需要**重启或 reload Prometheus；
+//  2. file_sd 文件（副产物）：写入 OutputDir/FileSDName，供人工核对或交给
+//     外部 Prometheus 使用。
+//
+// 为什么主通道用 HTTP 而不是共享卷：后端容器以非 root 用户运行，而共享命名卷的
+// 属主取决于「哪个容器先初始化该卷」，顺序不可控——file_sd 会静默写不进去。
+// HTTP 通道没有属主概念，跨主机部署也能用。
+type IntegrationConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// OutputDir 为产物目录（file_sd 文件落在这里，供人工/外部 Prometheus 使用）。
+	OutputDir string `mapstructure:"output_dir"`
+	// FileSDName 为 file_sd 文件名。
+	FileSDName string `mapstructure:"file_sd_name"`
+	// SDToken 为服务发现接口的只读令牌；留空表示不鉴权
+	// （该接口只暴露地址与标签，不含任何口令）。
+	SDToken string `mapstructure:"sd_token"`
+	// JobName 为 file_sd 抓取任务名；集成的纳管实例 prom_job 会写为该值。
+	JobName string `mapstructure:"job_name"`
+	// AutoRules 表示集成成功后自动创建模板内的推荐告警规则。
+	AutoRules bool `mapstructure:"auto_rules"`
+	// DockerEnabled 表示允许平台调用 Docker Engine API 拉起 Exporter 容器。
+	// 默认关闭：挂载 docker.sock 等于把宿主机 root 权限交给平台容器。
+	DockerEnabled bool `mapstructure:"docker_enabled"`
+	// DockerHost 支持 unix:///var/run/docker.sock 或 tcp://host:port。
+	DockerHost string `mapstructure:"docker_host"`
+	// ExporterNetwork 为 Exporter 容器加入的网络，必须与 Prometheus 同网络。
+	ExporterNetwork string `mapstructure:"exporter_network"`
+	// DefaultEnvironment 为集成的默认环境（数据权限按环境隔离）。
+	DefaultEnvironment string `mapstructure:"default_environment"`
 }
 
 // NotifyConfig 通知渠道（4.4：飞书/企微必选，钉钉/邮件备选）。

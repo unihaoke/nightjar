@@ -126,6 +126,35 @@ prometheus:
   retention: 360h
   exporter_job_prefix: middleware-exporter
 
+# ---------------------------------------------------------------------------
+# 集成中心：在页面上选组件（Redis/MySQL/...）、填地址与账号，平台自动完成
+# 「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」。
+# 详见 docs/INTEGRATION.md。
+# ---------------------------------------------------------------------------
+integration:
+  enabled: true
+  # 副产物目录（file_sd 文件）：平台自带 Prometheus 走 HTTP 服务发现，
+  # 该文件用于人工核对/审计，或交给无法访问平台接口的外部 Prometheus。
+  # 容器内默认 /app/data/integrations（落在 backend-data 卷内，属主正确）。
+  output_dir: ./data/integrations
+  # file_sd 文件名。
+  file_sd_name: integrations.json
+  # 服务发现只读令牌；留空表示不鉴权（接口只暴露地址与标签，不含口令）。
+  sd_token: ""
+  # file_sd 抓取任务名：集成的纳管实例 prom_job 会写成该值。
+  # 必须等于 deploy/prometheus/prometheus.yml 里 middleware-integration 这个 job_name。
+  job_name: middleware-integration
+  # 集成成功后自动创建模板内的推荐告警规则。
+  auto_rules: true
+  # 一键拉起 Exporter 容器：需要挂载 docker.sock，默认关闭（安全优先）。
+  docker_enabled: false
+  docker_host: unix:///var/run/docker.sock
+  # Exporter 容器加入的网络（逗号分隔）：第一个是监控面（Prometheus 所在网络），
+  # 其余是数据面。jd 场景示例：middleware-ops_mwops,jd-nightjar
+  exporter_network: mwops
+  # 新建集成的默认环境（数据权限按 dev/staging/prod 隔离）。
+  default_environment: dev
+
 notify:
   enabled: true
   feishu:

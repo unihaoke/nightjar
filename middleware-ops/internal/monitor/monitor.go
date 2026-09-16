@@ -50,6 +50,19 @@ type Snapshot struct {
 	// Degraded 为 true 表示 Prometheus 不可用，已降级为模拟数据。
 	Degraded bool   `json:"degraded"`
 	Note     string `json:"note"`
+	// Selector 为本次查询实际使用的 PromQL 标签匹配串（接入自检与排障用）。
+	//
+	// 它是「平台能不能找到这个实例的指标」的唯一依据：选择器错一个字符，
+	// 所有指标都会静默变成 unknown/0，因此必须随快照回传，便于前端与自检接口展示。
+	Selector string `json:"selector"`
+	// Matched 为成功取到数值的指标个数；Total 为画像中的指标总数。
+	Matched int `json:"matched"`
+	Total   int `json:"total"`
+	// JobUp 为 up{job="<选择器里的 job>"} 的取值（nil 表示该 job 在 Prometheus 中不存在）。
+	//
+	// 用途：区分「job 根本没被 Prometheus 抓取」与「job 有抓取但标签对不上」，
+	// 这两类故障的处理方式完全不同，靠一个空快照无法分辨。
+	JobUp *float64 `json:"job_up"`
 }
 
 // Get 按名称取指标。
@@ -112,6 +125,14 @@ type Target struct {
 	// Job / Instance 对应 Prometheus 标签 job / instance。
 	Job      string
 	Instance string
+}
+
+// SelectorReporter 由能暴露 PromQL 选择器的客户端实现，供接入自检接口使用。
+//
+// 单独定义而不是并入 Client：模拟器没有「选择器」概念，不应被迫实现。
+type SelectorReporter interface {
+	// Selector 返回该实例在 Prometheus 中的标签匹配串。
+	Selector(target Target) string
 }
 
 // Client 是监控查询接口。

@@ -146,6 +146,158 @@ export interface MetricSnapshot {
   source: string
   degraded: boolean
   note: string
+  /** 本次查询实际使用的 PromQL 标签匹配串（排障依据）。 */
+  selector?: string
+  /** 取到数值的指标个数 / 画像中的指标总数。 */
+  matched?: number
+  total?: number
+  /** up{job=...} 的取值；null 表示该 job 在 Prometheus 中不存在。 */
+  job_up?: number | null
+}
+
+/** 单个指标的接入自检结果。 */
+export interface DiagnoseMetric {
+  name: string
+  display_name: string
+  expr: string
+  matched: boolean
+  status: string
+}
+
+/** 实例接入自检结果（回答「为什么这个实例没有指标/日志」）。 */
+export interface DiagnoseResult {
+  instance_id: number
+  instance_name: string
+  mw_type: string
+  host: string
+  port: number
+  prom_job: string
+  prom_instance: string
+  monitor_kind: string
+  prometheus_healthy: boolean
+  selector: string
+  job_up: number | null
+  matched: number
+  total: number
+  source: string
+  degraded: boolean
+  note: string
+  metrics: DiagnoseMetric[]
+  hints: string[]
+  /** 日志链路（与中间件实例无关）的必备条件清单。 */
+  log_checklist: string[]
+}
+
+/** 集成中心：单个组件的可配置参数（环境变量或命令行开关）。 */
+export interface IntegrationOption {
+  key: string
+  label: string
+  target: 'env' | 'arg'
+  kind: 'bool' | 'string' | 'number' | string
+  default: string
+  help: string
+}
+
+/** 集成中心：推荐告警规则。 */
+export interface IntegrationAlert {
+  name: string
+  metric_name: string
+  operator: string
+  threshold: number
+  level: string
+  time_window: number
+  cooldown: number
+  description: string
+}
+
+/** 集成中心：组件模板。 */
+export interface IntegrationTemplate {
+  type: string
+  name: string
+  component: string
+  description: string
+  phase: number
+  image: string
+  exporter_port: number
+  default_port: number
+  metrics_path: string
+  needs_auth: boolean
+  address_label: string
+  address_hint: string
+  address_is_url: boolean
+  url_scheme: string
+  url_path: string
+  options: IntegrationOption[]
+  notes: string[]
+  docs: string[]
+  alerts: IntegrationAlert[]
+  dashboard: { title: string; id: string }
+  job_name: string
+  default_environment: string
+  integrated: number
+}
+
+/** 集成中心：概览。 */
+export interface IntegrationOverview {
+  total: number
+  by_type: Record<string, number>
+  templates: IntegrationTemplate[]
+  file_sd_path: string
+  docker_note: string
+  docker_ok: boolean
+}
+
+/** 集成中心：一条集成。 */
+export interface IntegrationView {
+  instance_id: number
+  name: string
+  mw_type: string
+  component: string
+  address: string
+  host: string
+  port: number
+  username: string
+  environment: string
+  group_name: string
+  labels: Record<string, string>
+  options: Record<string, string>
+  job_name: string
+  container: string
+  image: string
+  container_status: string
+  selector: string
+  applied_at: string
+  last_error: string
+  has_password: boolean
+}
+
+/** 集成中心：生成的采集配置。 */
+export interface IntegrationArtifacts {
+  job_name: string
+  targets: string[]
+  labels: Record<string, string>
+  file_sd: string
+  scrape_job: string
+  compose: string
+  deploy_cmd: string
+  selector: string
+  verify_steps: string[]
+}
+
+/** 集成中心：新建/更新入参。 */
+export interface IntegrationInput {
+  name: string
+  mw_type: string
+  address: string
+  username?: string
+  password?: string
+  labels?: Record<string, string>
+  options?: Record<string, string>
+  environment?: string
+  group_name?: string
+  tags?: string[]
+  deploy?: boolean
+  auto_rules?: boolean
 }
 
 /** 诊断证据。 */

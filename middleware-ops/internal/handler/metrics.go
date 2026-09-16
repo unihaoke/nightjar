@@ -31,6 +31,20 @@ func (h *Handler) GetMetrics(c *gin.Context) {
 	response.OK(c, snapshot)
 }
 
+// DiagnoseMetrics 执行实例接入自检（回答「为什么这个实例没有指标」）。
+func (h *Handler) DiagnoseMetrics(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	result, err := h.deps.Metrics.Diagnose(c.Request.Context(), id, h.scope(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
 // GetMetricsHistory 查询指标历史趋势。
 func (h *Handler) GetMetricsHistory(c *gin.Context) {
 	id, ok := idParam(c, "id")

@@ -16,6 +16,10 @@
 
 **一期核心能力（与设计文档 4.1 能力矩阵一致）**：Redis / MySQL / PostgreSQL / Kafka / Elasticsearch 支持纳管、监控、阈值告警与 AI 诊断；Nginx 支持纳管、监控与告警（不做 AI 诊断）；RabbitMQ 本版本仅纳管。
 
+**集成中心（M3 增强）**：在页面上选组件、填地址与账号即可完成「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」，
+对齐云厂商 Prometheus 控制台的「数据采集 → 集成中心」。抓取目标走 `file_sd`，新增集成无需重启 Prometheus；
+可选挂载 `docker.sock` 由平台一键拉起 Exporter 容器。详见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)。
+
 ---
 
 ## 二、快速开始
@@ -96,6 +100,8 @@ npm run dev                                          # 监听 :5173
 │       │       ├── quality.go      # ⑤ 质量护栏（结构化/证据/推测标注/评测集）
 │       │       └── cost.go         # ⑥ 成本治理（确定性缓存/配额/熔断）
 │       ├── monitor/                # Prometheus 查询封装（不含自研采集器）+ 模拟器
+│       ├── integration/            # 集成中心：组件模板 + 采集配置渲染（纯函数，可单测）
+│       ├── docker/                 # Docker Engine API 最小客户端（一键拉起 Exporter）
 │       ├── pkg/cache/              # 缓存与任务队列抽象（Redis / 内存双实现）
 │       ├── service/                # 业务服务（域：resource/ai/control）
 │       │   ├── ai/                 # 上下文组装与固定 Prompt 模板
@@ -167,6 +173,8 @@ AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管
 - 上报 Hook：`POST /api/hooks/logs`、`POST /api/hooks/alerts`，使用 `X-Hook-Token` 与服务令牌，与用户 JWT 分离。
 
 完整接口清单见 [`docs/API.md`](docs/API.md)，接入与运维说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)，
+**「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-JD-ONBOARD.md`](docs/GUIDE-JD-ONBOARD.md)（以 jd 为例）**，
+**「集成中心」的字段对照与落地方式见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)**，
 **「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**；
 针对具体项目的接入范例见 **[`docs/COLLECTOR-JD.md`](docs/COLLECTOR-JD.md)**（面试演练系统 jd：Spring Boot + MySQL + Redis + 自带 Prometheus）。
 

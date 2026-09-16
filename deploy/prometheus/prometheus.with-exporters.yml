@@ -7,8 +7,15 @@
 # 标签约定（平台按此匹配实例，务必与纳管信息一致）：
 #   - job：默认约定为 <exporter_job_prefix>-<中间件类型>，例如 middleware-exporter-redis；
 #          平台纳管实例时若填写了「Prometheus job」，则以该值为准；
-#   - instance_name：平台优先用它匹配实例名（各 Exporter 通过 SERVICE_NAME 上报）；
-#   - instance：平台纳管实例若填写了「Prometheus instance」，则用它精确匹配。
+#   - instance_name：平台未填「Prometheus instance」时用它匹配「实例名称」；
+#   - instance：平台填了「Prometheus instance」时用它精确匹配（与 instance_name 二选一）。
+#
+# ⚠️ 每个 job 都必须能产出 instance_name，平台才找得到实例：
+#   - redis_exporter（oliver006）**没有 SERVICE_NAME 这类 flag**，不会自带实例名；
+#   - mysqld_exporter / kafka_exporter / es_exporter / nginx_exporter 同样不带；
+#   - 因此下面统一用 relabel_configs（或 static_configs 的 labels）显式写入。
+#   早期版本在 redis job 上依赖 SERVICE_NAME 环境变量，导致 redis 实例纳管后
+#   指标恒为空——这是"新增实例却没有监控输出"最常见的成因之一。
 
 global:
   scrape_interval: 30s
@@ -32,10 +39,21 @@ scrape_configs:
     static_configs:
       - targets: ['backend:8080']
 
-  # Redis：Exporter 自带 instance_name（SERVICE_NAME 环境变量）
+  # 集成中心：HTTP 服务发现（由平台写入并周期性拉取，无需 reload）
+  #   集成的纳管实例 prom_job 与这里保持一致。
+  - job_name: middleware-integration
+    http_sd_configs:
+      - url: http://backend:8080/api/sd/integrations
+        refresh_interval: 30s
+
+  # Redis：Exporter 不提供 instance_name（无 SERVICE_NAME flag），这里统一补齐
   - job_name: middleware-exporter-redis
     static_configs:
       - targets: ['redis-exporter:9121']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: redis-dev-01
 
   # MySQL：mysqld-exporter 无 instance_name，这里统一补齐
   - job_name: middleware-exporter-mysql

@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,17 @@ import (
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/pkg/cache"
 )
+
+// errEmptyResult 表示 Prometheus 正常响应、但选择器没有匹配到任何时序。
+//
+// 必须与「请求失败」区分开：
+//   - 空结果 = 接入配置错（实例名/标签/job 对不上），是**真实故障信号**，不能降级掩盖；
+//   - 请求失败 = 上游不可用，此时才允许回退模拟器保证页面可用。
+//
+// 早期实现把两者都当作普通 error，导致 Prometheus 完全不可达时快照依然"成功"
+// （全部指标 unknown），回退模拟器成了死代码；同时"选择器无匹配"又被历史查询
+// 静默替换成模拟曲线，把接入错误彻底藏了起来。
+var errEmptyResult = errors.New("查询结果为空")
 
 // promClient 通过 Prometheus HTTP API 查询指标（4.2：不自建采集器）。
 type promClient struct {
@@ -58,27 +70,46 @@ func (p *promClient) Healthy(ctx context.Context) bool {
 	return resp.StatusCode < 400
 }
 
+// Selector 返回该实例的 PromQL 标签匹配串（实现 SelectorReporter）。
+func (p *promClient) Selector(target Target) string { return buildSelector(target, p.jobPrefix) }
+
 // Snapshot 采集实例当前指标。
+//
+// 三种结果必须严格区分，否则接入排障无从下手：
+//   - 至少一个指标取到值 → 正常快照；
+//   - 全部指标为「空结果」 → 快照照常返回，但在 Note 里写清是选择器没匹配到；
+//   - 全部指标为「请求失败」 → 返回 error，交给 fallbackClient 决定是否降级模拟器。
 func (p *promClient) Snapshot(ctx context.Context, target Target) (*Snapshot, error) {
 	profile := ProfileOf(target.MWType)
+	selector := buildSelector(target, p.jobPrefix)
 	snapshot := &Snapshot{
 		InstanceID: target.InstanceID,
 		MWType:     target.MWType,
 		Collected:  time.Now().UTC(),
 		Source:     "prometheus",
 		Metrics:    make([]Metric, 0, len(profile.Metrics)),
+		Selector:   selector,
+		Total:      len(profile.Metrics),
 	}
-	selector := buildSelector(target, p.jobPrefix)
-	var firstErr error
+	var (
+		firstErr  error
+		emptyCnt  int
+		failedCnt int
+	)
 	for _, spec := range profile.Metrics {
 		expr := strings.ReplaceAll(spec.Expr, "{selector}", "{"+selector+"}")
 		expr = strings.ReplaceAll(expr, ",}", "}")
 		value, err := p.queryValue(ctx, expr)
 		if err != nil {
+			if errors.Is(err, errEmptyResult) {
+				emptyCnt++
+			} else {
+				failedCnt++
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
-			p.log.Debug("指标查询失败", zap.String("metric", spec.Name), zap.Error(err))
+			p.log.Debug("指标查询失败", zap.String("metric", spec.Name), zap.String("expr", expr), zap.Error(err))
 			snapshot.Metrics = append(snapshot.Metrics, Metric{
 				Name: spec.Name, DisplayName: spec.DisplayName, Unit: spec.Unit,
 				Category: spec.Category, Status: "unknown", Expr: expr,
@@ -86,16 +117,57 @@ func (p *promClient) Snapshot(ctx context.Context, target Target) (*Snapshot, er
 			})
 			continue
 		}
+		snapshot.Matched++
 		snapshot.Metrics = append(snapshot.Metrics, Metric{
 			Name: spec.Name, DisplayName: spec.DisplayName, Unit: spec.Unit, Category: spec.Category,
 			Latest: value, Expr: expr, Status: evaluateStatus(spec, value),
 			WarningThreshold: spec.WarningThreshold, CriticalThreshold: spec.CriticalThreshold,
 		})
 	}
-	if firstErr != nil && len(snapshot.Metrics) == 0 {
-		return nil, firstErr
+
+	// 全部查询都失败（上游不可达/协议错误）→ 让 fallbackClient 降级为模拟器。
+	if failedCnt == len(profile.Metrics) && len(profile.Metrics) > 0 {
+		return nil, fmt.Errorf("Prometheus 查询全部失败（%d 项）：%w", failedCnt, firstErr)
 	}
+
+	// 探测 job 是否被 Prometheus 抓取：区分「job 未配置」与「标签对不上」。
+	snapshot.JobUp = p.probeJobUp(ctx, target)
+	snapshot.Note = buildSnapshotNote(selector, jobOf(target, p.jobPrefix), snapshot.JobUp, snapshot.Matched, emptyCnt, failedCnt)
 	return snapshot, nil
+}
+
+// probeJobUp 查询 up{job="..."}，返回 nil 表示该 job 在 Prometheus 中不存在。
+func (p *promClient) probeJobUp(ctx context.Context, target Target) *float64 {
+	job := jobOf(target, p.jobPrefix)
+	if job == "" {
+		return nil
+	}
+	value, err := p.queryValue(ctx, fmt.Sprintf(`up{job="%s"}`, job))
+	if err != nil {
+		return nil
+	}
+	return &value
+}
+
+// buildSnapshotNote 依据采集结果生成人可读的诊断说明；一切正常时返回空串。
+func buildSnapshotNote(selector, job string, jobUp *float64, matched, emptyCnt, failedCnt int) string {
+	if matched > 0 {
+		if emptyCnt > 0 || failedCnt > 0 {
+			return fmt.Sprintf("选择器 {%s} 命中 %d 项，另有 %d 项无数据、%d 项查询失败（多为该实例未暴露对应指标，属正常现象）",
+				selector, matched, emptyCnt, failedCnt)
+		}
+		return ""
+	}
+	switch {
+	case jobUp == nil:
+		return fmt.Sprintf("Prometheus 可达，但选择器 {%s} 未匹配到任何时序，且 up{job=%q} 也不存在：该 job 尚未在 Prometheus 中配置。请确认抓取配置已挂载并重建 Prometheus 容器。",
+			selector, job)
+	case *jobUp == 0:
+		return fmt.Sprintf("Prometheus 已配置 job=%q，但该 target 抓取失败（up=0）：Exporter 未启动或连不上被管中间件。请查看 Prometheus /targets 页面的 lastError 与 Exporter 容器日志。", job)
+	default:
+		return fmt.Sprintf("Prometheus 已正常抓取 job=%q（up=1），但选择器 {%s} 匹配不到时序：请让「实例名称」与 Prometheus 标签 instance_name 完全一致，或改用「Prometheus instance」精确指定；两者只能用一个（填了 Prometheus instance 会忽略实例名）。",
+			job, selector)
+	}
 }
 
 // History 查询指标历史趋势。
@@ -111,18 +183,31 @@ func (p *promClient) History(ctx context.Context, target Target, metric string, 
 }
 
 // Compare 多实例同指标对比。
+//
+// 单个实例查不到数据（空序列）不算失败，如实跳过；但**全部实例都查询失败**
+// 说明上游不可用，返回 error 以便降级链路生效。
 func (p *promClient) Compare(ctx context.Context, targets []Target, metric string) (map[string]float64, error) {
 	out := make(map[string]float64, len(targets))
+	var lastErr error
+	failures := 0
 	for _, target := range targets {
 		samples, err := p.History(ctx, target, metric, TimeRange{
 			Start: time.Now().Add(-5 * time.Minute),
 			End:   time.Now(),
 			Step:  time.Minute,
 		})
-		if err != nil || len(samples) == 0 {
+		if err != nil {
+			lastErr = err
+			failures++
+			continue
+		}
+		if len(samples) == 0 {
 			continue
 		}
 		out[target.Name] = samples[len(samples)-1].Value
+	}
+	if len(targets) > 0 && failures == len(targets) {
+		return nil, lastErr
 	}
 	return out, nil
 }
@@ -228,9 +313,12 @@ type promResultItem struct {
 }
 
 // firstValue 提取首个样本值。
+//
+// 结果集为空时返回 errEmptyResult（而不是普通错误）：调用方据此区分
+// 「选择器没匹配到时序」与「Prometheus 不可用」。
 func (r promResponse) firstValue() (float64, error) {
 	if len(r.Data.Result) == 0 {
-		return 0, fmt.Errorf("查询结果为空")
+		return 0, errEmptyResult
 	}
 	item := r.Data.Result[0]
 	if len(item.Value) < 2 {

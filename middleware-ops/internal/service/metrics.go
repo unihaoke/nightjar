@@ -149,6 +149,129 @@ func (s *MetricsService) Catalog(mwType string) map[string]any {
 	}
 }
 
+// DiagnoseMetric 是自检中单个指标的探测结果。
+type DiagnoseMetric struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Expr        string `json:"expr"`
+	Matched     bool   `json:"matched"`
+	Status      string `json:"status"`
+}
+
+// DiagnoseResult 是实例「接入自检」结果。
+//
+// 存在的意义：实例纳管后"看不到监控"有 6 种以上互不相同的原因，而平台早期
+// 统一表现为「页面空白/全是 0」，用户无法定位。自检把平台真正执行的 PromQL、
+// 选择器、job 抓取状态与逐条建议一次性摊开。
+type DiagnoseResult struct {
+	InstanceID   int64            `json:"instance_id"`
+	InstanceName string           `json:"instance_name"`
+	MWType       string           `json:"mw_type"`
+	Host         string           `json:"host"`
+	Port         int              `json:"port"`
+	PromJob      string           `json:"prom_job"`
+	PromInstance string           `json:"prom_instance"`
+	MonitorKind  string           `json:"monitor_kind"`
+	Healthy      bool             `json:"prometheus_healthy"`
+	Selector     string           `json:"selector"`
+	JobUp        *float64         `json:"job_up"`
+	Matched      int              `json:"matched"`
+	Total        int              `json:"total"`
+	Source       string           `json:"source"`
+	Degraded     bool             `json:"degraded"`
+	Note         string           `json:"note"`
+	Metrics      []DiagnoseMetric `json:"metrics"`
+	Hints        []string         `json:"hints"`
+	// LogChecklist 说明日志链路（与中间件实例无关）的必备条件。
+	LogChecklist []string `json:"log_checklist"`
+}
+
+// Diagnose 执行实例接入自检：把选择器、Prometheus 抓取状态与逐条排查建议返回给前端。
+func (s *MetricsService) Diagnose(ctx context.Context, instanceID int64, scope Scope) (*DiagnoseResult, error) {
+	item, err := s.instance(ctx, instanceID, scope)
+	if err != nil {
+		return nil, err
+	}
+	target := ToTarget(*item)
+	result := &DiagnoseResult{
+		InstanceID: item.ID, InstanceName: item.Name, MWType: item.MWType,
+		Host: item.Host, Port: item.Port,
+		PromJob: item.PromJob, PromInstance: item.PromInstance,
+		MonitorKind: s.MonitorKind(),
+		Metrics:     make([]DiagnoseMetric, 0),
+		Hints:       make([]string, 0, 6),
+		LogChecklist: []string{
+			"日志告警与中间件实例是两条独立链路：日志按「服务器 + 服务名」归集，纳管 MySQL/Redis 实例不会产生任何日志事件。",
+			"jd 侧必须以 logs profile 启动日志 Agent：./start.sh nightjar-logs（等价于 docker compose ... --profiles logs up -d），只跑 ./start.sh nightjar 是不会上报日志的。",
+			"平台 .env 的 HOOK_TOKEN 必须与 jd 侧 .env 的 NIGHTJAR_HOOK_TOKEN 完全一致，否则 /api/hooks/logs 返回 401，日志全部丢失。",
+			"Agent 只挂载 backend-logs 卷：确认容器内 /logs/error.log 存在（logback 启动即创建），gc.log 由 JVM -Xlog 写入同一目录。",
+			"日志事件按错误指纹聚合，在「日志告警 → 事件」中查看；服务名默认为 interview-review-backend，服务器名默认为 jd-host。",
+		},
+	}
+
+	if reporter, ok := s.monitor.(monitor.SelectorReporter); ok {
+		result.Selector = reporter.Selector(target)
+	}
+	if s.monitor != nil {
+		result.Healthy = s.monitor.Healthy(ctx)
+	}
+
+	snapshot, snapErr := s.monitor.Snapshot(ctx, target)
+	if snapErr != nil {
+		result.Hints = append(result.Hints, "指标快照采集失败："+snapErr.Error())
+	} else {
+		result.Source = snapshot.Source
+		result.Degraded = snapshot.Degraded
+		result.Note = snapshot.Note
+		result.Matched = snapshot.Matched
+		result.Total = snapshot.Total
+		result.JobUp = snapshot.JobUp
+		if result.Selector == "" {
+			result.Selector = snapshot.Selector
+		}
+		for _, metric := range snapshot.Metrics {
+			result.Metrics = append(result.Metrics, DiagnoseMetric{
+				Name: metric.Name, DisplayName: metric.DisplayName, Expr: metric.Expr,
+				Matched: metric.Status != "unknown", Status: metric.Status,
+			})
+		}
+	}
+
+	result.Hints = append(result.Hints, diagnoseHints(item, result)...)
+	return result, nil
+}
+
+// diagnoseHints 依据自检事实生成可执行的排查建议（按可能性从高到低）。
+func diagnoseHints(item *model.MiddlewareInstance, result *DiagnoseResult) []string {
+	hints := make([]string, 0, 6)
+	if result.MonitorKind == "simulator" {
+		hints = append(hints, "当前数据源是内置模拟器（prometheus.base_url 为空）：页面上的数值不是真实指标。请设置 MWOPS_PROMETHEUS_BASE_URL（jd 场景为 http://jd-prometheus:9090），并用 compose.jd-link.yml 启动平台。")
+	}
+	if !result.Healthy {
+		hints = append(hints, "Prometheus 健康检查未通过：确认地址可达、容器网络别名正确（平台侧 getent hosts jd-prometheus）。")
+	}
+	if result.Total == 0 {
+		hints = append(hints, "该中间件类型没有指标画像（rabbitmq 仅纳管），因此不会产出任何指标。")
+	}
+	switch {
+	case result.Matched > 0:
+		// 正常，无需提示。
+	case result.JobUp == nil && result.MonitorKind == "prometheus":
+		hints = append(hints, "Prometheus 中没有这个 job：抓取配置未生效。核对 job 名与 prom_job 字段，并确认抓取配置文件已挂载、Prometheus 已重建（docker compose up -d 后需重启该容器）。")
+	case result.JobUp != nil && *result.JobUp == 0:
+		hints = append(hints, "target 抓取失败（up=0）：Exporter 未运行，或连不上被管中间件。先看 Prometheus /targets 的 lastError，再看 Exporter 容器日志与认证口令。")
+	case result.Matched == 0:
+		hints = append(hints, "抓取正常但标签对不上：把平台「实例名称」改成与 Prometheus 标签 instance_name 完全一致的值，或填写「Prometheus instance」精确指定。")
+	}
+	if item.PromInstance != "" {
+		hints = append(hints, "已填写「Prometheus instance」：实例名称不再参与匹配（两者二选一）。jd 这类自建 Exporter 只上报 instance_name，此时应清空该字段。")
+	}
+	if result.Selector != "" {
+		hints = append(hints, "可以直接在 Prometheus 里验证："+result.Selector)
+	}
+	return hints
+}
+
 // instance 查询实例并校验数据权限。
 func (s *MetricsService) instance(ctx context.Context, id int64, scope Scope) (*model.MiddlewareInstance, error) {
 	item, err := s.instances.Get(ctx, id)

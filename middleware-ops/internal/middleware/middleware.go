@@ -159,6 +159,14 @@ func NewRateLimiter(limitPerMinute int) *RateLimiter {
 // Middleware 返回限流中间件。
 func (r *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 上报 Hook 是机器流量（日志 Agent 逐行上报，一次异常就是几百条），
+		// 不参与按用户/IP 的人机限流：否则一次日志刷屏就把该 IP 的额度打满，
+		// 后续上报统一被 403 静默丢弃——现象正是"新增实例后日志时有时无"。
+		// Hook 自身由 X-Hook-Token 鉴权，安全性不依赖限流。
+		if strings.HasPrefix(c.Request.URL.Path, "/api/hooks/") {
+			c.Next()
+			return
+		}
 		key := c.ClientIP()
 		if session := SessionOf(c); session != nil && session.User != nil {
 			key = session.User.Username

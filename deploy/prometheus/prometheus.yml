@@ -30,6 +30,27 @@ scrape_configs:
     static_configs:
       - targets: ['backend:8080']
 
+  # ---------------------------------------------------------------------------
+  # 集成中心（前端「集成中心」页保存的集成）
+  #
+  # 平台把每个集成渲染成一条服务发现目标（targets=Exporter 地址，
+  # labels.instance_name=集成名称），通过 HTTP 服务发现暴露。
+  # Prometheus 周期性拉取，因此**新增集成不需要重启或 reload Prometheus**。
+  #
+  # 为什么用 http_sd 而不是 file_sd 共享卷：后端容器以非 root 用户运行，
+  # 共享命名卷的属主取决于「哪个容器先初始化该卷」，顺序不可控，
+  # file_sd 会静默写不进去；HTTP 通道没有属主概念，跨主机也能用。
+  # 平台同时在容器内保留 # /app/data/integrations/integrations.json 作为副产物。
+  #
+  # 集成的纳管实例 prom_job 会被写成 middleware-integration，
+  # 与这里的 job_name 一致，平台按 {job,instance_name} 定位指标。
+  # 若设置了 integration.sd_token，把令牌拼到 url 上：...?token=<令牌>
+  # ---------------------------------------------------------------------------
+  - job_name: middleware-integration
+    http_sd_configs:
+      - url: http://backend:8080/api/sd/integrations
+        refresh_interval: 30s
+
   # Redis Exporter（示例：按实际部署替换 targets）
   - job_name: middleware-exporter-redis
     static_configs:

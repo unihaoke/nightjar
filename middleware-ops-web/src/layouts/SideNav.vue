@@ -38,6 +38,7 @@ const groups: NavGroup[] = [
   {
     group: '资源',
     items: [
+      { name: 'integrations', title: '集成中心', icon: 'Connection', permission: 'middleware:read' },
       { name: 'middlewares', title: '中间件纳管', icon: 'Coin', permission: 'middleware:read' },
       { name: 'monitor', title: '统一监控', icon: 'TrendCharts', permission: 'monitor:read' },
     ],

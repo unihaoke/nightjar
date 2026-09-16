@@ -13,8 +13,14 @@
 #     Linux 下 host.docker.internal 需要 extra_hosts 映射（本文件已为 exporter 配好）。
 #
 # 标签约定（与平台实例纳管字段对应，务必一致）：
-#   SERVICE_NAME 环境变量会被各 Exporter 作为 instance_name 标签上报，
-#   平台纳管时若未填写「Prometheus instance」，就按 instance_name 匹配实例名。
+#   instance_name 由 Prometheus 抓取配置写入（见 prometheus.with-exporters.yml 的
+#   relabel_configs），平台纳管时若未填写「Prometheus instance」，就按
+#   instance_name 匹配实例名称。
+#
+#   ⚠️ 不要指望 Exporter 自己上报实例名：oliver006/redis_exporter 的 flag 表里
+#      没有 SERVICE_NAME 一项（此前这里设置过，实际不生效），
+#      mysqld_exporter / kafka_exporter / es_exporter / nginx_exporter 同样没有。
+#      改实例名请改 prometheus.with-exporters.yml 里对应 job 的 replacement。
 
 services:
   # ---------------------------------------------------------------------------
@@ -43,8 +49,8 @@ services:
       # 只读账号（未开启 ACL 时留空）
       REDIS_USER: ${REDIS_TARGET_USER:-}
       REDIS_PASSWORD: ${REDIS_TARGET_PASSWORD:-}
-      # 该值会作为 instance_name 标签上报，需与平台纳管实例名一致
-      SERVICE_NAME: ${REDIS_INSTANCE_NAME:-redis-dev-01}
+      # 注意：这里**没有** SERVICE_NAME —— redis_exporter 不支持该 flag，
+      # 实例名（instance_name）由 prometheus.with-exporters.yml 的 relabel 写入。
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     ports:

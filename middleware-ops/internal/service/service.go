@@ -64,6 +64,7 @@ type Deps struct {
 	Audit        *AuditService
 	LogAlert     *LogAlertService
 	CodeAnalysis *CodeAnalysisService
+	Integration  *IntegrationService
 	Dashboard    *DashboardService
 	Notifier     *NotifierService
 

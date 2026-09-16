@@ -39,6 +39,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '全局大盘', group: '总览', permissions: ['system:overview'] },
       },
       {
+        path: 'integrations',
+        name: 'integrations',
+        component: () => import('@/views/Integration/Index.vue'),
+        meta: { title: '集成中心', group: '资源', permissions: ['middleware:read'] },
+      },
+      {
         path: 'middlewares',
         name: 'middlewares',
         component: () => import('@/views/Middleware/Index.vue'),

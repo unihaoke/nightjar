@@ -14,6 +14,9 @@ type fallbackClient struct {
 	primary Client
 	backup  Client
 	log     *zap.Logger
+	// jobPrefix 与 prometheus.exporter_job_prefix 一致，用于在降级时仍能回传
+	// 真实的选择器（用户排障时需要看到"平台到底查了什么"）。
+	jobPrefix string
 }
 
 // New 依据配置创建监控客户端。
@@ -26,9 +29,10 @@ func New(cfg *config.Config, store cache.Store, log *zap.Logger) Client {
 		return NewSimulator()
 	}
 	return &fallbackClient{
-		primary: NewPrometheusClient(cfg, store, log),
-		backup:  NewSimulator(),
-		log:     log,
+		primary:   NewPrometheusClient(cfg, store, log),
+		backup:    NewSimulator(),
+		log:       log,
+		jobPrefix: cfg.Prometheus.ExporterJobPrefix,
 	}
 }
 
@@ -39,6 +43,9 @@ func (f *fallbackClient) Kind() string { return f.primary.Kind() }
 func (f *fallbackClient) Healthy(ctx context.Context) bool { return f.primary.Healthy(ctx) }
 
 // Snapshot 采集指标，失败时回退模拟器。
+//
+// 只有 primary 报错（上游不可达/协议错误）才降级；primary 正常返回但
+// 选择器一条时序都没匹配到时，如实返回空快照并带上诊断 Note。
 func (f *fallbackClient) Snapshot(ctx context.Context, target Target) (*Snapshot, error) {
 	snapshot, err := f.primary.Snapshot(ctx, target)
 	if err == nil {
@@ -50,23 +57,40 @@ func (f *fallbackClient) Snapshot(ctx context.Context, target Target) (*Snapshot
 		return nil, err
 	}
 	fallback.Note = "Prometheus 查询失败（" + err.Error() + "），已回退内置模拟数据"
+	if f.jobPrefix != "" {
+		fallback.Selector = SelectorFor(target, f.jobPrefix)
+	}
 	return fallback, nil
 }
 
-// History 查询历史，失败时回退模拟器。
+// History 查询历史趋势，仅在查询失败时回退模拟器。
+//
+// 关键：**空结果不回退**。选择器写错时 Prometheus 会正常返回空序列，若在这里
+// 用模拟器补齐，前端就会画出一条看起来很正常的曲线，把「实例其实没接上」
+// 彻底掩盖掉——这正是早期版本"新增实例后看不到真实监控"的根因。
 func (f *fallbackClient) History(ctx context.Context, target Target, metric string, r TimeRange) ([]Sample, error) {
 	samples, err := f.primary.History(ctx, target, metric, r)
-	if err == nil && len(samples) > 0 {
+	if err == nil {
 		return samples, nil
 	}
+	f.log.Warn("Prometheus 历史查询失败，回退内置模拟器",
+		zap.String("instance", target.Name), zap.String("metric", metric), zap.Error(err))
 	return f.backup.History(ctx, target, metric, r)
 }
 
-// Compare 多实例对比，失败时回退模拟器。
+// Compare 多实例同指标对比，仅在查询失败时回退模拟器（理由同 History）。
 func (f *fallbackClient) Compare(ctx context.Context, targets []Target, metric string) (map[string]float64, error) {
 	out, err := f.primary.Compare(ctx, targets, metric)
-	if err == nil && len(out) > 0 {
+	if err == nil {
 		return out, nil
 	}
 	return f.backup.Compare(ctx, targets, metric)
+}
+
+// Selector 暴露底层 Prometheus 客户端的标签匹配串（实现 SelectorReporter）。
+func (f *fallbackClient) Selector(target Target) string {
+	if reporter, ok := f.primary.(SelectorReporter); ok {
+		return reporter.Selector(target)
+	}
+	return ""
 }

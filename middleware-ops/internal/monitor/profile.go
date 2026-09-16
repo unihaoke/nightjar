@@ -259,14 +259,32 @@ func SpecOf(mwType, metric string) (MetricSpec, bool) {
 	return MetricSpec{}, false
 }
 
+// jobOf 计算实例查询使用的 job 标签值。
+//
+// 纳管时填了 prom_job 就以它为准；否则按 jobPrefix + "-" + 中间件类型 兜底
+// （如 middleware-exporter-redis），与 deploy/prometheus/ 下的 job 命名约定一致。
+func jobOf(t Target, jobPrefix string) string {
+	if t.Job != "" {
+		return t.Job
+	}
+	if jobPrefix != "" && t.MWType != "" {
+		return fmt.Sprintf("%s-%s", jobPrefix, t.MWType)
+	}
+	return ""
+}
+
 // buildSelector 依据目标实例构造 PromQL 标签匹配串。
+//
+// 匹配优先级（与纳管表单的字段一一对应）：
+//  1. job：prom_job，为空时按 <前缀>-<类型> 兜底；
+//  2. 实例：prom_instance 非空 → instance="..."；否则 → instance_name="<实例名>"。
+//
+// 注意 2 是「二选一」而不是「都要满足」：一旦填了 prom_instance，实例名就不再参与
+// 匹配。这是接入时最容易踩的坑（jd 这类自建 Exporter 场景只上报 instance_name，
+// 把 instance 填成 IP:端口 就永远查不到数据），因此自检接口会显式提示。
 func buildSelector(t Target, jobPrefix string) string {
 	parts := make([]string, 0, 3)
-	job := t.Job
-	if job == "" && jobPrefix != "" && t.MWType != "" {
-		job = fmt.Sprintf("%s-%s", jobPrefix, t.MWType)
-	}
-	if job != "" {
+	if job := jobOf(t, jobPrefix); job != "" {
 		parts = append(parts, fmt.Sprintf(`job="%s"`, job))
 	}
 	if t.Instance != "" {
@@ -275,4 +293,9 @@ func buildSelector(t Target, jobPrefix string) string {
 		parts = append(parts, fmt.Sprintf(`instance_name="%s"`, t.Name))
 	}
 	return strings.Join(parts, ",")
+}
+
+// SelectorFor 返回实例在 Prometheus 中的标签匹配串（供接入自检与排障核对）。
+func SelectorFor(target Target, jobPrefix string) string {
+	return buildSelector(target, jobPrefix)
 }

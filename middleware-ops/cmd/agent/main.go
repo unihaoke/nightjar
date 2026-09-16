@@ -363,10 +363,11 @@ func (a *agent) readNewLines(target LogTarget) ([]LogReport, error) {
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var (
-		reports []LogReport
-		window  []string
-		pending string
-		readAny int64
+		reports   []LogReport
+		window    []string
+		pending   string
+		pendingLv string
+		readAny   int64
 	)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -381,19 +382,20 @@ func (a *agent) readNewLines(target LogTarget) ([]LogReport, error) {
 			continue
 		}
 		if pending != "" {
-			reports = append(reports, a.buildReport(target, pending, window))
+			reports = append(reports, a.buildReport(target, pending, pendingLv, window))
 			pending = ""
+			pendingLv = ""
 			if len(reports) >= a.cfg.MaxBatch {
 				break
 			}
 		}
 		if matched, level := matchLevel(line, target.LevelFilter); matched {
 			pending = line
-			_ = level
+			pendingLv = level
 		}
 	}
 	if pending != "" && len(reports) < a.cfg.MaxBatch {
-		reports = append(reports, a.buildReport(target, pending, window))
+		reports = append(reports, a.buildReport(target, pending, pendingLv, window))
 	}
 	if err := scanner.Err(); err != nil {
 		return reports, err
@@ -408,7 +410,10 @@ func (a *agent) readNewLines(target LogTarget) ([]LogReport, error) {
 }
 
 // buildReport 组装上报体，附带错误前后 N 行上下文。
-func (a *agent) buildReport(target LogTarget, message string, window []string) LogReport {
+func (a *agent) buildReport(target LogTarget, message, level string, window []string) LogReport {
+	if level == "" {
+		level = "ERROR"
+	}
 	contextLines := window
 	if len(contextLines) > a.cfg.ContextLines {
 		contextLines = contextLines[len(contextLines)-a.cfg.ContextLines:]
@@ -416,7 +421,7 @@ func (a *agent) buildReport(target LogTarget, message string, window []string) L
 	report := LogReport{
 		ServerName:   a.cfg.ServerName,
 		Service:      target.Service,
-		Level:        "ERROR",
+		Level:        level,
 		Message:      message,
 		ContextLines: strings.Join(contextLines, "\n"),
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
@@ -434,7 +439,17 @@ func (a *agent) buildReport(target LogTarget, message string, window []string) L
 	return report
 }
 
-// matchLevel 判断日志行是否达到采集等级。
+// matchLevel 判断日志行是否达到采集等级，并返回识别到的等级。
+//
+// level_filter 的语义是「最低采集等级」：
+//   - 缺省 / ERROR：只采集 ERROR / FATAL / PANIC / 异常堆栈 / Full GC；
+//   - WARN：在上一档基础上额外采集 WARN；
+//   - INFO / DEBUG：采集全部非空行——gc.log 这类日志本身没有等级字段，
+//     必须用 INFO 才能采到。
+//
+// 早期实现只判断了 WARN 分支，level_filter: INFO 被静默忽略，导致
+// agent.yaml 里配了 gc.log 却永远没有 GC 日志上报（配置写了不生效）。
+// 同时上报体的 level 被硬编码为 ERROR，GC 日志会被误标成错误。
 func matchLevel(line, filter string) (bool, string) {
 	upper := strings.ToUpper(line)
 	for _, level := range []string{"FATAL", "PANIC", "ERROR", "EXCEPTION"} {
@@ -442,11 +457,18 @@ func matchLevel(line, filter string) (bool, string) {
 			return true, level
 		}
 	}
-	if strings.EqualFold(filter, "WARN") && strings.Contains(upper, "WARN") {
-		return true, "WARN"
-	}
 	if strings.Contains(upper, "FULL GC") || strings.Contains(upper, "OUTOFMEMORY") {
 		return true, "FATAL"
+	}
+	switch strings.ToUpper(strings.TrimSpace(filter)) {
+	case "WARN":
+		if strings.Contains(upper, "WARN") {
+			return true, "WARN"
+		}
+	case "INFO", "DEBUG", "TRACE", "ALL":
+		if strings.TrimSpace(line) != "" {
+			return true, "INFO"
+		}
 	}
 	return false, ""
 }

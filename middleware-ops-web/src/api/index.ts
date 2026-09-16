@@ -8,11 +8,16 @@ import type {
   AuditSnapshot,
   CodeAnalysis,
   CodeRepo,
+  DiagnoseResult,
   DiagnosisRecord,
   DiagnosisResponse,
   FixExecuteResult,
   FixPreview,
   FixRecord,
+  IntegrationArtifacts,
+  IntegrationInput,
+  IntegrationOverview,
+  IntegrationView,
   KnowledgeEntry,
   LogEvent,
   Metric,
@@ -91,6 +96,20 @@ export const metricsApi = {
       types: string[]
       metrics: { name: string; display_name: string; unit: string; category: string }[]
     }>('/api/metrics/catalog', mwType ? { mw_type: mwType } : undefined),
+  /** 接入自检：纳管后看不到监控时先看这里。 */
+  diagnose: (id: number) => get<DiagnoseResult>(`/api/metrics/${id}/diagnose`),
+}
+
+/** 集成中心：页面一键集成（对齐云厂商控制台的「数据采集 → 集成中心」）。 */
+export const integrationApi = {
+  overview: () => get<IntegrationOverview>('/api/integrations/overview'),
+  list: () => get<{ items: IntegrationView[] }>('/api/integrations'),
+  detail: (id: number) => get<IntegrationView>(`/api/integrations/${id}`),
+  preview: (payload: IntegrationInput) => post<IntegrationArtifacts>('/api/integrations/preview', payload),
+  create: (payload: IntegrationInput) => post<IntegrationView>('/api/integrations', payload),
+  update: (id: number, payload: IntegrationInput) => put<IntegrationView>(`/api/integrations/${id}`, payload),
+  apply: (id: number) => post<IntegrationView>(`/api/integrations/${id}/apply`),
+  remove: (id: number) => del<{ message: string }>(`/api/integrations/${id}`),
 }
 
 /** AI 诊断（4.3）。 */

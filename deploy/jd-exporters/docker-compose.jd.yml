@@ -158,8 +158,11 @@ services:
       SERVICE_NAME: interview-review-backend
       SERVER_NAME: ${SERVER_NAME:-jd-host}
       ENVIRONMENT: dev
-      # 分号分隔的 文件:告警类型:级别 三元组
-      LOG_TARGETS: /logs/error.log:error:ERROR;/logs/gc.log:gc:INFO
+      # 分号分隔的 文件:告警类型:级别 三元组。
+      # 默认只采集 error.log：gc.log 逐行上报会打爆日志告警列表（每行一个事件），
+      # 需要 GC 诊断时再按需追加（并先把 JVM 参数收敛为 -Xlog:gc）：
+      #   LOG_TARGETS: /logs/error.log:error:ERROR;/logs/gc.log:gc:INFO
+      LOG_TARGETS: ${LOG_TARGETS:-/logs/error.log:error:ERROR}
     volumes:
       - backend-logs:/logs:ro
     depends_on:

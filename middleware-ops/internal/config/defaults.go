@@ -98,6 +98,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("prometheus.retention", 15*24*time.Hour)
 	v.SetDefault("prometheus.exporter_job_prefix", "middleware-exporter")
 
+	v.SetDefault("integration.enabled", true)
+	v.SetDefault("integration.output_dir", "./data/integrations")
+	v.SetDefault("integration.file_sd_name", "integrations.json")
+	v.SetDefault("integration.sd_token", "")
+	v.SetDefault("integration.job_name", "middleware-integration")
+	v.SetDefault("integration.auto_rules", true)
+	v.SetDefault("integration.docker_enabled", false)
+	v.SetDefault("integration.docker_host", "unix:///var/run/docker.sock")
+	v.SetDefault("integration.exporter_network", "mwops")
+	v.SetDefault("integration.default_environment", "dev")
+
 	v.SetDefault("notify.enabled", true)
 	v.SetDefault("notify.feishu.enabled", false)
 	v.SetDefault("notify.wecom.enabled", false)
