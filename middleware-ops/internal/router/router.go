@@ -98,6 +98,9 @@ func New(opt Options) *gin.Engine {
 		integrations.GET("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.ListIntegrations)
 		integrations.GET("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.GetIntegration)
 		integrations.POST("/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewIntegration)
+		// 日志接入：平台读取被管容器的 docker 配置反查日志位置，自建采集容器（被管项目零改动）
+		integrations.POST("/logs/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewLogCollect)
+		integrations.POST("/logs", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateLogCollect)
 		integrations.POST("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateIntegration)
 		integrations.PUT("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.UpdateIntegration)
 		integrations.POST("/:id/apply", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.ApplyIntegration)

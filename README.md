@@ -34,7 +34,11 @@ docker compose up -d --build
 
 启动后访问 `http://<主机>:8000`，使用 `.env` 中的管理员账号登录（默认 `admin`），**登录后请立即修改密码**。
 
-包含组件：PostgreSQL 15 + pgvector、Redis 7、Prometheus、后端（Go）、Nginx + 前端静态资源。
+包含组件：PostgreSQL 15 + pgvector、Redis 7、Prometheus、**Grafana（统一监控大盘）**、后端（Go）、Nginx + 前端静态资源。
+
+> **监控栈统一在本平台**：被管项目（如 jd）不再需要自带 Prometheus / Grafana / Exporter——
+> 平台按「集成中心」的配置创建只读监控账号、拉起 Exporter、自动接入对方网络并抓取；
+> 数据源已由 provisioning 自动注入 Grafana，大盘按集成卡片给出的编号导入即可。
 
 > 表结构由后端 `GORM AutoMigrate` 在启动时创建（`database.auto_migrate=true`）；`deploy/postgres/init/` 下的初始化脚本**只创建扩展与数据库参数，不建表**。请勿手工先建表：PostgreSQL 会把内联 `UNIQUE` 命名为 `users_username_key`，而 GORM 迁移列唯一性时期望 `uni_users_username`，`DropConstraint` 会报 `SQLSTATE 42704` 导致启动失败。需要手工建库的 DBA 场景请使用 `docs/SCHEMA.sql`（约束名已按 GORM 策略显式命名），并同时把 `auto_migrate` 置为 `false`。修复办法见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) 第 5.6 节。
 
@@ -122,15 +126,14 @@ npm run dev                                          # 监听 :5173
 ├── deploy/                         # Postgres 初始化（仅扩展/参数）、Prometheus 抓取与告警规则
 │   ├── postgres/init/              # 只建扩展与数据库参数，不建表
 │   ├── prometheus/                 # prometheus.yml / prometheus.with-exporters.yml / rules
-│   ├── exporters/                  # Exporter 凭据模板（my.cnf）
-│   ├── jd-exporters/               # 「jd 面试演练系统」接入用的 Exporter override 与抓取配置
+│   ├── grafana/                    # 统一大盘：provisioning（数据源+加载器）与 dashboards 目录
+│   ├── agent/                      # 自托管日志采集 Agent 模板（agent.example.yaml）
+│   ├── compose.jd-link.yml         # 接跨栈项目时给平台追加目标网络
 │   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
-├── scripts/setup-jd-link.sh        # 一键接入/修复（Linux/macOS）：只维护 .env，其余全自动
-├── scripts/setup-jd-link.ps1       # 同上的 PowerShell 版（Windows 宿主）
-├── scripts/doctor-jd-link.sh       # 跨栈网络体检（Linux/macOS）
-├── scripts/doctor-jd-link.ps1      # 跨栈网络体检（Windows）
+├── scripts/setup-jd-link.sh        # 一键接入/修复：只维护 .env，其余全自动
+├── scripts/doctor-jd-link.sh       # 跨栈体检：平台/网络/别名/Exporter/采集/抓取
 └── Makefile                        # 常用开发/部署命令
 ```
 
@@ -179,8 +182,7 @@ AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管
 完整接口清单见 [`docs/API.md`](docs/API.md)，接入与运维说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)，
 **「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-JD-ONBOARD.md`](docs/GUIDE-JD-ONBOARD.md)（以 jd 为例）**，
 **「集成中心」的字段对照与落地方式见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)**，
-**「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**；
-针对具体项目的接入范例见 **[`docs/COLLECTOR-JD.md`](docs/COLLECTOR-JD.md)**（面试演练系统 jd：Spring Boot + MySQL + Redis + 自带 Prometheus）。
+**「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**。
 
 ---
 

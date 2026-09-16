@@ -174,9 +174,9 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops,jd-nightjar
 - 容器的第一个网络在创建时指定，其余通过 `POST /networks/{id}/connect` 追加；
 - `jd-nightjar` 由 jd 侧创建（internal），Exporter 因此能解析 `jd-redis` / `jd-mysql`；
 - 集成地址填 **容器别名**（`jd-redis:6379` / `jd-mysql:3306`），与
-  `docs/COLLECTOR-JD.md` 的纳管口径一致；
-- 若更希望由 **jd 自己的 Prometheus** 抓取，用第 4 节的「显式 scrape job」方式，
-  或把共享目录同时挂给两边（见 `jd/deploy/jd-exporters/prometheus-jd.yml` 顶部注释）。
+  `docs/GUIDE-JD-ONBOARD.md` 的纳管口径一致；
+- 目标网络不会自动挂载：平台只把 `INTEGRATION_EXPORTER_NETWORK` 里列出的网络接给
+  Exporter，第一个网络用于连 Prometheus，其余用于解析目标地址。
 
 ---
 
@@ -205,6 +205,92 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops,jd-nightjar
 | 一键部署报错 | 集成列表里该行会显示「待处理」与失败原因；`INTEGRATION_DOCKER_ENABLED` 与 socket 挂载是否都就绪 |
 | MySQL 某个采集项"关了没关掉" | 开关是否渲染成 `--no-collect.xxx`（抽屉里看 compose 片段） |
 | 想彻底重来 | 列表行 →「重新应用」（重写服务发现 + 重建容器），或删除后重新集成 |
+
+---
+
+## 8.5 集成后"直接能跑"的边界（自动化矩阵）
+
+一次集成要真正产出指标，需要四个环节都成立。下表说明每个环节今天由谁完成、
+以及全自动化的前置条件——**跨栈接入时，"平台能否写被管系统"决定了自动化上限**。
+
+| 环节 | 今天的状态 | 能否全自动 | 前置条件 / 风险 |
+|---|---|---|---|
+| ① Exporter 容器拉起 | ✅ 平台调 Docker Engine API 创建（默认关闭，可开） | 能 | 需挂载 `docker.sock`（等价宿主机 root 权限） |
+| ② 网络接入（监控面 + 数据面） | ✅ 按 `integration.exporter_network` 多网络接入；`setup-jd-link.sh` 会自动写进 `.env` | 能 | 需 `docker.sock`；也可像 jd 脚本那样把网络名写进 `.env` |
+| ③ 抓取目标注册（`instance_name` 标签） | ✅ http_sd，保存后 30s 内生效，无需重启 | 能 | 无 |
+| ④ 实例纳管 / 命名一致 / 告警规则 | ✅ 自动（集成即纳管；relabel 由 `JD_*_INSTANCE_NAME` 同步） | 能 | 无 |
+| ⑤ 凭据注入（口令含特殊字符） | ✅ 改为官方 flag + 环境变量（`--mysqld.username` / `MYSQLD_EXPORTER_PASSWORD`），不拼 DSN | 能 | 无（本轮修复） |
+| ⑥ 「到底跑没跑起来」的核验 | ✅ 保存后**异步核验**：抓取目标 up 则标记已应用，失败则把 Prometheus 的 `lastError` 翻译后写回集成 | 能 | 无（本轮新增） |
+| **⑦ 只读监控账号的创建** | ✅ **平台可代劳**：集成表单勾选「由平台创建/更新只读监控账号」并填一次管理凭据 | 能 | 属写操作 → 需显式授权；平台只执行内置模板 SQL（幂等 + 最小权限 + `MAX_USER_CONNECTIONS`），口令由平台生成，审计不含口令 |
+| ⑧ 账号存在性预检 | ✅ 由 ⑦ 覆盖（建号后立刻核验；未建号时核验阶段会报 `Access denied`） | 能 | 无 |
+
+**结论**：①②③④⑤⑥⑦⑧ 现在都能在平台上一次配置完成——**对被管项目零侵入**：
+
+- 账号：平台用一次性 client 容器执行固定模板 SQL 建号，不需要登录被管库手工建；
+- 网络：平台按**别名自动发现**目标所在的 docker 网络（跨 compose 项目也行），
+  使用者只需填 `jd-mysql` 这样的名字，不必知道它属于哪个项目、哪张网；
+- Exporter：平台拉起（同时接入监控面与数据面）；
+- 抓取与大盘：平台自带的 Prometheus + Grafana，被管项目**不再需要自带监控栈**。
+
+> 唯一仍需被管项目配合的是**日志链路**：日志文件在被管容器里，
+> 平台侧的采集需要共享日志卷（jd 的 `docker-compose.yml` 里那一行 `backend-logs` 挂载）。
+> 这是"读对方文件"的物理前提，与监控栈无关。
+
+**结论**：①②③④⑤⑥ 已经做到"配置即接入"；**唯一的硬缺口是 ⑦**——
+没有只读账号，mysqld_exporter 必然 `up=0`（表现为 `Access denied`）。
+这正是 `docs/GUIDE-JD-ONBOARD.md` §8.4 里最常见的那一类。
+
+给使用者的两条路（**现已默认走平台托管**）：
+
+- **路径 A（平台托管，推荐）**：集成表单勾选「由平台创建/更新只读监控账号」，
+  填一次管理凭据 → 平台执行固定模板 SQL 建号（详见上表 ⑦），
+  口令留空则由平台生成十六进制随机串。**被管项目零配置**。
+- **路径 B（自行预置）**：不勾选该选项，账号由被管系统侧预置
+  （模板 SQL 见组件说明；jd 的 `setup-jd-link.sh` 也会执行 initdb）。
+  适合不便提供管理凭据的环境（如生产库由 DBA 管控）。
+
+---
+
+## 8.6 日志接入（平台侧采集，被管项目零改动）
+
+集成中心顶部有 **日志接入** 入口，用于采集被管项目的应用日志。与中间件集成的区别是
+**它不止配置，还会真的去读对方的 docker 配置**：
+
+```
+① 你填「目标容器名」（如 interview-backend）
+        ↓
+② 平台 docker inspect 该容器，读 env 与 Mounts
+        ↓
+③ 发现日志位置（按可信度）：
+     a) 环境变量 LOG_PATH/LOG_DIR/... 指向的目录，且该目录被某个卷/宿主目录覆盖；
+     b) 挂载点的容器内路径或卷名/宿主路径含 "log"；
+     c) 都没有 → **拒绝配置**（不猜路径）
+        ↓
+④ 用**平台自身镜像**创建一个采集容器（只覆盖 Entrypoint=mwops-agent）：
+     挂载同一份存储（命名卷按名字 / 宿主目录按路径）→ /logs:ro
+     挂载 mwops-log-agent-state:/data（偏移量，重启不重复上报）
+     接入平台网络 → 环境变量注入 platform_url / hook_token / service / files=/logs/*.log
+        ↓
+⑤ 日志事件进入「日志告警 → 事件」，按服务名归集
+```
+
+要点：
+
+- **为什么拒绝而不是猜**：猜错的后果是采集容器起来了、但日志页永远为空，
+  比直接报错难排查得多。拒绝时会明确告诉你"环境变量指了目录但没被挂载"或
+  "没有任何像日志的挂载"。
+- **为什么不需要额外镜像**：Agent 二进制已打进平台镜像（`middleware-ops/Dockerfile`
+  同时构建 `cmd/server` 与 `cmd/agent`），采集容器复用它并覆盖 Entrypoint，
+  因此不存在"另一个镜像要构建/分发/对版本"的问题。
+- **通配采集**：默认采集 `<挂载点>/*.log` 里符合级别的行——平台不需要知道具体文件名，
+  logback 轮转出的新文件也会被采到；`INFO` 级别会连 GC 这类无级别日志一起采（可选）。
+- **对生产环境的写操作走审批**：`environment=prod` 时，由平台创建只读监控账号
+  （见 §8.5 ⑦）不会立即执行，而是**创建审批工单**（工单里带将执行的固定 SQL，不含口令），
+  审批通过后再点「重新应用」由平台建号。
+
+> 备选方案（被管项目侧自建 Agent）仍保留：`cmd/agent` 支持 YAML 与**纯环境变量**两种配置，
+> 既可以由平台代管，也可以在被管项目里自己跑一个容器；后者适合网络不允许平台访问
+> docker.sock 的环境。
 
 ---
 

@@ -5,6 +5,61 @@
 
 ---
 
+## INC-004 · 指标序列含 NaN 导致「HTTP 200 + 空响应体」，前端报无关错误
+
+**首次暴露**：2026-09-17，实例详情页看「命中率」指标时报
+
+```
+Cannot read properties of undefined (reading 'series')
+```
+
+同一页面的「内存使用率」趋势则是一条不动的直线（见文末附注）。
+
+**定位过程**
+
+1. 前端报错点是 `result.series`，而两个调用处都写了 `result.series || []`——
+   说明 `result` 本身是 `undefined`，不是 `series` 为空；
+2. `undefined` 只可能来自 `request()` 里的 `body?.data`，即 **HTTP 200 但响应体为空**；
+3. 后端侧只有一种写法会产生这种响应：gin 的 `c.JSON` **先写状态码、再 `json.Marshal`**，
+   Marshal 失败时 body 就没了；
+4. 那么是什么数据无法编码？命中率的 PromQL 是
+   `rate(redis_keyspace_hits_total[5m]) / (rate(hits)+rate(misses)) * 100`，
+   Redis 在该窗口内没有读写时两侧都是 0 → Prometheus 返回字符串 **`"NaN"`**；
+   而 Go 的 `strconv.ParseFloat` 会**成功**解析 `"NaN"` / `"+Inf"` / `"-Inf"`，
+   于是 NaN 一路进入 `[]monitor.Sample`，`encoding/json` 拒绝编码非有限数。
+
+**根因**
+
+数据源头的取值函数没有区分「有限数」与「Prometheus 的特殊值」，
+且响应封装把「序列化失败」降级成了「200 + 空 body」——错误被静默转移给了前端，
+最终以与真实原因无关的 TypeError 呈现。
+
+**修复**
+
+1. `internal/monitor/prometheus.go`：新增 `isFinite()`；`firstValue()` 把 NaN/±Inf
+   视为 `errEmptyResult`（语义：该指标此刻没有可用数值）；`firstSeries()` 逐点跳过
+   非有限值（全部跳过则为空序列，前端显示「暂无采样数据」）；
+2. `internal/response/response.go`：新增 `Encode()`，`OK()` 改为**先编码成功再写响应**，
+   失败即返回 500 与可读原因，不再产生「200 + 空 body」；
+3. `src/api/http.ts`：`request()` 校验响应体确为 `{code,message,data}`，
+   否则抛出说明性错误（原文案会让调用方在 `result.series` 处抛出无关 TypeError）；
+4. 两个调用点改为 `result?.series || []` 兜底。
+
+**防复发**
+
+`internal/monitor/finite_test.go` 锁定 NaN/±Inf 的四种字面量与嵌套场景；
+`internal/response/response_test.go` 断言含 NaN 的负载**必须编码失败**（而不是悄悄输出空）。
+
+**附注：内存使用率为什么是一条直线**
+
+与该缺陷无关，属于展示问题：`redis_memory_used_bytes / redis_memory_max_bytes * 100`
+在 jd 这类低流量 Redis 上长期在 1%~3% 之间微动，而 ECharts 的 value 轴默认
+`scale:false`（从 0 起），微小波动被压缩成一条贴底直线。
+已改为 `scale: true`（量程按数据自适应），并把时间轴与 tooltip 的时间格式统一为
+`yyyy-MM-dd HH:mm:ss`。
+
+---
+
 ## INC-003 · 前端白屏：手工分包造成 chunk 循环依赖触发 TDZ
 
 **首次暴露**：2026-09-16，部署后访问页面白屏，浏览器控制台报

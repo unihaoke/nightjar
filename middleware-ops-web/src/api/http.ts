@@ -101,10 +101,19 @@ http.interceptors.response.use(
 export async function request<T>(config: AxiosRequestConfig): Promise<T> {
   const response = await http.request<ApiEnvelope<T>>(config)
   const body = response.data
-  if (body && typeof body.code === 'number' && body.code !== 0) {
+  // 空响应体 / 非标准结构：多半是服务端序列化失败或网关拦截。
+  // 必须显式抛错——否则会返回 undefined，让调用方在 `result.series` 这种地方
+  // 抛出与真实原因完全无关的 TypeError。
+  if (!body || typeof body !== 'object' || typeof (body as ApiEnvelope<T>).code !== 'number') {
+    throw new Error(
+      `响应格式异常（HTTP ${response.status}）：服务端未返回标准 {code,message,data} 结构，` +
+        `可能是序列化失败（如数据中包含 NaN/Inf）或被网关改写`,
+    )
+  }
+  if (body.code !== 0) {
     throw new Error(body.message || '业务处理失败')
   }
-  return body?.data as T
+  return body.data as T
 }
 
 /** GET 请求。 */

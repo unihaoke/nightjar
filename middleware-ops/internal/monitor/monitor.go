@@ -155,6 +155,15 @@ type EndpointReporter interface {
 	Endpoint() string
 }
 
+// TargetReporter 由能查询抓取目标状态的客户端实现。
+//
+// 用途：up=0 时把 Prometheus 记录的 lastError 取回来翻译成结论。
+// 否则使用者只能自己去 /targets 页面翻，而"抓取失败"这四个字毫无信息量。
+type TargetReporter interface {
+	// Targets 返回指定 job 的抓取目标状态；job 为空表示全部。
+	Targets(ctx context.Context, job string) ([]TargetStatus, error)
+}
+
 // Client 是监控查询接口。
 type Client interface {
 	// Snapshot 采集某实例的当前指标。

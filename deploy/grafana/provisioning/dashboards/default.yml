@@ -1,0 +1,21 @@
+# Grafana 大盘加载器：把 ./deploy/grafana/dashboards/ 下的 JSON 自动导入。
+#
+# 放入即生效（30s 轮询），不需要登录 Grafana 手工 Import。
+# 大盘来源：集成中心每张组件卡片上给出的 grafana.com 编号（Redis 763 / MySQL 7362 /
+# PostgreSQL 9628 / Kafka 7589 / Elasticsearch 2322 / Nginx 9614），
+# 或自建大盘导出 JSON 后放进同目录。
+apiVersion: 1
+
+providers:
+  - name: mwops
+    orgId: 1
+    folder: ''
+    type: file
+    # 允许在 Grafana 里删除大盘后不自动重建（方便试验）
+    disableDeletion: false
+    # 文件变化后 30s 内重新加载
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

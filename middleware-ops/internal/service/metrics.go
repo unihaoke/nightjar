@@ -204,10 +204,10 @@ func (s *MetricsService) Diagnose(ctx context.Context, instanceID int64, scope S
 		Hints:       make([]string, 0, 6),
 		LogChecklist: []string{
 			"日志告警与中间件实例是两条独立链路：日志按「服务器 + 服务名」归集，纳管 MySQL/Redis 实例不会产生任何日志事件。",
-			"jd 侧必须以 logs profile 启动日志 Agent：./start.sh nightjar-logs（等价于 docker compose ... --profiles logs up -d），只跑 ./start.sh nightjar 是不会上报日志的。",
-			"平台 .env 的 HOOK_TOKEN 必须与 jd 侧 .env 的 NIGHTJAR_HOOK_TOKEN 完全一致，否则 /api/hooks/logs 返回 401，日志全部丢失。",
-			"Agent 只挂载 backend-logs 卷：确认容器内 /logs/error.log 存在（logback 启动即创建），gc.log 由 JVM -Xlog 写入同一目录。",
-			"日志事件按错误指纹聚合，在「日志告警 → 事件」中查看；服务名默认为 interview-review-backend，服务器名默认为 jd-host。",
+			"日志采集需在「集成中心 → 日志接入」为该服务创建采集容器；只保存中间件集成是不会产生日志事件的。",
+			"采集容器读取目标容器已挂载的日志目录，路径由平台从 docker 配置中读取（环境变量 LOG_PATH 或像日志的挂载），读不到就拒绝配置而不会猜路径。",
+			"采集容器与平台之间用服务令牌鉴权（平台 .env 的 HOOK_TOKEN），令牌不一致时 /api/hooks/logs 返回 401，日志会静默丢失。",
+			"日志事件按错误指纹聚合，在「日志告警 → 事件」中查看；服务名与服务器名取自创建集成时填写的值。",
 		},
 	}
 
@@ -280,7 +280,7 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 	if result != nil && !result.Healthy {
 		return []string{fmt.Sprintf(
 			"主机名 %s 能解析，但 Prometheus 健康检查不通：方向在 Prometheus 自身或其端口。"+
-				"确认容器在运行、端口与 prometheus.base_url 一致（同机部署注意 jd/平台两侧的 PROMETHEUS_PORT 不要用反）。当前查询地址：%s",
+				"确认容器在运行、端口与 prometheus.base_url 一致（同机部署注意平台两侧的 PROMETHEUS_PORT 不要用反）。当前查询地址：%s",
 			host, endpoint)}
 	}
 	return nil
@@ -290,10 +290,10 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 func diagnoseHints(item *model.MiddlewareInstance, result *DiagnoseResult) []string {
 	hints := make([]string, 0, 6)
 	if result.MonitorKind == "simulator" {
-		hints = append(hints, "当前数据源是内置模拟器（prometheus.base_url 为空）：页面上的数值不是真实指标。请设置 MWOPS_PROMETHEUS_BASE_URL（jd 场景为 http://jd-prometheus:9090），并用 compose.jd-link.yml 启动平台。")
+		hints = append(hints, "当前数据源是内置模拟器（prometheus.base_url 为空）：页面上的数值不是真实指标。请设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090（平台自带 Prometheus），并用 docker compose 启动平台监控服务。")
 	}
 	if !result.Healthy {
-		hints = append(hints, "Prometheus 健康检查未通过：确认地址可达、容器网络别名正确（平台侧 getent hosts jd-prometheus）。")
+		hints = append(hints, "Prometheus 健康检查未通过：确认 mwops-prometheus 容器在运行、地址可达、网络别名正确（平台侧 getent hosts prometheus）。")
 	}
 	if result.Total == 0 {
 		hints = append(hints, "该中间件类型没有指标画像（rabbitmq 仅纳管），因此不会产出任何指标。")

@@ -76,6 +76,8 @@
 | GET | `/api/integrations` | `middleware:read` | L0 | 集成列表 |
 | GET | `/api/integrations/:id` | `middleware:read` | L0 | 集成详情（含 Exporter 容器状态与查询选择器） |
 | POST | `/api/integrations/preview` | `middleware:read` | L0 | **只渲染不落库**：服务发现 JSON / 显式 job / compose / docker run / 核对步骤 |
+| POST | `/api/integrations/logs/preview` | `middleware:read` | L0 | **日志接入探测**：读目标容器的 docker 配置反查日志位置；**读不到则返回 400，不猜路径** |
+| POST | `/api/integrations/logs` | `middleware:write` | L1 | 创建平台侧日志采集容器（复用平台镜像，`Entrypoint=mwops-agent`），并登记服务器 |
 | POST | `/api/integrations` | `middleware:write` | L1 | 新建集成：纳管实例 + 服务发现更新 + 可选拉起容器 + 可选推荐告警规则 |
 | PUT | `/api/integrations/:id` | `middleware:write` | L1 | 更新集成（改名会同步 instance_name 标签） |
 | POST | `/api/integrations/:id/apply` | `middleware:write` | L1 | 重新应用：重写产物 + 重建 Exporter 容器 |

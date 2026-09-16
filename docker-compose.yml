@@ -79,6 +79,36 @@ services:
     networks: [mwops]
 
   # ---------------------------------------------------------------------------
+  # 监控大盘：Grafana（平台统一托管）
+  #
+  # 被管项目**不再需要自带 Prometheus/Grafana**：Exporter 由「集成中心」拉起、
+  # 抓取由本平台的 Prometheus 负责、大盘在这里看。数据源由 provisioning 自动注入
+  # （见 deploy/grafana/provisioning/），大盘 JSON 放进 deploy/grafana/dashboards/ 即生效。
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: mwops-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      # 允许被 iframe 嵌入平台页面（同源代理场景）
+      GF_SECURITY_ALLOW_EMBEDDING: 'true'
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS:-false}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - '${GRAFANA_PORT:-3000}:3000'
+    networks: [mwops]
+
+  # ---------------------------------------------------------------------------
   # 后端：模块化单体（Go）
   # ---------------------------------------------------------------------------
   backend:
@@ -107,8 +137,8 @@ services:
       MWOPS_DATABASE_AUTO_MIGRATE: 'true'
       MWOPS_REDIS_ADDR: redis:6379
       MWOPS_REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_change_me}
-      # 指标数据源：默认平台自带 Prometheus；接入外部栈时在 .env 覆盖
-      # （如复用 jd 的 Prometheus：MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090）
+      # 指标数据源：平台自带 Prometheus（集成中心创建的 Exporter 由它抓取）
+      # 只在接入「外部已有 Prometheus」时才需要覆盖
       MWOPS_PROMETHEUS_BASE_URL: ${MWOPS_PROMETHEUS_BASE_URL:-http://prometheus:9090}
       MWOPS_JWT_SECRET: ${JWT_SECRET:?请设置 JWT_SECRET（≥32 位随机字符串）}
       MWOPS_JWT_BOOTSTRAP_ADMIN: ${ADMIN_USER:-admin}
@@ -182,6 +212,7 @@ volumes:
   redis-data:
   prometheus-data:
   backend-data:
+  grafana-data:
 
 networks:
   mwops:

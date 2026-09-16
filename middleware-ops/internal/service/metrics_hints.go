@@ -83,10 +83,50 @@ func labelHints(ctx context.Context, reporter monitor.LabelReporter, item *model
 		case instErr == nil && len(instances) > 0:
 			hints = append(hints, "该 job 的时序**没有 instance_name 标签**（抓取配置缺少 relabel_configs）："+
 				"可先把「Prometheus instance」填成 "+strings.Join(instances, "、")+" 立即生效；"+
-				"正解是在 Prometheus 抓取配置里补 relabel（jd 场景见 deploy/jd-exporters/prometheus-jd.yml）后重建该容器。")
+				"正解是把该实例改由「集成中心」纳管（平台写入的服务发现自带 instance_name）后重建该容器。")
 		default:
 			hints = append(hints, "该 job 的 target 虽为 up，但取不到标签取值：确认 Prometheus 版本 ≥ 2.24（label values 的 match[] 支持）与网络连通。")
 		}
+	}
+
+	// ③ job 存在但 target 抓取失败（up=0）：把 Prometheus 记录的 lastError 取回来并翻译。
+	//
+	// 这一步最省时间：lastError 里通常直接写着 "Access denied for user ..." 或
+	// "invalid DSN" ——不用再去翻 /targets 页面猜。
+	if result.JobUp != nil && *result.JobUp == 0 {
+		hints = append(hints, targetFailureHints(ctx, reporter, jobOfTarget(item))...)
+	}
+	return hints
+}
+
+// targetFailureHints 读取某个 job 的抓取失败原因并翻译成结论。
+func targetFailureHints(ctx context.Context, reporter monitor.LabelReporter, job string) []string {
+	targetReporter, ok := reporter.(monitor.TargetReporter)
+	if !ok {
+		return nil
+	}
+	targets, err := targetReporter.Targets(ctx, job)
+	if err != nil {
+		return []string{"未能读取 Prometheus 的 target 状态（" + err.Error() + "）：请直接查看 Prometheus 的 /targets 页面。"}
+	}
+	hints := make([]string, 0, 3)
+	for _, target := range targets {
+		if target.Health == "up" {
+			continue
+		}
+		detail := "Prometheus 抓取 " + target.Job + " 的 target " + target.Instance + " 失败（up=0）"
+		if target.LastError != "" {
+			detail += "，lastError：" + target.LastError
+		}
+		if target.ScrapeURL != "" {
+			detail += "（scrape_url=" + target.ScrapeURL + "）"
+		}
+		hints = append(hints, detail)
+		hints = append(hints, monitor.DescribeTargetError(target.LastError))
+		break
+	}
+	if len(hints) == 0 {
+		hints = append(hints, "Prometheus 记为 up=0，但当前读不到失败详情：多半是 Exporter 容器没起来（端口无人监听）。")
 	}
 	return hints
 }

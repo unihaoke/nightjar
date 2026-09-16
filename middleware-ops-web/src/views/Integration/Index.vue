@@ -12,7 +12,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { integrationApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView } from '@/api/types'
+import type { IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
 import { envLabels, formatTime } from '@/utils/format'
 
 const router = useRouter()
@@ -42,8 +42,29 @@ const form = reactive({
   group_name: '',
   deploy: false,
   auto_rules: true,
+  // 平台代建只读账号：默认关闭（写操作需显式授权），管理凭据仅本次提交使用
+  bootstrap_account: false,
+  admin_username: '',
+  admin_password: '',
   labels: [] as { key: string; value: string }[],
   options: {} as Record<string, string>,
+})
+
+/** 该组件是否支持由平台代建只读监控账号（目前仅 MySQL / PostgreSQL）。 */
+const bootstrapSupported = computed(() => ['mysql', 'pg'].includes(activeTemplate.value?.type || ''))
+
+/** 平台将执行的固定模板 SQL（仅用于向使用者展示，实际语句在服务端内置）。 */
+const bootstrapSQLPreview = computed(() => {
+  const user = form.username || 'exporter'
+  if (activeTemplate.value?.type === 'pg') {
+    return `DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${user}') THEN CREATE ROLE ${user} LOGIN PASSWORD '<平台生成>'; ELSE ALTER ROLE ${user} LOGIN PASSWORD '<平台生成>'; END IF; END $$;\nGRANT pg_monitor TO ${user};`
+  }
+  return [
+    `CREATE USER IF NOT EXISTS '${user}'@'%' IDENTIFIED WITH mysql_native_password BY '<平台生成>' WITH MAX_USER_CONNECTIONS 3;`,
+    `ALTER USER '${user}'@'%' IDENTIFIED WITH mysql_native_password BY '<平台生成>';`,
+    `GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO '${user}'@'%';`,
+    'FLUSH PRIVILEGES;',
+  ].join('\n')
 })
 
 const rules: FormRules = {
@@ -93,6 +114,9 @@ function openInstall(template: IntegrationTemplate, item?: IntegrationView): voi
   form.group_name = item?.group_name || ''
   form.deploy = dockerReady.value
   form.auto_rules = true
+  form.bootstrap_account = false
+  form.admin_username = ''
+  form.admin_password = ''
   form.labels = Object.entries(item?.labels || {}).map(([key, value]) => ({ key, value }))
   const options: Record<string, string> = {}
   for (const option of template.options) {
@@ -128,6 +152,12 @@ function buildPayload(): IntegrationInput {
     group_name: form.group_name,
     deploy: form.deploy,
     auto_rules: form.auto_rules,
+  }
+  // 代建账号：只有勾选时才提交管理凭据（否则一个字节也不上传）
+  if (form.bootstrap_account) {
+    payload.bootstrap_account = true
+    payload.admin_username = form.admin_username.trim()
+    payload.admin_password = form.admin_password
   }
   if (form.password) {
     payload.password = form.password
@@ -279,6 +309,68 @@ function addLabel(): void {
   form.labels.push({ key: '', value: '' })
 }
 
+// ---------------------------------------------------------------------------
+// 日志接入：平台读被管容器的 docker 配置反查日志位置，自建采集容器（被管项目零改动）
+// ---------------------------------------------------------------------------
+const logDialogVisible = ref(false)
+const logLoading = ref(false)
+const logPlan = ref<LogCollectPlan | null>(null)
+const logForm = reactive<LogCollectInput>({
+  name: '',
+  target_container: '',
+  service: '',
+  environment: 'dev',
+  level_filter: 'ERROR',
+})
+
+/** 打开日志接入弹窗。 */
+function openLogDialog(): void {
+  logForm.name = ''
+  logForm.target_container = ''
+  logForm.service = ''
+  logForm.environment = 'dev'
+  logForm.level_filter = 'ERROR'
+  logPlan.value = null
+  logDialogVisible.value = true
+}
+
+/** 预览：读取被管容器配置并反查日志位置（读不到会直接报错）。 */
+async function handleLogPreview(): Promise<void> {
+  logLoading.value = true
+  try {
+    logPlan.value = await integrationApi.previewLog(buildLogPayload())
+  } catch (error) {
+    logPlan.value = null
+    toastError(error)
+  } finally {
+    logLoading.value = false
+  }
+}
+
+/** 保存并创建采集容器。 */
+async function handleLogSubmit(): Promise<void> {
+  logLoading.value = true
+  try {
+    logPlan.value = await integrationApi.createLog(buildLogPayload())
+    ElMessage({ type: 'success', message: '日志采集已创建（被管项目无需任何改动）' })
+    await load()
+  } catch (error) {
+    toastError(error)
+  } finally {
+    logLoading.value = false
+  }
+}
+
+/** 组装日志接入载荷（服务名缺省取接入名）。 */
+function buildLogPayload(): LogCollectInput {
+  return {
+    ...logForm,
+    name: logForm.name.trim(),
+    target_container: logForm.target_container.trim(),
+    service: (logForm.service || logForm.name).trim(),
+  }
+}
+
 /** 删除一行自定义标签。 */
 function removeLabel(index: number): void {
   form.labels.splice(index, 1)
@@ -301,6 +393,7 @@ onMounted(load)
       </div>
       <div class="row">
         <el-button size="small" @click="load">刷新</el-button>
+        <el-button size="small" :disabled="!dockerReady" @click="openLogDialog">日志接入</el-button>
         <el-tag size="small" :type="dockerReady ? 'success' : 'info'" effect="light">
           {{ dockerReady ? '一键部署已启用' : '仅生成配置' }}
         </el-tag>
@@ -483,6 +576,34 @@ onMounted(load)
           <span>自动创建推荐告警规则（{{ (activeTemplate?.alerts || []).length }} 条）</span>
         </div>
 
+        <!-- 账号托管：平台代为创建只读监控账号（写操作，需显式授权） -->
+        <template v-if="bootstrapSupported">
+          <el-divider content-position="left">监控账号</el-divider>
+          <div class="switch-row">
+            <el-switch v-model="form.bootstrap_account" :disabled="!dockerReady" />
+            <span>由平台创建/更新只读监控账号（无需登录被管数据库手工建号）</span>
+          </div>
+          <el-row v-if="form.bootstrap_account" :gutter="12">
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="管理账号（仅本次使用）">
+                <el-input v-model="form.admin_username" placeholder="如 root" />
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="管理口令（仅本次使用）">
+                <el-input v-model="form.admin_password" type="password" show-password placeholder="不落库、不写审计、不回显" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <el-alert v-if="form.bootstrap_account" type="warning" :closable="false" show-icon class="mt"
+            title="平台将在被管实例上执行以下固定 SQL（不接受任意语句）">
+            <pre class="code">{{ bootstrapSQLPreview }}</pre>
+            <p class="field-hint">
+              口令留空时由平台生成十六进制随机串（无特殊字符，天然免转义）；执行结果会记入审计（不含口令）。
+            </p>
+          </el-alert>
+        </template>
+
         <el-alert
           v-for="(note, index) in activeTemplate?.notes || []"
           :key="index"
@@ -539,6 +660,79 @@ onMounted(load)
         </el-tabs>
       </template>
     </el-drawer>
+    <!-- 日志接入：从被管容器的 docker 配置反查日志位置（读不到不允许配置） -->
+    <el-dialog v-model="logDialogVisible" title="日志接入" width="720px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="平台会读取被管容器的 docker 配置（环境变量与挂载点）来确定日志位置，并创建自己的采集容器；读不到位置时会拒绝配置，不会猜路径。被管项目无需任何改动。"
+      />
+      <el-form label-position="top">
+        <el-row :gutter="12">
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="接入名称">
+              <el-input v-model="logForm.name" placeholder="如 jd-backend-logs" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="目标容器名">
+              <el-input v-model="logForm.target_container" placeholder="docker ps 里的 NAMES，如 interview-backend" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="服务名（日志事件按它归集）">
+              <el-input v-model="logForm.service" placeholder="留空取接入名称" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="最低采集级别">
+              <el-select v-model="logForm.level_filter" class="mobile-block">
+                <el-option label="ERROR" value="ERROR" />
+                <el-option label="WARN" value="WARN" />
+                <el-option label="INFO（含 GC 等无级别日志）" value="INFO" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+
+      <template v-if="logPlan">
+        <el-divider content-position="left">发现结果</el-divider>
+        <el-descriptions :column="1" border size="small">
+          <el-descriptions-item label="日志目录">
+            <span class="mono">{{ logPlan.source.dir }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="承载位置">
+            {{ logPlan.source.mount_kind === 'volume' ? '命名卷' : '宿主目录' }}
+            <span class="mono">{{ logPlan.source.mount_source }}</span> → 采集容器 <span class="mono">{{ logPlan.source.mount_target }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="判断依据">
+            <span v-for="(item, index) in logPlan.source.evidence" :key="index">{{ item }}<br /></span>
+          </el-descriptions-item>
+          <el-descriptions-item label="采集容器">
+            <span class="mono">{{ logPlan.collector_name }}</span>（镜像 {{ logPlan.collector_image }}，Entrypoint=mwops-agent）
+          </el-descriptions-item>
+        </el-descriptions>
+        <el-alert v-for="(item, index) in logPlan.warnings" :key="index" class="mt" type="warning" :closable="false" show-icon :title="item" />
+        <h4 class="diag-title">平台将执行</h4>
+        <ol class="steps">
+          <li v-for="(step, index) in logPlan.steps" :key="index">{{ step }}</li>
+        </ol>
+      </template>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button :loading="logLoading" @click="handleLogPreview">读取 docker 配置并预览</el-button>
+          <div class="spacer" />
+          <el-button @click="logDialogVisible = false">取消</el-button>
+          <el-button type="primary" :disabled="!logPlan" :loading="logLoading" @click="handleLogSubmit">
+            创建采集容器
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

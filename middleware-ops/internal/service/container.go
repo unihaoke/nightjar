@@ -106,7 +106,8 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, opt.Log)
 	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos, deps.Audit, opt.Log)
 	// 集成中心：把 Exporter 暴露 + Prometheus 抓取 + 实例纳管 + 告警规则串成一次点击。
-	deps.Integration = NewIntegrationService(cfg, deps.Instances, opt.Cipher, deps.AlertSvc, deps.Audit, opt.Log)
+	deps.Integration = NewIntegrationService(cfg, deps.Instances, deps.Servers, opt.Cipher,
+		deps.AlertSvc, deps.Audit, deps.Approval, opt.Monitor, opt.Log)
 	// 启动时对齐 file_sd：清理已删除集成残留的目标，并保证文件存在
 	// （Prometheus 的 file_sd_configs 指向它，文件缺失只会在日志里刷错误）。
 	if cfg.Integration.Enabled {

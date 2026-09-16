@@ -40,6 +40,36 @@ type ContainerSpec struct {
 	Networks []string
 	Restart  string
 	Labels   map[string]string
+	// Binds 为容器挂载，docker 语法："<命名卷或宿主路径>:<容器内路径>[:ro]"。
+	//
+	// 日志采集就靠它：平台把被管容器的日志卷按名字挂进自己的采集容器，
+	// 被管项目因此不需要为监控做任何改动（卷名相同即共享）。
+	Binds []string
+	// Entrypoint 用于复用平台镜像里附带的其它二进制（如日志 Agent）。
+	Entrypoint []string
+}
+
+// ContainerDetail 是被管容器的详细配置（日志位置发现的依据）。
+type ContainerDetail struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Image    string   `json:"image"`
+	Env      []string `json:"env"`
+	Networks []string `json:"networks"`
+	Mounts   []Mount  `json:"mounts"`
+}
+
+// Mount 描述一个挂载点。
+type Mount struct {
+	// Type 取值 volume / bind / tmpfs。
+	Type string `json:"type"`
+	// Name 为命名卷名（Type=volume 时有值）。
+	Name string `json:"name"`
+	// Source 为宿主路径（Type=bind 时有值）。
+	Source string `json:"source"`
+	// Destination 为容器内路径——日志目录就是从这里看出来的。
+	Destination string `json:"destination"`
+	ReadOnly    bool   `json:"read_only"`
 }
 
 // State 是容器的观测状态。
@@ -49,6 +79,8 @@ type State struct {
 	Image   string `json:"image"`
 	Status  string `json:"status"`
 	Running bool   `json:"running"`
+	// ExitCode 供一次性容器（如代执行 SQL 的 client）判断成败。
+	ExitCode int `json:"exit_code"`
 }
 
 // Client 是 Engine API 客户端。
@@ -120,8 +152,9 @@ func (c *Client) Inspect(ctx context.Context, name string) (*State, error) {
 		ID    string `json:"Id"`
 		Name  string `json:"Name"`
 		State struct {
-			Status  string `json:"Status"`
-			Running bool   `json:"Running"`
+			Status   string `json:"Status"`
+			Running  bool   `json:"Running"`
+			ExitCode int    `json:"ExitCode"`
 		} `json:"State"`
 		Config struct {
 			Image string `json:"Image"`
@@ -132,7 +165,8 @@ func (c *Client) Inspect(ctx context.Context, name string) (*State, error) {
 	}
 	return &State{
 		ID: payload.ID, Name: strings.TrimPrefix(payload.Name, "/"),
-		Image: payload.Config.Image, Status: payload.State.Status, Running: payload.State.Running,
+		Image: payload.Config.Image, Status: payload.State.Status,
+		Running: payload.State.Running, ExitCode: payload.State.ExitCode,
 	}, nil
 }
 
@@ -218,6 +252,9 @@ func (c *Client) create(ctx context.Context, spec ContainerSpec) (string, error)
 	if len(spec.Networks) > 0 && spec.Networks[0] != "" {
 		hostConfig["NetworkMode"] = spec.Networks[0]
 	}
+	if len(spec.Binds) > 0 {
+		hostConfig["Binds"] = spec.Binds
+	}
 	body := map[string]any{
 		"Image":      spec.Image,
 		"Env":        spec.Env,
@@ -226,6 +263,9 @@ func (c *Client) create(ctx context.Context, spec ContainerSpec) (string, error)
 	}
 	if len(spec.Cmd) > 0 {
 		body["Cmd"] = spec.Cmd
+	}
+	if len(spec.Entrypoint) > 0 {
+		body["Entrypoint"] = spec.Entrypoint
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -332,6 +372,228 @@ func (c *Client) ListManaged(ctx context.Context) ([]State, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// logTailLines 限制 RunOnce 拉取的日志行数。
+const logTailLines = 50
+
+// RunOnce 起一个一次性容器执行命令并取回输出（用于"平台代为执行固定 SQL"）。
+//
+// 语义：创建 → 启动 → 等退出 → 取日志 → 删除。全程使用平台模板内的镜像与参数，
+// 不接受使用者自定义命令（见 internal/service/integration.go 的固定 SQL 模板）。
+func (c *Client) RunOnce(ctx context.Context, spec ContainerSpec, timeout time.Duration) (string, error) {
+	if strings.TrimSpace(spec.Name) == "" || strings.TrimSpace(spec.Image) == "" {
+		return "", fmt.Errorf("容器名与镜像不能为空")
+	}
+	// 同名残留先清掉，保证可重复执行
+	if existing, err := c.Inspect(ctx, spec.Name); err == nil && existing != nil {
+		_ = c.Remove(ctx, spec.Name)
+	}
+	id, err := c.create(ctx, spec)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = c.Remove(ctx, spec.Name) }()
+
+	for _, network := range spec.Networks[min(1, len(spec.Networks)):] {
+		if network == "" {
+			continue
+		}
+		if err := c.ConnectNetwork(ctx, id, network); err != nil {
+			return "", err
+		}
+	}
+	if err := c.Start(ctx, id); err != nil {
+		return "", err
+	}
+	// 等退出：容器不存在（已被 --rm 语义删除）或状态为 exited 即视为结束。
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("等待一次性容器 %s 超时（%s）", spec.Name, timeout)
+		}
+		state, err := c.Inspect(ctx, spec.Name)
+		if err != nil {
+			return "", err
+		}
+		if state == nil || (!state.Running && state.Status == "exited") {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	logs, code, err := c.Logs(ctx, spec.Name)
+	if err != nil {
+		return logs, err
+	}
+	if code != 0 {
+		return logs, fmt.Errorf("一次性容器退出码 %d：%s", code, strings.TrimSpace(logs))
+	}
+	return logs, nil
+}
+
+// Logs 读取容器日志与退出码（tail 限制见 logTailLines）。
+func (c *Client) Logs(ctx context.Context, name string) (string, int, error) {
+	inspect, err := c.Inspect(ctx, name)
+	if err != nil {
+		return "", 0, err
+	}
+	if inspect == nil {
+		return "", 0, fmt.Errorf("容器 %s 不存在", name)
+	}
+	query := fmt.Sprintf("?stdout=1&stderr=1&tail=%d", logTailLines)
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(name)+"/logs"+query, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Docker 的日志流带 8 字节帧头（stdout/stderr 交替），这里只做可读化处理。
+	text := string(raw)
+	if len(raw) > 8 && (raw[0] == 1 || raw[0] == 2) && raw[1] == 0 && raw[2] == 0 && raw[3] == 0 {
+		text = stripDockerLogFrames(raw)
+	}
+	return text, inspect.ExitCode, nil
+}
+
+// stripDockerLogFrames 去掉 Docker multiplexed stream 的帧头。
+func stripDockerLogFrames(raw []byte) string {
+	var b strings.Builder
+	for i := 0; i+8 <= len(raw); {
+		size := int(raw[i+4])<<24 | int(raw[i+5])<<16 | int(raw[i+6])<<8 | int(raw[i+7])
+		i += 8
+		if size < 0 || i+size > len(raw) {
+			b.Write(raw[i:])
+			break
+		}
+		b.Write(raw[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// FindAliasNetworks 找出「哪些 docker 网络里存在该别名」。
+//
+// 用途：集成时把 Exporter 自动接到目标所在的网络上——使用者在平台里只填
+// "jd-mysql" 这样的名字，不必知道它属于哪个 compose 项目、哪张网络。
+// 别名可能出现在多张网（compose 会给服务名做别名），因此返回并集。
+func (c *Client) FindAliasNetworks(ctx context.Context, alias string) ([]string, error) {
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
+		return nil, nil
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/containers/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("列出容器失败：HTTP %d", resp.StatusCode)
+	}
+	var list []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("解析容器列表失败: %w", err)
+	}
+	// 只看前 100 个容器，避免在容器很多的主机上做上百次 inspect。
+	if len(list) > 100 {
+		list = list[:100]
+	}
+	found := make(map[string]bool)
+	for _, item := range list {
+		detail, err := c.inspectNetworks(ctx, item.ID)
+		if err != nil {
+			continue
+		}
+		for network, aliases := range detail {
+			for _, candidate := range aliases {
+				if candidate == trimmed {
+					found[network] = true
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(found))
+	for name := range found {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// inspectNetworks 返回「网络名 → 该容器在该网络上的别名列表」。
+func (c *Client) inspectNetworks(ctx context.Context, id string) (map[string][]string, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("查询容器失败：HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	out := make(map[string][]string, len(payload.NetworkSettings.Networks))
+	for name, network := range payload.NetworkSettings.Networks {
+		out[name] = network.Aliases
+	}
+	return out, nil
+}
+
+// InspectDetail 返回容器的详细配置（网络、挂载、环境变量）。
+//
+// 平台据此**反查**被管项目的日志位置：容器把日志写在哪个卷/宿主目录、
+// 挂载到容器内哪个路径。使用者不需要知道这些，平台自己从 docker 配置里读。
+func (c *Client) InspectDetail(ctx context.Context, name string) (*ContainerDetail, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(name)+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("查询容器 %s 失败：HTTP %d", name, resp.StatusCode)
+	}
+	var payload struct {
+		ID     string `json:"Id"`
+		Name   string `json:"Name"`
+		Config struct {
+			Image string   `json:"Image"`
+			Env   []string `json:"Env"`
+		} `json:"Config"`
+		Mounts          []Mount `json:"Mounts"`
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("解析容器详情失败: %w", err)
+	}
+	detail := &ContainerDetail{
+		ID: payload.ID, Name: strings.TrimPrefix(payload.Name, "/"),
+		Image: payload.Config.Image, Env: payload.Config.Env, Mounts: payload.Mounts,
+	}
+	for network := range payload.NetworkSettings.Networks {
+		detail.Networks = append(detail.Networks, network)
+	}
+	sort.Strings(detail.Networks)
+	return detail, nil
 }
 
 // do 执行一次 Engine API 请求。

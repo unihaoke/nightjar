@@ -117,3 +117,12 @@ func (f *fallbackClient) Endpoint() string {
 	}
 	return ""
 }
+
+// Targets 透传抓取目标状态查询（实现 TargetReporter）。
+func (f *fallbackClient) Targets(ctx context.Context, job string) ([]TargetStatus, error) {
+	reporter, ok := f.primary.(TargetReporter)
+	if !ok {
+		return nil, fmt.Errorf("当前监控数据源不支持抓取目标查询")
+	}
+	return reporter.Targets(ctx, job)
+}

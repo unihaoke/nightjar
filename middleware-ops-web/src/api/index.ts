@@ -19,6 +19,8 @@ import type {
   IntegrationOverview,
   IntegrationView,
   KnowledgeEntry,
+  LogCollectInput,
+  LogCollectPlan,
   LogEvent,
   Metric,
   MetricSample,
@@ -112,6 +114,9 @@ export const integrationApi = {
   update: (id: number, payload: IntegrationInput) => put<IntegrationView>(`/api/integrations/${id}`, payload),
   apply: (id: number) => post<IntegrationView>(`/api/integrations/${id}/apply`),
   remove: (id: number) => del<{ message: string }>(`/api/integrations/${id}`),
+  /** 日志接入：读取被管容器的 docker 配置反查日志位置（读不到会报错，不猜路径）。 */
+  previewLog: (payload: LogCollectInput) => post<LogCollectPlan>('/api/integrations/logs/preview', payload),
+  createLog: (payload: LogCollectInput) => post<LogCollectPlan>('/api/integrations/logs', payload),
 }
 
 /** AI 诊断（4.3）。 */

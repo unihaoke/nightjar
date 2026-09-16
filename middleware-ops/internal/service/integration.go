@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"middleware-ops/internal/docker"
 	"middleware-ops/internal/integration"
 	"middleware-ops/internal/model"
+	"middleware-ops/internal/monitor"
 	"middleware-ops/internal/repository"
 )
 
@@ -34,12 +38,17 @@ import (
 type IntegrationService struct {
 	cfg        *config.Config
 	instances  *repository.InstanceRepository
+	servers    *repository.ServerRepository
 	cipher     cipherCodec
 	alerts     *AlertService
 	audit      *AuditService
+	approval   *ApprovalService
+	monitor    monitor.Client
 	log        *zap.Logger
 	docker     *docker.Client
 	dockerNote string
+	// selfImageName 缓存平台自身镜像名（采集容器复用它）。
+	selfImageName string
 }
 
 // cipherCodec 是集成中心需要的加解密能力（口令加密存储 + 部署时读回明文）。
@@ -52,13 +61,18 @@ type cipherCodec interface {
 func NewIntegrationService(
 	cfg *config.Config,
 	instances *repository.InstanceRepository,
+	servers *repository.ServerRepository,
 	cipher cipherCodec,
 	alerts *AlertService,
 	audit *AuditService,
+	approval *ApprovalService,
+	monitorClient monitor.Client,
 	log *zap.Logger,
 ) *IntegrationService {
 	svc := &IntegrationService{
-		cfg: cfg, instances: instances, cipher: cipher, alerts: alerts, audit: audit, log: log,
+		cfg: cfg, instances: instances, servers: servers, cipher: cipher,
+		alerts: alerts, audit: audit, approval: approval,
+		monitor: monitorClient, log: log,
 	}
 	if cfg.Integration.DockerEnabled {
 		client, err := docker.New(cfg.Integration.DockerHost)
@@ -99,6 +113,14 @@ type IntegrationInput struct {
 	Deploy *bool `json:"deploy"`
 	// AutoRules 表示是否自动创建推荐告警规则（缺省取配置 integration.auto_rules）。
 	AutoRules *bool `json:"auto_rules"`
+	// BootstrapAccount 表示由平台创建/更新只读监控账号（需要管理凭据）。
+	BootstrapAccount *bool `json:"bootstrap_account"`
+	// AdminUsername / AdminPassword 为被管实例的管理凭据，仅用于执行固定模板 SQL。
+	//
+	// 安全约定：只在本次请求内存中使用，绝不落库、绝不写审计、绝不回显；
+	// 平台只执行内置模板 SQL，不接受任意语句（见 monitoringAccountSQL）。
+	AdminUsername string `json:"admin_username"`
+	AdminPassword string `json:"admin_password"`
 }
 
 // IntegrationView 是集成中心列表/详情的对外结构。
@@ -245,6 +267,13 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 		return nil, apperr.Newf(apperr.CodeInvalidParam, "集成名称 %q 已存在（集成名称需全局唯一）", instance.Name)
 	}
 
+	// 平台托管账号：勾选"由平台创建只读账号"且未填口令时，口令由平台生成。
+	// 好处是使用者不需要自己编口令——十六进制随机串天然不含需要转义的字符。
+	bootstrap := s.shouldBootstrapAccount(in)
+	if bootstrap && strings.TrimSpace(instance.Password) == "" {
+		instance.Password = randomHexPassword(24)
+	}
+
 	encrypted, err := s.cipher.Encrypt(instance.Password)
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
@@ -278,7 +307,44 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 
 	// 落盘 file_sd：写入失败不回滚实例，但把原因回传给调用方（可重试"重新应用"）。
 	syncErr := s.SyncFileSD(ctx)
+
+	// 顺序很重要：先建只读账号，再拉起 Exporter。
+	// 反过来的话 Exporter 会因认证失败反复重启（虽然 restart 策略最终能恢复，但日志会很难看）。
+	var bootstrapNote string
+	var bootstrapErr error
+	if bootstrap {
+		// 生产环境：代管账号是**写被管数据库**，属 L2 高危 → 只创建审批工单，不执行。
+		// 工单里带上将执行的固定 SQL（不含口令），审批通过后由运维执行或再次保存触发。
+		if instance.Environment == model.EnvProd && s.approval != nil {
+			ticket, ticketErr := s.approval.Create(ctx, ApprovalRequest{
+				InstanceID:  item.ID,
+				Environment: instance.Environment,
+				ActionType:  "integration_bootstrap",
+				ActionDetail: map[string]any{
+					"name": item.Name, "mw_type": tpl.Type,
+					"address": instance.Address.Raw, "monitor_user": instance.Username,
+					"sql": monitoringAccountSQLForDisplay(tpl.Type, instance.Username),
+				},
+				Reason: "生产环境由平台创建只读监控账号（L2）",
+			}, operator)
+			if ticketErr != nil {
+				bootstrapErr = fmt.Errorf("创建审批工单失败：%w", ticketErr)
+			} else {
+				bootstrapNote = "生产环境需审批：已创建工单 " + ticket.TicketID +
+					"（工单内含将执行的 SQL）；审批通过后请点「重新应用」由平台建号"
+			}
+		} else {
+			bootstrapNote, bootstrapErr = s.ensureMonitoringAccount(ctx, instance, tpl, in.AdminUsername, in.AdminPassword)
+			if bootstrapErr != nil {
+				s.log.Warn("集成：创建只读监控账号失败",
+					zap.String("integration", item.Name), zap.Error(bootstrapErr))
+			}
+		}
+	}
 	deployErr := s.deploy(ctx, item, tpl, instance)
+	if bootstrapNote != "" {
+		s.setDeployNote(ctx, item.ID, bootstrapNote)
+	}
 
 	if s.shouldCreateRules(in) {
 		if err := s.createRecommendedRules(ctx, item, tpl, operator); err != nil {
@@ -288,15 +354,20 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 	s.record(ctx, operator, item.ID, "integration_create", map[string]any{
 		"name": item.Name, "mw_type": tpl.Type, "address": instance.Address.Raw,
 		"deploy": s.deployEnabled(in), "labels": instance.Labels,
+		// 只记录"是否代为建号"与账号名，**绝不记录口令**
+		"bootstrap_account": bootstrap, "monitor_user": instance.Username,
 	})
 
-	if err := firstErr(syncErr, deployErr); err != nil {
+	if err := firstErr(syncErr, bootstrapErr, deployErr); err != nil {
 		s.markError(ctx, item.ID, err.Error())
 		view := s.toView(ctx, *item)
 		view.LastError = err.Error()
 		return &view, nil
 	}
 	s.markApplied(ctx, item.ID)
+	// 保存即"声明成功"是不够的：Exporter 起没起来、Prometheus 抓没抓到，
+	// 只有核验过才知道。异步核验失败会把原因写回 LastError，前端直接可见。
+	s.scheduleVerify(item.ID, item.Name, s.jobName())
 	view := s.toView(ctx, *item)
 	return &view, nil
 }
@@ -375,6 +446,7 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 		return &view, nil
 	}
 	s.markApplied(ctx, item.ID)
+	s.scheduleVerify(item.ID, item.Name, s.jobName())
 	return &view, nil
 }
 
@@ -418,6 +490,7 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 		return &view, nil
 	}
 	s.markApplied(ctx, item.ID)
+	s.scheduleVerify(item.ID, item.Name, s.jobName())
 	return s.Get(ctx, id, Scope{})
 }
 
@@ -510,6 +583,234 @@ func (s *IntegrationService) fileSDPath() string {
 		name = "integrations.json"
 	}
 	return filepath.Join(s.cfg.Integration.OutputDir, name)
+}
+
+// scheduleVerify 异步核验集成是否真的"跑起来"（Exporter 被 Prometheus 抓到）。
+//
+// 为什么异步而不是同步等待：抓取目标经 http_sd 下发，refresh_interval 默认 30s，
+// 同步等待会把一次 HTTP 请求拖到 40s 以上；后台核验则把结论写回实例，
+// 前端刷新即可看到「待处理：<Prometheus 记录的失败原因>」，
+// 使用者不必再去 Prometheus 的 /targets 页面翻 lastError。
+func (s *IntegrationService) scheduleVerify(instanceID int64, name, job string) {
+	if s.monitor == nil {
+		return
+	}
+	if _, ok := s.monitor.(monitor.TargetReporter); !ok {
+		return // 模拟器等不支持目标查询，跳过核验（不影响集成本身）
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		delay := 35 * time.Second // 等 http_sd 刷新 + 首次抓取
+		for attempt := 1; attempt <= 3; attempt++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			reason := s.probeIntegration(ctx, job, name)
+			if reason == "" {
+				s.markApplied(context.Background(), instanceID)
+				s.log.Info("集成核验通过", zap.String("integration", name), zap.String("job", job))
+				return
+			}
+			if attempt == 3 {
+				s.markError(context.Background(), instanceID, reason)
+				s.log.Warn("集成核验未通过，已把原因写回集成",
+					zap.String("integration", name), zap.String("reason", reason))
+				return
+			}
+			delay = 25 * time.Second
+		}
+	}()
+}
+
+// probeIntegration 核验某个集成的抓取目标是否已 up。
+//
+// 返回空串表示通过；否则返回可读的失败原因（已翻译 lastError）。
+func (s *IntegrationService) probeIntegration(ctx context.Context, job, name string) string {
+	reporter, ok := s.monitor.(monitor.TargetReporter)
+	if !ok {
+		return ""
+	}
+	targets, err := reporter.Targets(ctx, job)
+	if err != nil {
+		// 查询本身失败（如 Prometheus 暂时不可达）不该判定为"集成失败"，
+		// 这类问题由接入自检负责呈现。
+		s.log.Debug("集成核验：查询 Prometheus 目标失败", zap.Error(err))
+		return ""
+	}
+	found := false
+	for _, target := range targets {
+		// 同一 job（middleware-integration）下会有多个集成，按 instance_name 区分。
+		if target.Labels["instance_name"] != "" && target.Labels["instance_name"] != name {
+			continue
+		}
+		found = true
+		if target.Health != "up" {
+			return "Exporter 未跑通（up=0）：" + monitor.DescribeTargetError(target.LastError)
+		}
+	}
+	if !found {
+		return "Prometheus 中还没有该集成对应的抓取目标：确认抓取配置里有 middleware-integration 任务（http_sd 默认 30s 刷新），" +
+			"必要时执行「重新应用」"
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// 只读监控账号托管（平台代为创建）
+// ---------------------------------------------------------------------------
+
+// monitoringAccountSQL 返回"创建只读监控账号"的固定模板 SQL。
+//
+// 设计约束（与平台的 fail-safe 护栏一致）：
+//   - 只接受内置模板，不接受使用者传入任意 SQL；
+//   - 幂等：CREATE USER IF NOT EXISTS + ALTER USER，可重复执行；
+//   - 最小权限：只授监控必需的只读权限；
+//   - MySQL 额外限制 MAX_USER_CONNECTIONS，避免高频抓取压垮实例。
+//
+// 口令由平台生成（十六进制随机串），因此不存在 SQL/DSN 转义问题。
+func monitoringAccountSQL(mwType, username, password string) ([]string, error) {
+	switch mwType {
+	case integration.TypeMySQL:
+		return []string{
+			fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s' WITH MAX_USER_CONNECTIONS 3", username, password),
+			fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED WITH mysql_native_password BY '%s'", username, password),
+			fmt.Sprintf("GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO '%s'@'%%'", username),
+			"FLUSH PRIVILEGES",
+		}, nil
+	case integration.TypePG:
+		return []string{
+			fmt.Sprintf("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%s') THEN CREATE ROLE %s LOGIN PASSWORD '%s'; ELSE ALTER ROLE %s LOGIN PASSWORD '%s'; END IF; END $$", username, username, password, username, password),
+			fmt.Sprintf("GRANT pg_monitor TO %s", username),
+		}, nil
+	default:
+		return nil, fmt.Errorf("%s 不需要只读监控账号（口令由目标自身的鉴权配置决定）", mwType)
+	}
+}
+
+// bootstrapClientImage 是执行模板 SQL 用的一次性客户端镜像。
+//
+// 选官方客户端镜像而不是引入 mysql/postgres 驱动：平台二进制保持无数据库驱动依赖，
+// 且"执行 SQL"这件事与"起容器"共用同一条已验证的 Docker 通道。
+func bootstrapClientImage(mwType string) string {
+	if mwType == integration.TypePG {
+		return "postgres:15-alpine"
+	}
+	return "mysql:8.0"
+}
+
+// bootstrapCommand 组装一次性容器的执行命令。
+//
+// 口令通过**环境变量**传入（MYSQL_PWD / PGPASSWORD），不出现在命令行里，
+// 因此既不会留在容器配置里，也不会出现在 `docker ps` 的输出中。
+func bootstrapCommand(mwType string, address integration.Address, adminUser, adminPassword string, statements []string) ([]string, []string) {
+	if mwType == integration.TypePG {
+		// psql 用 PGPASSWORD 环境变量，SQL 通过 -c 逐条执行
+		args := []string{"psql", "-h", address.Host, "-p", strconv.Itoa(address.Port),
+			"-U", adminUser, "-d", "postgres", "-v", "ON_ERROR_STOP=1"}
+		for _, stmt := range statements {
+			args = append(args, "-c", stmt)
+		}
+		return args, []string{"PGPASSWORD=" + adminPassword}
+	}
+	// mysql 客户端：口令走 MYSQL_PWD 环境变量
+	args := []string{"mysql", "-h", address.Host, "-P", strconv.Itoa(address.Port),
+		"-u", adminUser, "--protocol=TCP"}
+	for _, stmt := range statements {
+		args = append(args, "-e", stmt)
+	}
+	return args, []string{"MYSQL_PWD=" + adminPassword}
+}
+
+// ensureMonitoringAccount 由平台创建/更新只读监控账号。
+//
+// 返回人可读的执行说明（写入集成元信息，供前端展示）；失败时返回错误由调用方上报。
+func (s *IntegrationService) ensureMonitoringAccount(
+	ctx context.Context, in integration.Instance, tpl integration.Template,
+	adminUser, adminPassword string,
+) (string, error) {
+	if s.docker == nil {
+		return "", fmt.Errorf("未启用一键部署（integration.docker_enabled=false），平台无法代为创建账号")
+	}
+	if strings.TrimSpace(adminUser) == "" || strings.TrimSpace(adminPassword) == "" {
+		return "", fmt.Errorf("需要填写被管实例的管理账号与口令，平台才能创建只读监控账号")
+	}
+	statements, err := monitoringAccountSQL(tpl.Type, in.Username, in.Password)
+	if err != nil {
+		return "", err
+	}
+	// 网络自动发现：目标可能属于**另一个 compose 项目**（jd 场景），
+	// 使用者只需要填 "jd-mysql" 这样的别名，平台自己找出该别名所在的网络——
+	// 这就是"同服务器不同 docker/compose 也不用改对方配置"的关键一步。
+	networks := []string{}
+	if found, findErr := s.docker.FindAliasNetworks(ctx, in.Address.Host); findErr == nil {
+		networks = append(networks, found...)
+	} else {
+		s.log.Debug("集成：按别名发现网络失败", zap.String("alias", in.Address.Host), zap.Error(findErr))
+	}
+	// 再并上平台自己的网络（监控面），去重后作为 Exporter/一次性容器的网络列表。
+	for _, name := range s.exporterNetworks() {
+		networks = appendUnique(networks, name)
+	}
+
+	args, env := bootstrapCommand(tpl.Type, in.Address, adminUser, adminPassword, statements)
+	spec := docker.ContainerSpec{
+		Name:     integration.ContainerName(in.Name) + "-bootstrap",
+		Image:    bootstrapClientImage(tpl.Type),
+		Env:      env,
+		Cmd:      args,
+		Networks: networks,
+		Labels:   map[string]string{"mwops.integration": in.Name, "mwops.role": "bootstrap"},
+	}
+	output, err := s.docker.RunOnce(ctx, spec, 60*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("创建只读监控账号失败：%w（容器输出：%s）", err, truncateText(output, 400))
+	}
+	s.log.Info("集成：只读监控账号已就绪",
+		zap.String("integration", in.Name), zap.String("mw_type", tpl.Type), zap.String("user", in.Username))
+	return fmt.Sprintf("平台已创建/更新只读监控账号 %s（权限：%s）", in.Username, grantSummary(tpl.Type)), nil
+}
+
+// randomHexPassword 生成十六进制随机口令。
+//
+// 用十六进制而不是 base64：口令会进入 SQL 与容器环境变量，
+// 不含引号/反斜杠/@ 等字符，任何一层都不需要转义。
+func randomHexPassword(bytesLen int) string {
+	buf := make([]byte, bytesLen)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(buf)
+}
+
+// monitoringAccountSQLForDisplay 返回供审批工单展示的 SQL（口令用占位符）。
+//
+// 工单会流转到审批人眼前，绝不能把口令写进去：这里只展示"平台将执行什么"。
+func monitoringAccountSQLForDisplay(mwType, username string) []string {
+	statements, err := monitoringAccountSQL(mwType, username, "<平台生成>")
+	if err != nil {
+		return nil
+	}
+	return statements
+}
+
+// grantSummary 返回权限摘要（供前端展示"平台做了什么"）。
+func grantSummary(mwType string) string {
+	if mwType == integration.TypePG {
+		return "pg_monitor"
+	}
+	return "PROCESS, REPLICATION CLIENT, SELECT"
+}
+
+// truncateText 截断长文本（用于错误信息里的容器输出）。
+func truncateText(text string, limit int) string {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) <= limit {
+		return trimmed
+	}
+	return trimmed[:limit] + "…"
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +1036,17 @@ func (s *IntegrationService) deployEnabled(in IntegrationInput) bool {
 		return *in.Deploy
 	}
 	return s.docker != nil
+}
+
+// shouldBootstrapAccount 判断本次是否由平台创建只读监控账号。
+//
+// 默认关闭：这是一次**写操作**（在被管库里建账号/授权）。
+// 只有使用者显式勾选时才执行，且必须提供管理凭据。
+func (s *IntegrationService) shouldBootstrapAccount(in IntegrationInput) bool {
+	if in.BootstrapAccount == nil {
+		return false
+	}
+	return *in.BootstrapAccount
 }
 
 // createRecommendedRules 按模板创建推荐告警规则（已存在同名规则则跳过）。

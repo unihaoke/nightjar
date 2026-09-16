@@ -83,7 +83,7 @@ async function loadHistory(): Promise<void> {
   historyLoading.value = true
   try {
     const result = await metricsApi.history(instanceID.value, selectedMetric.value, { hours: 6 })
-    history.value = result.series || []
+    history.value = result?.series || []
   } catch (error) {
     toastError(error)
     history.value = []

@@ -138,7 +138,7 @@ func run(configPath string) error {
 	log.Info("监控数据源已就绪", zap.String("source", mon.Kind()))
 
 	// 启动期连通性预检：跨栈部署里最常见的故障是网络没接对
-	// （例如平台没带 deploy/compose.jd-link.yml 启动，容器解析不了 jd-prometheus），
+	// （例如平台没带 deploy/compose.jd-link.yml 启动，容器解析不了目标网络别名），
 	// 此时页面只会显示"没有数据"，排查方向完全靠猜。这里把结论直接写进启动日志。
 	if mon.Kind() == "prometheus" {
 		if mon.Healthy(ctx) {

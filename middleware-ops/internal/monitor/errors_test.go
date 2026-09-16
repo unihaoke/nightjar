@@ -78,3 +78,29 @@ func TestLookupHostCtxFailsForUnknownName(t *testing.T) {
 		t.Skip("当前 DNS 环境把 .invalid 解析成功了，跳过该断言")
 	}
 }
+
+// TestDescribeTargetErrorMapsCommonCauses 锁定 up=0 时 lastError 的翻译。
+//
+// 这些字符串都是真实 Exporter / Prometheus 会产出的原文；
+// 使用者最需要的是"看到一句话就知道去改哪里"，而不是去 /targets 页面翻原文。
+func TestDescribeTargetErrorMapsCommonCauses(t *testing.T) {
+	cases := []struct {
+		lastError string
+		wantWord  string
+	}{
+		{"Error opening connection to database: Access denied for user 'exporter'@'172.20.0.5'", "账号或口令不一致"},
+		{"invalid DSN: unescaped @ in password", "特殊字符"},
+		{"dial tcp 172.20.0.3:3306: connect: connection refused", "连不上被管实例"},
+		{"dial tcp: lookup mysql on 127.0.0.11:53: server misbehaving", "网络/别名问题"},
+		{"context deadline exceeded", "超时"},
+		{"x509: certificate signed by unknown authority", "证书"},
+		{"", "Exporter 容器没起来"},
+		{"something totally unexpected", "原文"},
+	}
+	for _, tc := range cases {
+		got := DescribeTargetError(tc.lastError)
+		if !strings.Contains(got, tc.wantWord) {
+			t.Fatalf("lastError=%q 的翻译应包含 %q，实际：%s", tc.lastError, tc.wantWord, got)
+		}
+	}
+}

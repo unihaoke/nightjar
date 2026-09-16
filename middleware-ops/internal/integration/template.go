@@ -184,10 +184,12 @@ var templates = map[string]Template{
 				Help: "采集已注册 binlog 文件的当前大小"},
 		},
 		Notes: []string{
-			"需要预先创建只读监控账号并授权：GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%';",
-			"账号口令通过 DATA_SOURCE_NAME 注入，口令含 @ ( ) / 等特殊字符时建议改用 --config.my-cnf 挂载方式。",
+			"需要预先创建只读监控账号并授权：CREATE USER 'exporter'@'%' IDENTIFIED BY '...' WITH MAX_USER_CONNECTIONS 3; " +
+				"GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%';（MAX_USER_CONNECTIONS 避免高频抓取压垮实例）",
+			"凭据走官方方式：--mysqld.username + MYSQLD_EXPORTER_PASSWORD + --mysqld.address，" +
+				"**不拼 DATA_SOURCE_NAME** —— 因此口令含 @ ( ) / : ? 也不会出现 invalid DSN（那类 up=0 从此消失）。",
 			"MySQL 低于 5.6 / MariaDB 低于 10.1 时部分指标采集不到，属预期现象。",
-			"采集开关是 mysqld_exporter 的命令行参数（--collect.*），不是环境变量。",
+			"采集开关是 mysqld_exporter 的命令行参数（--collect.*），不是环境变量；上游默认开启的项被关闭时输出 --no-<flag>。",
 		},
 		Docs: []string{
 			"https://cloud.tencent.com/document/product/1416/111841",
@@ -538,7 +540,12 @@ func (t Template) RenderEnv(in Instance) map[string]string {
 			env["REDIS_PASSWORD"] = in.Password
 		}
 	case TypeMySQL:
-		env["DATA_SOURCE_NAME"] = mysqlDSN(in)
+		// 官方推荐方式：地址与用户名走 flag，口令走 MYSQLD_EXPORTER_PASSWORD。
+		// 刻意**不拼 DATA_SOURCE_NAME**：口令里的 @ ( ) / : ? 会破坏 DSN 解析，
+		// 表现为 Exporter 启动即失败、Prometheus 侧 up=0，而原因很难看出来。
+		if in.Password != "" {
+			env["MYSQLD_EXPORTER_PASSWORD"] = in.Password
+		}
 	case TypePG:
 		env["DATA_SOURCE_NAME"] = pgDSN(in)
 	}
@@ -557,6 +564,13 @@ func (t Template) RenderEnv(in Instance) map[string]string {
 func (t Template) RenderArgs(in Instance) []string {
 	args := make([]string, 0, len(t.Options)+3)
 	switch t.Type {
+	case TypeMySQL:
+		// 地址与用户名走 flag（口令走 MYSQLD_EXPORTER_PASSWORD 环境变量）：
+		// 这样 DSN 里不再拼接口令，特殊字符不会导致解析失败。
+		args = append(args, "--mysqld.address="+in.Address.HostPort())
+		if in.Username != "" {
+			args = append(args, "--mysqld.username="+in.Username)
+		}
 	case TypeKafka:
 		args = append(args, "--kafka.server="+in.Address.HostPort())
 	case TypeES:
@@ -610,18 +624,9 @@ func (t Template) optionValue(in Instance, opt Option) (string, bool) {
 	return value, true
 }
 
-// mysqlDSN 拼装 mysqld_exporter 的 DATA_SOURCE_NAME。
-func mysqlDSN(in Instance) string {
-	user := in.Username
-	credential := user
-	if in.Password != "" {
-		credential = user + ":" + in.Password
-	}
-	if credential == "" {
-		return "(" + in.Address.HostPort() + ")/"
-	}
-	return credential + "@(" + in.Address.HostPort() + ")/"
-}
+// mysqlDSN 已移除：mysqld_exporter 的凭据改为 --mysqld.username / --mysqld.address
+// 加 MYSQLD_EXPORTER_PASSWORD 环境变量，不再拼装 DATA_SOURCE_NAME——
+// 拼串方式会让口令里的 @ ( ) / : ? 破坏 DSN 解析（表现为 Exporter 启动失败、up=0）。
 
 // pgDSN 拼装 postgres_exporter 的 DATA_SOURCE_NAME。
 func pgDSN(in Instance) string {

@@ -40,6 +40,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -86,14 +87,20 @@ type LogReport struct {
 type position map[string]int64
 
 func main() {
-	configPath := flag.String("config", "agent.yaml", "Agent 配置文件路径")
+	configPath := flag.String("config", "agent.yaml", "Agent 配置文件路径（也可完全用环境变量配置，见 envConfig）")
 	once := flag.Bool("once", false, "只执行一轮采集后退出（用于调试）")
 	flag.Parse()
 
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
-		os.Exit(1)
+	// 优先尝试环境变量配置：平台在别的项目里创建采集容器时无法预置配置文件，
+	// 只用环境变量 + 挂载日志卷就能跑起来（被管项目零改动）。
+	cfg, fromEnv := envConfig()
+	if !fromEnv {
+		loaded, err := loadConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "加载配置失败: %v（可用环境变量 MWOPS_AGENT_PLATFORM_URL / MWOPS_AGENT_FILES 配置）\n", err)
+			os.Exit(1)
+		}
+		cfg = loaded
 	}
 
 	agent := &agent{
@@ -122,6 +129,69 @@ func main() {
 		interval = 0
 	}
 	agent.run(ctx, interval)
+}
+
+// envConfig 从环境变量构建配置。
+//
+// 环境变量：
+//
+//	MWOPS_AGENT_PLATFORM_URL     平台地址（如 http://mwops-backend:8080）
+//	MWOPS_AGENT_HOOK_TOKEN       上报令牌（与平台 HOOK_TOKEN 一致）
+//	MWOPS_AGENT_SERVICE          服务名（日志事件按它归集）
+//	MWOPS_AGENT_SERVER_NAME      服务器名
+//	MWOPS_AGENT_ENVIRONMENT      环境（dev/staging/prod）
+//	MWOPS_AGENT_POSITION_FILE    偏移量文件（默认 /data/agent-position.json）
+//	MWOPS_AGENT_CONTEXT_LINES    错误上下文行数（默认 20）
+//	MWOPS_AGENT_MAX_BATCH        单轮上报上限（默认 50）
+//	MWOPS_AGENT_FILES            分号分隔的 "<路径或通配>:<alert_type>:<最低级别>"
+//	                             例：/logs/*.log:error:ERROR;/logs/gc.log:gc:INFO
+//
+// 返回 (nil,false) 表示未使用环境变量配置，调用方应回退到 YAML 文件。
+func envConfig() (*AgentConfig, bool) {
+	files := strings.TrimSpace(os.Getenv("MWOPS_AGENT_FILES"))
+	platformURL := strings.TrimSpace(os.Getenv("MWOPS_AGENT_PLATFORM_URL"))
+	if files == "" || platformURL == "" {
+		return nil, false
+	}
+	cfg := &AgentConfig{
+		PlatformURL:  platformURL,
+		HookToken:    os.Getenv("MWOPS_AGENT_HOOK_TOKEN"),
+		Service:      envOr("MWOPS_AGENT_SERVICE", "unknown-service"),
+		Environment:  envOr("MWOPS_AGENT_ENVIRONMENT", "dev"),
+		ServerName:   os.Getenv("MWOPS_AGENT_SERVER_NAME"),
+		PositionFile: envOr("MWOPS_AGENT_POSITION_FILE", "/data/agent-position.json"),
+		ContextLines: atoiDefault(envOr("MWOPS_AGENT_CONTEXT_LINES", "20"), 20),
+		MaxBatch:     atoiDefault(envOr("MWOPS_AGENT_MAX_BATCH", "50"), 50),
+	}
+	for _, entry := range strings.Split(files, ";") {
+		parts := strings.Split(strings.TrimSpace(entry), ":")
+		if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+			continue
+		}
+		target := LogTarget{
+			Path: strings.TrimSpace(parts[0]), AlertType: "error",
+			Service: cfg.Service, LevelFilter: "ERROR",
+		}
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			target.AlertType = strings.TrimSpace(parts[1])
+		}
+		if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
+			target.LevelFilter = strings.TrimSpace(parts[2])
+		}
+		cfg.Files = append(cfg.Files, target)
+	}
+	if len(cfg.Files) == 0 {
+		return nil, false
+	}
+	return cfg, true
+}
+
+// envOr 读取环境变量，为空时返回默认值。
+func envOr(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
 }
 
 // agent 是采集器实例。
@@ -337,8 +407,39 @@ func (a *agent) collect(ctx context.Context) {
 }
 
 // readNewLines 从上次偏移继续读取，返回需要上报的报告列表。
+//
+// Path 支持通配（如 /logs/*.log）：平台代管的采集容器只知道"日志目录"，
+// 不知道里面具体有哪些文件，用通配可以自适应（logback 轮转出的新文件也会被采到）。
 func (a *agent) readNewLines(target LogTarget) ([]LogReport, error) {
-	file, err := os.Open(target.Path)
+	paths := []string{target.Path}
+	if strings.ContainsAny(target.Path, "*?[") {
+		matches, err := filepath.Glob(target.Path)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, nil
+		}
+		sort.Strings(matches)
+		paths = matches
+	}
+	out := make([]LogReport, 0, a.cfg.MaxBatch)
+	for _, path := range paths {
+		reports, err := a.readOneFile(target, path)
+		out = append(out, reports...)
+		if err != nil {
+			return out, err
+		}
+		if len(out) >= a.cfg.MaxBatch {
+			break
+		}
+	}
+	return out, nil
+}
+
+// readOneFile 读取单个文件的新增内容。
+func (a *agent) readOneFile(target LogTarget, path string) ([]LogReport, error) {
+	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -351,7 +452,7 @@ func (a *agent) readNewLines(target LogTarget) ([]LogReport, error) {
 	if err != nil {
 		return nil, err
 	}
-	offset := a.position[target.Path]
+	offset := a.position[path]
 	// 文件被轮转（变小）时从头开始读。
 	if info.Size() < offset {
 		offset = 0
@@ -400,12 +501,8 @@ func (a *agent) readNewLines(target LogTarget) ([]LogReport, error) {
 	if err := scanner.Err(); err != nil {
 		return reports, err
 	}
-	// 仅当整文件读完（未因批量上限中断）时推进偏移。
-	if len(reports) < a.cfg.MaxBatch {
-		a.position[target.Path] = offset + readAny
-	} else {
-		a.position[target.Path] = offset + readAny
-	}
+	// 偏移量按"解析后的实际文件路径"记录（通配场景下每个文件各有偏移）。
+	a.position[path] = offset + readAny
 	return reports, nil
 }
 

@@ -1,0 +1,22 @@
+# Grafana 数据源：自动指向平台自带的 Prometheus。
+#
+# 为什么由平台统一托管监控栈：
+#   被管项目（如 jd）不再需要自带 Prometheus + Grafana —— Exporter 由「集成中心」
+#   拉起、抓取由本平台负责、大盘在这里看，对被管项目是零侵入。
+#
+# url 用 compose 服务名 prometheus（容器内解析），因此 Grafana 必须与 Prometheus
+# 在同一张网络（compose 里已声明 networks: [mwops]）。
+apiVersion: 1
+
+datasources:
+  - name: mwops-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # 置为 false：数据源由平台统一维护，避免页面上的改动与服务端声明不一致
+    editable: false
+    jsonData:
+      # 与 Prometheus 的 scrape_interval 对齐，减少大盘查询压力
+      timeInterval: 30s
+      httpMethod: POST

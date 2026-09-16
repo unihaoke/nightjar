@@ -298,6 +298,53 @@ export interface IntegrationInput {
   tags?: string[]
   deploy?: boolean
   auto_rules?: boolean
+  /** 由平台创建/更新只读监控账号（写操作，默认关闭）。 */
+  bootstrap_account?: boolean
+  /** 被管实例的管理凭据：仅本次请求使用，平台不落库、不写审计、不回显。 */
+  admin_username?: string
+  admin_password?: string
+}
+
+/** 日志接入：入参（平台按目标容器名反查日志位置）。 */
+export interface LogCollectInput {
+  name: string
+  /** 被管容器名（docker ps 里的 NAMES 列）。 */
+  target_container: string
+  service?: string
+  environment?: string
+  glob?: string
+  level_filter?: string
+}
+
+/** 日志接入：发现到的日志位置。 */
+export interface LogSource {
+  container: string
+  networks: string[]
+  dir: string
+  mount_target: string
+  mount_source: string
+  mount_kind: 'volume' | 'bind' | string
+  mount_spec: string
+  glob: string
+  /** 判断依据（环境变量名 / 挂载点），供使用者核对。 */
+  evidence: string[]
+}
+
+/** 日志接入：预览/执行结果。 */
+export interface LogCollectPlan {
+  name: string
+  service: string
+  source: LogSource
+  collector_name: string
+  collector_image: string
+  binds: string[]
+  networks: string[]
+  agent_env: Record<string, string>
+  steps: string[]
+  discovered_from: string
+  target_container: string
+  existing?: { status: string; running: boolean } | null
+  warnings: string[]
 }
 
 /** 诊断证据。 */

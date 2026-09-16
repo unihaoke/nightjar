@@ -173,10 +173,20 @@ func TestRenderMySQLIntegrationUsesCollectFlags(t *testing.T) {
 	if !strings.Contains(artifacts.Compose, "--no-collect.info_schema.tables") {
 		t.Fatalf("显式关闭默认开启的采集项时应输出 --no- 前缀：\n%s", artifacts.Compose)
 	}
-	// 口令必须脱敏；DATA_SOURCE_NAME 的 DSN 形态保持 "user:pass@(host:port)/"。
-	// 含括号的值会被 YAML 加引号输出，因此只断言关键片段。
-	if !strings.Contains(artifacts.Compose, "exporter:${MONITOR_PASSWORD}@(10.0.0.12:3306)/") {
-		t.Fatalf("DATA_SOURCE_NAME 不符或未脱敏：\n%s", artifacts.Compose)
+	// 凭据必须走官方 flag + 环境变量，**绝不能拼 DATA_SOURCE_NAME**：
+	// 拼串方式会让口令里的 @ ( ) / : ? 破坏 DSN 解析（表现为 Exporter 启动失败、up=0，
+	// 且 Prometheus 侧只看到一句泛泛的抓取失败）。
+	if strings.Contains(artifacts.Compose, "DATA_SOURCE_NAME") {
+		t.Fatalf("MySQL 集成不应再使用 DATA_SOURCE_NAME（口令特殊字符会破坏 DSN）：\n%s", artifacts.Compose)
+	}
+	if !strings.Contains(artifacts.Compose, "--mysqld.address=10.0.0.12:3306") {
+		t.Fatalf("应渲染 --mysqld.address：\n%s", artifacts.Compose)
+	}
+	if !strings.Contains(artifacts.Compose, "--mysqld.username=exporter") {
+		t.Fatalf("应渲染 --mysqld.username：\n%s", artifacts.Compose)
+	}
+	if !strings.Contains(artifacts.Compose, "MYSQLD_EXPORTER_PASSWORD") {
+		t.Fatalf("口令应通过 MYSQLD_EXPORTER_PASSWORD 注入：\n%s", artifacts.Compose)
 	}
 	if strings.Contains(artifacts.Compose, "secret") {
 		t.Fatalf("生成的配置中出现了明文口令：\n%s", artifacts.Compose)

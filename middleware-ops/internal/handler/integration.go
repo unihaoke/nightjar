@@ -75,6 +75,37 @@ func (h *Handler) IntegrationServiceDiscovery(c *gin.Context) {
 	c.String(http.StatusOK, body)
 }
 
+// PreviewLogCollect 预览日志接入：平台读取被管容器的 docker 配置，反查日志位置。
+//
+// **读不到位置会直接失败**（不猜路径），这是刻意的：猜错的后果是采集容器空转、
+// 日志页永远为空，比直接报错难排查得多。
+func (h *Handler) PreviewLogCollect(c *gin.Context) {
+	var in service.LogCollectInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	plan, err := h.deps.Integration.PreviewLogCollect(c.Request.Context(), in)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, plan)
+}
+
+// CreateLogCollect 创建日志采集容器（平台侧，被管项目零改动）。
+func (h *Handler) CreateLogCollect(c *gin.Context) {
+	var in service.LogCollectInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	plan, err := h.deps.Integration.CreateLogCollect(c.Request.Context(), in, h.operator(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, plan)
+}
+
 // PreviewIntegration 预览生成的 Exporter 配置与抓取配置（不落库、不部署）。
 func (h *Handler) PreviewIntegration(c *gin.Context) {
 	var in service.IntegrationInput

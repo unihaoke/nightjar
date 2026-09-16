@@ -12,6 +12,7 @@ import * as echarts from 'echarts/core'
 import { LineChart, BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, MarkLineComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import dayjs from 'dayjs'
 import type { MetricSample } from '@/api/types'
 import { useUserStore } from '@/stores/user'
 
@@ -51,6 +52,15 @@ let chart: echarts.ECharts | null = null
 
 const hasData = computed(() => props.series.length > 0)
 
+/** 时间轴标签格式：yyyy-MM-dd HH:mm:ss（后端返回 UTC ISO，dayjs 会转成本地时区展示）。 */
+const TIME_FORMAT = 'YYYY-MM-DD HH:mm:ss'
+
+/** 把样本时间格式化为本地时间字符串；非法值原样返回，避免图上出现 Invalid Date。 */
+function formatSampleTime(raw: unknown): string {
+  const parsed = dayjs(String(raw ?? ''))
+  return parsed.isValid() ? parsed.format(TIME_FORMAT) : String(raw ?? '')
+}
+
 /** 读取当前主题下的绘图配色。 */
 function palette(): { text: string; text3: string; border: string; accent: string; warning: string; danger: string; area: string } {
   const styles = getComputedStyle(document.documentElement)
@@ -69,7 +79,9 @@ function palette(): { text: string; text3: string; border: string; accent: strin
 /** 构造 ECharts 配置。 */
 function buildOption(): echarts.EChartsCoreOption {
   const c = palette()
-  const times = props.series.map((item) => item.timestamp)
+  // 分类轴直接用「格式化后的本地时间」作为类目：这样坐标轴标签与 tooltip 表头
+  // 都会显示 yyyy-MM-dd HH:mm:ss，无需再写两套 formatter。
+  const times = props.series.map((item) => formatSampleTime(item.timestamp))
   const values = props.series.map((item) => item.value)
   const markLines: Record<string, unknown>[] = []
   if (props.warning) {
@@ -105,13 +117,21 @@ function buildOption(): echarts.EChartsCoreOption {
       axisLabel: {
         color: c.text3,
         fontSize: 10,
+        // 标签变长（yyyy-MM-dd HH:mm:ss）后必须靠 hideOverlap 自动抽稀，
+        // 否则 6 小时的 70+ 个点会糊成一片。
         hideOverlap: true,
-        formatter: (value: string) => (value.length > 11 ? value.slice(5, 16) : value),
+        margin: 10,
+        // 显式回显类目值，避免 ECharts 对长字符串做截断
+        formatter: (value: string) => value,
       },
       axisTick: { show: false },
     },
     yAxis: {
       type: 'value',
+      // scale=true：量程按数据范围自适应，而不是从 0 开始。
+      // 否则像「Redis 内存使用率」这种在 1%~3% 之间微小波动的指标，
+      // 曲线会贴着底边成一条直线，看起来像"没有采集到数据"。
+      scale: true,
       axisLine: { show: false },
       axisLabel: { color: c.text3, fontSize: 10 },
       splitLine: { lineStyle: { color: c.border, type: 'dotted' } },

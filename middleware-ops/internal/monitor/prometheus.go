@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -76,6 +77,56 @@ func (p *promClient) Selector(target Target) string { return buildSelector(targe
 
 // Endpoint 返回 Prometheus 查询地址（实现 EndpointReporter）。
 func (p *promClient) Endpoint() string { return p.baseURL }
+
+// maxTargetStatus 限制返回的目标条数（只用于提示，不需要全量）。
+const maxTargetStatus = 20
+
+// Targets 查询抓取目标状态（实现 TargetReporter）。
+//
+// 走 GET /api/v1/targets?state=active：up=0 时 data.activeTargets[].lastError
+// 就是"为什么抓不到"的原始答案（如 Access denied / invalid DSN / connection refused）。
+func (p *promClient) Targets(ctx context.Context, job string) ([]TargetStatus, error) {
+	body, err := p.do(ctx, "/api/v1/targets", url.Values{"state": {"active"}})
+	if err != nil {
+		return nil, err
+	}
+	var parsed struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+		Data   struct {
+			ActiveTargets []struct {
+				Labels     map[string]string `json:"labels"`
+				ScrapeURL  string            `json:"scrapeUrl"`
+				LastError  string            `json:"lastError"`
+				LastScrape string            `json:"lastScrape"`
+				Health     string            `json:"health"`
+				ScrapePool string            `json:"scrapePool"`
+			} `json:"activeTargets"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("解析 targets 响应失败: %w", err)
+	}
+	if parsed.Status != "success" {
+		return nil, fmt.Errorf("prometheus 返回 %s: %s", parsed.Status, parsed.Error)
+	}
+	out := make([]TargetStatus, 0, len(parsed.Data.ActiveTargets))
+	for _, item := range parsed.Data.ActiveTargets {
+		itemJob := item.Labels["job"]
+		if job != "" && itemJob != job {
+			continue
+		}
+		out = append(out, TargetStatus{
+			Job: itemJob, Instance: item.Labels["instance"], Health: item.Health,
+			LastError: item.LastError, LastScrape: item.LastScrape,
+			ScrapeURL: item.ScrapeURL, Labels: item.Labels,
+		})
+		if len(out) >= maxTargetStatus {
+			break
+		}
+	}
+	return out, nil
+}
 
 // LabelValues 查询标签取值（实现 LabelReporter）。
 //
@@ -360,6 +411,12 @@ type promResultItem struct {
 //
 // 结果集为空时返回 errEmptyResult（而不是普通错误）：调用方据此区分
 // 「选择器没匹配到时序」与「Prometheus 不可用」。
+//
+// 另外把 NaN / ±Inf 也视为"没有可用数值"：Prometheus 在「除以 0」「无样本可计算」
+// 等场景会返回字符串 "NaN" / "+Inf"，Go 的 strconv.ParseFloat 会**成功**解析它们。
+// 这类值一旦进入响应，encoding/json 会直接失败，而 gin 是先写状态码再 Marshal——
+// 客户端收到「HTTP 200 + 空响应体」，前端解包得到 undefined，报出与真实原因无关的
+// 错误（如 Cannot read properties of undefined (reading 'series')）。
 func (r promResponse) firstValue() (float64, error) {
 	if len(r.Data.Result) == 0 {
 		return 0, errEmptyResult
@@ -368,10 +425,22 @@ func (r promResponse) firstValue() (float64, error) {
 	if len(item.Value) < 2 {
 		return 0, fmt.Errorf("查询结果缺少样本值")
 	}
-	return toFloat(item.Value[1])
+	value, err := toFloat(item.Value[1])
+	if err != nil {
+		return 0, err
+	}
+	if !isFinite(value) {
+		return 0, errEmptyResult
+	}
+	return value, nil
 }
 
 // firstSeries 提取首个序列。
+//
+// 逐点丢弃 NaN / ±Inf：例如「命中率」= rate(hits)/(rate(hits)+rate(misses))*100，
+// Redis 在该窗口内没有读写时两侧都是 0，Prometheus 会算出 NaN。
+// 与其把 NaN 塞进响应（会破坏 JSON 编码），不如把它当作"该点无数据"跳过；
+// 全部点都无数据时返回空序列，前端显示"暂无采样数据"。
 func (r promResponse) firstSeries() ([]Sample, error) {
 	if len(r.Data.Result) == 0 {
 		return nil, nil
@@ -387,12 +456,19 @@ func (r promResponse) firstSeries() ([]Sample, error) {
 			continue
 		}
 		val, err := toFloat(pair[1])
-		if err != nil {
+		if err != nil || !isFinite(val) {
 			continue
 		}
 		out = append(out, Sample{Timestamp: time.Unix(int64(ts), 0).UTC(), Value: val})
 	}
 	return out, nil
+}
+
+// isFinite 判断样本值是否为有限数。
+//
+// 供 toFloat 的调用方在做"可编码性"检查时复用：JSON 无法表示 NaN/±Inf。
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 // toFloat 把 Prometheus 的字符串/浮点样本值转为 float64。

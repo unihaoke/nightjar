@@ -343,18 +343,26 @@ curl -X POST http://<平台地址>/api/hooks/logs \
 
 响应中的 `signature` 为错误指纹，`merged=true` 表示与 5 分钟窗口内的既有事件合并。
 
-可直接使用仓库内示例脚本（含单条、批量、扫描日志文件三种模式）。
-脚本已写入 UTF-8 BOM，PowerShell 5.1 与 PowerShell 7 均可直接运行：
-`pwsh` 存在时用 `pwsh`，Windows 自带环境用 `powershell`。
+脚本接入用 `curl` 即可（`X-Hook-Token` 取自平台 `.env` 的 `MWOPS_HOOK_TOKEN`）：
 
-```powershell
-# PowerShell 7+
-pwsh -File scripts/hook-log-report.ps1 -BaseUrl http://127.0.0.1:8080
-pwsh -File scripts/hook-log-report.ps1 -LogFile /var/log/order-service/error.log -TailLines 400
+```bash
+# 单条上报
+curl -sS -X POST http://127.0.0.1:8080/api/hooks/logs \
+  -H "X-Hook-Token: $MWOPS_HOOK_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"server":"order-service","service":"order-api","level":"ERROR",
+       "message":"connection pool exhausted","file":"/var/log/order-service/error.log"}'
 
-# Windows PowerShell 5.1（无 pwsh 时）
-powershell -ExecutionPolicy Bypass -File scripts\hook-log-report.ps1 -BaseUrl http://127.0.0.1:8080
+# 直接扫描日志文件尾部 400 行批量上报（每条一行 JSON 的数组）
+tail -n 400 /var/log/order-service/error.log | while IFS= read -r line; do
+  curl -sS -X POST http://127.0.0.1:8080/api/hooks/logs \
+    -H "X-Hook-Token: $MWOPS_HOOK_TOKEN" -H 'Content-Type: application/json' \
+    -d "$(printf '{"server":"order-service","service":"order-api","level":"ERROR","message":%s}' \
+          "$(printf '%s' "$line" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')")"
+done
 ```
+
+> 由平台托管的采集（无需在被管项目里写脚本）见 [`INTEGRATION.md`](INTEGRATION.md) 第 8.6 节：
+> 平台按 docker 配置发现日志位置，再用自带的 `mwops-agent` 容器读同一个卷。
 
 各语言框架的接入点（示意）：
 
