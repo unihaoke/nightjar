@@ -260,7 +260,7 @@ onMounted(load)
             </template>
           </el-table-column>
           <el-table-column label="收敛" width="130">
-            <template #default="{ row }">窗口 {{ row.window }}m / 冷却 {{ row.cooldown }}m</template>
+            <template #default="{ row }">窗口 {{ row.time_window }}m / 冷却 {{ row.cooldown }}m</template>
           </el-table-column>
           <el-table-column label="状态" width="90">
             <template #default="{ row }">

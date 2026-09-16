@@ -270,7 +270,8 @@ export interface AlertRule {
   operator: string
   threshold: number
   level: string
-  window: number
+  /** 去重窗口（分钟）。列名刻意避开 PostgreSQL 保留字 window，使用 time_window。 */
+  time_window: number
   cooldown: number
   notify_channels: string[] | null
   enabled: boolean

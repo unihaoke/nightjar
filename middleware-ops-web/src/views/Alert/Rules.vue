@@ -39,7 +39,7 @@ const form = reactive({
   operator: '>',
   threshold: 0,
   level: 'warning',
-  window: 5,
+  time_window: 5,
   cooldown: 10,
   notify_channels: ['feishu', 'wecom'] as string[],
   enabled: true,
@@ -107,7 +107,7 @@ function openForm(rule?: AlertRule): void {
       operator: rule.operator,
       threshold: rule.threshold,
       level: rule.level,
-      window: rule.window,
+      time_window: rule.time_window,
       cooldown: rule.cooldown,
       notify_channels: rule.notify_channels || [],
       enabled: rule.enabled,
@@ -124,7 +124,7 @@ function openForm(rule?: AlertRule): void {
       operator: '>',
       threshold: 0,
       level: 'warning',
-      window: 5,
+      time_window: 5,
       cooldown: 10,
       notify_channels: ['feishu', 'wecom'],
       enabled: true,
@@ -270,7 +270,7 @@ onMounted(async () => {
             </template>
           </el-table-column>
           <el-table-column label="收敛策略" width="150">
-            <template #default="{ row }">窗口 {{ row.window }}m · 冷却 {{ row.cooldown }}m</template>
+            <template #default="{ row }">窗口 {{ row.time_window }}m · 冷却 {{ row.cooldown }}m</template>
           </el-table-column>
           <el-table-column label="通知渠道" min-width="140">
             <template #default="{ row }">
@@ -347,7 +347,7 @@ onMounted(async () => {
           </el-col>
           <el-col :xs="12" :sm="12">
             <el-form-item label="去重窗口（分钟）">
-              <el-input-number v-model="form.window" :min="1" :max="120" class="mobile-block" />
+              <el-input-number v-model="form.time_window" :min="1" :max="120" class="mobile-block" />
             </el-form-item>
           </el-col>
           <el-col :xs="12" :sm="12">

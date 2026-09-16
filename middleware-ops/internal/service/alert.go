@@ -154,7 +154,7 @@ func (s *AlertService) Trigger(ctx context.Context, rule model.AlertRule, metric
 	fingerprint := utils.Fingerprint(rule.MetricName, fmt.Sprintf("%d", rule.InstanceID), rule.Level)
 
 	// 规则级收敛：窗口内同指纹合并。
-	windowStart := now.Add(-time.Duration(rule.Window) * time.Minute)
+	windowStart := now.Add(-time.Duration(rule.TimeWindow) * time.Minute)
 	existing, findErr := s.alerts.FindActiveByFingerprint(ctx, fingerprint, windowStart)
 	if findErr == nil && existing != nil {
 		if err := s.alerts.BumpCount(ctx, existing.ID, now); err != nil {
@@ -231,7 +231,7 @@ func (s *AlertService) Ingest(ctx context.Context, in IngestAlertInput) (*model.
 		MetricName: defaultString(in.MetricName, "external"),
 		Operator:   ">",
 		Level:      level,
-		Window:     5,
+		TimeWindow: 5,
 		Cooldown:   10,
 		Enabled:    true,
 	}
@@ -326,14 +326,16 @@ func (s *AlertService) ListRules(ctx context.Context, instanceID int64, limit, o
 
 // RuleInput 是告警规则入参。
 type RuleInput struct {
-	Name           string   `json:"name" binding:"required"`
-	InstanceID     int64    `json:"instance_id" binding:"required"`
-	MWType         string   `json:"mw_type"`
-	MetricName     string   `json:"metric_name" binding:"required"`
-	Operator       string   `json:"operator" binding:"required"`
-	Threshold      float64  `json:"threshold"`
-	Level          string   `json:"level"`
-	Window         int      `json:"window"`
+	Name       string  `json:"name" binding:"required"`
+	InstanceID int64   `json:"instance_id" binding:"required"`
+	MWType     string  `json:"mw_type"`
+	MetricName string  `json:"metric_name" binding:"required"`
+	Operator   string  `json:"operator" binding:"required"`
+	Threshold  float64 `json:"threshold"`
+	Level      string  `json:"level"`
+	// TimeWindow 为去重窗口（分钟）；对外 JSON 字段与数据库列名统一为 time_window，
+	// 避免沿用 window 这一 PostgreSQL 保留关键字（见 model.AlertRule）。
+	TimeWindow     int      `json:"time_window"`
 	Cooldown       int      `json:"cooldown"`
 	NotifyChannels []string `json:"notify_channels"`
 	Enabled        *bool    `json:"enabled"`
@@ -357,8 +359,8 @@ func (s *AlertService) CreateRule(ctx context.Context, in RuleInput, operator Op
 	rule := &model.AlertRule{
 		Name: in.Name, InstanceID: in.InstanceID, MWType: in.MWType,
 		MetricName: in.MetricName, Operator: in.Operator, Threshold: in.Threshold,
-		Level:  defaultString(in.Level, model.AlertLevelWarning),
-		Window: defaultInt(in.Window, 5), Cooldown: defaultInt(in.Cooldown, 10),
+		Level:      defaultString(in.Level, model.AlertLevelWarning),
+		TimeWindow: defaultInt(in.TimeWindow, 5), Cooldown: defaultInt(in.Cooldown, 10),
 		NotifyChannels: model.JSONStringSlice(in.NotifyChannels),
 		Enabled:        enabled, AIEnabled: aiEnabled, Description: in.Description,
 	}
@@ -396,7 +398,7 @@ func (s *AlertService) UpdateRule(ctx context.Context, id int64, in RuleInput, o
 	if in.Level != "" {
 		rule.Level = in.Level
 	}
-	rule.Window = defaultInt(in.Window, rule.Window)
+	rule.TimeWindow = defaultInt(in.TimeWindow, rule.TimeWindow)
 	rule.Cooldown = defaultInt(in.Cooldown, rule.Cooldown)
 	rule.NotifyChannels = model.JSONStringSlice(in.NotifyChannels)
 	if in.Enabled != nil {

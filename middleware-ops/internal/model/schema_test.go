@@ -167,6 +167,81 @@ func TestSchemaReferenceMatchesModels(t *testing.T) {
 	}
 }
 
+// postgresReservedKeywords 收录相关度较高、确属 PostgreSQL 保留关键字（reserved）
+// 或「列名 + 数据类型」位置会产生歧义的词。
+//
+// 背景：deploy 阶段的初始化脚本曾用未加引号的建表语句，`window INTEGER DEFAULT 5`
+// 直接报 syntax error at or near "window"（WINDOW 为 reserved，属 reserved_keywords，
+// 不能作列名；而 COUNT / RESULT / LEVEL / STATUS 等属 non-reserved，可裸写）。
+// GORM 会对标识符加引号，但初始化脚本、手工 SQL、BI 工具不会，
+// 因此模型列名一律不得使用下列词汇。
+var postgresReservedKeywords = map[string]bool{
+	"all": true, "analyse": true, "analyze": true, "and": true, "any": true, "array": true,
+	"as": true, "asc": true, "asymmetric": true, "both": true, "case": true, "cast": true,
+	"check": true, "collate": true, "column": true, "constraint": true, "create": true,
+	"current_catalog": true, "current_date": true, "current_role": true, "current_time": true,
+	"current_timestamp": true, "current_user": true, "default": true, "deferrable": true,
+	"desc": true, "distinct": true, "do": true, "else": true, "end": true, "except": true,
+	"false": true, "fetch": true, "for": true, "foreign": true, "from": true, "grant": true,
+	"group": true, "having": true, "in": true, "initially": true, "intersect": true,
+	"into": true, "lateral": true, "leading": true, "limit": true, "localtime": true,
+	"localtimestamp": true, "not": true, "null": true, "offset": true, "on": true,
+	"only": true, "or": true, "order": true, "placing": true, "primary": true,
+	"references": true, "returning": true, "select": true, "session_user": true,
+	"some": true, "symmetric": true, "table": true, "then": true, "to": true,
+	"trailing": true, "true": true, "union": true, "unique": true, "user": true,
+	"using": true, "variadic": true, "when": true, "where": true, "window": true,
+	"with": true,
+}
+
+// TestModelColumnsAvoidPostgresReservedKeywords 防止模型列名撞上 PostgreSQL 保留字。
+//
+// 这是线上故障的直接回归：alert_rules.window 曾导致初始化脚本建表语法错误，
+// 进而留下半成品 schema 并让后端 AutoMigrate 失败。
+func TestModelColumnsAvoidPostgresReservedKeywords(t *testing.T) {
+	parser := schema.NamingStrategy{}
+	cache := &sync.Map{}
+	checked := 0
+	for _, entity := range MigrationList() {
+		parsed, err := schema.Parse(entity, cache, parser)
+		if err != nil {
+			t.Fatalf("解析实体失败（%T）: %v", entity, err)
+		}
+		for _, field := range parsed.Fields {
+			name := strings.ToLower(field.DBName)
+			checked++
+			if postgresReservedKeywords[name] {
+				t.Fatalf("表 %s 的列 %s 命中 PostgreSQL 保留关键字，裸写 SQL（初始化脚本/手工运维）会语法报错；"+
+					"请改用带 gorm:\"column:...\" 的非保留字列名",
+					parsed.Table, field.DBName)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("未解析到任何列，测试前置条件失效")
+	}
+}
+
+// TestSchemaReferenceColumnsAvoidReserved 校验参考 schema 的列名同样不撞保留字。
+func TestSchemaReferenceColumnsAvoidReserved(t *testing.T) {
+	content, ok := readSchemaReference(t)
+	if !ok {
+		t.Skip("跳过：未找到 docs/SCHEMA.sql")
+	}
+	code := stripSQLLineComments(content)
+	tablePattern := regexp.MustCompile(`(?is)CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)\s*\((.*?)\n\);`)
+	columnPattern := regexp.MustCompile(`(?m)^\s{4}([a-z_][a-z0-9_]*)\s+[A-Z]`)
+	for _, tableMatch := range tablePattern.FindAllStringSubmatch(code, -1) {
+		table := tableMatch[1]
+		for _, columnMatch := range columnPattern.FindAllStringSubmatch(tableMatch[2], -1) {
+			column := strings.ToLower(columnMatch[1])
+			if postgresReservedKeywords[column] {
+				t.Fatalf("docs/SCHEMA.sql 中表 %s 的列 %s 命中 PostgreSQL 保留关键字，必须加引号或改名", table, column)
+			}
+		}
+	}
+}
+
 // stripSQLLineComments 去掉 SQL 行注释（-- 之后的内容），逐行处理。
 func stripSQLLineComments(content string) string {
 	lines := strings.Split(content, "\n")

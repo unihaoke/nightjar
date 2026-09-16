@@ -168,8 +168,12 @@ type AlertRule struct {
 	Operator   string  `gorm:"size:8;not null" json:"operator"` // > >= < <= == !=
 	Threshold  float64 `json:"threshold"`
 	Level      string  `gorm:"size:16;default:warning" json:"level"`
-	// Window 为去重窗口（分钟），Cooldown 为静默冷却期（分钟）。
-	Window         int             `gorm:"default:5" json:"window"`
+	// TimeWindow 为去重窗口（分钟），Cooldown 为静默冷却期（分钟）。
+	//
+	// 数据库列名刻意使用 time_window 而非 window：window 是 PostgreSQL 保留关键字，
+	// 裸写会直接报语法错误（syntax error at or near "window"）。GORM 会对标识符加引号，
+	// 但初始化脚本、手工 SQL、BI 工具等非 GORM 途径不会，因此从命名上规避更安全。
+	TimeWindow     int             `gorm:"column:time_window;default:5" json:"time_window"`
 	Cooldown       int             `gorm:"default:10" json:"cooldown"`
 	NotifyChannels JSONStringSlice `gorm:"type:text" json:"notify_channels"`
 	Enabled        bool            `gorm:"default:true" json:"enabled"`

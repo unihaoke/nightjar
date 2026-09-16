@@ -259,6 +259,25 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/audit/verify
 
 > 若选择手工建库（执行 `docs/SCHEMA.sql`），务必同时把配置项 `database.auto_migrate` 置为 `false`，避免 AutoMigrate 再去维护这套约束。
 
+### 5.7 保留关键字与 DDL 引号
+
+早期版本的初始化脚本使用未加引号的建表语句，`alert_rules.window INTEGER` 会直接失败：
+
+```
+ERROR: syntax error at or near "window"
+LINE 12: window INTEGER DEFAULT 5,
+```
+
+原因：`WINDOW` 属 PostgreSQL **reserved** 关键字（`reserved_keywords`），不能作为裸列名；而 `COUNT` / `RESULT` / `LEVEL` / `STATUS` / `KEY` / `VALUE` / `SOURCE` 等属 **non-reserved**，可以裸写——所以只有 `window` 这一处有问题。
+
+处理方式：
+
+- 该列已重命名为 `time_window`（数据库列名、API 字段名、前端表单字段一致），模型侧用 `gorm:"column:time_window"` 固定列名；
+- GORM 生成的 DDL 本身是带引号的（`QuoteTo` 内部无条件加 `"`），因此模型列名即使撞保留字也能建表成功——但初始化脚本、手工 SQL、BI 导出不会加引号，故统一从命名上规避；
+- 已加入回归测试 `internal/model/schema_test.go`：`TestModelColumnsAvoidPostgresReservedKeywords` 与 `TestSchemaReferenceColumnsAvoidReserved` 会遍历全部模型列名与 `docs/SCHEMA.sql` 列名，禁止命中保留字表。新增模型字段时若误用保留字，`go test ./internal/model/` 会直接失败。
+
+若已有环境建过旧表结构，`alert_rules` 可能因该语法错误而**整表缺失**（初始化脚本是按语句逐条执行的，失败后该表不会存在）。请按 5.6 节的第 1 种方式清库重建，或单独补建该表并确认其唯一约束命名符合 `uni_*` 规则。
+
 ---
 
 ## 六、升级与回滚

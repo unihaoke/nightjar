@@ -66,14 +66,15 @@ func (r *AlertRuleRepository) Create(ctx context.Context, rule *model.AlertRule)
 func (r *AlertRuleRepository) Update(ctx context.Context, rule *model.AlertRule) error {
 	res := r.withCtx(ctx).Model(&model.AlertRule{}).Where("id = ?", rule.ID).
 		Updates(map[string]any{
-			"name":            rule.Name,
-			"instance_id":     rule.InstanceID,
-			"mw_type":         rule.MWType,
-			"metric_name":     rule.MetricName,
-			"operator":        rule.Operator,
-			"threshold":       rule.Threshold,
-			"level":           rule.Level,
-			"window":          rule.Window,
+			"name":        rule.Name,
+			"instance_id": rule.InstanceID,
+			"mw_type":     rule.MWType,
+			"metric_name": rule.MetricName,
+			"operator":    rule.Operator,
+			"threshold":   rule.Threshold,
+			"level":       rule.Level,
+			// 列名为 time_window：window 是 PostgreSQL 保留关键字（见 model.AlertRule）
+			"time_window":     rule.TimeWindow,
 			"cooldown":        rule.Cooldown,
 			"notify_channels": rule.NotifyChannels,
 			"enabled":         rule.Enabled,

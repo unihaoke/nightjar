@@ -181,7 +181,7 @@ data: {"code":5002,"message":"AI 引擎不可用"}
   "operator": ">",
   "threshold": 85,
   "level": "critical",
-  "window": 5,
+  "time_window": 5,
   "cooldown": 10,
   "notify_channels": ["feishu", "wecom"],
   "ai_enabled": true,
@@ -190,7 +190,8 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 ```
 
 - `operator` 支持 `>` `>=` `<` `<=` `==` `!=`（阈值型指标用前者，命中率型指标用 `<`）。
-- 收敛：`window` 分钟内同指纹（规则 + 实例 + 级别）合并为一条并累加 `count`；`cooldown` 分钟内静默不外发通知。
+- 收敛：`time_window` 分钟内同指纹（规则 + 实例 + 级别）合并为一条并累加 `count`；`cooldown` 分钟内静默不外发通知。
+- 字段名为 `time_window` 而非 `window`：后者是 PostgreSQL 保留关键字，裸写会触发语法错误，因此从字段名到数据库列名统一规避。
 
 ---
 

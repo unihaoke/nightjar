@@ -125,7 +125,10 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     operator         VARCHAR(8)   NOT NULL,
     threshold        DOUBLE PRECISION,
     level            VARCHAR(16)  DEFAULT 'warning',
-    window           INTEGER DEFAULT 5,
+    -- 注意：列名刻意使用 time_window 而非 window。
+    -- window 是 PostgreSQL 保留关键字，裸写会报 syntax error at or near "window"；
+    -- GORM 会对标识符加引号，但初始化脚本 / 手工 SQL / BI 工具不会，故从命名规避。
+    time_window      INTEGER DEFAULT 5,
     cooldown         INTEGER DEFAULT 10,
     notify_channels  TEXT,
     enabled          BOOLEAN DEFAULT TRUE,
