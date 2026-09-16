@@ -286,6 +286,16 @@ $mwopsNetwork = 'middleware-ops_mwops'
 $jd = Set-EnvValue $jd 'NIGHTJAR_URL' 'http://mwops-backend:8080'
 $nj = Set-EnvValue $nj 'INTEGRATION_EXPORTER_NETWORK' "$mwopsNetwork,$network"
 
+# 2.4 实例名（唯一真源）：平台「实例名称」== Prometheus 的 instance_name 标签值。
+# 第 5 步会用它同步 prometheus-jd.yml 的 relabel replacement 与 agent.yaml。
+$redisName = Get-EnvValue $jd 'JD_REDIS_INSTANCE_NAME'
+$mysqlName = Get-EnvValue $jd 'JD_MYSQL_INSTANCE_NAME'
+if ([string]::IsNullOrWhiteSpace($redisName)) { $redisName = 'jd-redis' }
+if ([string]::IsNullOrWhiteSpace($mysqlName)) { $mysqlName = 'jd-mysql' }
+$jd = Set-EnvValue $jd 'JD_REDIS_INSTANCE_NAME' $redisName
+$jd = Set-EnvValue $jd 'JD_MYSQL_INSTANCE_NAME' $mysqlName
+Ok "实例名（Prometheus instance_name）：redis=$redisName，mysql=$mysqlName"
+
 # ---------------------------------------------------------------------------
 # 3. 端口错开
 # ---------------------------------------------------------------------------
@@ -342,6 +352,38 @@ function Update-FileByRegex([string]$path, [string]$pattern, [string]$replacemen
   Fix "$desc → $masked（$path）"
 }
 
+# Sync-PrometheusRelabel 把两个中间件 job 的 instance_name（relabel replacement）
+# 对齐到 .env 里的实例名。
+#
+# 逐行处理并跟踪当前 job_name：replacement 在文件里出现多次，只有跟在
+# middleware-exporter-redis / -mysql 之后的那个才该改；顺带避免误改注释里的示例文本。
+function Sync-PrometheusRelabel([string]$path, [string]$redisName, [string]$mysqlName) {
+  if (-not (Test-Path $path)) { Info "跳过不存在的文件：$path"; return }
+  $lines = [System.IO.File]::ReadAllLines($path, $script:Utf8NoBom)
+  $currentJob = ''
+  $changes = New-Object System.Collections.Generic.List[string]
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match "job_name:\s*'?([^'\s]+)'?") { $currentJob = $Matches[1] }
+    if ($lines[$i] -match '^(\s*)replacement:\s*(\S+)\s*$') {
+      $indent = $Matches[1]
+      $current = $Matches[2]
+      $want = switch ($currentJob) {
+        'middleware-exporter-redis' { $redisName }
+        'middleware-exporter-mysql' { $mysqlName }
+        default { $null }
+      }
+      if ($want -and $current -ne $want) {
+        $lines[$i] = "${indent}replacement: $want"
+        $changes.Add("$currentJob : $current → $want")
+      }
+    }
+  }
+  if ($changes.Count -eq 0) { Ok "Prometheus relabel 实例名已是最新（$path）"; return }
+  if ($DryRun) { foreach ($c in $changes) { DryTag "prometheus relabel $c（$path）" }; return }
+  [System.IO.File]::WriteAllLines($path, $lines, $script:Utf8NoBom)
+  foreach ($c in $changes) { Fix "prometheus relabel $c（$path）" }
+}
+
 $monitorPassword = Get-EnvValue $jd 'MYSQL_EXPORTER_PASSWORD'
 if (-not [string]::IsNullOrWhiteSpace($monitorPassword)) {
   # 只替换 SQL 语句里的 BY '<口令>'，不动注释里的占位说明（例如 "本文件的 BY '<口令>'"）。
@@ -368,6 +410,34 @@ if (-not [string]::IsNullOrWhiteSpace($monitorPassword)) {
   }
   $cnfPath = Join-Path (Resolve-Path $JdDir).Path 'deploy\jd-exporters\my.cnf'
   Update-FileByRegex $cnfPath '(?m)^\s*password\s*=.*$' "password = $monitorPassword" 'my.cnf 的 exporter 口令' 'password = ******'
+}
+
+# 5.2 实例名：把 .env 的 JD_*_INSTANCE_NAME 同步进 Prometheus relabel 与 agent.yaml。
+#
+# 为什么要同步：平台按 instance_name 标签定位实例，而这个标签值写在 prometheus-jd.yml 的
+# relabel replacement 里，是**文件里的硬编码**。以前改名要同时改 .env、relabel、平台实例名
+# 三处，漏一处就出现"up=1 但 matched=0"。现在以 .env 为唯一真源，脚本负责铺开
+# （这两个值在第 2 步已写回 .env）。
+$relabelTargets = @(
+  (Join-Path (Resolve-Path $JdDir).Path 'deploy\jd-exporters\prometheus-jd.yml'),
+  # 平台仓库里保留的同名副本也一起同步，避免两份配置漂移
+  (Join-Path (Resolve-Path $NightjarDir).Path 'deploy\jd-exporters\prometheus-jd.yml')
+)
+$redisName = Get-EnvValue $jd 'JD_REDIS_INSTANCE_NAME'
+$mysqlName = Get-EnvValue $jd 'JD_MYSQL_INSTANCE_NAME'
+foreach ($relabelPath in $relabelTargets) {
+  Sync-PrometheusRelabel $relabelPath $redisName $mysqlName
+}
+
+# agent.yaml 只在改用官方 Agent 时才生效，同样从 .env 派生，省一次手填
+$agentPath = Join-Path (Resolve-Path $JdDir).Path 'deploy\jd-exporters\agent.yaml'
+$hookToken = Get-EnvValue $jd 'NIGHTJAR_HOOK_TOKEN'
+$nightjarUrl = Get-EnvValue $jd 'NIGHTJAR_URL'
+if (Test-Path $agentPath) {
+  Update-FileByRegex $agentPath '(?m)^\s*hook_token:.*$' "hook_token: $hookToken" 'agent.yaml 的上报令牌' 'hook_token: ******'
+  Update-FileByRegex $agentPath '(?m)^\s*platform_url:.*$' "platform_url: $nightjarUrl" 'agent.yaml 的平台地址' "platform_url: $nightjarUrl"
+} else {
+  Info '跳过不存在的文件：agent.yaml（未使用官方 Agent 时属正常）'
 }
 
 # 需要 docker.sock 才能一键拉起 Exporter，这里只做提示
@@ -492,7 +562,12 @@ if ($DryRun) {
     $resp = Invoke-RestMethod -Uri $uri -TimeoutSec 5
     if ($resp.data.Count -gt 0) {
       Ok "Prometheus(:$promPort) 上 job=$job 的 instance_name = $($resp.data -join ', ')"
-      Info "平台实例名必须等于其中之一；jd 场景应为 jd-redis"
+      if ($resp.data -contains $redisName) {
+        Ok "与 .env 的 JD_REDIS_INSTANCE_NAME（$redisName）一致，平台实例名应填 $redisName"
+      } else {
+        Warn "与 .env 的 JD_REDIS_INSTANCE_NAME（$redisName）不一致：relabel 改动尚未生效"
+        Hint 'docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml up -d --force-recreate prometheus'
+      }
     } else {
       Bad "Prometheus(:$promPort) 上 job=$job 没有 instance_name 标签"
       Hint '抓取配置缺 relabel，或 Prometheus 未用带 overlay 的配置重建（docker compose ... up -d --force-recreate prometheus）'
@@ -531,14 +606,19 @@ if ($FixInstances) {
         if ([string]::IsNullOrWhiteSpace($newJob) -or ($jobs.Count -gt 0 -and $jobs -notcontains $newJob)) {
           $newJob = $expectedJob; $needFix = $true
         }
-        # 实例名与 Prometheus 标签不一致时，按实际标签纠正
-        $expectedName = $item.name
+        # 实例名以 .env 的 JD_*_INSTANCE_NAME 为准（relabel 已按它同步），
+        # Prometheus 里的实际标签值只用于提示"是否需要重建 Prometheus 让配置生效"。
+        $expectedName = if ($item.mw_type -eq 'redis') { $redisName } else { $mysqlName }
+        if ([string]::IsNullOrWhiteSpace($expectedName)) { $expectedName = $item.name }
         try {
           $matcher = [uri]::EscapeDataString("up{job=`"$newJob`"}")
           $names = (Invoke-RestMethod -Uri "http://127.0.0.1:$promPort/api/v1/label/instance_name/values?match[]=$matcher" -TimeoutSec 5).data
-          if ($names.Count -eq 1 -and $names[0] -ne $item.name) { $expectedName = $names[0]; $needFix = $true }
+          if ($names.Count -gt 0 -and $names -notcontains $expectedName) {
+            Warn "Prometheus 上 job=$newJob 的实际标签是 $($names -join ', ')，与 .env 的 $expectedName 不同"
+            Hint '说明 relabel 改动还没生效：docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml up -d --force-recreate prometheus'
+          }
         } catch { }
-        if (-not $needFix) { Ok "$($item.name) 已正确（job=$newJob）"; continue }
+        if (-not $needFix) { Ok "$($item.name) 已正确（job=$newJob，名称=$expectedName）"; continue }
         $body = @{
           name = $expectedName; mw_type = $item.mw_type; host = $item.host; port = $item.port
           username = $item.username; environment = $item.environment; group_name = $item.group_name

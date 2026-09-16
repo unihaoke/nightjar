@@ -171,6 +171,11 @@ GRAFANA_PASSWORD=<Grafana 口令>
 
 # ---------- 接入 nightjar ----------
 MYSQL_EXPORTER_PASSWORD=<监控账号口令>   # 必改，且要同步改 01-monitor-user.sql
+# 实例名（= nightjar 平台里的「实例名称」= Prometheus 的 instance_name 标签）。
+# 这是唯一真源：改这两行后由 nightjar 的一键脚本同步 relabel 与平台实例，
+# 不需要再去改 prometheus-jd.yml。
+JD_REDIS_INSTANCE_NAME=jd-redis
+JD_MYSQL_INSTANCE_NAME=jd-mysql
 JD_NIGHTJAR_NETWORK=jd-nightjar
 NIGHTJAR_URL=http://mwops-backend:8080   # 同机同网络直接用容器名
 NIGHTJAR_HOOK_TOKEN=<与 nightjar 的 HOOK_TOKEN 相同>
@@ -373,6 +378,8 @@ pwsh -File scripts/setup-jd-link.ps1              # ② 正式执行
 | 按取数方式写 `MWOPS_PROMETHEUS_BASE_URL`、拼好 `INTEGRATION_EXPORTER_NETWORK` | `<nightjar>/.env` |
 | 端口错开（nightjar 9090 / jd 9091、Web 8000 / 8542） | 两份 `.env` |
 | 用 `.env` 的口令重写 `01-monitor-user.sql` 与 `my.cnf` | 以前要手工 `sed` 的两个文件 |
+| 用 `JD_*_INSTANCE_NAME` 重写 `prometheus-jd.yml` 的 `relabel replacement`（jd 与 nightjar 两份副本一起同步） | 以前"平台实例名必须等于 Prometheus 标签"只能手改文件 |
+| 把 `NIGHTJAR_HOOK_TOKEN` / `NIGHTJAR_URL` 写进 `agent.yaml` | 改用官方日志 Agent 时的手填项 |
 | 创建 internal 互联网络、按正确 overlay 启动两栈、补建 MySQL 只读账号 | `./start.sh nightjar` + `nightjar-initdb` |
 | 清掉手工 `docker network connect` 的遗留网络 | 第 8.1 节第 ④ 步 |
 | 体检：容器网络挂载、`getent` 双向解析、Prometheus 里真实的 `instance_name` | 第 8.3 节 |
@@ -829,17 +836,24 @@ cd <nightjar> && docker compose down -v
 
 ### B. 文件总表（jd 侧改动）
 
-| 文件 | 作用 |
-|---|---|
-| `docker-compose.yml` | 四网分区；MySQL/Redis 取消宿主端口；日志落 `backend-logs` 卷 |
-| `deploy/jd-exporters/docker-compose.jd.yml` | overlay：两个 Exporter + `jd-nightjar` 别名 + initdb + 日志 Agent |
-| `deploy/jd-exporters/docker-compose.jd-link.yml` | 只打通网络的最小 overlay |
-| `deploy/jd-exporters/prometheus-jd.yml` | 抓取配置：两个 job 用 relabel 写 `instance_name` |
-| `deploy/jd-exporters/init/01-monitor-user.sql` | MySQL 只读监控账号 |
-| `deploy/jd-exporters/log-shipper.sh` / `Dockerfile.logagent` / `agent.yaml` | 日志上报（shell 版 / 镜像 / 官方 Agent 模板） |
-| `backend/src/main/resources/logback-spring.xml` | `error.log`（仅 ERROR）+ 全量日志 |
-| `backend/Dockerfile` | GC 日志路径 `/app/data/logs/gc.log` |
-| `start.sh` | `nightjar` / `nightjar-logs` / `nightjar-initdb` / `link` / `restore` / `exporters-only` |
+> 「维护方式」一列：**只改 .env** = 由 `scripts/setup-jd-link.ps1` 从 `.env` 推导并写回，
+> 正常情况不需要手工编辑；**固定资产** = 一次性改造，之后不动。
+
+| 文件 | 维护方式 | 作用 |
+|---|---|---|
+| `.env` | **唯一手工维护点** | 口令、实例名、网络名、日志令牌、端口 |
+| `.gitignore` | 固定资产 | 已忽略 `.env` / `*.key` / `*.pem`，避免密钥入库 |
+| `docker-compose.yml` | 固定资产 | 四网分区；MySQL/Redis 取消宿主端口；日志落 `backend-logs` 卷 |
+| `deploy/jd-exporters/docker-compose.jd.yml` | 固定资产 | overlay：两个 Exporter + `jd-nightjar` 别名 + initdb + 日志 Agent |
+| `deploy/jd-exporters/docker-compose.jd-link.yml` | 固定资产 | 只打通网络的最小 overlay |
+| `deploy/jd-exporters/prometheus-jd.yml` | **派生（脚本同步）** | 抓取配置；`instance_name` 由 `JD_*_INSTANCE_NAME` 推导 |
+| `deploy/jd-exporters/init/01-monitor-user.sql` | **派生（脚本同步）** | 监控账号口令由 `MYSQL_EXPORTER_PASSWORD` 推导 |
+| `deploy/jd-exporters/my.cnf` | **派生（脚本同步）** | 同上（口令由 `.env` 推导） |
+| `deploy/jd-exporters/agent.yaml` | **派生（脚本同步）** | 官方 Agent 模板；令牌与平台地址由 `.env` 推导 |
+| `deploy/jd-exporters/log-shipper.sh` / `Dockerfile.logagent` | 固定资产 | 简易日志上报（shell 版 / 镜像构建） |
+| `backend/src/main/resources/logback-spring.xml` | 固定资产 | `error.log`（仅 ERROR）+ 全量日志 |
+| `backend/Dockerfile` | 固定资产 | GC 日志路径 `/app/data/logs/gc.log` |
+| `start.sh` | 固定资产 | 手工用的便捷命令；一键脚本走 `docker compose`，不依赖它 |
 
 ### C. 端点与端口总表
 
