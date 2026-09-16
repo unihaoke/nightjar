@@ -265,7 +265,7 @@ export const alertApi = {
   resolve: (id: number) => post<{ message: string }>(`/api/alerts/${id}/resolve`),
   evaluate: () =>
     post<{ evaluated: number; triggered: number; merged: number; suppressed: number; skipped: number }>('/api/alerts/evaluate'),
-  cluster: (threshold?: number) =>
+  cluster: () =>
     post<{ processed: number; clusters: { cluster_id: string; label: string; count: number; alert_ids: number[] }[] }>(
       '/api/alerts/cluster',
       undefined,

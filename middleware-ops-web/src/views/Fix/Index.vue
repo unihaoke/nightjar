@@ -12,9 +12,6 @@ import { toastError } from '@/api/http'
 import type { FixPreview, FixRecord, MiddlewareInstance } from '@/api/types'
 import LevelTag from '@/components/LevelTag.vue'
 import { approvalStatusLabels, envLabels, formatTime, levelLabels, mwTypeLabels, prettyJSON } from '@/utils/format'
-import { useUserStore } from '@/stores/user'
-
-const store = useUserStore()
 
 const loading = ref(false)
 const previewing = ref(false)

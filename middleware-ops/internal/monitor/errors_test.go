@@ -11,6 +11,7 @@ import (
 // 平台必须把它翻译成使用者的语言，而不是抛出 Go 的原始错误。
 //
 // 原始错误形态（真实案例）：dial tcp: lookup jd-prometheus on 127.0.0.11:53: server misbehaving
+// 注意：修复方向必须是"平台侧自动接入网络"，而不是让被管项目去建互联网络/加别名。
 
 func TestDescribeErrorMapsDockerDNSFailure(t *testing.T) {
 	raw := errors.New(`Get "http://jd-prometheus:9090/api/v1/query?query=up": dial tcp: lookup jd-prometheus on 127.0.0.11:53: server misbehaving`)
@@ -18,8 +19,11 @@ func TestDescribeErrorMapsDockerDNSFailure(t *testing.T) {
 	if !strings.Contains(got, "解析不了 jd-prometheus") {
 		t.Fatalf("应指出解析失败的主机名，实际：%s", got)
 	}
-	if !strings.Contains(got, "compose.jd-link.yml") || !strings.Contains(got, "jd-nightjar") {
-		t.Fatalf("应给出跨栈网络的具体修复方向，实际：%s", got)
+	if !strings.Contains(got, "自动") || !strings.Contains(got, "docker.sock") {
+		t.Fatalf("应把修复方向指向平台侧自动接入网络（docker.sock），实际：%s", got)
+	}
+	if strings.Contains(got, "jd-nightjar") || strings.Contains(got, "compose.jd-link.yml") {
+		t.Fatalf("不应再要求被管项目建互联网络/加别名，实际：%s", got)
 	}
 }
 

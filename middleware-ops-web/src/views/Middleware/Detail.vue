@@ -2,13 +2,13 @@
 /** 实例详情：指标概览 + 告警规则 + 最近告警 + 快捷诊断入口。 */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { aiApi, alertApi, middlewareApi, metricsApi } from '@/api'
+import { ElMessage } from 'element-plus'
+import { alertApi, middlewareApi, metricsApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { Alert, AlertRule, DiagnoseResult, Metric, MetricSnapshot, MiddlewareInstance } from '@/api/types'
 import MetricChart from '@/components/MetricChart.vue'
 import StatCard from '@/components/StatCard.vue'
-import { alertLevelLabels, alertStatusLabels, envLabels, envTagType, formatNumber, formatTime, horizonLabels, mwTypeLabels } from '@/utils/format'
+import { alertLevelLabels, alertStatusLabels, envLabels, envTagType, formatNumber, formatTime, mwTypeLabels } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const route = useRoute()

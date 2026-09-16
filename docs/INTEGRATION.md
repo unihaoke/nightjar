@@ -116,7 +116,7 @@ INTEGRATION_DOCKER_ENABLED=true
 | 方式 | 适用 | 操作 |
 |---|---|---|
 | **http_sd（推荐，平台内置）** | 平台自带 Prometheus（`deploy/prometheus/prometheus.yml` 已内置 `middleware-integration` job） | 无：保存后 30 秒内自动生效 |
-| **http_sd（外部 Prometheus）** | 复用 jd 自带的 interview-prometheus 等外部 Prometheus | 在其 `scrape_configs` 加一个 job，`http_sd_configs.url: http://mwops-backend:8080/api/sd/integrations`（该 Prometheus 需与 `mwops-backend` 同网，jd 场景已通过 `jd-nightjar` 打通） |
+| **http_sd（外部 Prometheus）** | 复用 jd 自带的 interview-prometheus 等外部 Prometheus | 在其 `scrape_configs` 加一个 job，`http_sd_configs.url: http://mwops-backend:8080/api/sd/integrations`（该 Prometheus 需能访问 `mwops-backend`，例如与平台同网络） |
 | **显式 scrape job** | 外部 Prometheus 无法访问平台接口（例如跨主机且未放通 8000） | 抽屉 →「Prometheus(显式 job)」→ 复制片段并入 `scrape_configs` → reload/重启 |
 | **人工 compose** | 平台未启用 Docker 一键部署 | 抽屉 →「Exporter(compose)」→ 合并进 compose → `docker compose up -d` |
 
@@ -162,21 +162,29 @@ job="middleware-integration",instance_name="<集成名称>"
 
 ## 6. 与 jd（跨栈被管系统）的组合
 
-jd 的 MySQL / Redis 在 `jd-data`（internal）网络里，不发布宿主端口。要让平台
-拉起的 Exporter 同时「被平台 Prometheus 抓到」且「连得上 jd 的库」，Exporter
-需要接两张网：
+jd 的 MySQL / Redis 在 `jd-data`（internal）网络里，不发布宿主端口，也不为监控做任何改动。
+平台创建 Exporter 时会**自己发现**目标容器所在的网络（`jd_jd-data`），然后把 Exporter
+接成两张网：「平台网络（Prometheus 抓它）」+「目标网络（它连被管实例）」。
+因此 jd 侧不需要建互联网络、不需要加别名，`deploy/compose.jd-link.yml` 已经删除。
 
 ```bash
-# .env —— 第一个是监控面（Prometheus 所在网络），第二个是数据面
-INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops,jd-nightjar
+# .env —— 只需平台网络；目标网络由集成时自动发现，不必手写
+INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops
 ```
 
-- 容器的第一个网络在创建时指定，其余通过 `POST /networks/{id}/connect` 追加；
-- `jd-nightjar` 由 jd 侧创建（internal），Exporter 因此能解析 `jd-redis` / `jd-mysql`；
-- 集成地址填 **容器别名**（`jd-redis:6379` / `jd-mysql:3306`），与
-  `docs/GUIDE-JD-ONBOARD.md` 的纳管口径一致；
-- 目标网络不会自动挂载：平台只把 `INTEGRATION_EXPORTER_NETWORK` 里列出的网络接给
-  Exporter，第一个网络用于连 Prometheus，其余用于解析目标地址。
+发现过程（`internal/docker.ResolveTarget`）：
+
+1. 列容器 → 逐个 inspect，按 **容器名 → compose 服务名 → 网络别名** 顺序匹配用户填的地址；
+2. 取命中容器的真实网络名（如 `jd_jd-data`），与 `INTEGRATION_EXPORTER_NETWORK` 求并集；
+3. 把用户填的地址**换成容器名**（`interview-redis`）——容器名在目标网络上一定能被内嵌 DNS 解析，
+   而别名可能只存在于用户以为的那张网上；
+4. 容器第一个网络在创建时指定，其余通过 `POST /networks/{id}/connect` 追加；
+5. 同时把平台自身（`MWOPS_SELF_CONTAINER`，默认 `mwops-backend`）也接进目标网络，
+   这样纳管实例的 TCP 健康探测不再需要任何人调整宿主机上的 compose。
+
+> 平台看不到 docker（未挂 `docker.sock`）时退化为"只接配置里列出的网络"，
+> 此时集成地址必须填**平台能解析**的名字，并且 Exporter 的抓取目标仍是平台容器
+> （`mwops-exporter-<集成名>:<端口>`），不会去抓 MySQL 的 3306。
 
 ---
 

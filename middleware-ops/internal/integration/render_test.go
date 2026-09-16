@@ -88,7 +88,7 @@ func TestRenderRedisIntegration(t *testing.T) {
 		Options:     map[string]string{"REDIS_EXPORTER_EXCLUDE_SLOWLOG_METRICS": "true"},
 		Environment: "dev", GroupName: "interview",
 	}
-	artifacts, err := Render(tpl, instance, "middleware-integration", "/etc/prometheus/sd/integrations.json", "mwops,jd-nightjar")
+	artifacts, err := Render(tpl, instance, "middleware-integration", "/etc/prometheus/sd/integrations.json", "mwops,target_default")
 	if err != nil {
 		t.Fatalf("渲染失败：%v", err)
 	}
@@ -129,11 +129,11 @@ func TestRenderRedisIntegration(t *testing.T) {
 		t.Fatalf("compose 片段缺少集群架构的排除开关：\n%s", artifacts.Compose)
 	}
 
-	// 多网络：监控面 + 数据面都要列出。
-	if strings.Count(artifacts.Compose, "      - ") < 2 || !strings.Contains(artifacts.Compose, "- jd-nightjar") {
+	// 多网络：监控面 + 目标所在网络（后者由平台自动发现）都要列出。
+	if strings.Count(artifacts.Compose, "      - ") < 2 || !strings.Contains(artifacts.Compose, "- target_default") {
 		t.Fatalf("compose 片段应列出两个网络：\n%s", artifacts.Compose)
 	}
-	if !strings.Contains(artifacts.DeployCmd, "--network mwops") || !strings.Contains(artifacts.DeployCmd, "--network jd-nightjar") {
+	if !strings.Contains(artifacts.DeployCmd, "--network mwops") || !strings.Contains(artifacts.DeployCmd, "--network target_default") {
 		t.Fatalf("docker run 命令应包含两个网络：%s", artifacts.DeployCmd)
 	}
 

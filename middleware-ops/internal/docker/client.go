@@ -34,9 +34,9 @@ type ContainerSpec struct {
 	// Networks 为需要加入的网络列表：第一个作为创建时的 NetworkMode，
 	// 其余在容器创建后通过 /networks/{id}/connect 追加。
 	//
-	// 为什么需要多网络：Exporter 既要被 Prometheus 抓到（监控面），
-	// 又要能连上被管实例（数据面），两个网络经常不是同一个
-	// （如 jd 场景：mwops 监控面 + jd-nightjar 数据面）。
+	// 为什么需要多网络：Exporter 既要被 Prometheus 抓到（监控面，平台网络），
+	// 又要能连上被管实例（目标容器所在网络）。后者由平台在集成时自动发现，
+	// 例如：mwops（监控面）+ jd_jd-data（目标容器所在网络）。
 	Networks []string
 	Restart  string
 	Labels   map[string]string
@@ -475,11 +475,157 @@ func stripDockerLogFrames(raw []byte) string {
 	return b.String()
 }
 
+// TargetResolution 是「集成目标」的解析结果。
+//
+// 使用者在平台里只填一个地址（如 `interview-redis:6379`、`jd-mysql:3306`），
+// 平台自己去 docker 里查这个名字对应哪个容器、容器在哪张网络上——
+// 被管项目因此**不需要**为监控改任何配置：不用建互联网络、不用加别名、
+// 不用把自己的 compose 文件交给平台。
+type TargetResolution struct {
+	// Host 是可在 Networks 上解析的主机名。优先取容器名：容器名在同一个
+	// 用户自定义网络里一定能被内嵌 DNS 解析，比别名更可靠。
+	Host string
+	// Container 是匹配到的容器名；为空表示没找到。
+	Container string
+	// Networks 是该容器所在的真实 docker 网络名（如 `jd_jd-data`）。
+	Networks []string
+	// MatchedBy 说明匹配依据：container_name / compose_service / alias。
+	MatchedBy string
+	// Running 表示目标容器是否在运行。
+	Running bool
+	// Candidates 在没匹配到时给出已知的容器名（便于报错时提示正确写法）。
+	Candidates []string
+}
+
+// targetInfo 是解析过程中的单个容器快照。
+type targetInfo struct {
+	name    string
+	service string
+	aliases []string
+	nets    []string
+	running bool
+}
+
+// ResolveTarget 把「用户填的名字」解析成「容器 + 容器所在的网络」。
+//
+// 匹配顺序：容器名 → compose 服务名 → 网络别名（并集所有命中者）。
+// 这样无论用户填 `interview-redis`（容器名）、`redis`（服务名）
+// 还是 `jd-redis`（别名），平台都能自己找到目标，并把 Exporter 接到
+// 目标真正所在的网络上。
+func (c *Client) ResolveTarget(ctx context.Context, nameOrAlias string) (*TargetResolution, error) {
+	target := strings.TrimSpace(nameOrAlias)
+	res := &TargetResolution{Host: target, Candidates: []string{}}
+	if target == "" {
+		return res, nil
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/containers/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("列出容器失败：HTTP %d", resp.StatusCode)
+	}
+	var list []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("解析容器列表失败: %w", err)
+	}
+	// 只看前 200 个运行中的容器：容器很多的主机上不必做成百次 inspect。
+	if len(list) > 200 {
+		list = list[:200]
+	}
+	seenNet := map[string]bool{}
+	for _, item := range list {
+		info, err := c.inspectTarget(ctx, item.ID)
+		if err != nil || info == nil {
+			continue
+		}
+		res.Candidates = append(res.Candidates, info.name)
+		matched := ""
+		switch {
+		case info.name == target:
+			matched = "container_name"
+		case info.service != "" && info.service == target:
+			matched = "compose_service"
+		case containsString(info.aliases, target):
+			matched = "alias"
+		}
+		if matched == "" {
+			continue
+		}
+		if res.Container == "" {
+			res.Container, res.MatchedBy, res.Running = info.name, matched, info.running
+			// 容器名是最稳的可解析名；用容器名覆盖用户输入（如输入的是别名）。
+			res.Host = info.name
+		}
+		for _, network := range info.nets {
+			if network == "" || seenNet[network] {
+				continue
+			}
+			seenNet[network] = true
+			res.Networks = append(res.Networks, network)
+		}
+	}
+	sort.Strings(res.Networks)
+	sort.Strings(res.Candidates)
+	return res, nil
+}
+
+// inspectTarget 读取容器名、compose 服务名、网络别名与网络列表。
+func (c *Client) inspectTarget(ctx context.Context, id string) (*targetInfo, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("查询容器失败：HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Name  string `json:"Name"`
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	info := &targetInfo{
+		name:    strings.TrimPrefix(payload.Name, "/"),
+		service: payload.Config.Labels["com.docker.compose.service"],
+		running: payload.State.Running,
+	}
+	for network, detail := range payload.NetworkSettings.Networks {
+		info.nets = append(info.nets, network)
+		info.aliases = append(info.aliases, detail.Aliases...)
+	}
+	sort.Strings(info.nets)
+	return info, nil
+}
+
+// containsString 判断字符串切片是否含某值（大小写敏感，docker 名本身区分大小写）。
+func containsString(items []string, value string) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
 // FindAliasNetworks 找出「哪些 docker 网络里存在该别名」。
 //
-// 用途：集成时把 Exporter 自动接到目标所在的网络上——使用者在平台里只填
-// "jd-mysql" 这样的名字，不必知道它属于哪个 compose 项目、哪张网络。
-// 别名可能出现在多张网（compose 会给服务名做别名），因此返回并集。
+// 保留为兼容入口；新代码请用 ResolveTarget（它同时支持容器名/服务名）。
 func (c *Client) FindAliasNetworks(ctx context.Context, alias string) ([]string, error) {
 	trimmed := strings.TrimSpace(alias)
 	if trimmed == "" {

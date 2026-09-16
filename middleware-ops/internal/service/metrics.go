@@ -272,8 +272,9 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 	if err := monitor.LookupHostCtx(probeCtx, host); err != nil {
 		return []string{fmt.Sprintf(
 			"平台容器内解析不了 %s（%v）：这是**容器网络**问题，不是 Prometheus 的问题。"+
-				"jd 场景请确认平台用 deploy/compose.jd-link.yml 启动（mwops-backend 必须在 jd-nightjar 网络上），"+
-				"可执行 scripts/setup-jd-link.sh 一键修复，或 scripts/doctor-jd-link.sh 体检。当前查询地址：%s",
+				"集成中心创建 Exporter 时会自动把容器接进目标网络；若仍解析不了，"+
+				"请核对名字是否与 `docker ps` 的容器名一致，并确认平台已挂载 docker.sock。"+
+				"可执行 scripts/doctor-jd-link.sh 体检。当前查询地址：%s",
 			host, err, endpoint)}
 	}
 	// 解析成功：把方向指向 Prometheus 自身/端口，避免用户继续在网络层打转。

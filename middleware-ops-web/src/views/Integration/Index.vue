@@ -453,10 +453,18 @@ onMounted(load)
           </el-table-column>
           <el-table-column label="Exporter" width="120">
             <template #default="{ row }">
-              <el-tag v-if="row.container_status" size="small" :type="row.container_status === 'running' ? 'success' : 'danger'">
-                {{ row.container_status }}
-              </el-tag>
-              <span v-else class="muted">未托管</span>
+              <el-tooltip v-if="row.deploy_note" :content="row.deploy_note" placement="top">
+                <el-tag v-if="row.container_status" size="small" :type="row.container_status === 'running' ? 'success' : 'danger'">
+                  {{ row.container_status }}
+                </el-tag>
+                <span v-else class="muted">未托管</span>
+              </el-tooltip>
+              <template v-else>
+                <el-tag v-if="row.container_status" size="small" :type="row.container_status === 'running' ? 'success' : 'danger'">
+                  {{ row.container_status }}
+                </el-tag>
+                <span v-else class="muted">未托管</span>
+              </template>
             </template>
           </el-table-column>
           <el-table-column label="状态" min-width="150">
@@ -484,6 +492,9 @@ onMounted(load)
       </div>
       <p v-if="items.some((item) => item.last_error)" class="muted note">
         待处理项：{{ items.find((item) => item.last_error)?.last_error }}
+      </p>
+      <p v-if="items.some((item) => item.deploy_note)" class="muted note">
+        平台自动完成：{{ items.find((item) => item.deploy_note)?.deploy_note }}
       </p>
     </div>
 

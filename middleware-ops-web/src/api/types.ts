@@ -265,6 +265,7 @@ export interface IntegrationView {
   container: string
   image: string
   container_status: string
+  deploy_note: string
   selector: string
   applied_at: string
   last_error: string

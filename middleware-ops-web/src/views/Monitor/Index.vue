@@ -12,10 +12,8 @@ import { toastError } from '@/api/http'
 import type { MetricSnapshot, MiddlewareInstance } from '@/api/types'
 import MetricChart from '@/components/MetricChart.vue'
 import { envLabels, formatNumber, mwTypeLabels } from '@/utils/format'
-import { useAppStore } from '@/stores/app'
 
 const router = useRouter()
-const app = useAppStore()
 
 const loading = ref(false)
 const historyLoading = ref(false)

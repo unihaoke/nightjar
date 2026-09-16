@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# nightjar ⇄ 被管项目 跨栈体检
+# nightjar ⇄ 被管项目 · 接入体检
 #
-# 逐条核对"平台托管监控"所需的链路是否就绪：
-#   1. 平台自身：Prometheus / Grafana / backend 是否在平台网络上
-#   2. 跨栈网络：互联网络存在且为 internal；平台 backend 已接入
-#   3. 被管项目：mysql/redis 在互联网络上且有稳定别名（平台据此纳管与自动接网）
-#   4. 平台创建的资产：Exporter（mwops-exporter-*）网络是否齐全；日志采集容器是否存在
-#   5. 抓取与标签：平台 Prometheus 上目标的 up 状态 + instance_name 实际取值
+# 逐条核对"平台托管监控"所需的链路是否就绪。**不再检查任何跨栈互联网络/别名**：
+# 新架构下目标容器所在的网络由平台在集成时自动发现并接入，被管项目零改动。
+#
+#   1. 平台自身：backend / Prometheus / Grafana 是否运行在平台网络上
+#   2. 自动发现能力：平台是否挂载了 docker.sock（没有它就无法自动接网）
+#   3. 被管项目：目标容器是否在运行，并列出它们**真实所在**的网络
+#   4. 平台创建的资产，以及 Prometheus 上目标的 up 状态 + instance_name 实际取值
 #
 # 用法（在 nightjar 项目根目录）：
 #   ./scripts/doctor-jd-link.sh
-#   ./scripts/doctor-jd-link.sh --jd-dir ../jd
+#   ./scripts/doctor-jd-link.sh --targets interview-mysql,interview-redis
 #   ./scripts/doctor-jd-link.sh --target-container interview-backend
 #
 # 退出码：0=全部通过；非 0=失败项数量
@@ -21,7 +22,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NIGHTJAR_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-JD_DIR="$(cd "$NIGHTJAR_DIR/.." 2>/dev/null && pwd)/jd"
+TARGETS=(interview-mysql interview-redis)
 TARGET_CONTAINER="interview-backend"
 
 if [ -t 1 ]; then
@@ -40,10 +41,10 @@ info() { printf '  %s\n' "$1"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --jd-dir)            JD_DIR="${2:-}"; shift ;;
-    --nightjar-dir)      NIGHTJAR_DIR="${2:-}"; shift ;;
+    --targets)           IFS=',' read -r -a TARGETS <<< "${2:-}"; shift ;;
     --target-container)  TARGET_CONTAINER="${2:-}"; shift ;;
-    -h|--help)           sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --nightjar-dir)      NIGHTJAR_DIR="${2:-}"; shift ;;
+    -h|--help)           sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf '未知参数：%s\n' "$1" >&2; exit 2 ;;
   esac
   shift
@@ -55,80 +56,103 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 env_get() { sed -n -E "s/^[[:space:]]*$2[[:space:]]*=(.*)$/\1/p" "$1" 2>/dev/null | head -n1; }
-container_networks() { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1" 2>/dev/null; }
+container_networks() { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//'; }
 resolve_network() { docker network ls --format '{{.Name}}' 2>/dev/null | grep -E "(_|^)${1}\$" | head -n1; }
+has_net() { printf ' %s ' "$1" | grep -qw "$2"; }
 
 NJ_ENV="$NIGHTJAR_DIR/.env"
-NET="$(env_get "$NJ_ENV" JD_NIGHTJAR_NETWORK)"; [ -z "$NET" ] && NET='jd-nightjar'
 MWOPS_NET=$(resolve_network 'mwops'); [ -z "$MWOPS_NET" ] && MWOPS_NET='middleware-ops_mwops'
 NJ_PROM=$(env_get "$NJ_ENV" PROMETHEUS_PORT); [ -z "$NJ_PROM" ] && NJ_PROM=9090
 
-printf '互联网络：%s    平台网络：%s    平台 Prometheus：127.0.0.1:%s\n' "$NET" "$MWOPS_NET" "$NJ_PROM"
+printf '平台网络：%s    平台 Prometheus：127.0.0.1:%s    目标容器：%s\n' "$MWOPS_NET" "$NJ_PROM" "${TARGETS[*]}"
 
 # ---------------------------------------------------------------------------
-step '1/5 平台自身'
+step '1/4 平台自身'
 for pair in "mwops-backend:$MWOPS_NET" "mwops-prometheus:$MWOPS_NET" "mwops-grafana:$MWOPS_NET"; do
   name="${pair%%:*}"; want="${pair##*:}"
   actual=$(container_networks "$name")
   if [ -z "$actual" ]; then bad "$name 未运行"
-  elif printf '%s' "$actual" | grep -qw "$want"; then ok "$name → $actual"
+  elif has_net "$actual" "$want"; then ok "$name → $actual"
   else bad "$name 不在 $want 上（实际：$actual）"; hint "cd $NIGHTJAR_DIR && docker compose up -d $name"; fi
 done
 
 # ---------------------------------------------------------------------------
-step '2/5 跨栈互联网络'
-if docker network inspect "$NET" >/dev/null 2>&1; then
-  internal=$(docker network inspect "$NET" --format '{{.Internal}}' 2>/dev/null)
-  [ "$internal" = 'true' ] && ok "$NET 存在且为 internal" \
-    || bad "$NET 不是 internal（Internal=$internal）"
+step '2/4 自动发现能力（平台侧唯一前置条件）'
+sock_src=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' mwops-backend 2>/dev/null | tr ' ' '\n' | grep -x '/var/run/docker.sock' || true)
+if [ -n "$sock_src" ]; then
+  ok 'mwops-backend 已挂载 docker.sock：集成时可自动发现并接入目标网络'
+  docker_flag=$(env_get "$NJ_ENV" INTEGRATION_DOCKER_ENABLED)
+  case "$docker_flag" in
+    true|1|yes) ok 'INTEGRATION_DOCKER_ENABLED 已开启' ;;
+    *) bad "INTEGRATION_DOCKER_ENABLED=${docker_flag:-未设置}：一键拉起 Exporter/代建账号/日志接入都会不可用"
+       hint "在 $NJ_ENV 里设为 true（或重跑 ./scripts/setup-jd-link.sh）" ;;
+  esac
 else
-  bad "$NET 不存在"
-  hint "cd $JD_DIR && ./start.sh nightjar（被管项目负责创建）"
+  bad 'mwops-backend 未挂载 docker.sock：平台无法自动发现目标网络（也不会自动接网）'
+  hint '取消 docker-compose.yml 中 backend.volumes 的 docker.sock 注释后 docker compose up -d backend'
+  hint '或直接重跑 ./scripts/setup-jd-link.sh（它会自动放开注释）'
 fi
-actual=$(container_networks mwops-backend)
-case " $actual " in
-  *" $NET "*) ok "mwops-backend 已接入 $NET" ;;
-  *) bad "mwops-backend 不在 $NET 上：平台没带 overlay 启动"
-     hint "cd $NIGHTJAR_DIR && docker compose -f docker-compose.yml -f deploy/compose.jd-link.yml up -d" ;;
-esac
 
 # ---------------------------------------------------------------------------
-step '3/5 被管项目的别名（平台纳管与自动接网的依据）'
-for pair in 'interview-mysql:jd-mysql:3306' 'interview-redis:jd-redis:6379'; do
-  c="${pair%%:*}"; rest="${pair#*:}"; alias_name="${rest%%:*}"
-  actual=$(container_networks "$c")
-  if [ -z "$actual" ]; then warn "$c 未运行（未接入该被管项目时属正常）"; continue; fi
-  if printf '%s' "$actual" | grep -qw "$NET"; then ok "$c 在 $NET 上（别名 $alias_name）"
-  else bad "$c 不在 $NET 上"; hint "cd $JD_DIR && ./start.sh nightjar"; fi
+step '3/4 被管项目（平台会接入它们所在网络）'
+target_nets=""
+for name in "${TARGETS[@]}" "$TARGET_CONTAINER"; do
+  [ -z "$name" ] && continue
+  state=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
+  if [ -z "$state" ]; then
+    warn "未找到容器 $name（未部署该容器时属正常）"
+    continue
+  fi
+  nets=$(container_networks "$name")
+  # 去掉平台网络本身，剩下的就是"平台需要自动接入"的目标网络
+  for n in $nets; do
+    [ "$n" = "$MWOPS_NET" ] && continue
+    target_nets="$target_nets $n"
+  done
+  if [ "$state" = 'running' ]; then
+    ok "$name 运行中，所在网络：${nets:-（无）}"
+  else
+    warn "$name 状态为 $state（不是 running）"
+  fi
 done
-if docker exec mwops-backend getent hosts jd-mysql >/dev/null 2>&1; then ok 'mwops-backend 能解析 jd-mysql'
-else warn 'mwops-backend 解析不了 jd-mysql（纳管探测会显示连接失败）'; fi
+if [ -n "$(printf '%s' "$target_nets" | tr -d ' ')" ]; then
+  info "平台集成时会自动接入的目标网络：$(printf '%s' "$target_nets" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+else
+  warn '未发现任何目标容器网络：被管项目还没起来，或目标容器名与默认值不同'
+  hint '用 --targets 指定容器名，例如 --targets my-mysql,my-redis'
+fi
 
 # ---------------------------------------------------------------------------
-step '4/5 平台创建的资产'
+step '4/4 平台创建的资产与抓取状态'
 managed=$(docker ps --format '{{.Names}}' 2>/dev/null | grep '^mwops-exporter-' || true)
 if [ -z "$managed" ]; then
-  warn '未发现平台创建的 Exporter（mwops-exporter-*）：到「集成中心」集成中间件并勾选一键拉起'
+  info '未发现平台创建的 Exporter（mwops-exporter-*）：到「集成中心」集成中间件并勾选一键拉起'
 else
   for name in $managed; do
     actual=$(container_networks "$name")
     missing=""
-    for want in "$MWOPS_NET" "$NET"; do
-      printf '%s' "$actual" | grep -qw "$want" || missing="$missing $want"
+    # 监控面必须有（Prometheus 要抓它）；目标网络也必须有（它要连被管实例）。
+    has_net "$actual" "$MWOPS_NET" || missing="$missing $MWOPS_NET"
+    for n in $(printf '%s' "$target_nets" | tr ' ' '\n' | sort -u); do
+      [ -z "$n" ] && continue
+      has_net "$actual" "$n" || missing="$missing $n"
     done
-    [ -z "$missing" ] && ok "$name → $actual" \
-      || bad "$name 缺少网络：$missing（实际：$actual）"
+    if [ -z "$missing" ]; then
+      ok "$name → $actual"
+    else
+      bad "$name 缺少网络：$missing（实际：$actual）"
+      hint "在集成中心点该集的「重新应用」——平台会重新发现并接入目标网络"
+    fi
   done
 fi
-collectors=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mwops-exporter-.*-logs$|^mwops-logcollect' || true)
+
+collectors=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mwops-exporter-.*-logs$|^mwops-logcollect|^mwops-.*-logs$' || true)
 if [ -n "$collectors" ]; then
   for name in $collectors; do ok "日志采集容器 $name 运行中"; done
 else
   info '尚无日志采集容器（在「集成中心 → 日志接入」创建）'
 fi
 
-# ---------------------------------------------------------------------------
-step '5/5 抓取与标签'
 if curl -fsS --max-time 5 "http://127.0.0.1:$NJ_PROM/-/healthy" >/dev/null 2>&1; then
   ok "平台 Prometheus 可达（127.0.0.1:$NJ_PROM）"
   body=$(curl -fsS --max-time 5 "http://127.0.0.1:$NJ_PROM/api/v1/targets?state=active" 2>/dev/null)
@@ -146,7 +170,7 @@ if not targets:
 for t in targets:
     labels = t.get("labels") or {}
     if t.get("health") != "up":
-        err = (t.get("lastError") or "").strip() or "(无 lastError：容器可能未启动)"
+        err = (t.get("lastError") or "").strip() or "(无 lastError：Exporter 容器可能未启动)"
         name = labels.get("instance_name") or labels.get("instance") or "?"
         print("  [FAIL] target %s 未就绪：%s" % (name, err))
 up = [t for t in targets if t.get("health") == "up"]
@@ -170,7 +194,7 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n%s================ 结果 ================%s\n' "$C_CYAN" "$C_RESET"
 if [ "$fail" -eq 0 ]; then
-  printf '%s跨栈链路就绪（%d 条提示）%s\n' "$C_GREEN" "$warns" "$C_RESET"
+  printf '%s接入链路就绪（%d 条提示）%s\n' "$C_GREEN" "$warns" "$C_RESET"
   printf '%s下一步：平台「集成中心」集成中间件/日志；实例详情「接入自检」应显示 matched>0%s\n' "$C_GRAY" "$C_RESET"
 else
   printf '%s失败 %d 项、提示 %d 条，按上面的 [FAIL]/[HINT] 处理%s\n' "$C_RED" "$fail" "$warns" "$C_RESET"

@@ -44,9 +44,11 @@ func DescribeError(err error, baseURL string) string {
 		strings.Contains(lower, "name resolution"),
 		strings.Contains(lower, "lookup "):
 		return fmt.Sprintf("平台容器内解析不了 %s（Docker 内置 DNS 报 server misbehaving）："+
-			"说明平台没有连接到该名字所在的容器网络。"+
-			"跨栈（jd）场景请确认平台是带 deploy/compose.jd-link.yml 启动的——mwops-backend 必须在 jd-nightjar 网络上；"+
-			"可执行 scripts/setup-jd-link.sh 一键修复，或 scripts/doctor-jd-link.sh 体检。当前查询地址：%s",
+			"说明平台当前不在该名字所在的容器网络上。"+
+			"集成中心创建 Exporter 时会**自动**把容器接进目标容器所在网络，"+
+			"因此先确认：① 该名字与 `docker ps` 里的容器名（或 compose 服务名）一致；"+
+			"② 平台已挂载 docker.sock 且 integration.docker_enabled=true；"+
+			"③ 目标容器在运行。当前查询地址：%s",
 			displayHost(host), endpoint)
 
 	case strings.Contains(lower, "connection refused"):

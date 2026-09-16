@@ -128,7 +128,6 @@ npm run dev                                          # 监听 :5173
 │   ├── prometheus/                 # prometheus.yml / prometheus.with-exporters.yml / rules
 │   ├── grafana/                    # 统一大盘：provisioning（数据源+加载器）与 dashboards 目录
 │   ├── agent/                      # 自托管日志采集 Agent 模板（agent.example.yaml）
-│   ├── compose.jd-link.yml         # 接跨栈项目时给平台追加目标网络
 │   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）

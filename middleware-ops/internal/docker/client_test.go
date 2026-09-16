@@ -84,7 +84,7 @@ func TestEnsureCreatesContainerWithNetworkAndEnv(t *testing.T) {
 		Name: "mwops-exporter-jd-redis", Image: "oliver006/redis_exporter:v1.66.0",
 		Env:      []string{"REDIS_ADDR=redis://jd-redis:6379", "REDIS_PASSWORD=secret"},
 		Cmd:      []string{"--check-keys=db0=session:*"},
-		Networks: []string{"mwops", "jd-nightjar"},
+		Networks: []string{"mwops", "target_default"},
 	})
 	if err != nil {
 		t.Fatalf("Ensure 失败：%v", err)
@@ -100,7 +100,7 @@ func TestEnsureCreatesContainerWithNetworkAndEnv(t *testing.T) {
 	if hostConfig["NetworkMode"] != "mwops" {
 		t.Fatalf("NetworkMode 应为 mwops，实际 %v", hostConfig["NetworkMode"])
 	}
-	if len(stub.networks) != 1 || stub.networks[0] != "jd-nightjar" {
+	if len(stub.networks) != 1 || stub.networks[0] != "target_default" {
 		t.Fatalf("应只对第二个网络发起 connect，实际 %v", stub.networks)
 	}
 	env, _ := stub.createdBody["Env"].([]any)

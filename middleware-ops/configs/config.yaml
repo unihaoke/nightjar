@@ -149,8 +149,8 @@ integration:
   # 一键拉起 Exporter 容器：需要挂载 docker.sock，默认关闭（安全优先）。
   docker_enabled: false
   docker_host: unix:///var/run/docker.sock
-  # Exporter 容器加入的网络（逗号分隔）：第一个是监控面（Prometheus 所在网络），
-  # 其余是数据面。jd 场景示例：middleware-ops_mwops,jd-nightjar
+  # Exporter 容器加入的网络（逗号分隔）：第一个是监控面（Prometheus 所在网络）。
+  # 目标容器（数据面）所在的网络**不需要**写在这里——集成时平台会自动发现并接入。
   exporter_network: mwops
   # 新建集成的默认环境（数据权限按 dev/staging/prod 隔离）。
   default_environment: dev

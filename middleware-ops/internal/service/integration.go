@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -142,10 +143,12 @@ type IntegrationView struct {
 	Image       string            `json:"image"`
 	// ContainerStatus 为 Exporter 容器状态（未启用一键部署时为空）。
 	ContainerStatus string `json:"container_status"`
-	Selector        string `json:"selector"`
-	AppliedAt       string `json:"applied_at"`
-	LastError       string `json:"last_error"`
-	HasPassword     bool   `json:"has_password"`
+	// DeployNote 记录平台"为你做了什么"：一键部署结果，以及在哪个网络上发现了目标容器。
+	DeployNote  string `json:"deploy_note"`
+	Selector    string `json:"selector"`
+	AppliedAt   string `json:"applied_at"`
+	LastError   string `json:"last_error"`
+	HasPassword bool   `json:"has_password"`
 }
 
 // IntegrationOverview 是集成中心的概览（用于卡片上的角标）。
@@ -552,10 +555,14 @@ func (s *IntegrationService) ServiceDiscovery(ctx context.Context) (string, erro
 				zap.String("integration", item.Name), zap.String("address", meta.Address), zap.Error(parseErr))
 			continue
 		}
-		entries = append(entries, integration.EntryFor(integration.Instance{
+		entry := integration.EntryFor(integration.Instance{
 			Name: item.Name, MWType: tpl.Type, Address: address,
 			Labels: meta.Labels, Environment: item.Environment, GroupName: item.GroupName,
-		}))
+		})
+		// 抓取目标指向平台自己的 Exporter 容器，而不是被管实例：
+		// MySQL / Redis 自身没有 /metrics，抓实例地址只会得到 up=0。
+		entry.Targets = []string{s.scrapeTarget(meta, address)}
+		entries = append(entries, entry)
 	}
 	return integration.RenderFileSD(entries)
 }
@@ -741,18 +748,21 @@ func (s *IntegrationService) ensureMonitoringAccount(
 	if err != nil {
 		return "", err
 	}
-	// 网络自动发现：目标可能属于**另一个 compose 项目**（jd 场景），
-	// 使用者只需要填 "jd-mysql" 这样的别名，平台自己找出该别名所在的网络——
+	// 网络自动发现：目标可能属于**另一个 compose 项目**（如 jd），
+	// 使用者只需要填 "jd-mysql" / "interview-mysql" 这样的名字，平台自己找出
+	// 该名字对应哪个容器、在哪张网络上，并把一次性容器接进去——
 	// 这就是"同服务器不同 docker/compose 也不用改对方配置"的关键一步。
-	networks := []string{}
-	if found, findErr := s.docker.FindAliasNetworks(ctx, in.Address.Host); findErr == nil {
-		networks = append(networks, found...)
-	} else {
-		s.log.Debug("集成：按别名发现网络失败", zap.String("alias", in.Address.Host), zap.Error(findErr))
+	networks, resolvedHost, note := s.targetNetworks(ctx, in.Address.Host)
+	if len(networks) == 0 {
+		return "", fmt.Errorf("平台无法确定目标所在网络：地址里的主机名与 docker 里的容器名/别名都不匹配 %s，"+
+			"且平台没有可用的默认网络（请检查 integration.exporter_network 与 docker.sock 挂载）",
+			s.targetHint(ctx, in.Address.Host))
 	}
-	// 再并上平台自己的网络（监控面），去重后作为 Exporter/一次性容器的网络列表。
-	for _, name := range s.exporterNetworks() {
-		networks = appendUnique(networks, name)
+	if resolvedHost != "" && resolvedHost != in.Address.Host {
+		in.Address.Host = resolvedHost
+	}
+	if note != "" {
+		s.log.Info("集成：目标解析结果", zap.String("integration", in.Name), zap.String("detail", note))
 	}
 
 	args, env := bootstrapCommand(tpl.Type, in.Address, adminUser, adminPassword, statements)
@@ -951,10 +961,20 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 }
 
 // deploy 按配置尝试一键拉起 Exporter 容器。
+//
+// 网络不需要任何人预先配置：平台先用 docker 反查目标容器在哪张网络上，
+// 再把 Exporter 接进「监控面（平台网络）+ 目标网络」。被管项目因此
+// 不需要建互联网络、不需要加别名，也不需要把 compose 文件交给平台。
 func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template, instance integration.Instance) error {
 	if s.docker == nil {
 		s.setDeployNote(ctx, item.ID, s.dockerNote)
 		return nil
+	}
+	networks, resolvedHost, note := s.targetNetworks(ctx, instance.Address.Host)
+	// 平台把用户填的名字换成"在目标网络上一定能解析"的名字（优先容器名）：
+	// 用户填 `jd-redis`（别名）也不会因为别名只存在于旧网络而连不上。
+	if resolvedHost != "" && resolvedHost != instance.Address.Host {
+		instance.Address.Host = resolvedHost
 	}
 	env := tpl.RenderEnv(instance)
 	args := tpl.RenderArgs(instance)
@@ -963,7 +983,7 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 		Image:    tpl.Image,
 		Env:      envPairs(env),
 		Cmd:      args,
-		Networks: s.exporterNetworks(),
+		Networks: networks,
 		Labels: map[string]string{
 			"mwops.integration": instance.Name,
 			"mwops.mw_type":     tpl.Type,
@@ -974,9 +994,141 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 		s.setDeployNote(ctx, item.ID, "一键部署失败："+err.Error())
 		return fmt.Errorf("一键部署 Exporter 失败：%w", err)
 	}
-	s.setDeployNote(ctx, item.ID, fmt.Sprintf("Exporter 容器已%s（%s，ID %s）", actionLabel(action), spec.Name, shortID(id)))
+	// 顺带把平台自己接进目标网络，纳管实例的 TCP 健康探测才能成功——
+	// 这一步同样是平台侧动作，被管项目无感。
+	s.attachSelf(ctx, instance.Address.Host)
+	if instance.Address.Host != item.Host && instance.Address.Host != "" {
+		// 纳管实例的连接地址也统一成可解析名，避免"平台能抓指标、但健康探测失败"。
+		item.Host = instance.Address.Host
+		if err := s.instances.Update(ctx, item); err != nil {
+			s.log.Debug("集成：同步解析后的地址失败", zap.Int64("instance_id", item.ID), zap.Error(err))
+		}
+	}
+
+	done := fmt.Sprintf("Exporter 容器已%s（%s，ID %s）", actionLabel(action), spec.Name, shortID(id))
+	if note != "" {
+		done += "；" + note
+	}
+	s.setDeployNote(ctx, item.ID, done)
 	return nil
 }
+
+// resolveTarget 用 docker 反查目标容器与其所在网络。
+//
+// 第二个返回值是人可读的说明（写进集成备注，让用户看到"平台做了什么"），
+// 第三个返回值在解析失败时给出候选名，便于拼出可执行的报错。
+func (s *IntegrationService) resolveTarget(ctx context.Context, host string) (res *docker.TargetResolution, note string) {
+	if s.docker == nil || strings.TrimSpace(host) == "" {
+		return &docker.TargetResolution{Host: host}, ""
+	}
+	res, err := s.docker.ResolveTarget(ctx, host)
+	if err != nil {
+		s.log.Debug("集成：解析目标容器失败", zap.String("host", host), zap.Error(err))
+		return &docker.TargetResolution{Host: host}, ""
+	}
+	if res == nil {
+		return &docker.TargetResolution{Host: host}, ""
+	}
+	if res.Container == "" {
+		return res, ""
+	}
+	note = fmt.Sprintf("平台自动发现目标容器 %s（依据 %s），所在网络：%s",
+		res.Container, res.MatchedBy, strings.Join(res.Networks, "、"))
+	if !res.Running {
+		note += "（注意：该容器当前未运行）"
+	}
+	return res, note
+}
+
+// targetNetworks 返回容器应加入的网络 = 平台网络（配置项）+ 目标容器所在网络（自动发现）。
+//
+// 第二个返回值是"替换后的可解析主机名"：用户填别名时，平台会换成容器名，
+// 因为容器名在目标容器所在的任意网络上都能被内嵌 DNS 解析。
+func (s *IntegrationService) targetNetworks(ctx context.Context, host string) ([]string, string, string) {
+	networks := append([]string{}, s.exporterNetworks()...)
+	res, note := s.resolveTarget(ctx, host)
+	resolvedHost := host
+	if res != nil {
+		for _, name := range res.Networks {
+			networks = appendUnique(networks, name)
+		}
+		if res.Host != "" {
+			resolvedHost = res.Host
+		}
+	}
+	return networks, resolvedHost, note
+}
+
+// targetHint 在解析失败时拼出"你可能想填什么"的提示。
+func (s *IntegrationService) targetHint(ctx context.Context, host string) string {
+	res, _ := s.resolveTarget(ctx, host)
+	if res == nil || len(res.Candidates) == 0 {
+		return ""
+	}
+	limit := res.Candidates
+	if len(limit) > 8 {
+		limit = limit[:8]
+	}
+	return "（docker 里现有的容器：" + strings.Join(limit, "、") + "）"
+}
+
+// scrapeTarget 返回 Prometheus 应当抓取的目标。
+//
+// 关键点：集成由平台拉起 Exporter 时，抓取目标必须是 **Exporter 容器**
+// （mwops-exporter-<集成名>:<模板端口>），而不是被管实例本身——
+// MySQL / Redis 自己不暴露 /metrics，抓实例地址必然是 up=0。
+// 只有平台拿不到 Exporter 信息时才回落到实例地址。
+func (s *IntegrationService) scrapeTarget(meta IntegrationMeta, address integration.Address) string {
+	if strings.TrimSpace(meta.Container) != "" && meta.ExporterPort > 0 {
+		return net.JoinHostPort(meta.Container, strconv.Itoa(meta.ExporterPort))
+	}
+	return address.HostPort()
+}
+
+// attachSelf 把平台自身（backend 容器）接入目标容器所在网络。
+//
+// 为什么需要：纳管实例保存后平台会做一次 TCP 健康探测，如果平台不在目标网络上，
+// 探测必然失败，而这个失败**不是**用户的配置问题。与其要求用户去改宿主机上两个
+// compose 项目的网络，不如平台自己接进去（可在挂载了 docker.sock 时完成）。
+// 失败只记日志：探测失败会被降级为提示，不影响集成本身。
+func (s *IntegrationService) attachSelf(ctx context.Context, host string) {
+	if s.docker == nil {
+		return
+	}
+	res, _ := s.resolveTarget(ctx, host)
+	if res == nil || len(res.Networks) == 0 {
+		return
+	}
+	networks := res.Networks
+	self := strings.TrimSpace(os.Getenv("MWOPS_SELF_CONTAINER"))
+	if self == "" {
+		self = defaultSelfContainer
+	}
+	state, err := s.docker.Inspect(ctx, self)
+	if err != nil || state == nil {
+		s.log.Debug("集成：未找到平台自身容器，跳过网络接入", zap.String("container", self), zap.Error(err))
+		return
+	}
+	current, err := s.docker.InspectDetail(ctx, self)
+	if err != nil {
+		current = nil
+	}
+	for _, network := range networks {
+		if current != nil && contains(current.Networks, network) {
+			continue
+		}
+		if err := s.docker.ConnectNetwork(ctx, state.ID, network); err != nil {
+			s.log.Debug("集成：平台接入目标网络失败",
+				zap.String("network", network), zap.Error(err))
+			continue
+		}
+		s.log.Info("集成：平台已自动接入目标网络",
+			zap.String("container", self), zap.String("network", network))
+	}
+}
+
+// defaultSelfContainer 是平台自身（backend）的默认容器名。
+const defaultSelfContainer = "mwops-backend"
 
 // syncErr 保留错误顺序，便于把首个失败原因回传。
 func firstErr(errs ...error) error {
@@ -1093,7 +1245,7 @@ func (s *IntegrationService) toView(ctx context.Context, item model.MiddlewareIn
 		Address: meta.Address, Host: item.Host, Port: item.Port, Username: item.Username,
 		Environment: item.Environment, GroupName: item.GroupName,
 		Labels: meta.Labels, Options: meta.Options, JobName: meta.Job,
-		Container: meta.Container, Image: meta.Image,
+		Container: meta.Container, Image: meta.Image, DeployNote: meta.DeployNote,
 		Selector:  integration.SelectorFor(integration.Instance{Name: item.Name, MWType: item.MWType}, meta.Job),
 		AppliedAt: meta.AppliedAt, LastError: meta.LastError,
 		HasPassword: item.PasswordEncrypted != "",
@@ -1186,7 +1338,7 @@ func (s *IntegrationService) exporterNetwork() string { return s.cfg.Integration
 //
 // 第一个网络是「监控面」（Prometheus 能抓到 Exporter），其余是「数据面」
 // （Exporter 能连上被管实例）。jd 场景下两者不同：
-// exporter_network: "middleware-ops_mwops,jd-nightjar"。
+// exporter_network: "middleware-ops_mwops,my-project_default"。
 func (s *IntegrationService) exporterNetworks() []string {
 	raw := s.cfg.Integration.ExporterNetwork
 	parts := strings.Split(raw, ",")

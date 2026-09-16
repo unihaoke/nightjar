@@ -169,9 +169,11 @@ services:
       # 一键拉起 Exporter 容器：需同时取消注释下面的 docker.sock 挂载
       MWOPS_INTEGRATION_DOCKER_ENABLED: ${INTEGRATION_DOCKER_ENABLED:-false}
       MWOPS_INTEGRATION_DOCKER_HOST: ${INTEGRATION_DOCKER_HOST:-unix:///var/run/docker.sock}
-      # 逗号分隔：第一个是监控面（Prometheus 所在网络），其余是数据面
-      # jd 场景示例：middleware-ops_mwops,jd-nightjar
+      # 逗号分隔：第一个是监控面（Prometheus 所在网络）。
+      # 目标容器所在的网络**不需要**写在这里：集成时会自动发现并接入。
       MWOPS_INTEGRATION_EXPORTER_NETWORK: ${INTEGRATION_EXPORTER_NETWORK:-middleware-ops_mwops}
+      # 平台自身容器名：集成后平台会把自己也接进目标网络，以便做 TCP 健康探测
+      MWOPS_SELF_CONTAINER: mwops-backend
     volumes:
       - backend-data:/app/data
       # 集成中心的服务发现走 HTTP（Prometheus http_sd_configs 拉取

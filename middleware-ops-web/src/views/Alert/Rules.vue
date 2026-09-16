@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { alertApi, metricsApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { AlertRule, MiddlewareInstance } from '@/api/types'
+import type { AlertRule } from '@/api/types'
 import { alertLevelLabels, mwTypeLabels } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
