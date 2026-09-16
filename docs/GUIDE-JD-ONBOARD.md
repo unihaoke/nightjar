@@ -361,13 +361,20 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops,jd-nightjar
 
 ### 3.2 启动平台（推荐：交给一键脚本）
 
-**只维护两份 `.env`，其余全部自动**：
+**只维护两份 `.env`，其余全部自动**。按宿主系统选脚本（行为一致，Linux 上无需安装 pwsh）：
 
 ```bash
+# Linux / macOS
 cd <nightjar>
-pwsh -File scripts/setup-jd-link.ps1 -DryRun      # ① 先预览：打印将要改什么，不写任何文件
-pwsh -File scripts/setup-jd-link.ps1              # ② 正式执行
+./scripts/setup-jd-link.sh --dry-run      # ① 先预览：打印将要改什么，不写任何文件
+./scripts/setup-jd-link.sh                # ② 正式执行
+
+# Windows（PowerShell）
+pwsh -File scripts/setup-jd-link.ps1 -DryRun
+pwsh -File scripts/setup-jd-link.ps1
 ```
+
+> 脚本首次使用若提示权限不足：`chmod +x scripts/*.sh`（仓库里 `*.sh` 已是 LF 行尾，可直接执行）。
 
 脚本会自动完成（幂等，可重复执行）：
 
@@ -389,13 +396,14 @@ pwsh -File scripts/setup-jd-link.ps1              # ② 正式执行
 > 只在数据卷首启时生效，事后改 `.env` 不会改库里的口令，改了反而连不上——
 > 脚本会提示正确的改法（先 `ALTER USER` 再同步 `.env`）。
 
-常用参数：
+常用参数（bash 版用 `--xxx`，PowerShell 版用 `-Xxx`）：
 
 ```bash
-pwsh -File scripts/setup-jd-link.ps1 -Mode mwops-prometheus   # 改用平台自带 Prometheus + 集成中心
-pwsh -File scripts/setup-jd-link.ps1 -FixInstances            # 顺带纠正纳管实例字段
-pwsh -File scripts/setup-jd-link.ps1 -SkipStart               # 只改配置不起容器
-pwsh -File scripts/setup-jd-link.ps1 -JdDir ..\jd -NightjarDir .
+./scripts/setup-jd-link.sh --mode mwops-prometheus   # 改用平台自带 Prometheus + 集成中心
+./scripts/setup-jd-link.sh --fix-instances          # 顺带纠正纳管实例字段
+./scripts/setup-jd-link.sh --skip-start             # 只改配置不起容器
+./scripts/setup-jd-link.sh --jd-dir ../jd --nightjar-dir .
+./scripts/setup-jd-link.sh --help                   # 查看全部参数
 ```
 
 ### 3.3 启动平台（手工方式，等价于脚本内部执行）
@@ -654,6 +662,7 @@ FEISHU_WEBHOOK=<webhook>
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| **`dial tcp: lookup jd-prometheus on 127.0.0.11:53: server misbehaving`** | `127.0.0.11` 是 **Docker 内置 DNS**；`server misbehaving` 的真实含义是「该容器所属的网络上没有这个名字」→ **平台又不在 `jd-nightjar` 上了**（多半是不带 overlay 重启了平台） | 一键修复；随后确认：`docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' mwops-backend` 应同时包含 `middleware-ops_mwops` 与 `jd-nightjar` |
 | 报错 `job="jd-redis-exporter"` 不存在 | 把**容器名**当成 **job 名**填进了「Prometheus job」 | 改成 `middleware-exporter-redis`（或留空走前缀兜底），实例名改成 `jd-redis`；接入自检会列出可用的 job 与 instance_name |
 | 报错 `up{job="..."} = 1` 但 `matched = 0` | ① 平台连的是**另一台** Prometheus；② 该 job 的时序**没有** `instance_name` 标签（抓取配置缺 relabel 或改后没重建容器）；③ 有标签但值不是当前实例名 | 按 8.3 节三步定位；接入自检（重建平台后）会直接列出该 job 真实的 `instance_name` / `instance` 取值 |
 | **`mwops-backend` 只挂在 `middleware-ops_mwops`**（`docker ps` 可见） | 平台启动时**没带** `deploy/compose.jd-link.yml` | 症状是三件事同时发生：指标为空、实例探测「连接失败」、日志一条不来。修：带 overlay 重启平台（见 8.1） |
@@ -680,9 +689,10 @@ FEISHU_WEBHOOK=<webhook>
 
 ```bash
 cd <nightjar>
-pwsh -File scripts/setup-jd-link.ps1 -DryRun     # 先看它会改什么（不写文件、不调 docker）
-pwsh -File scripts/setup-jd-link.ps1             # 执行：修 .env → 修派生文件 → 修网络 → 重建两栈 → 体检
-pwsh -File scripts/setup-jd-link.ps1 -FixInstances   # 顺带纠正 prom_job / 实例名
+./scripts/setup-jd-link.sh --dry-run     # 先看它会改什么（不写文件、不调 docker）
+./scripts/setup-jd-link.sh               # 执行：修 .env → 修派生文件 → 修网络 → 重建两栈 → 体检
+./scripts/setup-jd-link.sh --fix-instances   # 顺带纠正 prom_job / 实例名
+# Windows 用 pwsh -File scripts/setup-jd-link.ps1，参数为 -DryRun / -FixInstances
 ```
 
 它内部等价于下面这些手工步骤（需要单独排查时再逐条执行）：
@@ -771,7 +781,16 @@ curl -s 'http://127.0.0.1:<PORT>/api/v1/status/config' | grep -A3 instance_name
 | `jd-prometheus` | `["jd-redis"]` | 标签没问题 → 检查平台实例名是否被改过、`prom_instance` 是否被误填（填了它实例名就不参与匹配） |
 | `jd-prometheus` | `[]` | 正在跑的 Prometheus 加载的配置里没有 relabel：确认 jd 用 `./start.sh nightjar` 启动，且改过 `prometheus-jd.yml` 后**重建了容器**（`docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml up -d --force-recreate prometheus`）。应急：把「Prometheus instance」填成 ③ 输出的值（如 `redis-exporter:9121`） |
 | `prometheus`（平台自带） | `["redis-dev-01"]` 等 | 平台连错了数据源：`.env` 改成 `MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090` 后重建 backend；或把实例名改成那台 Prometheus 里实际的值 |
-| 任意 | 报错/超时 | `docker exec mwops-backend wget -qO- <base_url>/-/healthy` 验证连通性 |
+| 任意 | 报错/超时 | 看下面的「连接层错误对照表」 |
+
+**连接层错误对照表**（平台已把这些翻译成中文结论写进快照的 `note` 与自检的 `hints`）：
+
+| 报错片段 | 真实含义 | 处理 |
+|---|---|---|
+| `lookup <host> on 127.0.0.11:53: server misbehaving` | 平台容器所属的网络上**没有这个名字** | 容器网络挂错：带 overlay 重建平台（`scripts/setup-jd-link.sh`） |
+| `connection refused` | 名字解析到了，但目标端口没人监听 | Prometheus 容器没起、端口写错，或把宿主端口当成了容器端口 |
+| `context deadline exceeded` / `i/o timeout` | 不可路由或防火墙拦截 | 跨主机部署要放通端口；确认没有把容器放进 internal 网络去访问外部地址 |
+| `x509` / `certificate` | 自签证书未被信任 | 平台侧信任该 CA，或改用 http |
 
 > 平台自带 Prometheus 的默认抓取配置里，示例 Exporter job 已**默认注释**——
 > 之前它们带着硬编码的 `instance_name: redis-dev-01` 且 up=0，一旦有同名容器被手工接入

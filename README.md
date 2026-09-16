@@ -127,8 +127,10 @@ npm run dev                                          # 监听 :5173
 │   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
-├── scripts/setup-jd-link.ps1       # 一键接入/修复：只维护 .env，其余（口令派生、网络、启动、体检）全自动
-├── scripts/doctor-jd-link.ps1      # 跨栈网络体检（对照期望拓扑逐条判定并给修复命令）
+├── scripts/setup-jd-link.sh        # 一键接入/修复（Linux/macOS）：只维护 .env，其余全自动
+├── scripts/setup-jd-link.ps1       # 同上的 PowerShell 版（Windows 宿主）
+├── scripts/doctor-jd-link.sh       # 跨栈网络体检（Linux/macOS）
+├── scripts/doctor-jd-link.ps1      # 跨栈网络体检（Windows）
 └── Makefile                        # 常用开发/部署命令
 ```
 

@@ -57,7 +57,9 @@ func (f *fallbackClient) Snapshot(ctx context.Context, target Target) (*Snapshot
 	if fallbackErr != nil {
 		return nil, err
 	}
-	fallback.Note = "Prometheus 查询失败（" + err.Error() + "），已回退内置模拟数据"
+	// 把底层错误翻译成"结论 + 修复方向"：跨栈场景下最常见的失败是容器网络挂错
+	// （Docker 内置 DNS 报 server misbehaving），原始 Go 错误使用者看不出来。
+	fallback.Note = "Prometheus 不可达，已回退内置模拟数据。" + DescribeError(err, f.Endpoint())
 	if f.jobPrefix != "" {
 		fallback.Selector = SelectorFor(target, f.jobPrefix)
 	}
@@ -106,4 +108,12 @@ func (f *fallbackClient) LabelValues(ctx context.Context, label string, matchers
 		return nil, fmt.Errorf("当前监控数据源不支持标签取值查询")
 	}
 	return reporter.LabelValues(ctx, label, matchers...)
+}
+
+// Endpoint 透传 Prometheus 查询地址（实现 EndpointReporter）。
+func (f *fallbackClient) Endpoint() string {
+	if reporter, ok := f.primary.(EndpointReporter); ok {
+		return reporter.Endpoint()
+	}
+	return ""
 }

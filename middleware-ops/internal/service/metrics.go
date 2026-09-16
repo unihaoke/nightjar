@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -241,7 +243,47 @@ func (s *MetricsService) Diagnose(ctx context.Context, instanceID int64, scope S
 	// 把「Prometheus 里实际有什么」补进来：报错只说"未匹配到任何时序"时，
 	// 使用者最需要的是下面这份可选项（job 名 / instance_name 取值）。
 	result.Hints = append(result.Hints, s.augmentLabelHints(ctx, item, result)...)
+	// 容器网络/DNS 判定：这一步能确定地区分"网络挂错"与"Prometheus 自身问题"。
+	result.Hints = append(result.Hints, s.augmentEndpointHints(ctx, result)...)
 	return result, nil
+}
+
+// augmentEndpointHints 在自检里做一次容器内 DNS 实测。
+//
+// 为什么值得单独做：跨栈接入时最常见的故障是平台没接到 jd 的容器网络，
+// 表现为 Docker 内置 DNS（127.0.0.11）报 server misbehaving。与其让使用者
+// 去猜，不如在平台容器里直接解析一次 prometheus.base_url 的主机名——
+// 解析失败即可确定结论为"容器网络问题"，解析成功则把方向指向 Prometheus 本身。
+func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *DiagnoseResult) []string {
+	reporter, ok := s.monitor.(monitor.EndpointReporter)
+	if !ok {
+		return nil
+	}
+	endpoint := strings.TrimSpace(reporter.Endpoint())
+	if endpoint == "" {
+		return []string{"当前未配置 prometheus.base_url：监控页面展示的是内置模拟数据，不是真实指标。"}
+	}
+	host := monitor.HostOf(endpoint)
+	if host == "" {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := monitor.LookupHostCtx(probeCtx, host); err != nil {
+		return []string{fmt.Sprintf(
+			"平台容器内解析不了 %s（%v）：这是**容器网络**问题，不是 Prometheus 的问题。"+
+				"jd 场景请确认平台用 deploy/compose.jd-link.yml 启动（mwops-backend 必须在 jd-nightjar 网络上），"+
+				"可执行 scripts/setup-jd-link.sh 一键修复，或 scripts/doctor-jd-link.sh 体检。当前查询地址：%s",
+			host, err, endpoint)}
+	}
+	// 解析成功：把方向指向 Prometheus 自身/端口，避免用户继续在网络层打转。
+	if result != nil && !result.Healthy {
+		return []string{fmt.Sprintf(
+			"主机名 %s 能解析，但 Prometheus 健康检查不通：方向在 Prometheus 自身或其端口。"+
+				"确认容器在运行、端口与 prometheus.base_url 一致（同机部署注意 jd/平台两侧的 PROMETHEUS_PORT 不要用反）。当前查询地址：%s",
+			host, endpoint)}
+	}
+	return nil
 }
 
 // diagnoseHints 依据自检事实生成可执行的排查建议（按可能性从高到低）。

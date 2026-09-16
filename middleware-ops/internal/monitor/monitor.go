@@ -146,6 +146,15 @@ type LabelReporter interface {
 	LabelValues(ctx context.Context, label string, matchers ...string) ([]string, error)
 }
 
+// EndpointReporter 由能暴露上游查询地址的客户端实现（自检用于判定容器网络/DNS）。
+//
+// 有了它，自检才能确定地说"平台容器解析不了 jd-prometheus"，
+// 而不是笼统地提示"请检查网络"。
+type EndpointReporter interface {
+	// Endpoint 返回 prometheus.base_url（模拟器返回空串）。
+	Endpoint() string
+}
+
 // Client 是监控查询接口。
 type Client interface {
 	// Snapshot 采集某实例的当前指标。

@@ -74,6 +74,9 @@ func (p *promClient) Healthy(ctx context.Context) bool {
 // Selector 返回该实例的 PromQL 标签匹配串（实现 SelectorReporter）。
 func (p *promClient) Selector(target Target) string { return buildSelector(target, p.jobPrefix) }
 
+// Endpoint 返回 Prometheus 查询地址（实现 EndpointReporter）。
+func (p *promClient) Endpoint() string { return p.baseURL }
+
 // LabelValues 查询标签取值（实现 LabelReporter）。
 //
 // 走 GET /api/v1/label/<label>/values，可带 match[] 限定序列范围。
