@@ -136,7 +136,10 @@ func (s *MetricsService) Catalog(mwType string) map[string]any {
 		metrics = append(metrics, map[string]any{
 			"name": spec.Name, "display_name": spec.DisplayName, "unit": spec.Unit,
 			"category": spec.Category, "warning_threshold": spec.WarningThreshold,
-			"critical_threshold": spec.CriticalThreshold, "higher_is_worse": spec.HigherIsWorse,
+			"critical_threshold": spec.CriticalThreshold,
+			// threshold_mode 决定前端如何解读阈值方向：
+			//   higher_worse 越高越差 / lower_worse 越低越差 / bool_down 正常-异常 / 空 表示纯观测
+			"threshold_mode": string(spec.Mode),
 		})
 	}
 	return map[string]any{

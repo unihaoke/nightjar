@@ -22,6 +22,9 @@ middleware-ops-web/*.tsbuildinfo
 .env
 *.key
 *.pem
+# Exporter 凭据文件（含明文口令）：仓库只保留 .example 模板
+deploy/exporters/my.cnf
+!deploy/exporters/my.cnf.example
 
 # 编辑器与系统
 .idea/

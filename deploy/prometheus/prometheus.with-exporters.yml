@@ -1,0 +1,83 @@
+# Prometheus 抓取配置（含被管中间件 Exporter 版本）。
+#
+# 与 prometheus.yml 的区别：本文件额外加入平台自带的 6 个官方 Exporter 抓取任务，
+# 适合「平台与被管中间件在同一台机器/同一 compose 网络」的验证与轻量生产场景。
+# 用法见 deploy/compose.middleware-exporters.yml 顶部说明。
+#
+# 标签约定（平台按此匹配实例，务必与纳管信息一致）：
+#   - job：默认约定为 <exporter_job_prefix>-<中间件类型>，例如 middleware-exporter-redis；
+#          平台纳管实例时若填写了「Prometheus job」，则以该值为准；
+#   - instance_name：平台优先用它匹配实例名（各 Exporter 通过 SERVICE_NAME 上报）；
+#   - instance：平台纳管实例若填写了「Prometheus instance」，则用它精确匹配。
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    platform: middleware-ops
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+scrape_configs:
+  # 平台自身指标
+  - job_name: middleware-ops
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['backend:8080']
+
+  # Redis：Exporter 自带 instance_name（SERVICE_NAME 环境变量）
+  - job_name: middleware-exporter-redis
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # MySQL：mysqld-exporter 无 instance_name，这里统一补齐
+  - job_name: middleware-exporter-mysql
+    static_configs:
+      - targets: ['mysqld-exporter:9104']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: mysql-dev-01
+
+  # PostgreSQL
+  - job_name: middleware-exporter-pg
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: pg-dev-01
+
+  # Kafka
+  - job_name: middleware-exporter-kafka
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: kafka-dev-01
+
+  # Elasticsearch
+  - job_name: middleware-exporter-es
+    static_configs:
+      - targets: ['es-exporter:9114']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: es-dev-01
+
+  # Nginx
+  - job_name: middleware-exporter-nginx
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: nginx-dev-01

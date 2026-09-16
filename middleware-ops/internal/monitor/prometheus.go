@@ -277,28 +277,41 @@ func toFloat(v any) (float64, error) {
 	}
 }
 
-// evaluateStatus 依据阈值判定指标状态。
+// evaluateStatus 依据 ThresholdMode 判定指标状态。
+//
+// 语义见 ThresholdMode 注释。两个关键设计点（均由真实缺陷驱动）：
+//
+//  1. 「越低越差」采用**含边界**比较（value <= 告警线 即异常）。
+//     因为 0 是有意义的临界值（Elasticsearch red=0），严格小于会导致 x < 0 永远为假，
+//     red 状态被判成 warning。
+//  2. critical 必须先于 warning 判定，否则 warning 会先短路掉更严重的状态。
 func evaluateStatus(spec MetricSpec, value float64) string {
-	if spec.WarningThreshold == 0 && spec.CriticalThreshold == 0 {
-		return "ok"
-	}
-	if spec.HigherIsWorse {
+	switch spec.Mode {
+	case ThresholdHigherWorse:
 		switch {
-		case spec.CriticalThreshold > 0 && value >= spec.CriticalThreshold:
+		case value >= spec.CriticalThreshold:
 			return "critical"
-		case spec.WarningThreshold > 0 && value >= spec.WarningThreshold:
+		case value >= spec.WarningThreshold:
 			return "warning"
 		default:
 			return "ok"
 		}
-	}
-	// 数值越高越好（命中率等）：低于阈值即异常。
-	switch {
-	case spec.CriticalThreshold > 0 && value <= spec.CriticalThreshold:
-		return "critical"
-	case spec.WarningThreshold > 0 && value <= spec.WarningThreshold:
-		return "warning"
+	case ThresholdLowerWorse:
+		switch {
+		case value <= spec.CriticalThreshold:
+			return "critical"
+		case value <= spec.WarningThreshold:
+			return "warning"
+		default:
+			return "ok"
+		}
+	case ThresholdBoolDown:
+		if value <= spec.CriticalThreshold {
+			return "critical"
+		}
+		return "ok"
 	default:
+		// ThresholdNone：纯观测型指标不做判定，避免用未配置的阈值误报。
 		return "ok"
 	}
 }
