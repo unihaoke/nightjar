@@ -80,9 +80,12 @@ down: ## 停止并移除容器
 logs: ## 查看服务日志
 	docker compose logs -f --tail=200
 
+# 选择可用的 PowerShell：优先 pwsh（PS 7），回退到 Windows PowerShell 5.1
+PS ?= $(shell command -v pwsh 2>/dev/null || echo powershell)
+
 .PHONY: verify
 verify: ## 端到端冒烟验证（需后端已在 8080 运行）
-	pwsh -File scripts/smoke-test.ps1
+	$(PS) -File scripts/smoke-test.ps1
 
 .PHONY: all-check
 all-check: backend-lint backend-test frontend-build frontend-smoke ## 提交前全量自检

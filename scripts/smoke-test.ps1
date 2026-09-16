@@ -1,4 +1,4 @@
-# End-to-end smoke test for the middleware-ops platform.
+﻿# End-to-end smoke test for the middleware-ops platform.
 #
 # Prerequisites: backend running at http://127.0.0.1:8080 with a reachable PostgreSQL.
 # Usage: pwsh -File scripts/smoke-test.ps1 [-BaseUrl http://127.0.0.1:8080] [-Username admin] [-Password Admin@12345]

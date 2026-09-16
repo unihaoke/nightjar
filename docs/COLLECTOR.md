@@ -343,11 +343,17 @@ curl -X POST http://<平台地址>/api/hooks/logs \
 
 响应中的 `signature` 为错误指纹，`merged=true` 表示与 5 分钟窗口内的既有事件合并。
 
-可直接使用仓库内示例脚本（含单条、批量、扫描日志文件三种模式）：
+可直接使用仓库内示例脚本（含单条、批量、扫描日志文件三种模式）。
+脚本已写入 UTF-8 BOM，PowerShell 5.1 与 PowerShell 7 均可直接运行：
+`pwsh` 存在时用 `pwsh`，Windows 自带环境用 `powershell`。
 
-```bash
+```powershell
+# PowerShell 7+
 pwsh -File scripts/hook-log-report.ps1 -BaseUrl http://127.0.0.1:8080
 pwsh -File scripts/hook-log-report.ps1 -LogFile /var/log/order-service/error.log -TailLines 400
+
+# Windows PowerShell 5.1（无 pwsh 时）
+powershell -ExecutionPolicy Bypass -File scripts\hook-log-report.ps1 -BaseUrl http://127.0.0.1:8080
 ```
 
 各语言框架的接入点（示意）：
@@ -469,9 +475,10 @@ curl -s -H "Authorization: Bearer $TOKEN" 'http://<平台>/api/metrics/1' | jq '
 
 ### 8.2 端到端冒烟
 
-```bash
+```powershell
 # 后端全链路（含纳管、指标、诊断、告警、审计）
-pwsh -File scripts/smoke-test.ps1 -BaseUrl http://127.0.0.1:8080
+pwsh -File scripts/smoke-test.ps1 -BaseUrl http://127.0.0.1:8080        # PowerShell 7+
+powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1 -BaseUrl http://127.0.0.1:8080   # PS 5.1
 ```
 
 ---

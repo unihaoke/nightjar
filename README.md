@@ -181,7 +181,7 @@ cd middleware-ops-web && npm run build
 # 前端运行时冒烟（无头浏览器加载产物，捕获白屏/TDZ 这类只在运行时暴露的问题）
 cd middleware-ops-web && npm run smoke
 
-# 端到端冒烟（需后端已在 8080 运行）
+# 端到端冒烟（需后端已在 8080 运行；PS 7 用 pwsh，Windows 自带 PS 5.1 用 powershell）
 pwsh -File scripts/smoke-test.ps1
 ```
 

@@ -40,7 +40,9 @@
    ```
 2. **填写 `.env`**：`JWT_SECRET`、`ADMIN_PASSWORD`、`DB_PASSWORD`、`REDIS_PASSWORD` 必改。
 3. **启动**：`docker compose up -d --build`。
-4. **验证**：`curl -fsS http://127.0.0.1:8000/healthz`，随后 `pwsh -File scripts/smoke-test.ps1 -BaseUrl http://127.0.0.1:8000`。
+4. **验证**：`curl -fsS http://127.0.0.1:8000/healthz`，随后运行端到端冒烟
+   （PowerShell 7 用 `pwsh -File scripts/smoke-test.ps1 -BaseUrl http://127.0.0.1:8000`；
+   Windows 自带 PowerShell 5.1 用 `powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1 -BaseUrl http://127.0.0.1:8000`）。
 5. **登录并改密**：浏览器访问 `http://<host>:8000`，使用管理员账号登录后立即修改密码。
 
 ---
