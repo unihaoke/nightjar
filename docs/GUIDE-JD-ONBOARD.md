@@ -67,18 +67,23 @@
 | 端口 | 属于 | 说明 |
 |---|---|---|
 | 8000 | nightjar 前端 | `WEB_PORT` |
-| **9090** | **两边都要用** ⚠️ | jd 的 Prometheus 绑 `127.0.0.1:9090`；nightjar 的 Prometheus 默认绑 `0.0.0.0:9090` → **同机会冲突** |
+| **9090 / 9091** | **两边的 Prometheus** ⚠️ | 同机部署必须错开。**当前约定：jd = 9091，nightjar = 9090**（`jd/.env.example` 已按此调整） |
 | 3000 | jd Grafana | `GRAFANA_PORT` |
 | 8542 | jd 前端 | `WEB_PORT` |
 | 8541 | jd 后端 | 仅绑 `127.0.0.1` |
 | 9121 / 9104 | Exporter | 只在容器网络内，不发布宿主端口 |
 
-**冲突处理**：把 nightjar 的 Prometheus 挪走即可（方式一必做；方式二下 nightjar 的 Prometheus 可以不用）：
+**端口与 `.env` 的对应关系**（排查时很容易看错，务必按各自 `.env` 推导）：
 
-```bash
-# <nightjar>/.env
-PROMETHEUS_PORT=9091
-```
+| 想访问谁 | 宿主地址 | 由哪个变量决定 |
+|---|---|---|
+| jd 的 Prometheus（`jd-prometheus:9090`） | `http://127.0.0.1:<jd/.env 的 PROMETHEUS_PORT>` → 当前 `9091` | `<jd>/.env` |
+| 平台自带的 Prometheus（`prometheus:9090`） | `http://127.0.0.1:<nightjar/.env 的 PROMETHEUS_PORT>` → 当前 `9090` | `<nightjar>/.env` |
+| 平台 Web | `http://127.0.0.1:<nightjar/.env 的 WEB_PORT>` → `8000` | `<nightjar>/.env` |
+
+> 两个 `.env` 是**互相独立**的文件（同名变量含义可能完全不同，例如 `REDIS_PASSWORD`、`DB_NAME`、
+> `WEB_PORT`），绝不能互相复制；详见 §2.1 与 §3.1 的说明。
+> 若你已经把某一侧改成别的端口，只要求两边**不相同**即可。
 
 ### 1.2 口令清单（三处必须一致的项）
 
@@ -109,6 +114,27 @@ openssl rand -hex 32        # JWT_SECRET / HOOK_TOKEN
 > 顺序不能反：nightjar 启动时若 `jd-nightjar` 网络不存在，compose 会直接报
 > `network jd-nightjar declared as external, but could not be found`。
 
+### 1.4 期望的网络拓扑（体检用）
+
+跨栈故障里最难查的一类是「容器都在跑，但网络挂错了」——平台 UI 只会显示「没有数据」。
+把下表与实际 `docker ps` 对照，或用体检脚本一键核对（见 3.3 第 ④ 步）。
+
+| 容器 | 必须加入的网络 | 为什么 |
+|---|---|---|
+| `mwops-backend` | `middleware-ops_mwops` + **`jd-nightjar`** | 查 jd 指标（方式二）、TCP 探测 `jd-mysql`/`jd-redis`、被 jd 的 Agent 推日志、被 jd 的 Prometheus 拉服务发现 |
+| `mwops-prometheus` | `middleware-ops_mwops` | 抓平台自身指标；集成中心拉起的 Exporter 也在该网络上 |
+| `mwops-frontend` / `mwops-postgres` / `mwops-redis` | `middleware-ops_mwops` | 平台内部 |
+| `interview-mysql` / `interview-redis` | `jd_jd-data` + **`jd-nightjar`** | 数据面；别名 `jd-mysql`/`jd-redis` 供平台探测 |
+| `interview-prometheus` | `jd_jd-data` + `jd_jd-obs` + **`jd-nightjar`** | 抓 jd 后端与 Exporter；别名 `jd-prometheus` 供平台查询 |
+| `jd-log-agent` | **`jd-nightjar`** | 把日志推给 `mwops-backend:8080` |
+| `jd-redis-exporter` / `jd-mysqld-exporter` | `jd_jd-data` | 方式二下由 jd 的 Prometheus 抓取 |
+| `mwops-exporter-<集成名>` | `middleware-ops_mwops` + **`jd-nightjar`** | 方式一（集成中心）自动创建：监控面被抓取 + 数据面能连上 jd 的库 |
+
+> 三条铁律：
+> 1. **平台的 backend 必须在 `jd-nightjar` 上**——少了它，指标/探活/日志会同时失效；
+> 2. `mwops-prometheus` 至少要有 `middleware-ops_mwops`——出现「没有任何网络」的容器一定有问题；
+> 3. **不要手工 `docker network connect`**：状态会漂移，下次 `compose up` 就与声明不一致。要加网络就改 compose 文件。
+
 ---
 
 ## 2. jd 侧：改造与启动
@@ -138,7 +164,7 @@ BACKEND_PORT=8541
 WEB_PORT=8542
 
 # ---------- 监控 ----------
-PROMETHEUS_PORT=9090                 # 同机部署 nightjar 时按 1.1 节处理冲突
+PROMETHEUS_PORT=9091                 # 与 nightjar 的 9090 错开（两边必须不同）
 GRAFANA_PORT=3000
 GRAFANA_USER=admin
 GRAFANA_PASSWORD=<Grafana 口令>
@@ -298,7 +324,7 @@ ADMIN_PASSWORD=<平台管理员口令>
 DB_PASSWORD=<平台 PG 口令>
 REDIS_PASSWORD=<平台自身 Redis 口令>
 HOOK_TOKEN=<openssl rand -hex 32>        # 必须等于 jd 的 NIGHTJAR_HOOK_TOKEN
-PROMETHEUS_PORT=9091                     # 见 1.1 端口冲突
+PROMETHEUS_PORT=9090                     # 与 jd 的 9091 错开；两边必须不同
 
 # ---------- 接入 jd ----------
 JD_NIGHTJAR_NETWORK=jd-nightjar
@@ -328,7 +354,44 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops,jd-nightjar
 > ⚠️ 挂载 docker.sock 等于把宿主机 root 权限交给平台容器。生产环境建议保持关闭，
 > 改用「集成中心 → 配置 → 复制 compose 片段/docker run 命令」人工执行。
 
-### 3.2 启动平台
+### 3.2 启动平台（推荐：交给一键脚本）
+
+**只维护两份 `.env`，其余全部自动**：
+
+```bash
+cd <nightjar>
+pwsh -File scripts/setup-jd-link.ps1 -DryRun      # ① 先预览：打印将要改什么，不写任何文件
+pwsh -File scripts/setup-jd-link.ps1              # ② 正式执行
+```
+
+脚本会自动完成（幂等，可重复执行）：
+
+| 它替你做的事 | 对应以前要手工改的地方 |
+|---|---|
+| 生成缺失的 `JWT_SECRET` / 各类口令 / `HOOK_TOKEN`（十六进制，无特殊字符） | 两份 `.env` |
+| 对齐 `HOOK_TOKEN` == `NIGHTJAR_HOOK_TOKEN`、`JD_NIGHTJAR_NETWORK` | 两份 `.env`（最容易漏） |
+| 按取数方式写 `MWOPS_PROMETHEUS_BASE_URL`、拼好 `INTEGRATION_EXPORTER_NETWORK` | `<nightjar>/.env` |
+| 端口错开（nightjar 9090 / jd 9091、Web 8000 / 8542） | 两份 `.env` |
+| 用 `.env` 的口令重写 `01-monitor-user.sql` 与 `my.cnf` | 以前要手工 `sed` 的两个文件 |
+| 创建 internal 互联网络、按正确 overlay 启动两栈、补建 MySQL 只读账号 | `./start.sh nightjar` + `nightjar-initdb` |
+| 清掉手工 `docker network connect` 的遗留网络 | 第 8.1 节第 ④ 步 |
+| 体检：容器网络挂载、`getent` 双向解析、Prometheus 里真实的 `instance_name` | 第 8.3 节 |
+| （可选 `-FixInstances`）用平台接口纠正 `prom_job`/实例名 | 第 4.2 节的手工填表 |
+
+> 弱口令只**警告不改**：MySQL 的 `MYSQL_ROOT_PASSWORD`、PostgreSQL 的 `POSTGRES_PASSWORD`
+> 只在数据卷首启时生效，事后改 `.env` 不会改库里的口令，改了反而连不上——
+> 脚本会提示正确的改法（先 `ALTER USER` 再同步 `.env`）。
+
+常用参数：
+
+```bash
+pwsh -File scripts/setup-jd-link.ps1 -Mode mwops-prometheus   # 改用平台自带 Prometheus + 集成中心
+pwsh -File scripts/setup-jd-link.ps1 -FixInstances            # 顺带纠正纳管实例字段
+pwsh -File scripts/setup-jd-link.ps1 -SkipStart               # 只改配置不起容器
+pwsh -File scripts/setup-jd-link.ps1 -JdDir ..\jd -NightjarDir .
+```
+
+### 3.3 启动平台（手工方式，等价于脚本内部执行）
 
 ```bash
 cd <nightjar>
@@ -350,6 +413,11 @@ docker exec mwops-backend sh -c 'getent hosts jd-mysql && getent hosts jd-redis'
 # ③ 浏览器登录 http://<主机>:8000 ，进入「系统信息」页确认：
 #    - 监控数据源：Prometheus（不是「内置模拟器」）
 #    - 集成中心可用性提示
+
+# ④ 跨栈网络体检（推荐每次都跑）：对照 1.4 的期望拓扑逐条判定并给出修复命令
+pwsh -File scripts/doctor-jd-link.ps1
+#   声明用集成中心取数时：pwsh -File scripts/doctor-jd-link.ps1 -Mode mwops-prometheus
+#   jd 目录不在同级时：  pwsh -File scripts/doctor-jd-link.ps1 -NightjarDir . -JdDir ../<jd目录名>
 ```
 
 ---
@@ -449,6 +517,18 @@ MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090
 
 > **`Prometheus instance` 必须留空**：填了之后平台改用 `instance="..."` 匹配并**忽略** `instance_name`，
 > 而 jd 的时序只有 `instance_name`，结果就是永远查不到数据。
+
+> **三个名字别搞混**（这是本节最容易踩的坑）：
+>
+> | 名字 | jd 场景的取值 | 从哪里看 |
+> |---|---|---|
+> | 容器名 | `jd-redis-exporter` | `docker ps` |
+> | Prometheus job 名 | `middleware-exporter-redis` | `jd/deploy/jd-exporters/prometheus-jd.yml` 的 `job_name` |
+> | `instance_name` 标签（= 平台「实例名称」） | `jd-redis` | 同一个文件的 `relabel_configs.replacement` |
+>
+> 把**容器名**填进「Prometheus job」是最高频的错误，报错为
+> `选择器 {job="jd-redis-exporter",...} 未匹配到任何时序，且 up{job="jd-redis-exporter"} 也不存在`。
+> 平台已把 Prometheus 里实际存在的 job 做成下拉候选，接入自检也会列出该 job 下真实的 `instance_name` 取值。
 
 **第 4 步**：验证（实例详情 →「接入自检」，或 4.1 第 4 步同样的 curl）。
 
@@ -567,13 +647,20 @@ FEISHU_WEBHOOK=<webhook>
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 报错 `job="jd-redis-exporter"` 不存在 | 把**容器名**当成 **job 名**填进了「Prometheus job」 | 改成 `middleware-exporter-redis`（或留空走前缀兜底），实例名改成 `jd-redis`；接入自检会列出可用的 job 与 instance_name |
+| 报错 `up{job="..."} = 1` 但 `matched = 0` | ① 平台连的是**另一台** Prometheus；② 该 job 的时序**没有** `instance_name` 标签（抓取配置缺 relabel 或改后没重建容器）；③ 有标签但值不是当前实例名 | 按 8.3 节三步定位；接入自检（重建平台后）会直接列出该 job 真实的 `instance_name` / `instance` 取值 |
+| **`mwops-backend` 只挂在 `middleware-ops_mwops`**（`docker ps` 可见） | 平台启动时**没带** `deploy/compose.jd-link.yml` | 症状是三件事同时发生：指标为空、实例探测「连接失败」、日志一条不来。修：带 overlay 重启平台（见 8.1） |
+| **`mwops-prometheus` 一个网络都没有** | 容器被手工 `docker network disconnect` 过，或不是由 compose 创建 | `docker compose up -d --force-recreate prometheus` 重建（仓库里声明的是 `networks: [mwops]`） |
+| **Exporter 出现在 `middleware-ops_mwops` 上**（如 `jd-redis-exporter`） | 手工 `docker network connect` 的痕迹 | `docker network disconnect middleware-ops_mwops jd-redis-exporter`；要跨栈抓取请用「集成中心」（它按声明把 Exporter 同时挂两张网） |
+| `jd-mysqld-exporter` 一直 `Restarting (1)` | **不是网络问题**（它在 `jd_jd-data`，与 mysql 同网）：只读账号没建 / 口令不一致 / 口令含 `@ ( ) /` 导致 DSN 解析失败 | 见 8.2 |
+| 跨栈网络改动后状态反复 | 手工改网络后又执行了 `compose up` | 统一用同一条命令重建：平台 `-f docker-compose.yml -f deploy/compose.jd-link.yml up -d`，jd `./start.sh nightjar` |
 | `network jd-nightjar not found` | 先起了 nightjar | 先 `cd <jd> && ./start.sh link`（或 `nightjar`），再起平台 |
 | 平台显示「内置模拟器」 | `MWOPS_PROMETHEUS_BASE_URL` 空或不通 | 按接入方式设为 `http://prometheus:9090` 或 `http://jd-prometheus:9090` |
 | 有实例但指标全 0 / unknown | `job_up=null`：job 未配置；`job_up=0`：Exporter 抓取失败；`job_up=1` 且 `matched=0`：标签对不上 | 依次看「接入自检」的提示；名称必须等于 `instance_name` |
 | 趋势图有曲线但数值很"整" | 修复前历史查询会用模拟器补齐空结果 | 升级后用「接入自检」确认 `source=prometheus` 且 `matched>0` |
 | Redis 指标全无（方式二） | Redis 开了 `requirepass` 但 Exporter 没拿到口令 | 核对 jd `.env` 的 `REDIS_PASSWORD` 与 redis-exporter 环境变量 |
 | mysqld-exporter 认证失败 | 账号未建或口令不一致 | `./start.sh nightjar-initdb`；核对 `.env` 与 `01-monitor-user.sql` |
-| 平台启动报端口占用 | 两边 Prometheus 都占 9090 | 见 1.1 节，给 nightjar 设 `PROMETHEUS_PORT=9091` |
+| 平台启动报端口占用 | 两边 Prometheus 都想绑同一个宿主端口 | 按 1.1 节让两边错开：jd `PROMETHEUS_PORT=9091`、nightjar `PROMETHEUS_PORT=9090` |
 | 实例状态「连接失败」 | TCP 探测不通 | 方式一/二都需 `jd-nightjar` 网络；`docker exec mwops-backend getent hosts jd-redis` |
 | 日志页完全没有事件 | 没启用 logs profile，或令牌不一致 | `./start.sh nightjar-logs`；两侧 `HOOK_TOKEN` 对齐；`docker logs jd-log-agent` |
 | 日志上报 `HTTP=000` | Agent 连不上平台 | 确认 Agent 在 `jd-nightjar` 内、`NIGHTJAR_URL` 为 `http://mwops-backend:8080` |
@@ -581,6 +668,107 @@ FEISHU_WEBHOOK=<webhook>
 | 集成中心提示「仅生成配置」 | 未开 `INTEGRATION_DOCKER_ENABLED` 或没挂 docker.sock | 按 3.1 节开启，或直接用渲染出的 compose/`docker run` 人工执行 |
 | 集成保存成功但没指标 | 服务发现未到期 / Prometheus 拉不到平台接口 | 等 30s；`curl -s http://127.0.0.1:8000/api/sd/integrations`；`docker exec mwops-prometheus wget -qO- http://backend:8080/api/sd/integrations` |
 | Exporter 起来了但 `up=0`（方式一） | Exporter 连不上 jd 的库 | 核对 `INTEGRATION_EXPORTER_NETWORK` 是否含 `jd-nightjar`；`docker inspect mwops-exporter-jd-redis \| grep -A5 Networks` |
+
+### 8.1 网络不一致 / 配置不一致：跑一次一键脚本
+
+```bash
+cd <nightjar>
+pwsh -File scripts/setup-jd-link.ps1 -DryRun     # 先看它会改什么（不写文件、不调 docker）
+pwsh -File scripts/setup-jd-link.ps1             # 执行：修 .env → 修派生文件 → 修网络 → 重建两栈 → 体检
+pwsh -File scripts/setup-jd-link.ps1 -FixInstances   # 顺带纠正 prom_job / 实例名
+```
+
+它内部等价于下面这些手工步骤（需要单独排查时再逐条执行）：
+
+```bash
+# ① 确认跨栈网络存在且是 internal
+docker network ls | grep -E 'jd-nightjar|jd-data|mwops'
+docker network inspect jd-nightjar --format '{{.Internal}}'          # 期望 true
+
+# ② 平台侧：带 overlay 重建（backend 获得 jd-nightjar，顺带修好 prometheus 缺失的网络）
+cd <nightjar>
+grep -E '^(MWOPS_PROMETHEUS_BASE_URL|PROMETHEUS_PORT|HOOK_TOKEN)=' .env
+docker compose -f docker-compose.yml -f deploy/compose.jd-link.yml up -d --build --force-recreate
+
+# ③ jd 侧：按取数方式重建（不要手工连网络）
+cd <jd>
+docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml --profile logs up -d --build
+
+# ④ 清掉历史遗留的手工网络
+docker network disconnect middleware-ops_mwops jd-redis-exporter 2>/dev/null || true
+
+# ⑤ 体检 + 实测
+pwsh -File <nightjar>/scripts/doctor-jd-link.ps1
+docker exec mwops-backend getent hosts jd-prometheus jd-mysql jd-redis
+docker exec jd-log-agent  getent hosts mwops-backend
+```
+
+重建后 `docker ps` 应满足 1.4 的期望拓扑：`mwops-backend` 在 `middleware-ops_mwops,middleware-ops_jd-nightjar`（或 `jd-nightjar`）上，`mwops-prometheus` 在 `middleware-ops_mwops` 上。
+
+### 8.2 jd-mysqld-exporter 反复重启（Restarting (1)）
+
+先明确一点：它在 `jd_jd-data` 上与 `mysql` 同网，**能连通**，所以这不是网络问题。
+
+```bash
+docker logs --tail 50 jd-mysqld-exporter       # 关键错误通常在最后几行
+
+# 常见 1：账号不存在或口令不一致（Access denied for user 'exporter'@...）
+cd <jd>
+set -a; . ./.env; set +a
+./start.sh nightjar-initdb                     # 期望：>> monitor user ready
+docker compose exec -T mysql mysql -uroot -p"$DB_PASS" -e \
+  "SELECT user,host,plugin FROM mysql.user WHERE user='exporter';"
+docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml \
+  up -d --force-recreate mysqld-exporter
+
+# 常见 2：口令含 @ ( ) / 等特殊字符 → DSN 解析失败（invalid DSN / parse error）
+#   改用 my.cnf 挂载：注释掉 docker-compose.jd.yml 的 DATA_SOURCE_NAME，
+#   启用 deploy/jd-exporters/my.cnf（口令写进 [client] 段），详见该文件头部注释。
+
+# 常见 3：MySQL 尚未就绪（connection refused）
+docker inspect -f '{{.State.Health.Status}}' interview-mysql   # 等 healthy 后重启 Exporter
+```
+
+修好后 `mysql_up` 才会变 1，平台上的 `jd-mysql` 实例才会有指标。
+
+### 8.3 `up=1` 但 `matched=0`：三步定位到底是哪台 Prometheus 的哪个标签
+
+这条报错有三类完全不同的原因，**先定位是哪一类，再动手**：
+
+```bash
+# ① 平台查的到底是哪台 Prometheus？（最常见的原因就是这里指错了）
+docker inspect mwops-backend --format '{{range .Config.Env}}{{println .}}{{end}}' | grep MWOPS_PROMETHEUS_BASE_URL
+#   http://jd-prometheus:9090  → 方式二，查 jd 的 Prometheus
+#                                 宿主端口 = <jd>/.env 的 PROMETHEUS_PORT（本仓库示例 9091）
+#   http://prometheus:9090     → 查平台自带的
+#                                 宿主端口 = <nightjar>/.env 的 PROMETHEUS_PORT（示例 9090）
+#   ⚠️ 两个端口别搞反：查错机器会得到"up=1 但标签对不上"这种极具误导性的结果
+
+# ② 那台 Prometheus 上，该 job 的真实标签值是什么？（把 <PORT> 换成①对应的宿主端口）
+curl -sG --data-urlencode 'match[]=up{job="middleware-exporter-redis"}' \
+  'http://127.0.0.1:<PORT>/api/v1/label/instance_name/values'
+#   {"data":["jd-redis"]}      → 标签正常，问题在平台实例名/选择器
+#   {"data":[]}                → 该 job 没有 instance_name 标签 → 抓取配置缺 relabel（见下面 ③）
+#   {"data":["redis-dev-01"]}  → 平台正在查自己那台 Prometheus 的示例 job（典型"指错了"）
+
+# ③ 该 job 最终标签全貌 + 当前生效的抓取配置（确认 relabel 到底有没有加载）
+curl -sG --data-urlencode 'match[]=up{job="middleware-exporter-redis"}' \
+  'http://127.0.0.1:<PORT>/api/v1/label/instance/values'
+curl -s 'http://127.0.0.1:<PORT>/api/v1/status/config' | grep -A3 instance_name
+```
+
+对策：
+
+| ①的输出 | ②的输出 | 结论与处理 |
+|---|---|---|
+| `jd-prometheus` | `["jd-redis"]` | 标签没问题 → 检查平台实例名是否被改过、`prom_instance` 是否被误填（填了它实例名就不参与匹配） |
+| `jd-prometheus` | `[]` | 正在跑的 Prometheus 加载的配置里没有 relabel：确认 jd 用 `./start.sh nightjar` 启动，且改过 `prometheus-jd.yml` 后**重建了容器**（`docker compose -f docker-compose.yml -f deploy/jd-exporters/docker-compose.jd.yml up -d --force-recreate prometheus`）。应急：把「Prometheus instance」填成 ③ 输出的值（如 `redis-exporter:9121`） |
+| `prometheus`（平台自带） | `["redis-dev-01"]` 等 | 平台连错了数据源：`.env` 改成 `MWOPS_PROMETHEUS_BASE_URL=http://jd-prometheus:9090` 后重建 backend；或把实例名改成那台 Prometheus 里实际的值 |
+| 任意 | 报错/超时 | `docker exec mwops-backend wget -qO- <base_url>/-/healthy` 验证连通性 |
+
+> 平台自带 Prometheus 的默认抓取配置里，示例 Exporter job 已**默认注释**——
+> 之前它们带着硬编码的 `instance_name: redis-dev-01` 且 up=0，一旦有同名容器被手工接入
+> 平台网络就会"看似抓到了"，很容易把"指错了数据源"误判成"relabel 没生效"。
 
 ---
 
@@ -623,7 +811,7 @@ cd <nightjar> && docker compose down -v
 | `JD_NIGHTJAR_NETWORK` |  | 跨项目网络名，默认 `jd-nightjar` |
 | `NIGHTJAR_URL` |  | 日志上报地址，同机用 `http://mwops-backend:8080` |
 | `NIGHTJAR_HOOK_TOKEN` | ✅ | 必须等于 nightjar 的 `HOOK_TOKEN` |
-| `PROMETHEUS_PORT` / `GRAFANA_PORT` / `WEB_PORT` / `BACKEND_PORT` |  | 同机部署注意 9090 冲突 |
+| `PROMETHEUS_PORT` / `GRAFANA_PORT` / `WEB_PORT` / `BACKEND_PORT` |  | 同机部署时必须与 nightjar 的端口错开（示例：jd 9091 / nightjar 9090） |
 | `SERVER_NAME` / `LOG_TARGETS` |  | 可选，不在 `.env.example` 中，需要时追加 |
 
 **nightjar 侧（`<nightjar>/.env`）**
@@ -634,7 +822,7 @@ cd <nightjar> && docker compose down -v
 | `HOOK_TOKEN` | ✅ | 与 jd 的 `NIGHTJAR_HOOK_TOKEN` 相同 |
 | `JD_NIGHTJAR_NETWORK` |  | 默认 `jd-nightjar` |
 | `MWOPS_PROMETHEUS_BASE_URL` | ✅ | 方式一 `http://prometheus:9090`；方式二 `http://jd-prometheus:9090` |
-| `PROMETHEUS_PORT` |  | 同机部署改 `9091` 避让 jd |
+| `PROMETHEUS_PORT` |  | 与 jd 的错开（示例 9090；jd 用 9091） |
 | `INTEGRATION_ENABLED` / `INTEGRATION_JOB_NAME` / `INTEGRATION_AUTO_RULES` |  | 集成中心开关与抓取任务名 |
 | `INTEGRATION_DOCKER_ENABLED` / `INTEGRATION_DOCKER_HOST` |  | 一键拉起 Exporter（需挂 docker.sock） |
 | `INTEGRATION_EXPORTER_NETWORK` |  | 多网络：`middleware-ops_mwops,jd-nightjar` |

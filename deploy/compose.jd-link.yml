@@ -16,6 +16,18 @@
 # 前置：jd 侧已执行 ./start.sh nightjar（该脚本会以 --internal 创建 jd-nightjar）。
 #       网络不存在时本文件会启动失败——这是有意的，避免退化成非隔离的普通桥接网。
 #
+# ---- 网络不一致是本接入最常见的故障（先看这里）-----------------------------
+#   本 overlay 是**必须**的：没有它，mwops-backend 不在 jd-nightjar 上，会同时出现
+#     「指标为空」+「实例探测连接失败」+「日志一条不来」三种现象，而 UI 只显示"没有数据"。
+#   两种取数方式对网络的要求不同：
+#     方式二（默认）：平台查 http://jd-prometheus:9090，Exporter 由 jd 侧提供，
+#                     只需 mwops-backend 在本网络上；
+#     方式一（集成中心）：Exporter 由平台拉起，会自动加入 mwops + jd-nightjar 两张网，
+#                     平台自带的 Prometheus 在 mwops 上即可抓到。
+#   注意：mwops-prometheus 不在本网络上（保持最小可见面）。
+#
+#   体检：pwsh -File scripts/doctor-jd-link.ps1（逐条对照期望拓扑并给出修复命令）
+#
 # 用法（在 nightjar 项目根目录执行）：
 #   cp .env.example .env        # 至少设置 JWT_SECRET / ADMIN_PASSWORD / HOOK_TOKEN
 #   docker compose -f docker-compose.yml -f deploy/compose.jd-link.yml up -d --build

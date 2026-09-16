@@ -137,6 +137,22 @@ func run(configPath string) error {
 	mon := monitor.New(cfg, cacheDeps.Store, log)
 	log.Info("监控数据源已就绪", zap.String("source", mon.Kind()))
 
+	// 启动期连通性预检：跨栈部署里最常见的故障是网络没接对
+	// （例如平台没带 deploy/compose.jd-link.yml 启动，容器解析不了 jd-prometheus），
+	// 此时页面只会显示"没有数据"，排查方向完全靠猜。这里把结论直接写进启动日志。
+	if mon.Kind() == "prometheus" {
+		if mon.Healthy(ctx) {
+			log.Info("监控数据源连通性正常", zap.String("base_url", cfg.Prometheus.BaseURL))
+		} else {
+			log.Warn("监控数据源不可达，指标查询将回退内置模拟器",
+				zap.String("base_url", cfg.Prometheus.BaseURL),
+				zap.String("hint", "跨栈部署请确认平台用 deploy/compose.jd-link.yml 启动"+
+					"（mwops-backend 必须在跨栈网络上），并核对 MWOPS_PROMETHEUS_BASE_URL 与 PROMETHEUS_PORT"))
+		}
+	} else if mon.Kind() == "simulator" {
+		log.Warn("未配置 prometheus.base_url：监控页面展示的是内置模拟数据，不是真实指标")
+	}
+
 	// 服务容器
 	deps, err := service.NewContainer(service.ContainerOptions{
 		Config:        cfg,

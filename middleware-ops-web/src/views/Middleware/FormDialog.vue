@@ -28,6 +28,8 @@ const testing = ref(false)
 const testResult = ref<TestResult | null>(null)
 const types = ref<{ value: string; label: string; port: number; phase: number }[]>([])
 const groups = ref<string[]>([])
+/** Prometheus 中实际存在的 job 名：直接给候选，避免把容器名当 job 名填。 */
+const promJobs = ref<string[]>([])
 const environments = ref<{ value: string; label: string }[]>([
   { value: 'dev', label: '开发' },
   { value: 'staging', label: '预发' },
@@ -138,6 +140,11 @@ async function handleSubmit(): Promise<void> {
       prom_job: form.prom_job,
       prom_instance: form.prom_instance,
     }
+    // 编辑时回传原有 config：后端在缺省时也会保留，但显式回传能避免误清空
+    // （集成中心创建的实例，其 config.integration 丢失后会从集成列表里消失）。
+    if (isEdit.value && props.instance?.config) {
+      payload.config = props.instance.config
+    }
     if (form.password) {
       payload.password = form.password
     }
@@ -168,6 +175,7 @@ watch(
       const options = await middlewareApi.options()
       types.value = options.types
       groups.value = options.groups
+      promJobs.value = options.prom_jobs || []
       if (options.environments?.length) {
         environments.value = options.environments.map((value) => ({
           value,
@@ -238,13 +246,32 @@ watch(
         </el-col>
         <el-col :xs="24" :sm="12">
           <el-form-item label="Prometheus job（可选）">
-            <el-input v-model="form.prom_job" placeholder="默认 exporter-job-<类型>" />
+            <el-select
+              v-model="form.prom_job"
+              class="mobile-block"
+              filterable
+              allow-create
+              clearable
+              default-first-option
+              :placeholder="promJobs.length ? '从 Prometheus 现有 job 中选择' : '默认 middleware-exporter-<类型>'"
+            >
+              <el-option v-for="job in promJobs" :key="job" :label="job" :value="job" />
+            </el-select>
           </el-form-item>
+          <p class="field-hint">
+            这里填的是 <span class="mono">prometheus.yml</span> 里的 job_name（如
+            <span class="mono">middleware-exporter-redis</span>），<b>不是容器名</b>（如
+            <span class="mono">jd-redis-exporter</span>）。留空则按前缀自动匹配。
+          </p>
         </el-col>
         <el-col :xs="24" :sm="12">
           <el-form-item label="Prometheus instance（可选）">
-            <el-input v-model="form.prom_instance" placeholder="如 10.0.0.1:6379" />
+            <el-input v-model="form.prom_instance" placeholder="如 10.0.0.1:6379；与实例名二选一" />
           </el-form-item>
+          <p class="field-hint">
+            填了它就用 <span class="mono">instance</span> 标签匹配，<b>实例名称不再参与</b>。
+            jd 这类自建 Exporter 只上报 <span class="mono">instance_name</span>，请留空。
+          </p>
         </el-col>
         <el-col :span="24">
           <el-form-item label="标签">
@@ -281,6 +308,13 @@ watch(
 </template>
 
 <style scoped>
+.field-hint {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--c-text-muted);
+}
+
 .test-result {
   display: flex;
   align-items: center;

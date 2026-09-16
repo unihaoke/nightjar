@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -72,6 +73,46 @@ func (p *promClient) Healthy(ctx context.Context) bool {
 
 // Selector 返回该实例的 PromQL 标签匹配串（实现 SelectorReporter）。
 func (p *promClient) Selector(target Target) string { return buildSelector(target, p.jobPrefix) }
+
+// LabelValues 查询标签取值（实现 LabelReporter）。
+//
+// 走 GET /api/v1/label/<label>/values，可带 match[] 限定序列范围。
+// 结果截断到 maxLabelValues 条：只用于给使用者提示，不需要全量。
+func (p *promClient) LabelValues(ctx context.Context, label string, matchers ...string) ([]string, error) {
+	trimmed := strings.TrimSpace(label)
+	if trimmed == "" {
+		return nil, fmt.Errorf("标签名不能为空")
+	}
+	params := url.Values{}
+	for _, matcher := range matchers {
+		if strings.TrimSpace(matcher) != "" {
+			params.Add("match[]", matcher)
+		}
+	}
+	body, err := p.do(ctx, "/api/v1/label/"+url.PathEscape(trimmed)+"/values", params)
+	if err != nil {
+		return nil, err
+	}
+	var parsed struct {
+		Status string   `json:"status"`
+		Error  string   `json:"error"`
+		Data   []string `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("解析标签取值失败: %w", err)
+	}
+	if parsed.Status != "success" {
+		return nil, fmt.Errorf("prometheus 返回 %s: %s", parsed.Status, parsed.Error)
+	}
+	sort.Strings(parsed.Data)
+	if len(parsed.Data) > maxLabelValues {
+		parsed.Data = parsed.Data[:maxLabelValues]
+	}
+	return parsed.Data, nil
+}
+
+// maxLabelValues 限制标签取值返回条数（避免把几百个序列刷到前端）。
+const maxLabelValues = 50
 
 // Snapshot 采集实例当前指标。
 //

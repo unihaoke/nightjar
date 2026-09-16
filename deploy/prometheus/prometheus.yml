@@ -3,9 +3,12 @@
 # 职责（设计文档 4.2）：平台自身不实现采集器，指标统一由 Prometheus + 官方 Exporter
 # 采集，平台通过 PromQL 查询。本文件负责：
 #   1. 抓取平台自身指标（/metrics，见 10. 平台自身可观测性）；
-#   2. 抓取被管中间件的官方 Exporter（按 job 命名约定 middleware-exporter-<类型>，
-#      与 config.prometheus.exporter_job_prefix 对应）；
+#   2. 抓取「集成中心」创建的集成（middleware-integration，http_sd 服务发现）；
 #   3. 加载告警规则（触发后通过 webhook 推送到平台 /api/hooks/alerts）。
+#
+# 注意：被管中间件的官方 Exporter 默认不在这里配置（见文件末尾的说明与示例）；
+# 平台自带 Exporter 的场景请用 deploy/compose.middleware-exporters.yml 启动，
+# 它会把本文件整体替换为 prometheus.with-exporters.yml。
 
 global:
   scrape_interval: 30s
@@ -51,44 +54,28 @@ scrape_configs:
       - url: http://backend:8080/api/sd/integrations
         refresh_interval: 30s
 
-  # Redis Exporter（示例：按实际部署替换 targets）
-  - job_name: middleware-exporter-redis
-    static_configs:
-      - targets: ['redis-exporter:9121']
-        labels:
-          instance_name: redis-dev-01
+  # ---------------------------------------------------------------------------
+  # 被管中间件的官方 Exporter（示例，默认全部注释）
+  #
+  # 为什么默认注释掉：这些 job 指向的 Exporter 服务并不在基础 docker-compose.yml 里，
+  # 开着它们只会得到一批 up=0 的 target；更麻烦的是它们带着硬编码的 instance_name
+  # （redis-dev-01 / mysql-dev-01），一旦有同名容器被手工接入本网络就会"看似抓到了"，
+  # 但标签值与平台实例名对不上——排查时会误以为是 relabel 没生效。
+  #
+  # 需要平台自带 Exporter 时，用 deploy/compose.middleware-exporters.yml 启动，
+  # 它会把抓取配置整体换成 deploy/prometheus/prometheus.with-exporters.yml（各 job 带 relabel）。
+  # 集成中心创建的集成走上面的 middleware-integration（http_sd），不依赖这里。
+  #
+  # - job_name: middleware-exporter-redis
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
+  #       labels:
+  #         instance_name: redis-dev-01
+  #
+  # - job_name: middleware-exporter-mysql
+  #   static_configs:
+  #     - targets: ['mysqld-exporter:9104']
+  #       labels:
+  #         instance_name: mysql-dev-01
+  # ---------------------------------------------------------------------------
 
-  # MySQL Exporter
-  - job_name: middleware-exporter-mysql
-    static_configs:
-      - targets: ['mysqld-exporter:9104']
-        labels:
-          instance_name: mysql-dev-01
-
-  # PostgreSQL Exporter
-  - job_name: middleware-exporter-pg
-    static_configs:
-      - targets: ['postgres-exporter:9187']
-        labels:
-          instance_name: pg-dev-01
-
-  # Kafka Exporter
-  - job_name: middleware-exporter-kafka
-    static_configs:
-      - targets: ['kafka-exporter:9308']
-        labels:
-          instance_name: kafka-dev-01
-
-  # Elasticsearch Exporter
-  - job_name: middleware-exporter-es
-    static_configs:
-      - targets: ['es-exporter:9114']
-        labels:
-          instance_name: es-dev-01
-
-  # Nginx Exporter
-  - job_name: middleware-exporter-nginx
-    static_configs:
-      - targets: ['nginx-exporter:9113']
-        labels:
-          instance_name: nginx-dev-01

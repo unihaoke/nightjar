@@ -186,7 +186,14 @@ func (s *MiddlewareService) Update(ctx context.Context, id int64, in MiddlewareI
 	}
 	item.GroupName = in.GroupName
 	item.Tags = model.JSONStringSlice(in.Tags)
-	item.Config = model.JSONMap(in.Config)
+	// 表单未提交 config 时保持原值。
+	//
+	// 不能无条件覆盖：纳管页面并不提交 config，一次"编辑"就会把实例的配置备注清空；
+	// 对「集成中心」创建的实例更严重——Config.integration 被清掉后，该实例会从
+	// 集成列表里消失（只剩一个纳管实例），排查时表现为"集成莫名不见了"。
+	if in.Config != nil {
+		item.Config = model.JSONMap(in.Config)
+	}
 	item.PromJob = in.PromJob
 	item.PromInstance = in.PromInstance
 

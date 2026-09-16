@@ -70,6 +70,8 @@ export const middlewareApi = {
       groups: string[]
       environments: string[]
       status_options: { value: number; label: string }[]
+      /** Prometheus 中实际存在的 job 名（查不到时为空数组）。 */
+      prom_jobs?: string[]
     }>('/api/middlewares/options'),
   create: (payload: MiddlewareInput) => post<MiddlewareInstance>('/api/middlewares', payload),
   update: (id: number, payload: MiddlewareInput) => put<MiddlewareInstance>(`/api/middlewares/${id}`, payload),

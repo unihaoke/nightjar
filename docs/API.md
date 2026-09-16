@@ -67,16 +67,98 @@
 
 ---
 
-## 3. 统一监控（4.2）
+## 2.5 集成中心（对齐云厂商控制台的「一键集成」）
 
+| 方法 | 路径 | 权限点 | 级别 | 说明 |
+|------|------|--------|------|------|
+| GET | `/api/sd/integrations` | **公开**（可选 `integration.sd_token`） | — | Prometheus `http_sd_configs` 服务发现文档（只含地址与标签，不含口令） |
+| GET | `/api/integrations/overview` | `middleware:read` | L0 | 组件模板 + 已集成数量 + 产物路径 + 一键部署可用性 |
+| GET | `/api/integrations` | `middleware:read` | L0 | 集成列表 |
+| GET | `/api/integrations/:id` | `middleware:read` | L0 | 集成详情（含 Exporter 容器状态与查询选择器） |
+| POST | `/api/integrations/preview` | `middleware:read` | L0 | **只渲染不落库**：服务发现 JSON / 显式 job / compose / docker run / 核对步骤 |
+| POST | `/api/integrations` | `middleware:write` | L1 | 新建集成：纳管实例 + 服务发现更新 + 可选拉起容器 + 可选推荐告警规则 |
+| PUT | `/api/integrations/:id` | `middleware:write` | L1 | 更新集成（改名会同步 instance_name 标签） |
+| POST | `/api/integrations/:id/apply` | `middleware:write` | L1 | 重新应用：重写产物 + 重建 Exporter 容器 |
+| DELETE | `/api/integrations/:id` | `middleware:write` | L1 | 删除集成（同时移除抓取目标与容器；历史告警/诊断保留） |
+
+请求体与「中间件纳管」的字段一致，另加集成专属字段：
+
+```json
+{
+  "name": "jd-redis",
+  "mw_type": "redis",
+  "address": "jd-redis:6379",
+  "username": "monitor",
+  "password": "******",
+  "environment": "dev",
+  "group_name": "interview",
+  "labels": { "team": "interview" },
+  "options": { "REDIS_EXPORTER_EXCLUDE_SLOWLOG_METRICS": "true" },
+  "deploy": true,
+  "auto_rules": true
+}
+```
+
+约定（与 `internal/integration` 一一对应）：
+
+- `name` 唯一，且是 Prometheus 的 `instance_name` 标签值（平台按它定位指标）；
+- `options` 的键必须来自模板声明（`GET /api/integrations/overview` 的 `templates[].options`），
+  `target=env` 落成环境变量、`target=arg` 落成命令行开关，未知键一律拒绝；
+- `labels` 不允许覆盖 `job`/`instance`/`instance_name`/`mw_type`；
+- 集成产物同时是一个纳管实例，`prom_job` 自动写为服务发现抓取任务名（默认 `middleware-integration`），
+  `prom_instance` 恒为空。
+
+`GET /api/sd/integrations` 是 Prometheus `http_sd_configs` 的服务发现文档，形如：
+
+```json
+[
+  {
+    "targets": ["mwops-exporter-jd-redis:9121"],
+    "labels": { "instance_name": "jd-redis", "mw_type": "redis", "env": "dev", "team": "interview" }
+  }
+]
+```
+
+它注册在鉴权组之外（Prometheus 无法携带用户 JWT），只暴露地址与标签、**不含任何口令**；
+需要收紧时设置 `integration.sd_token`，Prometheus 侧用 `...?token=<令牌>` 访问。
+
+---
+
+## 3. 统一监控（4.2）
 | 方法 | 路径 | 权限点 | 级别 | 说明 |
 |------|------|--------|------|------|
 | GET | `/api/metrics/catalog` | `monitor:read` | L0 | 指标目录（可按 `mw_type` 过滤） |
 | GET | `/api/metrics/compare` | `monitor:read` | L0 | 多实例对比（`metric` + `instance_ids`） |
 | GET | `/api/metrics/:id` | `monitor:read` | L0 | 当前指标快照（含阈值与状态判定） |
 | GET | `/api/metrics/:id/history` | `monitor:read` | L0 | 历史趋势（`metric`、`hours` 或 `start/end/step_seconds`） |
+| GET | `/api/metrics/:id/diagnose` | `monitor:read` | L0 | **接入自检**：选择器、job 抓取状态、逐条指标命中情况与排查建议 |
 
 指标全部来自 Prometheus（PromQL 查询），平台不建自有指标表；未配置 `prometheus.base_url` 时回退内置确定性模拟器，响应中 `source` 字段区分来源、`degraded` 标识降级。
+
+**降级与空结果的边界（务必按此实现扩展）**：
+
+- 只有 Prometheus **不可达/协议错误**（全部指标查询失败）才降级为模拟器；
+- Prometheus 正常响应但选择器一条时序都没匹配到时，如实返回空快照，并在 `snapshot.note` 写明原因，
+  **绝不用模拟数据补齐**——否则前端会画出似是而非的曲线，把接入错误掩盖掉；
+- 快照附带 `selector`、`matched` / `total`、`job_up` 三个诊断字段：
+  `job_up = null` 表示该 job 未被 Prometheus 配置，`job_up = 0` 表示 target 抓取失败，
+  `job_up = 1` 但 `matched = 0` 则是实例名与 `instance_name` 标签对不上。
+
+`GET /api/metrics/:id/diagnose` 响应示例（回答「为什么新增实例后没有监控/日志」）：
+
+```json
+{
+  "selector": "job=\"middleware-exporter-redis\",instance_name=\"jd-redis\"",
+  "job_up": 1,
+  "matched": 0,
+  "total": 8,
+  "monitor_kind": "prometheus",
+  "prometheus_healthy": true,
+  "note": "Prometheus 已正常抓取 job=\"middleware-exporter-redis\"（up=1），但选择器 {...} 匹配不到时序…",
+  "hints": ["抓取正常但标签对不上：把平台「实例名称」改成与 Prometheus 标签 instance_name 完全一致的值…"],
+  "log_checklist": ["日志告警与中间件实例是两条独立链路：日志按「服务器 + 服务名」归集，纳管 MySQL/Redis 实例不会产生任何日志事件。"]
+}
+```
 
 ---
 

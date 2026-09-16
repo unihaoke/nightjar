@@ -179,6 +179,8 @@ func (h *Handler) MiddlewareOptions(c *gin.Context) {
 	}
 	response.OK(c, gin.H{
 		"types": types, "groups": groups, "environments": envs,
+		// Prometheus 中实际存在的 job 名：表单直接给候选，避免把容器名当 job 名填。
+		"prom_jobs": h.deps.Metrics.PrometheusJobs(c.Request.Context()),
 		"status_options": []map[string]any{
 			{"value": 1, "label": "在线"}, {"value": 0, "label": "离线"},
 		},

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 
 	"go.uber.org/zap"
 
@@ -93,4 +94,16 @@ func (f *fallbackClient) Selector(target Target) string {
 		return reporter.Selector(target)
 	}
 	return ""
+}
+
+// LabelValues 透传标签取值查询（实现 LabelReporter）。
+//
+// 模拟器没有标签体系，因此这里只转发主客户端；主客户端不可用时返回错误，
+// 由调用方降级为"无法列出候选值"（自检提示仍然可用）。
+func (f *fallbackClient) LabelValues(ctx context.Context, label string, matchers ...string) ([]string, error) {
+	reporter, ok := f.primary.(LabelReporter)
+	if !ok {
+		return nil, fmt.Errorf("当前监控数据源不支持标签取值查询")
+	}
+	return reporter.LabelValues(ctx, label, matchers...)
 }

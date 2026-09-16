@@ -135,6 +135,17 @@ type SelectorReporter interface {
 	Selector(target Target) string
 }
 
+// LabelReporter 由能查询标签取值的客户端实现，用于把「Prometheus 里实际有什么」
+// 回给使用者。
+//
+// 典型场景：纳管时把容器名（jd-redis-exporter）当成 job 名填进 prom_job，
+// 于是选择器永远为空。此时最有用的不是"查不到"，而是"Prometheus 里的 job 是这几个、
+// 该 job 下的实例标签是这几个"。
+type LabelReporter interface {
+	// LabelValues 返回某标签的全部取值；matchers 为可选的序列选择器（match[]）。
+	LabelValues(ctx context.Context, label string, matchers ...string) ([]string, error)
+}
+
 // Client 是监控查询接口。
 type Client interface {
 	// Snapshot 采集某实例的当前指标。

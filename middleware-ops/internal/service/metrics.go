@@ -238,6 +238,9 @@ func (s *MetricsService) Diagnose(ctx context.Context, instanceID int64, scope S
 	}
 
 	result.Hints = append(result.Hints, diagnoseHints(item, result)...)
+	// 把「Prometheus 里实际有什么」补进来：报错只说"未匹配到任何时序"时，
+	// 使用者最需要的是下面这份可选项（job 名 / instance_name 取值）。
+	result.Hints = append(result.Hints, s.augmentLabelHints(ctx, item, result)...)
 	return result, nil
 }
 
@@ -293,4 +296,25 @@ func (s *MetricsService) MonitorKind() string {
 		return "none"
 	}
 	return s.monitor.Kind()
+}
+
+// PrometheusJobs 返回 Prometheus 中已存在的 job 名，供纳管表单直接选择。
+//
+// 目的：把「job 名靠猜」变成「从列表里选」。纳管时最容易踩的坑就是把容器名
+// （jd-redis-exporter）当成 job 名（middleware-exporter-redis）填进去。
+// 查询失败或超时不阻塞表单，返回空列表即可（前端退化为手工输入）。
+func (s *MetricsService) PrometheusJobs(ctx context.Context) []string {
+	reporter, ok := s.monitor.(monitor.LabelReporter)
+	if !ok {
+		return nil
+	}
+	// 表单是同步请求，这里给一个比 prometheus.timeout 更短的预算。
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	jobs, err := reporter.LabelValues(probeCtx, "job")
+	if err != nil {
+		s.log.Debug("查询 Prometheus job 列表失败（表单将退化为手工输入）", zap.Error(err))
+		return nil
+	}
+	return jobs
 }
