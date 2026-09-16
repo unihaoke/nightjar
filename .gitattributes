@@ -1,0 +1,21 @@
+# 行尾规范化
+#
+# 背景：仓库未统一行尾，Windows 上 core.autocrlf=true 会把文件检出为 CRLF。
+# 以下文件会在 Linux 容器内执行或被容器读取，CRLF 会导致：
+#   - *.sh   → `#!/bin/sh\r` 解释器找不到，脚本直接失败
+#   - *.cnf / *.sql → MySQL / mysqld-exporter 解析异常
+# 因此强制 LF：入库与检出都用 LF，与平台无关。
+
+*.sh    text eol=lf
+*.cnf   text eol=lf
+*.sql   text eol=lf
+Dockerfile* text eol=lf
+
+# compose / prometheus 配置保持 LF，避免容器内解析差异
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Windows 脚本保留 CRLF（PowerShell 需要 BOM/CRLF 才能正确执行）
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf

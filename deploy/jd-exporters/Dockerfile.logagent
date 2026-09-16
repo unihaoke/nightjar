@@ -12,7 +12,9 @@ FROM alpine:3.20
 RUN apk add --no-cache curl
 
 COPY log-shipper.sh /shipper/log-shipper.sh
-RUN chmod +x /shipper/log-shipper.sh
+# 去掉可能的 CRLF：Windows 上 core.autocrlf=true 会把脚本检出为 CRLF，
+# 直接拷进镜像会导致 `#!/bin/sh\r` 找不到解释器。这里兜底统一成 LF。
+RUN sed -i 's/\r$//' /shipper/log-shipper.sh && chmod +x /shipper/log-shipper.sh
 
 # 非 root 运行；日志卷以只读方式挂载，Agent 只需读取
 RUN addgroup -S mwops && adduser -S -G mwops mwops
