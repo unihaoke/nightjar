@@ -32,6 +32,8 @@ docker compose up -d --build
 
 包含组件：PostgreSQL 15 + pgvector、Redis 7、Prometheus、后端（Go）、Nginx + 前端静态资源。
 
+> 表结构由后端 `GORM AutoMigrate` 在启动时创建（`database.auto_migrate=true`）；`deploy/postgres/init/` 下的初始化脚本**只创建扩展与数据库参数，不建表**。请勿手工先建表：PostgreSQL 会把内联 `UNIQUE` 命名为 `users_username_key`，而 GORM 迁移列唯一性时期望 `uni_users_username`，`DropConstraint` 会报 `SQLSTATE 42704` 导致启动失败。需要手工建库的 DBA 场景请使用 `docs/SCHEMA.sql`（约束名已按 GORM 策略显式命名），并同时把 `auto_migrate` 置为 `false`。修复办法见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) 第 5.6 节。
+
 ### 2.2 本地开发
 
 前置：Go 1.23+、Node 20+、PostgreSQL 15（Redis / Prometheus 可缺省）。
@@ -111,7 +113,7 @@ npm run dev                                          # 监听 :5173
 │   ├── src/layouts/                # AppShell（桌面侧栏 ↔ 移动抽屉）
 │   ├── src/views/                  # 16 个页面（大盘/纳管/监控/AI/告警/知识库/…）
 │   └── src/styles/                 # 设计令牌 + 全局基础样式（深浅双主题）
-├── deploy/                         # Postgres 初始化与表结构、Prometheus 抓取与告警规则
+├── deploy/                         # Postgres 初始化（仅扩展/参数）、Prometheus 抓取与告警规则
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
 └── Makefile                        # 常用开发/部署命令
@@ -181,7 +183,8 @@ AI 同步/流式诊断与结构化输出校验、确定性缓存命中、告警�
 代码分析出网合规、修复预览 L2 判定、SQL 只读校验（含拒绝写操作）、审计哈希链校验、大盘与能力矩阵。
 
 单元测试重点覆盖**越权用例**（RBAC 权限点/级别、数据权限过滤、只读工具集强制）、**告警去重指纹**、
-**六道护栏**（预算截断、防死循环、SQL 校验、质量推测标注、成本缓存与配额）与**出网脱敏**。
+**六道护栏**（预算截断、防死循环、SQL 校验、质量推测标注、成本缓存与配额）、**出网脱敏**
+以及**数据库 schema 不变量**（唯一约束命名必须与 GORM 命名策略一致，防止 AutoMigrate 启动失败回归）。
 
 ---
 

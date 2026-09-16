@@ -25,7 +25,8 @@ services:
       TZ: UTC
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # 初始化脚本：创建扩展与索引（与后端 AutoMigrate 互补）
+      # 初始化脚本：仅创建扩展（pgvector / pg_trgm），不建表。
+      # 表结构由后端 GORM AutoMigrate 负责，避免两套建表来源产生唯一约束名冲突。
       - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-mwo} -d ${DB_NAME:-middleware_ops}']

@@ -211,6 +211,53 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/audit/verify
 | 前端刷新 404 | Nginx 未启用 history 回退（确认 `try_files $uri $uri/ /index.html`） |
 | SSE 诊断被截断 | 反向代理开启了缓冲；确认 `proxy_buffering off;` 且 `server.write_timeout=0` |
 | 审计校验失败 | 数据库被直接修改；用备份恢复并排查访问来源，`broken_id` 即首个异常位置 |
+| 后端启动报 `constraint "uni_users_username" ... does not exist (SQLSTATE 42704)` | 数据库里的唯一约束来自**非 GORM 来源**（手工执行过建表 SQL，或使用过早期版本的初始化脚本）。PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`，而 GORM 迁移列唯一性时期望 `uni_users_username`，`DropConstraint` 因找不到约束而报错。修复见下方 5.6 |
+
+### 5.6 数据库初始化职责划分（重要）
+
+**为什么会报 42704（已核对 GORM v1.25.x 源码）**
+
+- 模型用 `uniqueIndex` 标签声明唯一约束，AutoMigrate 通过 `NamingStrategy.IndexName` 创建唯一索引，名字是 `idx_<表>_<列>`；
+- 但迁移「列唯一性」时会走 `migrateColumnUnique`，用 `NamingStrategy.UniqueName` 生成 `uni_<表>_<列>` 并执行 `DropConstraint`；
+- 若数据库里的唯一约束由初始化脚本的内联 `UNIQUE` 建出，实际名字是 `<表>_<列>_key`，于是 `DROP CONSTRAINT "uni_users_username"` 直接报 42704 并使后端启动失败。
+
+**结论：表结构只能有一个来源。** 初始化脚本不建表，全部交给 GORM。
+
+| 来源 | 职责 | 是否建表 |
+|------|------|----------|
+| `deploy/postgres/init/01-extensions.sql` | 创建 pgvector / pg_trgm 扩展 | 否 |
+| `deploy/postgres/init/02-extensions-and-settings.sql` | 数据库级参数（时区、random_page_cost） | 否 |
+| 后端 `GORM AutoMigrate` | **全部业务表与索引（唯一权威）** | 是 |
+| `docs/SCHEMA.sql` | DBA 参考 / 手工建库（约束名已按 GORM 的 `uni_*` 策略显式命名） | 仅手工执行时 |
+
+**修复方式（二选一）**
+
+1. 开发/全新环境（推荐）：清掉旧数据卷重建，让 GORM 从零建表。
+   ```bash
+   docker compose down -v      # 注意：会删除数据库数据
+   docker compose up -d --build
+   ```
+2. 保留数据的生产环境：把 5 处唯一约束重命名成 GORM 期望的名字（`DBA` 操作，先在备库演练）。
+   ```sql
+   -- 先确认实际约束名（以 users 为例）
+   SELECT conname FROM pg_constraint
+   WHERE conrelid = 'users'::regclass AND contype = 'u';
+
+   ALTER TABLE users             RENAME CONSTRAINT users_username_key TO uni_users_username;
+   ALTER TABLE roles             RENAME CONSTRAINT roles_code_key     TO uni_roles_code;
+   ALTER TABLE approvals         RENAME CONSTRAINT approvals_ticket_id_key TO uni_approvals_ticket_id;
+   ALTER TABLE log_alert_events  RENAME CONSTRAINT log_alert_events_event_id_key TO uni_log_alert_events_event_id;
+   ALTER TABLE audit_snapshots   RENAME CONSTRAINT audit_snapshots_snapshot_date_key TO uni_audit_snapshots_snapshot_date;
+   ```
+   全部唯一约束的实际名字可一次查清：
+   ```sql
+   SELECT conrelid::regclass AS table_name, conname
+   FROM pg_constraint
+   WHERE contype = 'u' AND connamespace = 'public'::regnamespace
+   ORDER BY 1;
+   ```
+
+> 若选择手工建库（执行 `docs/SCHEMA.sql`），务必同时把配置项 `database.auto_migrate` 置为 `false`，避免 AutoMigrate 再去维护这套约束。
 
 ---
 
