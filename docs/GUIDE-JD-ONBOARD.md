@@ -113,6 +113,7 @@ cd <nightjar>
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 后端启动失败：`password authentication failed for user "mwo" (SQLSTATE 28P01)` | **Postgres 只在数据卷为空时应用 `POSTGRES_PASSWORD`**；卷早就初始化过，`setup` 脚本又轮换了 `.env` 的 `DB_PASSWORD`（旧版脚本的行为） | 重跑 `./scripts/setup-jd-link.sh`：第 5 步会用容器内 trust socket 把库内口令对齐到 `.env`（零数据损失）。详见 `OPERATIONS.md` §5.8 |
 | 集成报「无法确定目标所在网络」 | 地址里的名字与 docker 里的容器名/服务名/别名都不匹配，或平台没挂 docker.sock | 报错里会列出候选容器名；`./scripts/setup-jd-link.sh` 会自动放开 docker.sock |
 | 集成报「解析不了 jd-mysql / server misbehaving」 | 用的是**旧架构的人工别名**（jd 侧已不再提供） | 把地址改成容器名 `interview-mysql:3306` / `interview-redis:6379`，重新保存即可（平台会自动接入 `jd_jd-data`） |
 | 集成保存成功但指标为空（`job_up=0`） | Exporter 连不上目标：账号没建 / 口令不一致 / 目标容器没运行 | 列表里的「待处理」已写明 lastError；勾选代建账号可自动解决认证类问题 |

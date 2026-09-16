@@ -213,6 +213,8 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/audit/verify
 | 前端刷新 404 | Nginx 未启用 history 回退（确认 `try_files $uri $uri/ /index.html`） |
 | SSE 诊断被截断 | 反向代理开启了缓冲；确认 `proxy_buffering off;` 且 `server.write_timeout=0` |
 | 审计校验失败 | 数据库被直接修改；用备份恢复并排查访问来源，`broken_id` 即首个异常位置 |
+| 后端启动报 `password authentication failed for user "mwo" (SQLSTATE 28P01)` | 改过 `.env` 的 `DB_PASSWORD`，但数据卷早已初始化过（Postgres 只在空卷时应用该口令）。见 5.8 |
+| 后端启动报 `role "xxx" does not exist` | `DB_USER` 与数据卷初始化时不一致。见 5.8 |
 | 后端启动报 `constraint "uni_users_username" ... does not exist (SQLSTATE 42704)` | 数据库里的唯一约束来自**非 GORM 来源**（手工执行过建表 SQL，或使用过早期版本的初始化脚本）。PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`，而 GORM 迁移列唯一性时期望 `uni_users_username`，`DropConstraint` 因找不到约束而报错。修复见下方 5.6 |
 
 ### 5.6 数据库初始化职责划分（重要）
@@ -279,6 +281,42 @@ LINE 12: window INTEGER DEFAULT 5,
 - 已加入回归测试 `internal/model/schema_test.go`：`TestModelColumnsAvoidPostgresReservedKeywords` 与 `TestSchemaReferenceColumnsAvoidReserved` 会遍历全部模型列名与 `docs/SCHEMA.sql` 列名，禁止命中保留字表。新增模型字段时若误用保留字，`go test ./internal/model/` 会直接失败。
 
 若已有环境建过旧表结构，`alert_rules` 可能因该语法错误而**整表缺失**（初始化脚本是按语句逐条执行的，失败后该表不会存在）。请按 5.6 节的第 1 种方式清库重建，或单独补建该表并确认其唯一约束命名符合 `uni_*` 规则。
+
+### 5.8 数据库口令与数据卷的一致性（SQLSTATE 28P01）
+
+**记住一条规则：PostgreSQL 的 `POSTGRES_PASSWORD` 只在数据卷为空时生效。**
+
+数据卷 `middleware-ops_postgres-data` 一旦初始化完成，库里的口令就已经定死；
+此后无论怎么改 `.env` 的 `DB_PASSWORD`，Postgres 都不会重新应用它，表现为后端启动即失败：
+
+```
+初始化数据库: open postgres: failed to connect to `host=postgres user=mwo database=middleware_ops`:
+failed SASL auth (FATAL: password authentication failed for user "mwo" (SQLSTATE 28P01))
+```
+
+三种修法（**按推荐顺序**）：
+
+```bash
+cd <nightjar>
+
+# ① 首选：把库内口令对齐成 .env 里的值（零数据损失）
+#    容器内本地 socket 是 trust 认证，因此不需要原口令
+docker exec mwops-postgres psql -U mwo -d middleware_ops \
+  -c "ALTER USER mwo WITH PASSWORD '$(grep -E '^DB_PASSWORD=' .env | cut -d= -f2-)';"
+docker compose up -d
+
+# ② 或者：把 .env 改回卷初始化时用的旧口令（例如首次部署没改过默认值）
+sed -i 's/^DB_PASSWORD=.*/DB_PASSWORD=mwo_change_me/' .env && docker compose up -d
+
+# ③ 最后手段：重建平台数据卷（**会清空**集成/告警/诊断/知识/审计数据）
+docker compose down -v && docker compose up -d --build
+```
+
+`scripts/setup-jd-link.sh` 第 5 步已经内建了 ①：检测到数据卷已存在时**不会轮换** `DB_PASSWORD`，
+并在启动前用 `pg_isready` + TCP `scram` 认证核对口径，不一致就自动 `ALTER USER` 对齐。
+
+> 同理，`DB_USER` / `DB_NAME` 也是**卷初始化时定死的**：改了 `DB_USER` 会报
+> `role "xxx" does not exist`，此时只能改回原值或重建数据卷。
 
 ---
 
