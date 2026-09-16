@@ -1,0 +1,34 @@
+# 独立版 Prometheus 配置（供 deploy/jd-exporters/docker-compose.exporters-only.yml 使用）。
+#
+# 与 jd 自带的 9090 实例相互独立，端口 9190，只抓中间件 Exporter；
+# 若你愿意直接复用 jd 自带的 Prometheus，请改用 prometheus-jd.yml 覆盖方案（见文档 3.1）。
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Redis 中间件指标；instance_name=jd-redis 由 Exporter 的 SERVICE_NAME 上报
+  - job_name: 'middleware-exporter-redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # MySQL 中间件指标；mysqld-exporter 无实例名标签，用 relabel 补齐为 jd-mysql
+  - job_name: 'middleware-exporter-mysql'
+    static_configs:
+      - targets: ['mysqld-exporter:9104']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: jd-mysql
+
+  # 可选：同时抓 jd 后端的应用指标（Actuator），便于在平台侧关联应用与中间件
+  - job_name: 'interview-backend'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    static_configs:
+      - targets: ['backend:8080']
+        labels:
+          service: 'interview-review-backend'

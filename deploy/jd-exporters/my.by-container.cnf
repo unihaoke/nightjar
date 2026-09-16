@@ -1,0 +1,11 @@
+# jd 项目的 mysql-exporter 连接配置（按容器名直连，不依赖 compose 服务名 mysql）。
+#
+# 与 my.cnf 的区别：host 使用容器名 jd-mysql-db（由 docker-compose.exporters-only.yml
+# 通过 --network-alias 注册），因此 jd 用 SQLite profile 启动（没有 mysql 服务）时也能用。
+# 注意：含明文口令，生产请改环境变量注入或限制权限（0600）。
+
+[client]
+user = exporter
+password = exporter_change_me
+host = jd-mysql-db
+port = 3306

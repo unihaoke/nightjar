@@ -1,0 +1,90 @@
+# jd 项目中间件 Exporter —— 独立启动版（不修改 jd 任何文件）。
+#
+# 适用：不想动 jd 自己的 docker-compose.yml，或 jd 未用 MySQL profile（无 mysql 服务）。
+# 特点：
+#   - 通过 external network 直接加入 jd 的 interview-net，Exporter 可解析 backend/redis/mysql；
+#   - 自建 Prometheus 实例（端口 9190，避开 jd 自带的 9090），先把链路跑通；
+#   - 同时暴露 Redis(9121) 与 MySQL(9104) Exporter 端口，便于宿主机直接 curl 验证。
+#
+# 使用方式（在 jd 项目根目录执行，确保 jd 的 compose 已启动）：
+#   docker compose -f <本文件路径> up -d
+#
+# 随后把平台的 prometheus.base_url 指向 http://<宿主机IP>:9190
+
+services:
+  prometheus-jd:
+    image: prom/prometheus:v2.54.1
+    container_name: jd-prometheus-middleware
+    restart: unless-stopped
+    ports:
+      - '${JD_PROM_PORT:-9190}:9090'
+    volumes:
+      - ./deploy/jd-exporters/prometheus-standalone.yml:/etc/prometheus/prometheus.yml:ro
+      - jd-mw-prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    networks:
+      - interview-net
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: jd-redis-exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      # 该值作为 instance_name 标签上报，平台纳管实例名填 jd-redis
+      SERVICE_NAME: jd-redis
+    ports:
+      - '${JD_REDIS_EXPORTER_PORT:-9121}:9121'
+    networks:
+      - interview-net
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.15.1
+    container_name: jd-mysqld-exporter
+    restart: unless-stopped
+    # 复用 jd 的 MySQL 容器网络别名 jd-mysql-db，避免依赖 compose 服务名
+    command:
+      - '--config.my-cnf=/etc/mysql-exporter/my.cnf'
+    volumes:
+      - ./deploy/jd-exporters/my.by-container.cnf:/etc/mysql-exporter/my.cnf:ro
+    ports:
+      - '${JD_MYSQL_EXPORTER_PORT:-9104}:9104'
+    networks:
+      interview-net:
+        aliases:
+          - jd-mysqld-exporter
+
+  # ---------------------------------------------------------------------------
+  # 独立启动时，MySQL 里还没有只读监控账号（jd 的 initdb 脚本未包含它）。
+  # 用一次性容器执行建号 SQL：
+  #   docker compose -f <本文件> --profile initdb run --rm mysql-monitor-user
+  # SQL 来自挂载的 init/01-monitor-user.sql，避免命令行转义问题。
+  # ---------------------------------------------------------------------------
+  mysql-monitor-user:
+    image: mysql:8.0
+    container_name: jd-mysql-monitor-user
+    profiles: ['initdb']
+    entrypoint: ['/bin/sh', '-c']
+    # 注意 $$ 是 compose 的转义写法，容器内看到的 ${DB_PASS}
+    command:
+      - 'mysql -h jd-mysql-db -P 3306 -uroot -p"$${DB_PASS}" < /init/01-monitor-user.sql && echo "monitor user ready"'
+    environment:
+      DB_PASS: ${DB_PASS:-root}
+    volumes:
+      - ./deploy/jd-exporters/init:/init:ro
+    networks:
+      - interview-net
+
+volumes:
+  jd-mw-prometheus-data:
+
+networks:
+  # jd 项目 docker-compose 创建的桥接网络，名称通常为 <项目目录名>_interview-net。
+  # 若 docker network ls 显示的名称不同，请修改为实际名称。
+  interview-net:
+    external: true
+    name: ${JD_NETWORK:-jd_interview-net}

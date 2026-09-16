@@ -1,0 +1,60 @@
+# jd 项目的中间件 Exporter 接入配置（Prometheus + Redis/MySQL Exporter）。
+#
+# 用途：在不修改 jd 项目自身源码与配置文件的前提下，把它的 MySQL / Redis 指标
+# 接入到 jd 已有的 Prometheus（端口 9090），随后由本平台查询分析。
+#
+# 使用方式（在 jd 项目根目录执行）：
+#   docker compose -f docker-compose.yml -f <本文件路径> up -d
+#
+# 前提：本平台与本文件均只做「追加」，不覆盖 jd 原有服务定义：
+#   - mysql / redis / prometheus 仅追加挂载与端口，原有配置保持不变；
+#   - Prometheus 抓取配置使用 deploy/jd-exporters/prometheus-jd.yml 全量替换
+#     （该文件 = jd 原配置 + 中间件 Exporter 任务，保证 jd 原有的 backend 抓取不受影响）。
+#
+# 端口：redis-exporter 9121、mysqld-exporter 9104（仅需内网可达，未映射到宿主机）。
+
+services:
+  # ---------------------------------------------------------------------------
+  # MySQL：挂载只读监控账号初始化脚本（只在空数据卷首次启动时执行）
+  # ---------------------------------------------------------------------------
+  mysql:
+    volumes:
+      - ./deploy/jd-exporters/init:/docker-entrypoint-initdb.d:ro
+
+  # ---------------------------------------------------------------------------
+  # Prometheus：换成「原配置 + 中间件 Exporter 任务」的版本
+  # ---------------------------------------------------------------------------
+  prometheus:
+    volumes:
+      - ./deploy/jd-exporters/prometheus-jd.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  # ---------------------------------------------------------------------------
+  # Redis Exporter：抓 jd 的 redis:6379
+  #   instance_name 标签 = jd-redis（平台纳管时实例名必须与此一致）
+  # ---------------------------------------------------------------------------
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: jd-redis-exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      SERVICE_NAME: jd-redis
+      # jd 的 redis 未设置 requirepass，故不需要 REDIS_PASSWORD
+    networks:
+      - interview-net
+
+  # ---------------------------------------------------------------------------
+  # MySQL Exporter：抓 jd 的 mysql:3306（使用只读监控账号 exporter）
+  #   instance_name 标签 = jd-mysql（平台纳管时实例名必须与此一致）
+  # ---------------------------------------------------------------------------
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.15.1
+    container_name: jd-mysqld-exporter
+    restart: unless-stopped
+    command:
+      - '--config.my-cnf=/etc/mysql-exporter/my.cnf'
+    volumes:
+      - ./deploy/jd-exporters/my.cnf:/etc/mysql-exporter/my.cnf:ro
+    networks:
+      - interview-net

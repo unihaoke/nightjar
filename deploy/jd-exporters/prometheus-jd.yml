@@ -1,0 +1,45 @@
+# jd 项目 Prometheus 抓取配置（原配置 + 中间件 Exporter 任务）。
+#
+# 该文件由 deploy/jd-exporters/docker-compose.jd.yml 挂载覆盖 jd 原有的
+# monitoring/prometheus/prometheus.yml。
+# 前半部分与 jd 原配置保持一致（保证 jd 自身的 backend 指标抓取不受影响），
+# 后半部分为新增的中间件 Exporter 任务。
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # === jd 原配置：Spring Boot 后端（Actuator + Micrometer Prometheus）===
+  - job_name: 'interview-backend'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    static_configs:
+      - targets: ['backend:8080']
+        labels:
+          service: 'interview-review-backend'
+
+  # === jd 原配置：Prometheus 自身指标 ===
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # === 新增：Redis 中间件指标 ===
+  #   instance_name=jd-redis 由 redis-exporter 的 SERVICE_NAME 环境变量上报，
+  #   平台纳管时「实例名称」填 jd-redis 即可匹配。
+  - job_name: 'middleware-exporter-redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # === 新增：MySQL 中间件指标 ===
+  #   mysqld-exporter 不自带实例名标签，这里用 relabel 统一补上，
+  #   与平台纳管实例名 jd-mysql 对应。
+  - job_name: 'middleware-exporter-mysql'
+    static_configs:
+      - targets: ['mysqld-exporter:9104']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance_name
+        replacement: jd-mysql

@@ -117,6 +117,7 @@ npm run dev                                          # 监听 :5173
 │   ├── postgres/init/              # 只建扩展与数据库参数，不建表
 │   ├── prometheus/                 # prometheus.yml / prometheus.with-exporters.yml / rules
 │   ├── exporters/                  # Exporter 凭据模板（my.cnf）
+│   ├── jd-exporters/               # 「jd 面试演练系统」接入用的 Exporter override 与抓取配置
 │   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
@@ -166,7 +167,8 @@ AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管
 - 上报 Hook：`POST /api/hooks/logs`、`POST /api/hooks/alerts`，使用 `X-Hook-Token` 与服务令牌，与用户 JWT 分离。
 
 完整接口清单见 [`docs/API.md`](docs/API.md)，接入与运维说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)，
-**「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**。
+**「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**；
+针对具体项目的接入范例见 **[`docs/COLLECTOR-JD.md`](docs/COLLECTOR-JD.md)**（面试演练系统 jd：Spring Boot + MySQL + Redis + 自带 Prometheus）。
 
 ---
 
