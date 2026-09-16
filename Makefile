@@ -61,6 +61,10 @@ frontend-build: ## 类型检查 + 构建前端产物
 frontend-typecheck: ## 仅做前端类型检查
 	cd $(FRONTEND_DIR) && npm run typecheck
 
+.PHONY: frontend-smoke
+frontend-smoke: ## 前端运行时冒烟（无头浏览器加载产物，捕获白屏等运行时错误）
+	cd $(FRONTEND_DIR) && npm run smoke
+
 # ---------------------------------------------------------------------------
 # 部署
 # ---------------------------------------------------------------------------
@@ -81,5 +85,5 @@ verify: ## 端到端冒烟验证（需后端已在 8080 运行）
 	pwsh -File scripts/smoke-test.ps1
 
 .PHONY: all-check
-all-check: backend-lint backend-test frontend-typecheck ## 提交前全量自检
+all-check: backend-lint backend-test frontend-build frontend-smoke ## 提交前全量自检
 	@echo "全量自检通过"

@@ -29,14 +29,24 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
-    chunkSizeWarningLimit: 1500,
+    // 不使用 manualChunks 强制分包。
+    //
+    // 原因（曾导致线上运行时崩溃）：
+    //   element-plus 与 dayjs 之间存在互相引用（dayjs 的 locale/plugin 体系由 element-plus
+    //   的日期组件引入），把 element-plus 与 dayjs 拆进不同的手工 chunk 后，
+    //   chunk 之间会形成循环依赖：element -> vendor(dayjs) -> element。
+    //   ES module 遇到循环依赖时依赖 Rollup 的变量提升来打破环，而 element-plus 顶层
+    //   存在「导入后立即在模块初始化期求值」的常量/数组，结果触发 TDZ：
+    //     Uncaught ReferenceError: Cannot access 'Pt' before initialization
+    //   表现为整站白屏（#app 为空）。
+    //   交给 Rollup 自动分包时，它按真实依赖图保证求值顺序，不会产生该问题。
+    chunkSizeWarningLimit: 2000,
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['vue', 'vue-router', 'pinia', 'axios', 'dayjs'],
-          element: ['element-plus', '@element-plus/icons-vue'],
-          charts: ['echarts'],
-        },
+        // 仅对文件名做稳定分类，不干预 chunk 划分。
+        entryFileNames: 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]',
       },
     },
   },

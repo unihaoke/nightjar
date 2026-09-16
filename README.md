@@ -173,6 +173,8 @@ cd middleware-ops && gofmt -l . && go vet ./... && go test ./...
 
 # 前端：类型检查 + 构建
 cd middleware-ops-web && npm run build
+# 前端运行时冒烟（无头浏览器加载产物，捕获白屏/TDZ 这类只在运行时暴露的问题）
+cd middleware-ops-web && npm run smoke
 
 # 端到端冒烟（需后端已在 8080 运行）
 pwsh -File scripts/smoke-test.ps1
@@ -196,9 +198,17 @@ AI 同步/流式诊断与结构化输出校验、确定性缓存命中、告警�
 3. **因果收敛不做**：告警收敛仅实现规则级（实时）与语义聚类（离线、仅合并展示），依赖服务拓扑的因果收敛列为二期。
 4. **通知渠道需外部配置**：飞书/企微/钉钉/邮件在未配置 webhook 时仅记录通知日志，不影响主链路。
 5. **默认构建未启用 pgvector 原生类型**：向量以文本存储并在应用层做余弦检索，规模 ≤200 实例可接受；需要 ANN 索引时以 `-tags pgvector` 构建。
+6. **前端不做手工分包**：`vite.config.ts` 刻意不使用 `manualChunks`。element-plus 与 dayjs 互相引用，强行分包会形成 chunk 循环依赖并触发 ES module TDZ（表现为白屏），详见 [`docs/POSTMORTEM.md`](docs/POSTMORTEM.md) INC-003。
 
 ---
 
-## 八、许可与致谢
+## 八、故障记录
+
+交付过程中在部署阶段真实暴露的 3 个问题（两套建表来源、保留字列名、前端白屏）的现象、根因、
+修复与防复发措施，记录在 [`docs/POSTMORTEM.md`](docs/POSTMORTEM.md)，并各配有回归测试或冒烟脚本。
+
+---
+
+## 九、许可与致谢
 
 内部技术方案实现。指标采集依赖 Prometheus 生态与各中间件官方 Exporter（本仓库不包含采集器）。
