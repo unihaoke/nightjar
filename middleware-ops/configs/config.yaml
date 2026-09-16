@@ -1,0 +1,196 @@
+# 中间件智能问题解决平台 · 默认配置
+#
+# 加载优先级：环境变量（MWOPS_ 前缀）> 配置文件 > 内置默认值。
+# 环境变量写法：层级用下划线连接，例如 MWOPS_DATABASE_HOST、MWOPS_JWT_SECRET。
+#
+# 本文件即「单机零外部依赖可启动」的最小配置：
+#   - 仅需 PostgreSQL（平台元数据库）；
+#   - Redis 缺省为空 → 自动降级为进程内缓存与队列；
+#   - Prometheus 缺省为空 → 使用内置指标模拟器；
+#   - AI 引擎缺省 hybrid + mock → 规则引擎兜底，接入 LLM 只需填 base_url/api_key。
+
+app:
+  name: middleware-ops
+  version: 1.0.0
+  # debug / release；release 下强制校验 jwt.secret 长度
+  mode: debug
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  read_timeout: 30s
+  # 0 表示不限制写超时（SSE 流式诊断需要）
+  write_timeout: 0s
+  shutdown_timeout: 15s
+  trusted_proxies:
+    - 127.0.0.1
+    - ::1
+  rate_limit_per_minute: 600
+
+database:
+  host: 127.0.0.1
+  port: 5432
+  user: mwo
+  password: mwo
+  name: middleware_ops
+  ssl_mode: disable
+  time_zone: UTC
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime_minutes: 60
+  auto_migrate: true
+
+redis:
+  # 留空 = 单机模式（进程内缓存 + 内存队列）
+  addr: ""
+  password: ""
+  db: 0
+  pool_size: 20
+  dial_timeout: 3s
+  read_timeout: 3s
+  write_timeout: 3s
+  stream_key: mwops:ai:tasks
+  group: mwops-ai-workers
+  # AI 任务单实例并发上限（与 guardrail.max_concurrency 语义一致）
+  queue_workers: 4
+  fallback_to_memory: true
+
+jwt:
+  # 生产必须替换为 ≥32 位随机字符串
+  secret: dev-only-secret-please-change-in-release-mode
+  issuer: middleware-ops
+  access_ttl: 8h
+  refresh_ttl: 168h
+  cookie_name: mwops_token
+  cookie_secure: false
+  # lax / strict / none
+  cookie_same_site: lax
+  # 首次启动自动创建的管理员账号，登录后请立即改密
+  bootstrap_admin: admin
+  bootstrap_password: Admin@12345
+
+security:
+  # 主密钥：优先使用环境变量 MWOPS_SECURITY_MASTER_KEY；否则读取/生成该文件（0600）
+  master_key_file: ./data/master.key
+  master_key: ""
+  master_key_rotation_days: 90
+  # 出网白名单：默认空 = 禁止任何第三方 AI 分析（6.5）
+  outbound_whitelist: []
+  # 追加敏感词正则（内置已覆盖 IP/手机号/请求 ID/路径/邮箱/凭据）
+  sensitive_patterns: []
+  code_snippet_max_lines: 200
+
+ai_engine:
+  # third_party / self_hosted / hybrid
+  strategy: hybrid
+  third_party:
+    enabled: false
+    # openai / anthropic / mock
+    kind: openai
+    base_url: https://api.deepseek.com/v1
+    api_key: ""
+    model: deepseek-chat
+    max_tokens: 2048
+    price_per_k_token: 0.002
+    timeout:
+      connect: 5s
+      first_byte: 15s
+      total: 60s
+      tool_call: 10s
+      task_deadline: 120s
+  self_hosted:
+    enabled: true
+    # mock 表示使用进程内确定性引擎（离线演示）；本地 LLM 填 ollama/vllm 的 base_url
+    kind: mock
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen2.5:7b
+    max_tokens: 2048
+    price_per_k_token: 0
+    timeout:
+      connect: 5s
+      first_byte: 15s
+      total: 60s
+      tool_call: 10s
+      task_deadline: 120s
+  fallback:
+    # 第三方连续失败 N 次触发熔断并降级
+    failure_threshold: 2
+    open_duration: 60s
+    rules_engine_enabled: true
+
+prometheus:
+  # 留空 = 使用内置指标模拟器（离线可用）
+  base_url: ""
+  timeout: 8s
+  cache_ttl: 15s
+  retention: 360h
+  exporter_job_prefix: middleware-exporter
+
+notify:
+  enabled: true
+  feishu:
+    enabled: false
+    webhook: ""
+    secret: ""
+  wecom:
+    enabled: false
+    webhook: ""
+    secret: ""
+  dingtalk:
+    enabled: false
+    webhook: ""
+    secret: ""
+  email:
+    enabled: false
+    host: ""
+    port: 465
+    username: ""
+    password: ""
+    from: ""
+    to: []
+    use_tls: true
+  # IM 卡片「查看详情」回跳路径（执行统一回 Web 端，不做一键执行）
+  card_confirm_path: /alerts
+
+guardrail:
+  # ① 上下文预算（5.2）
+  input_token_budget: 8192
+  output_token_budget: 2048
+  log_context_lines: 20
+  max_log_sources: 5
+  max_code_files: 5
+  code_lines_per_file: 200
+  # ② 防死循环（5.3）
+  max_steps: 8
+  loop_repeat_threshold: 2
+  llm_retry: 2
+  # ⑥ 成本治理（5.7）
+  cache_ttl: 24h
+  daily_token_quota: 2000000
+  per_user_daily_token_quota: 200000
+  max_concurrency: 4
+  vector_reference_threshold: 0.78
+  # ④ SQL 规则校验（5.5）
+  sql_default_limit: 100
+  sql_max_limit: 1000
+  sql_table_allowlist:
+    - information_schema.tables
+    - pg_stat_activity
+    - pg_stat_statements
+
+scheduler:
+  enabled: true
+  health_probe_interval: 60s
+  metric_rule_eval_interval: 30s
+  alert_cluster_interval: 5m
+  # 每日 00:10 生成审计哈希链快照（6.4）
+  audit_snapshot_cron: "0 10 0 * * *"
+  approval_expire_interval: 1m
+
+log:
+  level: info
+  file_path: ./data/logs/middleware-ops.log
+  max_size_mb: 64
+  max_backups: 10
+  max_age_days: 30
+  console: true

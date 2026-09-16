@@ -1,0 +1,251 @@
+/** 全局基础样式与移动端适配。 */
+@import './tokens.css';
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--c-text);
+  background: var(--c-bg);
+  -webkit-font-smoothing: antialiased;
+  /* 移动端：禁止长按选中造成误操作，输入区单独放开 */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+a {
+  color: var(--c-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--c-accent-hover);
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* 焦点可见性（可访问性：键盘导航必须可见） */
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+}
+
+/* 滚动条：控制台风格，避免系统默认粗滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--c-border-strong);
+  border-radius: var(--r-pill);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- 通用布局工具类 ---------- */
+
+.page {
+  padding: var(--sp-5);
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.page-subtitle {
+  margin: var(--sp-1) 0 0;
+  color: var(--c-text-3);
+  font-size: 13px;
+}
+
+.card {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+}
+
+.card + .card {
+  margin-top: var(--sp-4);
+}
+
+.card-title {
+  margin: 0 0 var(--sp-3);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-text);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.muted {
+  color: var(--c-text-3);
+}
+
+.text-danger {
+  color: var(--c-danger);
+}
+
+.text-warning {
+  color: var(--c-warning);
+}
+
+.text-success {
+  color: var(--c-success);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+/* 可横向滚动的表格容器：移动端不挤压列宽 */
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ---------- Element Plus 主题对齐（令牌驱动） ---------- */
+
+:root {
+  --el-color-primary: var(--c-accent);
+  --el-color-success: var(--c-success);
+  --el-color-warning: var(--c-warning);
+  --el-color-danger: var(--c-danger);
+  --el-color-info: var(--c-text-3);
+  --el-bg-color: var(--c-surface);
+  --el-bg-color-overlay: var(--c-surface);
+  --el-text-color-primary: var(--c-text);
+  --el-text-color-regular: var(--c-text-2);
+  --el-text-color-secondary: var(--c-text-3);
+  --el-border-color: var(--c-border);
+  --el-border-color-light: var(--c-border);
+  --el-border-color-lighter: var(--c-border);
+  --el-border-radius-base: var(--r-md);
+  --el-border-radius-small: var(--r-sm);
+  --el-fill-color-blank: var(--c-surface);
+  --el-mask-color: rgba(16, 18, 22, 0.5);
+  --el-font-family: var(--font-sans);
+}
+
+html.dark {
+  --el-bg-color-page: var(--c-bg);
+  --el-fill-color-light: var(--c-surface-2);
+  --el-fill-color: var(--c-surface-2);
+}
+
+.el-card,
+.el-dialog,
+.el-drawer {
+  border-radius: var(--r-lg);
+}
+
+/* 移动端：表格改为紧凑排版，文字不折行以便横向滚动查看 */
+@media (max-width: 767px) {
+  .page {
+    padding: var(--sp-3) var(--sp-3) calc(var(--sp-6) + var(--safe-bottom));
+  }
+
+  .page-title {
+    font-size: 17px;
+  }
+
+  .el-table {
+    font-size: 13px;
+  }
+
+  .el-dialog {
+    width: calc(100vw - 24px) !important;
+    margin-top: 8vh !important;
+  }
+
+  .el-drawer {
+    width: 86vw !important;
+  }
+
+  /* 表单项在窄屏改为单列，标签置顶 */
+  .el-form--label-top .el-form-item,
+  .el-form-item {
+    margin-bottom: 14px;
+  }
+
+  .mobile-block {
+    width: 100%;
+  }
+}
+
+/* 移动端操作按钮：保证最小可点区域 40px */
+@media (pointer: coarse) {
+  .el-button {
+    min-height: 38px;
+  }
+
+  .el-button--small {
+    min-height: 32px;
+  }
+}
+
+/* 表格行密度 */
+.el-table .cell {
+  line-height: 1.5;
+}
+
+/* 描述列表在移动端单列展示 */
+@media (max-width: 767px) {
+  .el-descriptions__body .el-descriptions__table {
+    display: block;
+  }
+}

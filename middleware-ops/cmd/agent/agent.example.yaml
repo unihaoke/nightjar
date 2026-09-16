@@ -1,0 +1,35 @@
+# 轻量日志采集 Agent 配置样例。
+#
+# 投放方式：把 agent 二进制与本文档放到应用服务器，使用 systemd 托管。
+
+# 平台地址（不含路径）
+platform_url: http://127.0.0.1:8080
+
+# 上报令牌，与后端环境变量 MWOPS_HOOK_TOKEN 一致；留空表示平台未开启校验
+hook_token: ""
+
+# 默认服务名（各文件未单独指定时使用）
+service: order-service
+
+environment: prod
+server_name: order-app-01
+
+# 偏移量文件：记录每个日志文件的读取位置，避免重复上报（可放在数据盘）
+position_file: ./data/agent-position.json
+
+# 错误前后采集的行数（设计文档 5.2 默认 20 行）
+context_lines: 20
+
+# 单轮上报条数上限
+max_batch: 50
+
+files:
+  - path: /var/log/order-service/error.log
+    alert_type: error
+    service: order-service
+    # 仅采集 ERROR 及以上（可选 WARN）
+    level_filter: ERROR
+
+  - path: /var/log/order-service/gc.log
+    alert_type: gc
+    service: order-service

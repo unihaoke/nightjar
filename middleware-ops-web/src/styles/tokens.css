@@ -1,0 +1,94 @@
+/**
+ * 设计令牌（design tokens）。
+ *
+ * 设计决策：
+ *   - 控制台形态、B2B 运维受众 → 中等视觉密度、克制的动效、单一强调色；
+ *   - 强调色锁定为「电蓝」，状态色仅用于语义（成功/警告/危险），不做装饰性用色；
+ *   - 圆角体系统一为 4/6/10/999 四档（输入 6、卡片 10、按钮 6、标签 999）；
+ *   - 深浅色双主题，深浅切换只换令牌，不动组件样式。
+ */
+:root {
+  /* 中性色阶（冷灰，避免与强调色冲突） */
+  --c-bg: #f6f7f9;
+  --c-surface: #ffffff;
+  --c-surface-2: #f1f3f6;
+  --c-border: #e3e6ec;
+  --c-border-strong: #cdd3dd;
+  --c-text: #171a20;
+  --c-text-2: #4b525f;
+  --c-text-3: #7b8494;
+
+  /* 强调色（单一，全站一致） */
+  --c-accent: #1d5fd8;
+  --c-accent-hover: #1750bd;
+  --c-accent-soft: #e8effc;
+
+  /* 语义状态色 */
+  --c-success: #10794f;
+  --c-success-soft: #e4f4ec;
+  --c-warning: #9a6206;
+  --c-warning-soft: #fdf2df;
+  --c-danger: #b8232f;
+  --c-danger-soft: #fbeaea;
+  --c-info: #1d5fd8;
+  --c-info-soft: #e8effc;
+
+  /* 圆角体系 */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-pill: 999px;
+
+  /* 阴影：带色相偏移，避免纯黑投影 */
+  --shadow-1: 0 1px 2px rgba(23, 26, 32, 0.06), 0 1px 3px rgba(23, 26, 32, 0.04);
+  --shadow-2: 0 4px 12px rgba(23, 26, 32, 0.08), 0 1px 3px rgba(23, 26, 32, 0.04);
+
+  /* 间距节奏 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  /* 布局尺寸 */
+  --sidebar-w: 224px;
+  --header-h: 56px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  --font-sans: 'Inter', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+
+  color-scheme: light;
+}
+
+/* 深色主题：仅替换令牌 */
+html.dark {
+  --c-bg: #101216;
+  --c-surface: #171a20;
+  --c-surface-2: #1e222a;
+  --c-border: #262b34;
+  --c-border-strong: #363d49;
+  --c-text: #eef1f6;
+  --c-text-2: #aab2c0;
+  --c-text-3: #7d8695;
+
+  --c-accent: #6f9cf3;
+  --c-accent-hover: #8bb0f6;
+  --c-accent-soft: #1c2740;
+
+  --c-success: #4ec98d;
+  --c-success-soft: #16281f;
+  --c-warning: #e0a83e;
+  --c-warning-soft: #2a2114;
+  --c-danger: #ef6b74;
+  --c-danger-soft: #2c1619;
+  --c-info: #6f9cf3;
+  --c-info-soft: #1c2740;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.45);
+
+  color-scheme: dark;
+}

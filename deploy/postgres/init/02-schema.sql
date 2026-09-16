@@ -1,0 +1,357 @@
+-- 平台表结构与索引参考实现（与后端 AutoMigrate 等价）。
+--
+-- 用途：
+--   1. 供 DBA 评审与手工建库（关闭 auto_migrate 时手动执行）；
+--   2. 作为表结构的事实说明文档，与设计文档 7.1 / 7.2 一一对应。
+--
+-- 执行顺序：先建表，再建索引；向量列类型在启用 pgvector 时使用 vector(768)。
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ---------------------------------------------------------------------------
+-- 用户与角色（6.1 RBAC）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS users (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ,
+    username        VARCHAR(64)  NOT NULL UNIQUE,
+    password_hash   VARCHAR(128) NOT NULL,
+    nickname        VARCHAR(64),
+    email           VARCHAR(128),
+    role_code       VARCHAR(32)  NOT NULL,
+    env_scope       TEXT,
+    group_scope     TEXT,
+    status          SMALLINT     DEFAULT 1,
+    last_login      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role_code);
+
+CREATE TABLE IF NOT EXISTS roles (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ,
+    code            VARCHAR(32)  NOT NULL UNIQUE,
+    name            VARCHAR(64)  NOT NULL,
+    description     VARCHAR(255),
+    permissions     TEXT,
+    levels          TEXT,
+    builtin         BOOLEAN DEFAULT FALSE
+);
+
+-- ---------------------------------------------------------------------------
+-- 中间件纳管（4.1）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS middleware_instances (
+    id                  BIGSERIAL PRIMARY KEY,
+    created_at          TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ,
+    name                VARCHAR(128) NOT NULL,
+    mw_type             VARCHAR(16)  NOT NULL,
+    host                VARCHAR(255) NOT NULL,
+    port                INTEGER      NOT NULL,
+    username            VARCHAR(128),
+    password_encrypted  TEXT,
+    environment         VARCHAR(16)  DEFAULT 'dev',
+    group_name          VARCHAR(64),
+    tags                TEXT,
+    status              SMALLINT     DEFAULT 1,
+    last_message        VARCHAR(255),
+    last_check_at       TIMESTAMPTZ,
+    config              TEXT,
+    prom_job            VARCHAR(64),
+    prom_instance       VARCHAR(128)
+);
+CREATE INDEX IF NOT EXISTS idx_mw_name ON middleware_instances(name);
+CREATE INDEX IF NOT EXISTS idx_mw_type ON middleware_instances(mw_type);
+CREATE INDEX IF NOT EXISTS idx_mw_env ON middleware_instances(environment);
+CREATE INDEX IF NOT EXISTS idx_mw_group ON middleware_instances(group_name);
+
+-- ---------------------------------------------------------------------------
+-- AI 诊断（4.3 / 7.1，含 v0.2 新增字段 feedback / engine_status）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_diagnoses (
+    id                  BIGSERIAL PRIMARY KEY,
+    created_at          TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ,
+    user_id             BIGINT NOT NULL,
+    instance_id         BIGINT,
+    mw_type             VARCHAR(16),
+    user_query          TEXT   NOT NULL,
+    collected_metrics   TEXT,
+    diagnosis_result    TEXT,
+    report              TEXT,
+    suggestions         TEXT,
+    feedback            VARCHAR(16),
+    engine_status       VARCHAR(32),
+    cost_tokens         INTEGER DEFAULT 0,
+    engine_used         VARCHAR(32),
+    duration_ms         BIGINT,
+    cache_hit           BOOLEAN DEFAULT FALSE,
+    truncated           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_diagnosis_instance ON ai_diagnoses(instance_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnosis_user ON ai_diagnoses(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnosis_feedback ON ai_diagnoses(feedback);
+
+-- ---------------------------------------------------------------------------
+-- 告警域（4.4 / 7.1）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id               BIGSERIAL PRIMARY KEY,
+    created_at       TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ,
+    name             VARCHAR(128) NOT NULL,
+    instance_id      BIGINT,
+    mw_type          VARCHAR(16),
+    metric_name      VARCHAR(128) NOT NULL,
+    operator         VARCHAR(8)   NOT NULL,
+    threshold        DOUBLE PRECISION,
+    level            VARCHAR(16)  DEFAULT 'warning',
+    window           INTEGER DEFAULT 5,
+    cooldown         INTEGER DEFAULT 10,
+    notify_channels  TEXT,
+    enabled          BOOLEAN DEFAULT TRUE,
+    ai_enabled       BOOLEAN DEFAULT TRUE,
+    description      VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_instance ON alert_rules(instance_id);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ,
+    instance_id     BIGINT NOT NULL,
+    rule_id         BIGINT,
+    mw_type         VARCHAR(16),
+    alert_level     VARCHAR(16),
+    alert_message   VARCHAR(512),
+    metric_value    DOUBLE PRECISION,
+    fingerprint     VARCHAR(64),
+    status          VARCHAR(16),
+    count           INTEGER DEFAULT 1,
+    triggered_at    TIMESTAMPTZ,
+    acked_by        BIGINT,
+    acked_at        TIMESTAMPTZ,
+    resolved_at     TIMESTAMPTZ,
+    diagnosis_id    BIGINT,
+    cluster_id      VARCHAR(64),
+    suppressed      BOOLEAN DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_alert_instance_time ON alerts(instance_id, triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_fingerprint ON alerts(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_alert_status ON alerts(status);
+CREATE INDEX IF NOT EXISTS idx_alert_cluster ON alerts(cluster_id);
+
+CREATE TABLE IF NOT EXISTS alert_embeddings (
+    id             BIGSERIAL PRIMARY KEY,
+    created_at     TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ,
+    alert_id       BIGINT,
+    alert_content  TEXT,
+    -- 启用 pgvector 时改为：embedding vector(768)
+    embedding      TEXT,
+    clustered      BOOLEAN DEFAULT FALSE
+);
+-- 启用 pgvector 后执行：
+-- ALTER TABLE alert_embeddings ALTER COLUMN embedding TYPE vector(768) USING embedding::vector;
+-- CREATE INDEX IF NOT EXISTS idx_alert_embedding ON alert_embeddings USING hnsw (embedding vector_cosine_ops);
+
+-- ---------------------------------------------------------------------------
+-- 知识库（4.5 质量闭环）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS knowledge_base (
+    id             BIGSERIAL PRIMARY KEY,
+    created_at     TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ,
+    title          VARCHAR(255) NOT NULL,
+    content        TEXT,
+    mw_type        VARCHAR(16),
+    tags           TEXT,
+    source         VARCHAR(16),
+    status         VARCHAR(16),
+    author_id      BIGINT,
+    adopt_count    INTEGER DEFAULT 0,
+    use_count      INTEGER DEFAULT 0,
+    feedback       TEXT,
+    diagnosis_id   BIGINT,
+    -- 启用 pgvector 时改为：embedding vector(768)
+    embedding      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge_base(status);
+CREATE INDEX IF NOT EXISTS idx_knowledge_mwtype ON knowledge_base(mw_type);
+-- CREATE INDEX IF NOT EXISTS idx_knowledge_embedding ON knowledge_base USING hnsw (embedding vector_cosine_ops);
+
+-- ---------------------------------------------------------------------------
+-- 审计（4.7 / 6.4：只追加 + 哈希链）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id             BIGSERIAL PRIMARY KEY,
+    user_id        BIGINT,
+    username       VARCHAR(64),
+    instance_id    BIGINT,
+    action_type    VARCHAR(32),
+    action_detail  TEXT,
+    result         VARCHAR(16),
+    level          VARCHAR(4),
+    ip_address     VARCHAR(45),
+    user_agent     VARCHAR(255),
+    route          VARCHAR(255),
+    hash_prev      VARCHAR(64),
+    hash_self      VARCHAR(64),
+    created_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_instance ON audit_logs(instance_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action_type);
+
+CREATE TABLE IF NOT EXISTS audit_snapshots (
+    id             BIGSERIAL PRIMARY KEY,
+    created_at     TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ,
+    snapshot_date  VARCHAR(16) UNIQUE,
+    last_log_id    BIGINT,
+    log_count      BIGINT,
+    chain_hash     VARCHAR(64),
+    file_path      VARCHAR(255),
+    verified       BOOLEAN DEFAULT FALSE,
+    verified_at    TIMESTAMPTZ
+);
+
+-- ---------------------------------------------------------------------------
+-- 审批与修复执行（4.6 / 6.2）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS approvals (
+    id             BIGSERIAL PRIMARY KEY,
+    created_at     TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ,
+    ticket_id      VARCHAR(40) UNIQUE,
+    applicant_id   BIGINT,
+    approver_id    BIGINT,
+    instance_id    BIGINT,
+    environment    VARCHAR(16),
+    action_type    VARCHAR(64),
+    action_detail  TEXT,
+    preview        TEXT,
+    reason         VARCHAR(512),
+    status         VARCHAR(16),
+    comment        VARCHAR(512),
+    expires_at     TIMESTAMPTZ,
+    decided_at     TIMESTAMPTZ,
+    executed_at    TIMESTAMPTZ,
+    exec_result    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approval_status ON approvals(status);
+CREATE INDEX IF NOT EXISTS idx_approval_applicant ON approvals(applicant_id);
+
+CREATE TABLE IF NOT EXISTS fix_records (
+    id             BIGSERIAL PRIMARY KEY,
+    created_at     TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ,
+    approval_id    BIGINT,
+    ticket_id      VARCHAR(40),
+    user_id        BIGINT,
+    instance_id    BIGINT,
+    action_type    VARCHAR(64),
+    level          VARCHAR(4),
+    command        VARCHAR(512),
+    action_detail  TEXT,
+    status         VARCHAR(16),
+    result         TEXT,
+    dry_run        BOOLEAN DEFAULT FALSE,
+    duration_ms    BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_fix_instance ON fix_records(instance_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- 日志告警域（4.8：与应用域分离）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS server_instances (
+    id             BIGSERIAL PRIMARY KEY,
+    created_at     TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ,
+    name           VARCHAR(128) NOT NULL,
+    ip             VARCHAR(45),
+    hostname       VARCHAR(128),
+    environment    VARCHAR(16),
+    group_name     VARCHAR(64),
+    status         SMALLINT DEFAULT 1,
+    tags           TEXT,
+    last_seen_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_server_ip ON server_instances(ip);
+
+CREATE TABLE IF NOT EXISTS code_repos (
+    id                  BIGSERIAL PRIMARY KEY,
+    created_at          TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ,
+    service_name        VARCHAR(128) NOT NULL,
+    repo_url            VARCHAR(255),
+    branch              VARCHAR(64) DEFAULT 'main',
+    local_path          VARCHAR(255),
+    language            VARCHAR(32),
+    allow_third_party   BOOLEAN DEFAULT FALSE,
+    last_pull_at        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_repo_service ON code_repos(service_name);
+
+CREATE TABLE IF NOT EXISTS log_alert_events (
+    id               BIGSERIAL PRIMARY KEY,
+    created_at       TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ,
+    event_id         VARCHAR(40) UNIQUE,
+    server_id        BIGINT,
+    service_name     VARCHAR(128),
+    alert_type       VARCHAR(32),
+    error_signature  VARCHAR(255),
+    raw_stacktrace   TEXT,
+    context_lines    TEXT,
+    error_count      INTEGER DEFAULT 1,
+    severity         VARCHAR(16),
+    status           VARCHAR(16),
+    first_seen_at    TIMESTAMPTZ,
+    last_seen_at     TIMESTAMPTZ,
+    analyzed         BOOLEAN DEFAULT FALSE,
+    suppressed       BOOLEAN DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_log_event_sig ON log_alert_events(error_signature, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_log_event_srv ON log_alert_events(server_id, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_log_event_status ON log_alert_events(status);
+
+CREATE TABLE IF NOT EXISTS ai_code_analyses (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ,
+    event_id        BIGINT,
+    event_key       VARCHAR(40),
+    service_name    VARCHAR(128),
+    located_file    VARCHAR(512),
+    located_line    INTEGER,
+    code_snippet    TEXT,
+    root_cause      TEXT,
+    emergency_plan  TEXT,
+    fix_suggestion  TEXT,
+    impact_scope    TEXT,
+    confidence      DOUBLE PRECISION,
+    evidence        TEXT,
+    engine_used     VARCHAR(32),
+    engine_status   VARCHAR(32),
+    cost_tokens     INTEGER,
+    outbound_ok     BOOLEAN DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_event ON ai_code_analyses(event_id);
+
+CREATE TABLE IF NOT EXISTS notification_logs (
+    id          BIGSERIAL PRIMARY KEY,
+    created_at  TIMESTAMPTZ,
+    updated_at  TIMESTAMPTZ,
+    event_id    BIGINT,
+    alert_id    BIGINT,
+    channel     VARCHAR(32),
+    target      VARCHAR(255),
+    content     TEXT,
+    status      VARCHAR(16),
+    error       VARCHAR(512),
+    sent_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_notify_alert ON notification_logs(alert_id);
