@@ -303,6 +303,34 @@ func TestRemoteAccountSQLPlaybook(t *testing.T) {
 	}
 }
 
+// TestAnonymousInstancesCanBeSaved 锁定：**无认证实例必须能保存**。
+//
+// 真实反馈：曾经加过一道"账号与口令都空则拒绝保存"的门槛，结果无 requirepass 的 Redis
+// 既填不出账号也填不出口令，使用者被彻底卡住。正确做法是放行 + 靠 Exporter 日志自证
+//（NOAUTH → 平台翻译成"需要认证/口令不一致"写回备注）。
+func TestAnonymousInstancesCanBeSaved(t *testing.T) {
+	for _, mwType := range []string{TypeRedis, TypeKafka, TypeNginx, TypeES} {
+		tpl, ok := TemplateOf(mwType)
+		if !ok {
+			t.Fatalf("模板 %s 应存在", mwType)
+		}
+		address := mustAddress(t, "10.0.0.11:6379", tpl.DefaultPort)
+		if err := tpl.Validate(Instance{
+			Name: "anon-" + mwType, MWType: mwType, Address: address, Environment: "dev",
+		}); err != nil {
+			t.Fatalf("%s 无认证实例必须允许保存（账号与口令都可空），实际：%v", mwType, err)
+		}
+	}
+	// 但"平台要代建只读账号"的组件仍必须给出账号名，否则建号 SQL 无从下手。
+	mysqlTpl, _ := TemplateOf(TypeMySQL)
+	if err := mysqlTpl.Validate(Instance{
+		Name: "mysql-no-user", MWType: TypeMySQL,
+		Address: mustAddress(t, "10.0.0.12:3306", 3306), Environment: "dev",
+	}); err == nil {
+		t.Fatal("MySQL 未填监控账号名时应报错（平台要按该名字建号）")
+	}
+}
+
 func TestRemoteBridgeModeAddsPortMapping(t *testing.T) {
 	tpl, _ := TemplateOf(TypeMySQL)
 	address, _ := ParseAddress("10.0.0.12:3306", tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)

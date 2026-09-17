@@ -215,10 +215,22 @@ func TestRenderRejectsReservedLabelsAndUnknownOptions(t *testing.T) {
 		t.Fatal("模板未声明的 Exporter 参数应被拒绝")
 	}
 
-	noAccount := base
-	noAccount.Username = ""
-	if _, err := Render(tpl, noAccount, "", "", ""); err == nil {
-		t.Fatal("需要认证的组件未填账号应被拒绝")
+	// 无认证实例（账号与口令都空）必须能渲染通过：
+	// 内网 Redis 未开 requirepass 是合法场景，旧逻辑在这里拒绝保存，
+	// 使用者既填不出账号也填不出口令，被彻底卡住（真实反馈）。
+	anonymous := base
+	anonymous.Username = ""
+	if _, err := Render(tpl, anonymous, "", "", ""); err != nil {
+		t.Fatalf("无认证 Redis 应允许渲染（账号与口令都可空），实际：%v", err)
+	}
+
+	// 但"平台代建只读账号"的组件仍必须给出账号名，否则建号 SQL 无从下手。
+	mysqlTpl, _ := TemplateOf(TypeMySQL)
+	mysqlAddress, _ := ParseAddress("10.0.0.12:3306", 3306, "", "")
+	if _, err := Render(mysqlTpl, Instance{
+		Name: "mysql-01", MWType: TypeMySQL, Address: mysqlAddress, Environment: "dev",
+	}, "", "", ""); err == nil {
+		t.Fatal("MySQL 未填监控账号名时应被拒绝")
 	}
 }
 

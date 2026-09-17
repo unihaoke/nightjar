@@ -185,8 +185,9 @@ var templates = map[string]Template{
 			"REDIS_ADDR 形如 redis://<host>:<port>；口令用 REDIS_PASSWORD 注入，不要写进 URL。",
 			"**用户名只在 Redis 6+ 的 ACL 场景才需要**（如云厂商 Redis 的账号）。自建 Redis 通常只配了 requirepass：此时用户名必须**留空**，" +
 				"否则 Exporter 会发 AUTH <用户名> <口令>，得到 WRONGPASS、redis_up=0（在 prometheus.yml 里看起来一切正常，最容易被忽略）。",
+			"**无认证的 Redis（未开 requirepass）账号口令都留空即可**，保存不会被拦；若目标其实要求认证，" +
+				"Exporter 会返回 redis_up=0 并在集成备注里给出 NOAUTH 的结论，届时补填口令即可。",
 			"redis_exporter 没有 SERVICE_NAME 之类的实例名开关，instance_name 由平台写入 Prometheus 抓取标签（服务发现）。",
-			"开启 requirepass 的实例务必填写口令，否则 Exporter 侧 redis_up=0。",
 		},
 		Docs: []string{
 			"https://cloud.tencent.com/document/product/1416/111839",
@@ -627,10 +628,12 @@ func (t Template) Validate(in Instance) error {
 	if t.MonitorUser != "" && strings.TrimSpace(in.Username) == "" {
 		return fmt.Errorf("%s 集成需要填写监控账号（平台将按该账号名代建只读账号）", t.Name)
 	}
-	if t.NeedsAuth && strings.TrimSpace(in.Username) == "" && strings.TrimSpace(in.Password) == "" && t.Type != TypeES {
-		// 两者都空且该组件通常需要认证：给出明确提示，避免误配成匿名访问。
-		return fmt.Errorf("%s 集成需要填写口令（若确实匿名访问，请显式填写账号或口令以确认）", t.Name)
-	}
+	// 刻意**不**要求"必须填账号或口令"：
+	//   - 无认证的实例是合法场景（内网 Redis 未开 requirepass、Kafka 未开 SASL…），
+	//     曾经加过一道"两者都空则拒绝保存"的门槛，结果是使用者被卡住且无处可填（真实反馈）。
+	//   - 填错的代价很低且可自证：Exporter 会返回 redis_up=0 并在自己的日志里写 NOAUTH，
+	//     平台会把这条日志翻译成"口令不一致/需认证"写回集成备注（见 DescribeExporterLog）。
+	// 因此这里只做"能填就填对"的引导（见各模板的 Notes），不做阻塞。
 	if err := ValidateLabels(in.Labels); err != nil {
 		return err
 	}
