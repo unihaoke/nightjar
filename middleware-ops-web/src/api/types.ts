@@ -247,6 +247,9 @@ export interface IntegrationOverview {
   file_sd_path: string
   docker_note: string
   docker_ok: boolean
+  /** 远程安装（Ansible）是否已开启 / 是否真的可用（镜像内有 ansible-playbook）。 */
+  remote_install: boolean
+  remote_ready: boolean
 }
 
 /** 集成中心：一条集成。 */

@@ -12,13 +12,13 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { integrationApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
+import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationOverview, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
 import { envLabels, formatTime } from '@/utils/format'
 
 const router = useRouter()
 
 const loading = ref(false)
-const overview = ref<{ total: number; by_type: Record<string, number>; templates: IntegrationTemplate[]; file_sd_path: string; docker_note: string; docker_ok: boolean } | null>(null)
+const overview = ref<IntegrationOverview | null>(null)
 const items = ref<IntegrationView[]>([])
 
 const dialogVisible = ref(false)
@@ -129,8 +129,24 @@ function isTruthyValue(value: string): boolean {
 /** 是否处于编辑态。 */
 const isEdit = computed(() => Boolean(editing.value?.instance_id))
 
-/** 一键部署是否可用。 */
+/** 本机一键部署（Docker API）是否可用。 */
 const dockerReady = computed(() => Boolean(overview.value?.docker_ok))
+/** 远程安装（Ansible）是否可用：镜像带 ansible-playbook 且平台开关已打开。 */
+const remoteReady = computed(() => Boolean(overview.value?.remote_ready))
+/** 只要本机或远程有一种可用，就算"平台可代部署"。 */
+const deployReady = computed(() => dockerReady.value || remoteReady.value)
+/** 顶部状态标签：不要再在"仅远程可用"时误导成「仅生成配置」。 */
+const deployReadyLabel = computed(() => {
+  if (dockerReady.value) {
+    return '本机一键部署已启用'
+  }
+  if (remoteReady.value) {
+    return '远程安装可用（本机 Docker 通道不可用）'
+  }
+  return '仅生成配置'
+})
+/** 日志接入始终需要平台侧 docker（采集容器读同一个卷），因此单独判断。 */
+const logCollectReady = computed(() => dockerReady.value)
 
 /** 已集成总数。 */
 const total = computed(() => items.value.length)
@@ -674,22 +690,14 @@ onMounted(load)
       </div>
       <div class="row">
         <el-button size="small" @click="load">刷新</el-button>
-        <el-button size="small" :disabled="!dockerReady" @click="openLogDialog">日志接入</el-button>
+        <el-button size="small" :disabled="!logCollectReady" @click="openLogDialog">日志接入</el-button>
         <el-button size="small" @click="openAccounts">监控账号</el-button>
-        <el-tag size="small" :type="dockerReady ? 'success' : 'info'" effect="light">
-          {{ dockerReady ? '一键部署已启用' : '仅生成配置' }}
+        <el-tag size="small" :type="deployReady ? 'success' : 'info'" effect="light">
+          {{ deployReadyLabel }}
         </el-tag>
       </div>
     </div>
 
-    <el-alert
-      v-if="overview?.docker_note"
-      type="info"
-      :closable="false"
-      show-icon
-      :title="overview.docker_note"
-      class="mb"
-    />
 
     <!-- 组件模板 -->
     <div class="card">
@@ -902,6 +910,30 @@ onMounted(load)
             <el-option label="远程服务器（平台用内置 Ansible playbook 一键安装）" value="remote" />
           </el-select>
         </el-form-item>
+        <!-- Docker 通道提示只在「本机」时出现：选远程时它不相关，不该打扰使用者 -->
+        <el-alert
+          v-if="form.deploy_target === 'local' && overview?.docker_note"
+          type="info"
+          :closable="false"
+          show-icon
+          class="mb"
+          :title="overview.docker_note"
+        />
+        <el-alert
+          v-if="form.deploy_target === 'remote' && !remoteReady"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="mb"
+          title="远程安装当前不可用：平台镜像没有 ansible-playbook 或开关未打开"
+        >
+          <p class="field-hint">
+            请用 <span class="mono">WITH_ANSIBLE=true</span> 重新构建后端镜像，并在平台
+            <span class="mono">.env</span> 里设
+            <span class="mono">INTEGRATION_ALLOW_REMOTE_INSTALL=true</span>、
+            <span class="mono">INTEGRATION_ANSIBLE_ENABLED=true</span>（详见 deploy/ansible/README.md）。
+          </p>
+        </el-alert>
         <template v-if="form.deploy_target === 'remote'">
           <el-row :gutter="12">
             <el-col :xs="24" :sm="10">
@@ -964,31 +996,42 @@ onMounted(load)
 
         <el-divider content-position="left">落地方式</el-divider>
         <div class="switch-row">
-          <el-switch v-model="form.deploy" :disabled="!dockerReady" />
-          <span>由平台一键拉起 Exporter 容器（{{ dockerReady ? 'Docker API 可用' : '需开启 integration.docker_enabled' }}）</span>
+          <el-switch v-model="form.deploy" :disabled="form.deploy_target === 'remote' ? !remoteReady : !dockerReady" />
+          <span v-if="form.deploy_target === 'remote'">
+            由平台远程安装 Exporter（{{ remoteReady ? 'Ansible 通道可用' : '需平台镜像带 ansible-playbook' }}）
+          </span>
+          <span v-else>
+            由平台一键拉起 Exporter 容器（{{ dockerReady ? 'Docker API 可用' : '需开启 integration.docker_enabled' }}）
+          </span>
         </div>
         <div class="switch-row">
           <el-switch v-model="form.auto_rules" />
           <span>自动创建推荐告警规则（{{ (activeTemplate?.alerts || []).length }} 条）</span>
         </div>
+        <p v-if="form.deploy_target === 'remote' && !remoteReady" class="field-hint">
+          当前平台镜像没有 ansible-playbook：本地开发可先用「本机」部署位置，
+          生产请用 <span class="mono">WITH_ANSIBLE=true</span> 构建后端镜像（见 deploy/ansible/README.md）。
+        </p>
 
-        <!-- 网络接入方向：默认由平台把自己的 Exporter 接进目标网络（不动被管项目） -->
-        <div class="switch-row">
-          <el-switch v-model="form.join_platform_network" :disabled="!dockerReady" />
-          <span>改为把「目标容器」接入平台网络（仅在平台接不进去时使用）</span>
-        </div>
-        <el-alert v-if="form.join_platform_network" type="warning" :closable="false" show-icon class="mt"
-          title="这是反向接网：会修改被管容器的网络配置">
-          <p class="field-hint">
-            平台将执行等价于 <code>docker network connect &lt;平台网络&gt; &lt;目标容器&gt;</code> 的操作。
-            默认方向本来就是「平台自动接进目标网络」，正常情况下不需要勾选它。
-          </p>
-          <p class="field-hint">
-            务必注意：若目标容器原本只在 internal 网络里（例如 被管项目的 internal 网络，刻意做成无出网），
-            接入平台网络后它会多一条出网路径，数据面隔离随之失效。
-            地址填的是外部地址（非容器名）时无需勾选。
+        <!-- 反向接网：只对本机容器有意义（远程目标是别的机器上的容器，平台碰不到它的网络） -->
+        <template v-if="form.deploy_target === 'local'">
+          <div class="switch-row">
+            <el-switch v-model="form.join_platform_network" :disabled="!dockerReady" />
+            <span>改为把「目标容器」接入平台网络（仅在平台接不进去时使用）</span>
+          </div>
+          <el-alert v-if="form.join_platform_network" type="warning" :closable="false" show-icon class="mt"
+            title="这是反向接网：会修改被管容器的网络配置">
+            <p class="field-hint">
+              平台将执行等价于 <code>docker network connect &lt;平台网络&gt; &lt;目标容器&gt;</code> 的操作。
+              默认方向本来就是「平台自动接进目标网络」，正常情况下不需要勾选它。
+            </p>
+            <p class="field-hint">
+              务必注意：若目标容器原本只在 internal 网络里（例如 被管项目的 internal 网络，刻意做成无出网），
+              接入平台网络后它会多一条出网路径，数据面隔离随之失效。
+              地址填的是外部地址（非容器名）时无需勾选。
           </p>
         </el-alert>
+        </template>
 
         <!-- 账号托管：平台代为创建只读监控账号（写操作，需显式授权） -->
         <template v-if="bootstrapSupported">
@@ -1009,7 +1052,8 @@ onMounted(load)
             </p>
           </el-alert>
           <div class="switch-row">
-            <el-switch v-model="form.bootstrap_account" :disabled="!dockerReady" />
+            <el-switch v-model="form.bootstrap_account"
+              :disabled="form.deploy_target === 'remote' ? !remoteReady : !dockerReady" />
             <span>由平台创建/更新只读监控账号（无需登录被管数据库手工建号）</span>
           </div>
           <p v-if="form.bootstrap_account" class="field-hint">

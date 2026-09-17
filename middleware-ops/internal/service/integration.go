@@ -233,6 +233,10 @@ type IntegrationOverview struct {
 	Templates []TemplateView `json:"templates"`
 	// FileSDPath 为 file_sd 文件在平台侧的实际路径。
 	FileSDPath string `json:"file_sd_path"`
+	// RemoteInstall / RemoteReady 让界面区分"本机一键部署"与"远程安装"两种能力，
+	// 避免在没有 docker.sock 时把「远程可用」误报成「仅生成配置」。
+	RemoteInstall bool `json:"remote_install"`
+	RemoteReady   bool `json:"remote_ready"`
 	// DockerNote 说明一键部署能力当前是否可用。
 	DockerNote string `json:"docker_note"`
 	DockerOK   bool   `json:"docker_ok"`
@@ -278,6 +282,8 @@ func (s *IntegrationService) Overview(ctx context.Context) (*IntegrationOverview
 		Total: len(items), ByType: byType, Templates: views,
 		FileSDPath: s.fileSDPath(),
 		DockerNote: s.dockerNote, DockerOK: s.dockerOK,
+		RemoteInstall: s.cfg.Integration.AllowRemoteInstall && s.cfg.Integration.Ansible.Enabled,
+		RemoteReady:   s.remoteReady() == nil,
 	}, nil
 }
 
