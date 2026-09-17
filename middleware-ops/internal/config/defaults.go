@@ -9,7 +9,8 @@ import (
 // setDefaults 写入全部默认值。
 //
 // 默认值即「单机零外部依赖可启动」的最小集合：Redis 缺省降级为内存实现，
-// Prometheus 缺省使用内置指标源，AI 引擎缺省走自托管 + 规则兜底。
+// Prometheus 缺省禁用模拟数据（mock_enabled=false，需显式开启才填充假指标），
+// AI 引擎缺省走自托管 + 规则兜底。
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("app.name", "middleware-ops")
 	v.SetDefault("app.version", "1.0.0")
@@ -97,6 +98,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("prometheus.cache_ttl", 15*time.Second)
 	v.SetDefault("prometheus.retention", 15*24*time.Hour)
 	v.SetDefault("prometheus.exporter_job_prefix", "middleware-exporter")
+	// 模拟数据默认关闭：base_url 为空时不再用内置模拟器填充页面，
+	// 而是由监控链路明确返回「无数据源」，避免掩盖未接入的事实。
+	v.SetDefault("prometheus.mock_enabled", false)
 
 	v.SetDefault("integration.enabled", true)
 	v.SetDefault("integration.output_dir", "./data/integrations")

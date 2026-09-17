@@ -195,7 +195,7 @@ func (s *IntegrationService) selfCheckScrape(
 	reporter, ok := s.monitor.(monitor.TargetReporter)
 	if !ok || s.monitor == nil {
 		stage.Status = stageWarn
-		stage.Detail = "当前监控数据源不支持查询抓取目标（如内置模拟器），无法判定"
+		stage.Detail = "当前监控数据源不支持查询抓取目标（如内置模拟器或数据源已禁用），无法判定"
 		return stage
 	}
 	job := meta.Job
@@ -242,6 +242,12 @@ func (s *IntegrationService) selfCheckMetrics(ctx context.Context, item *model.M
 	if err != nil {
 		stage.Status = stageWarn
 		stage.Detail = "指标快照采集失败：" + err.Error()
+		return stage
+	}
+	if snapshot.Source == "disabled" {
+		stage.Status = stageWarn
+		stage.Detail = "模拟数据已关闭且未配置 Prometheus，当前无监控数据源，无法判定真实指标"
+		stage.Advice = "如需离线演示可开启 mock_enabled；生产环境请接入平台自带 Prometheus"
 		return stage
 	}
 	if snapshot.Degraded || snapshot.Source != "prometheus" {

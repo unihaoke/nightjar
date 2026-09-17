@@ -124,9 +124,18 @@ func TestHistoryDoesNotFabricateDataOnEmptyResult(t *testing.T) {
 
 // TestSnapshotDegradesToSimulatorWhenPrometheusDown 锁定：
 // 上游真的挂了才降级为模拟器，且降级后仍要回传真实选择器供排障。
+//
+// 注意：回退模拟器仅在 mock_enabled=true 时启用（默认关闭，避免用假数据掩盖未接入），
+// 因此本测试显式开启该开关。
 func TestSnapshotDegradesToSimulatorWhenPrometheusDown(t *testing.T) {
-	client, closeFn := newStubClient(t, stubDown)
-	defer closeFn()
+	server := httptest.NewServer(stubHandler(stubDown))
+	defer server.Close()
+	cfg := &config.Config{}
+	cfg.Prometheus.BaseURL = server.URL
+	cfg.Prometheus.Timeout = 2 * time.Second
+	cfg.Prometheus.ExporterJobPrefix = "middleware-exporter"
+	cfg.Prometheus.MockEnabled = true
+	client := New(cfg, nil, zap.NewNop())
 
 	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
 	if err != nil {
@@ -170,6 +179,39 @@ func TestSnapshotMatchesWhenJobAndLabelsAgree(t *testing.T) {
 	}
 	if len(samples) != 2 || samples[0].Value != 12.5 {
 		t.Fatalf("应返回 Prometheus 的真实序列，实际 %+v", samples)
+	}
+}
+
+// TestMockSwitchDefaultOff 锁定：mock_enabled 默认关闭时，base_url 为空不使用模拟器，
+// 而是返回 disabled 数据源，明确表达「无数据源」而非用假数据掩盖未接入。
+func TestMockSwitchDefaultOff(t *testing.T) {
+	cfg := &config.Config{} // base_url 为空，mock_enabled 默认 false
+	client := New(cfg, nil, zap.NewNop())
+	if client.Kind() != "disabled" {
+		t.Fatalf("mock 关闭且未配置 base_url 时应禁用数据源，实际 kind=%s", client.Kind())
+	}
+	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
+	if err != nil {
+		t.Fatalf("disabled 快照不应报错：%v", err)
+	}
+	if snapshot.Source != "disabled" || !snapshot.Degraded {
+		t.Fatalf("disabled 快照应标注 source=disabled，实际 source=%s degraded=%v", snapshot.Source, snapshot.Degraded)
+	}
+	if len(snapshot.Metrics) != 0 {
+		t.Fatalf("disabled 不应有指标数据，实际 %d 项", len(snapshot.Metrics))
+	}
+	if _, err := client.History(context.Background(), sampleRedisTarget(), "memory_usage_percent", TimeRange{}); err == nil {
+		t.Fatal("disabled 的历史查询应报错")
+	}
+}
+
+// TestMockSwitchOnWithEmptyBaseURL 锁定：开启 mock_enabled 且 base_url 为空时使用模拟器。
+func TestMockSwitchOnWithEmptyBaseURL(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Prometheus.MockEnabled = true
+	client := New(cfg, nil, zap.NewNop())
+	if client.Kind() != "simulator" {
+		t.Fatalf("开启 mock 且未配置 base_url 时应使用模拟器，实际 kind=%s", client.Kind())
 	}
 }
 

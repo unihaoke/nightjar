@@ -173,6 +173,13 @@ type PrometheusConfig struct {
 	Retention time.Duration `mapstructure:"retention"`
 	// ExporterJobPrefix 为 PromQL 标签匹配前缀。
 	ExporterJobPrefix string `mapstructure:"exporter_job_prefix"`
+	// MockEnabled 控制是否允许使用内置指标模拟器。
+	//
+	// 默认 false（关闭模拟数据）：base_url 为空时不返回任何假数据，监控链路明确
+	// 返回「无数据源」，避免用模拟指标掩盖「实例其实没接入」的事实。需要离线演示
+	// 时显式开启（MWOPS_PROMETHEUS_MOCK_ENABLED=true）。
+	// 设为 true 且 base_url 非空时，Prometheus 查询失败仍会回退模拟器以保证页面可用。
+	MockEnabled bool `mapstructure:"mock_enabled"`
 }
 
 // IntegrationConfig 是「集成中心」参数（对齐云厂商控制台的一键集成能力）。

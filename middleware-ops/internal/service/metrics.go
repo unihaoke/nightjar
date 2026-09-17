@@ -395,12 +395,15 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 func diagnoseHints(item *model.MiddlewareInstance, result *DiagnoseResult) []string {
 	hints := make([]string, 0, 6)
 	if result.MonitorKind == "simulator" {
-		hints = append(hints, "当前数据源是内置模拟器（prometheus.base_url 为空）：页面上的数值不是真实指标。请设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090（平台自带 Prometheus），并用 docker compose 启动平台监控服务。")
+		hints = append(hints, "当前数据源是内置模拟器（prometheus.base_url 为空且 mock_enabled=true）：页面上的数值不是真实指标。请设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090（平台自带 Prometheus），并用 docker compose 启动平台监控服务。")
+	}
+	if result.MonitorKind == "disabled" {
+		hints = append(hints, "模拟数据已关闭且未配置 prometheus.base_url：当前没有监控数据源，页面不展示任何指标。如需离线演示可设 MWOPS_PROMETHEUS_MOCK_ENABLED=true；生产环境请接入平台自带 Prometheus（docker compose 启动 mwops-prometheus）。")
 	}
 	if !result.Healthy {
 		hints = append(hints, "Prometheus 健康检查未通过：确认 mwops-prometheus 容器在运行、地址可达、网络别名正确（平台侧 getent hosts prometheus）。")
 	}
-	if result.Total == 0 {
+	if result.Total == 0 && result.MonitorKind != "disabled" {
 		hints = append(hints, "该中间件类型没有指标画像（rabbitmq 仅纳管），因此不会产出任何指标。")
 	}
 	switch {

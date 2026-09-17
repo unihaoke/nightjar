@@ -22,19 +22,30 @@ type fallbackClient struct {
 
 // New 依据配置创建监控客户端。
 //
-// prometheus.base_url 为空 → 直接使用模拟器（离线可运行）；
-// 否则使用 Prometheus，并在查询失败时回退模拟器（可用性优先，见 10.）。
+// 行为由 base_url 与 mock_enabled 共同决定：
+//
+//   - base_url 为空 且 mock_enabled=true  → 直接使用模拟器（离线演示）；
+//   - base_url 为空 且 mock_enabled=false → 数据源禁用，监控链路明确返回「无数据源」；
+//   - base_url 非空 且 mock_enabled=true  → 使用 Prometheus，查询失败时回退模拟器（可用性优先）；
+//   - base_url 非空 且 mock_enabled=false → 使用 Prometheus，查询失败直接报错，不回退模拟器。
 func New(cfg *config.Config, store cache.Store, log *zap.Logger) Client {
 	if cfg.Prometheus.BaseURL == "" {
-		log.Warn("未配置 prometheus.base_url，监控数据使用内置模拟器")
-		return NewSimulator()
+		if cfg.Prometheus.MockEnabled {
+			log.Warn("未配置 prometheus.base_url 但已开启 mock_enabled，监控数据使用内置模拟器")
+			return NewSimulator()
+		}
+		log.Warn("未配置 prometheus.base_url 且 mock_enabled=false，监控数据源已禁用（不提供模拟数据）")
+		return NewDisabledClient()
 	}
-	return &fallbackClient{
-		primary:   NewPrometheusClient(cfg, store, log),
-		backup:    NewSimulator(),
-		log:       log,
-		jobPrefix: cfg.Prometheus.ExporterJobPrefix,
+	if cfg.Prometheus.MockEnabled {
+		return &fallbackClient{
+			primary:   NewPrometheusClient(cfg, store, log),
+			backup:    NewSimulator(),
+			log:       log,
+			jobPrefix: cfg.Prometheus.ExporterJobPrefix,
+		}
 	}
+	return NewPrometheusClient(cfg, store, log)
 }
 
 // Kind 返回实现类型。

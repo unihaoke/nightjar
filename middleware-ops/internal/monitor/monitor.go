@@ -3,8 +3,9 @@
 // 设计依据（设计文档 4.2）：指标统一由 Prometheus + 官方 Exporter 采集，
 // 平台通过 PromQL 查询，**不建自有指标表**；历史趋势由 Prometheus 保留策略控制。
 //
-// 当 prometheus.base_url 为空时使用内置指标模拟器（simulator.go），
-// 保证离线环境下监控页面、告警规则评估与 AI 诊断链路仍然可用。
+// 当 prometheus.base_url 为空时，是否使用内置指标模拟器取决于 prometheus.mock_enabled：
+// 开启则用模拟器（simulator.go，离线演示用），关闭则监控数据源禁用（disabled.go），
+// 明确表达「无数据源」而不是用假数据掩盖未接入的事实。
 package monitor
 
 import (
