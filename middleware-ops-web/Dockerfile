@@ -1,10 +1,13 @@
+# syntax=docker/dockerfile:1
 # 前端镜像（构建产物交由 Nginx 托管，同时作为反向代理入口）。
 FROM node:22-alpine AS builder
 
 WORKDIR /src
 
 COPY package.json package-lock.json* ./
-RUN npm config set registry https://registry.npmmirror.com && npm install --no-audit --no-fund
+# npm 缓存挂载：依赖没变时不重复下载（改源码不会让这一层失效）
+RUN --mount=type=cache,target=/root/.npm \
+    npm config set registry https://registry.npmmirror.com && npm install --no-audit --no-fund
 
 COPY . .
 RUN npm run build:only

@@ -63,8 +63,15 @@ RUN if [ "$WITH_ANSIBLE" = "true" ]; then \
     fi
 ```
 
-> 只用到 `ansible.builtin.*` 模块，因此不需要 `community.*` 集合；
-> 若你的构建环境无法访问 Alpine community 源，可改用 `pip install ansible-core`（约 20MB）。
+> 只用到 `ansible.builtin.*` 模块，因此不需要 `community.*` 集合。
+>
+> **构建慢怎么办**：
+> 1. `ansible` 在 Alpine 的 `community` 仓库里（默认源不含它，Dockerfile 已显式写入 main+community）；
+> 2. 国内构建建议换源：`.env` 里设 `ALPINE_MIRROR=mirrors.aliyun.com`（或 `mirrors.tuna.tsinghua.edu.cn`）；
+> 3. 改业务代码不会重复下载 ansible（它是独立的靠前层）；Go 编译缓存也通过 BuildKit
+>    `--mount=type=cache` 保留，因此**第二次起构建只编改过的包**；
+> 4. 想看清每一步耗时：`docker compose build --progress=plain backend`。
+> 5. 只做本机 Docker 部署时用 `WITH_ANSIBLE=false`，构建最快、镜像最小。
 
 ## 2. 平台开关（默认已开）
 

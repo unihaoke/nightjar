@@ -126,6 +126,8 @@ services:
         # 远程安装 Exporter（Ansible）：默认构建进镜像（远程是默认部署路径）。
         # 只做本机 Docker 部署时设 WITH_ANSIBLE=false 可让镜像小约 200MB。
         WITH_ANSIBLE: ${WITH_ANSIBLE:-true}
+        # 国内构建慢时可换成阿里/清华源，例如 mirrors.aliyun.com 或 mirrors.tuna.tsinghua.edu.cn
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
     container_name: mwops-backend
     restart: unless-stopped
     depends_on:
