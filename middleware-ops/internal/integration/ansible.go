@@ -112,6 +112,11 @@ func RenderRemoteInstall(tpl Template, in Instance, opts RemoteOptions) (RemoteA
 		HostPID:     tpl.HostPID,
 		HostMounts:  tpl.HostMounts,
 	})
+	// 交给 ansible 之前先自校验：宁可在这里报「平台模板缺陷」，
+	// 也不要让使用者看到 ansible 那句 unhashable type（见 playbook_validate.go）。
+	if err := validatePlaybookYAML("远程安装", playbook); err != nil {
+		return RemoteArtifacts{}, err
+	}
 	return RemoteArtifacts{
 		Playbook: playbook, Inventory: renderInventory(host, opts, opts.SSHPassword), VarsFile: varsFile,
 		MaskedPlaybook: playbook, MaskedInventory: renderInventory(host, opts, ""), MaskedVarsFile: maskedVars,
@@ -181,6 +186,9 @@ func renderRemotePlaybook(in remotePlaybookInput) string {
 	var b strings.Builder
 	b.WriteString("# 由平台「集成中心」生成：远程安装 " + in.Component + "（集成 " + in.Name + "）\n")
 	b.WriteString("# 请勿手工修改：平台按此模板执行，改动会在下次「重新应用」时被覆盖。\n")
+	// 版本戳：远程安装报 YAML 语法错时，先看这一行判断平台跑的是哪一版渲染器
+	// （旧镜像会显示更低的版本号，见 docs/POSTMORTEM.md INC-005）。
+	b.WriteString("# 渲染器: " + PlaybookRendererVersion + "\n")
 	b.WriteString("- name: 安装并启动 Exporter（" + in.Component + "）\n")
 	b.WriteString("  hosts: exporter_target\n")
 	if in.Become {

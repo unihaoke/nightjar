@@ -5,6 +5,57 @@
 
 ---
 
+## INC-005 · 生成的 playbook 中裸 `{{ }}` 让远程安装整体失败，且报错与根因无关
+
+**首次暴露**：2026-09-18，在「集成中心」对 `jd-redis` 勾选「创建只读账号并拉起 Exporter」时报
+
+```
+创建只读账号并拉起 Exporter失败：Ansible 执行失败：exit status 4
+（输出：ERROR! We were unable to read either as JSON nor YAML ...
+  Syntax Error while loading YAML.
+  found unacceptable key (unhashable type: 'AnsibleMapping')
+The error appears to be in '/app/data/integrations/ansible/jd-redis.yml': line 33 ...
+        port: {{ exporter_port }}
+                    ^ here ）
+```
+
+**定位过程**
+
+1. 报错来自 `ansible.builtin.wait_for` 的 `port:` 字段——问题不在 SSH、不在目标机、
+   也不在那台 Redis；playbook **连解析都没通过**，所以「建号 + 装 Exporter」全流程一步没走；
+2. YAML 规范里，标量位置以 `{` 开头即 flow mapping 起始，`{{ exporter_port }}` 会被解析成
+   「以 mapping 为 key 的 mapping」，PyYAML 拒绝 → ansible 抛 exit 4；
+3. 模板里同一文件其余 `{{ }}` 都出现在 `docker pull {{ exporter_image }}` 这类
+   **行中**位置（合法），只有这一处落在值起始位置，因此此前从未暴露。
+
+**根因**
+
+`internal/integration/ansible.go` 用字符串拼接生成 YAML，`renders` 时直接写了
+`port: ` + `{{ exporter_port }}`，既没有加引号，也没有任何「生成物是否合法」的校验；
+模板一旦写错，只能在**别的机器上**由 ansible 以一句与根因无关的报错反馈。
+
+**修复**
+
+1. `port: '{{ exporter_port }}'`——所有以 `{{` 开头的 YAML 值统一走 `yamlScalar()` 加引号；
+2. 新增 `internal/integration/playbook_validate.go`：渲染完成后**先自己解析**一遍
+   （先扫「裸 `{{` 起始值」，再用 `gopkg.in/yaml.v3` 做真正的语法解析），
+   失败就返回「第 N 行 … 不是合法 YAML」并附原文，属于平台缺陷、不再让使用者看天书；
+3. playbook 第 3 行写入渲染器版本戳 `# 渲染器: mwops-playbook v2`，
+   `/healthz` 同时暴露 `playbook_renderer` 字段——用于区分「模板有缺陷」与
+   **「后端镜像没重建、仍跑旧渲染器」**（本次现场即为后者：
+   `docker compose up -d` 不会重建已存在的镜像，必须 `docker compose build backend`）。
+
+**防复发**
+
+1. `TestRenderedPlaybooksQuoteJinjaValues`：遍历全部组件 × 全部安装方式 + 账号 SQL 产物，
+   扫描「冒号后的值以裸 `{{` 开头」的行；
+2. `TestValidatePlaybookYAML`：直接给校验器喂坏样例，断言**能**报出带行号的错误，
+   并断言行中出现 `{{`（shell 命令）不会被误判——守卫必须验证「能失败」，不是空跑；
+3. `TestPlaybookRendererVersionStamped`：锁定版本戳存在且在第 3 行；
+4. 排障步骤写入 `deploy/ansible/README.md` §6.1（先 `curl /healthz` 看渲染器版本）。
+
+---
+
 ## INC-004 · 指标序列含 NaN 导致「HTTP 200 + 空响应体」，前端报无关错误
 
 **首次暴露**：2026-09-17，实例详情页看「命中率」指标时报
@@ -193,3 +244,8 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
 2. **表结构只能有一个来源**：任何"顺手的初始化 SQL"都会与 ORM 迁移争夺权威（INC-001）。
 3. **手写 DDL 必须考虑保留字与引号**：ORM 会自动加引号，人不会（INC-002）。
 4. **回归测试要验证"能失败"**：新增守卫后用注入故障的方式确认它会红，否则可能是空跑。
+5. **生成给外部工具消费的文件必须自校验、并带版本戳**：playbook / SQL / 配置一旦交给
+   ansible、mysql 这类外部程序，错误只会在**别的机器上**以难懂的形式返回；
+   渲染后先本地解析一遍，把「第几行、原文、为什么错」直接还给使用者（INC-005）。
+   同时产物要写渲染器版本戳，否则「模板有缺陷」与「镜像/产物是旧的」无法区分——
+   后者在现场排查中占了大半时间。

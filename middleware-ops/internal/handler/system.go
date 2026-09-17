@@ -9,6 +9,7 @@ import (
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/engine"
 	"middleware-ops/internal/engine/guardrail"
+	"middleware-ops/internal/integration"
 	"middleware-ops/internal/response"
 	"middleware-ops/internal/service"
 )
@@ -68,12 +69,17 @@ func (h *Handler) SystemInfo(c *gin.Context) {
 }
 
 // Health 健康检查（无需认证）。
+//
+// playbook_renderer 是「远程安装 playbook 渲染器」的版本号：远程安装报 YAML 语法错时，
+// 先 curl 这个端点即可判断跑的是不是旧镜像（字段缺失或版本低于代码里的常量
+// 就说明后端镜像没重建，见 docs/POSTMORTEM.md INC-005）。
 func (h *Handler) Health(c *gin.Context) {
 	response.OK(c, gin.H{
-		"status":  "healthy",
-		"version": h.deps.Config.App.Version,
-		"uptime":  nowUnix() - h.deps.StartedAt,
-		"engine":  service.WatchEngineStatus(h.deps.Engine),
+		"status":            "healthy",
+		"version":           h.deps.Config.App.Version,
+		"uptime":            nowUnix() - h.deps.StartedAt,
+		"engine":            service.WatchEngineStatus(h.deps.Engine),
+		"playbook_renderer": integration.PlaybookRendererVersion,
 	})
 }
 

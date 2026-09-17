@@ -92,6 +92,7 @@ func RenderAccountSQL(req AccountSQLRequest) (AccountSQLArtifacts, error) {
 	b.WriteString("# 由平台「集成中心」生成：在目标主机上执行监控账号 SQL（集成 " + req.Name + "）\n")
 	b.WriteString("# 请勿手工修改：平台按此模板执行，改动会在下次执行时被覆盖。\n")
 	b.WriteString("# 优先使用目标机自带的 " + client + " 客户端；缺失时回退到目标机上的 docker 一次性容器。\n")
+	b.WriteString("# 渲染器: " + PlaybookRendererVersion + "\n")
 	b.WriteString("- name: 执行账号 SQL（" + req.Name + "）\n")
 	b.WriteString("  hosts: exporter_target\n")
 	b.WriteString("  become: true\n")
@@ -144,6 +145,9 @@ func RenderAccountSQL(req AccountSQLRequest) (AccountSQLArtifacts, error) {
 	b.WriteString("      when: account_client.rc != 0 and (account_docker.rc | default(1)) == 0\n")
 
 	playbook := strings.Join(strings.Split(b.String(), "\r\n"), "\n")
+	if err := validatePlaybookYAML("账号 SQL", playbook); err != nil {
+		return AccountSQLArtifacts{}, err
+	}
 	realVars, maskedVars := renderAccountVars(req.ExecPassword)
 	return AccountSQLArtifacts{
 		Playbook: playbook, VarsFile: realVars,

@@ -157,3 +157,55 @@ sudo systemctl daemon-reload
 
 在平台上删除该集成不会自动卸载目标机上的 Exporter（平台不假设自己拥有那台机器），
 如需彻底清理请按上面命令手工执行。
+
+## 6. 排障
+
+### 6.1 `found unacceptable key (unhashable type: 'AnsibleMapping')`
+
+完整报错形如（`exit status 4`）：
+
+```
+ERROR! We were unable to read either as JSON nor YAML ...
+Syntax Error while loading YAML.
+  found unacceptable key (unhashable type: 'AnsibleMapping')
+The error appears to be in '/app/data/integrations/ansible/<集成名>.yml': line 33 ...
+        port: {{ exporter_port }}
+                    ^ here
+```
+
+先确认**是哪一种**（这一步能省掉大量瞎猜）：
+
+```bash
+# ① 跑的是哪一版渲染器？字段缺失或不是 mwops-playbook v2 → 后端镜像是旧的
+curl -s http://127.0.0.1:8080/healthz
+# ② 落盘的 playbook 第 3 行应带同一个版本戳
+docker exec mwops-backend sed -n '1,6p' /app/data/integrations/ansible/<集成名>.yml
+```
+
+- **版本戳是旧版 / `playbook_renderer` 字段不存在** → 后端镜像没重建。
+  `docker compose up -d` **不会**重建镜像（本地已存在同名镜像时直接复用），必须显式构建：
+
+  ```bash
+  cd nightjar
+  docker compose build backend && docker compose up -d backend
+  curl -s http://127.0.0.1:8080/healthz   # 应看到 "playbook_renderer": "mwops-playbook v2"
+  ```
+
+  然后在集成详情页点「重新应用」，重新生成并执行 playbook。
+
+- **版本戳已是最新却仍报错** → 平台模板缺陷：把第 2 步打印出的文件与
+  `middleware-ops/internal/integration/ansible.go` 对照提工单。
+
+> v2 渲染器起，平台在把 playbook 交给 `ansible-playbook` **之前**会自己用 YAML 解析器
+> 校验一遍（`internal/integration/playbook_validate.go`）：真出错时界面直接提示
+> 「第 N 行不是合法 YAML」，不会再抛 ansible 那句 unhashable type。
+> 因此**只要还看到这个原始报错，就说明跑的不是 v2 渲染器，即镜像未重建**。
+
+### 6.2 重建后仍未生效的常见原因
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `docker compose up -d` 后行为没变 | 该命令不重建镜像 | 用 `docker compose build backend` 或 `up -d --build backend` |
+| 构建很快但代码没变 | 构建上下文不是当前工作区（换了目录/机器） | `docker compose build --progress=plain backend` 看 `COPY` 的源；确认 `docker compose config \| grep context` |
+| 改了 `.env` 没生效 | 环境变量在容器创建时注入 | `docker compose up -d --force-recreate backend` |
+

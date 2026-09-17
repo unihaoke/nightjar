@@ -409,3 +409,76 @@ func TestRemoteBridgeModeAddsPortMapping(t *testing.T) {
 		t.Fatalf("systemd 模式应生成单元文件任务：\n%s", art.Playbook)
 	}
 }
+
+// TestValidatePlaybookYAML 锁定运行时自校验（INC-005 的第二道防线）。
+//
+// 回归测试只能守住"当前模板"；渲染器还要在执行前自己解析一遍，
+// 这样即使将来又写出非法 YAML，使用者在界面上看到的是
+// 「第 N 行 …不是合法 YAML」而不是 ansible 那句 unhashable type。
+func TestValidatePlaybookYAML(t *testing.T) {
+	broken := "- name: 安装\n  hosts: exporter_target\n  tasks:\n" +
+		"    - name: 等待 Exporter 端口就绪\n" +
+		"      ansible.builtin.wait_for:\n" +
+		"        host: 127.0.0.1\n" +
+		"        port: {{ exporter_port }}\n"
+	err := validatePlaybookYAML("远程安装", broken)
+	if err == nil {
+		t.Fatal("裸 {{ 值必须被拦下，否则 ansible 只会在执行阶段报 unhashable type")
+	}
+	if !strings.Contains(err.Error(), "第 7 行") {
+		t.Fatalf("错误信息应给出行号：%v", err)
+	}
+	if !strings.Contains(err.Error(), "port: {{ exporter_port }}") {
+		t.Fatalf("错误信息应给出原文：%v", err)
+	}
+	if !strings.Contains(err.Error(), "{{ 开头的值必须加引号") {
+		t.Fatalf("错误信息应说明修法：%v", err)
+	}
+
+	// 单引号修正后必须通过。
+	fixed := strings.Replace(broken, "port: {{ exporter_port }}", "port: '{{ exporter_port }}'", 1)
+	if err := validatePlaybookYAML("远程安装", fixed); err != nil {
+		t.Fatalf("加引号后应通过：%v", err)
+	}
+
+	// 行中出现 {{ 是合法的（shell 命令里很常见），不得误报。
+	inline := "- name: 安装\n  hosts: all\n  tasks:\n    - name: 拉取镜像\n" +
+		"      ansible.builtin.command: docker pull {{ exporter_image }}\n"
+	if err := validatePlaybookYAML("远程安装", inline); err != nil {
+		t.Fatalf("行中的 {{ 不应被误判：%v", err)
+	}
+
+	// 其它结构性错误交给真正的 YAML 解析器兜住。
+	if err := validatePlaybookYAML("远程安装", "key: [unclosed\n"); err == nil {
+		t.Fatal("非法 YAML 结构应被解析器拦下")
+	}
+}
+
+// TestPlaybookRendererVersionStamped 锁定产物第 3 行的渲染器版本戳。
+//
+// 远程安装报 YAML 语法错时，先看这一行即可区分
+// 「平台模板有缺陷」与「后端镜像未重建、仍在跑旧渲染器」。
+func TestPlaybookRendererVersionStamped(t *testing.T) {
+	tpl, _ := TemplateOf(TypeRedis)
+	art, err := RenderRemoteInstall(tpl, remoteTestInstance(t), remoteTestOptions())
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	if !strings.Contains(art.Playbook, "# 渲染器: "+PlaybookRendererVersion) {
+		t.Fatalf("安装 playbook 应带渲染器版本戳：\n%s", art.Playbook)
+	}
+	if got := strings.SplitN(art.Playbook, "\n", 4); len(got) < 3 || !strings.Contains(got[2], PlaybookRendererVersion) {
+		t.Fatalf("版本戳应在第 3 行（便于一眼确认镜像新旧）：\n%s", art.Playbook)
+	}
+
+	accountArt, err := RenderAccountSQL(AccountSQLRequest{
+		Name: "redis-prod-01", MWType: TypeMySQL, DBHost: "127.0.0.1", DBPort: 3306,
+		ExecUser: "root", ExecPassword: "pw", Statements: []string{"SELECT 1"},
+	})
+	if err != nil {
+		t.Fatalf("账号 playbook 渲染失败：%v", err)
+	}
+	if !strings.Contains(accountArt.Playbook, "# 渲染器: "+PlaybookRendererVersion) {
+		t.Fatalf("账号 playbook 应带渲染器版本戳：\n%s", accountArt.Playbook)
+	}
+}
