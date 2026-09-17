@@ -73,6 +73,27 @@ func DescribeExporterLog(logs string) string {
 
 	case strings.Contains(lower, "permission denied"):
 		return "Exporter 报权限不足：核对只读账号的授权（MySQL 需要 PROCESS / REPLICATION CLIENT / SELECT）。"
+
+	// 兜底放在**最后**：这是 redis_exporter 兜底路径的报错，日志里若已有具体原因
+	// （连接被拒 / 超时 / 认证失败），上面的分支已经命中——不能让"马甲"盖住真话。
+	case strings.Contains(lower, "unknown network"):
+		// redis_exporter v1.66 的 connectToRedis：
+		//
+		//	c, err := redis.DialURL(uri, ...)
+		//	if err != nil {                                  // ← 真正的失败（连不上/认证失败）被丢弃
+		//	    frags := strings.Split(e.redisAddr, "://")
+		//	    c, err = redis.Dial(frags[0], frags[1], ...) // Dial("redis", "host:port")
+		//	}
+		//
+		// 于是 `dial redis: unknown network redis` 成了"万能马甲"：连接被拒、超时、
+		// 口令不对，使用者看到的都是这一句（真实故障 INC-012）。
+		return "Exporter 报告 `dial <scheme>: unknown network <scheme>`：**这是 redis_exporter 的兜底路径，" +
+			"真正的原因被它吞掉了**（它先用 redis:// 连接失败，再按 `://` 拆分重试，于是把 scheme 当成了网络类型）。" +
+			"三种最常见的真实原因：① 地址不通——被管实例与 Exporter 同机时却填了公网 IP（要走 hairpin + 安全组）；" +
+			"② 口令不一致，或目标没设口令而这里却传了口令（`ERR Client sent AUTH, but no password is set`）；" +
+			"③ 多填了 ACL 用户名。三个动作：同机时把「地址」改成 127.0.0.1；" +
+			"用 `REDIS_EXPORTER_DEBUG=true` 重跑该容器看真实错误；" +
+			"或在被管机上 `redis-cli -h <地址> -p <端口> [-a <口令>] ping` 对照。"
 	}
 	return ""
 }

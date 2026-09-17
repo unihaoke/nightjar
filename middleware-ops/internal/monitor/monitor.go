@@ -164,6 +164,16 @@ type TargetReporter interface {
 	Targets(ctx context.Context, job string) ([]TargetStatus, error)
 }
 
+// ValueReporter 由能执行任意 PromQL 并取标量的客户端实现。
+//
+// 用途：自检要回答"组件自己是否可用"（redis_up / mysql_up / pg_up / 抓取目标的 up），
+// 这类指标不在 profile 里（profile 只放业务指标），必须按表达式直接查一次。
+// 内置模拟器不实现本接口，调用方据此跳过该环节。
+type ValueReporter interface {
+	// QueryValue 执行 PromQL 并返回标量；无结果返回 (nil, nil)。
+	QueryValue(ctx context.Context, expr string) (*float64, error)
+}
+
 // Client 是监控查询接口。
 type Client interface {
 	// Snapshot 采集某实例的当前指标。

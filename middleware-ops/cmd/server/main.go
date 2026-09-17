@@ -197,7 +197,7 @@ func run(configPath string) error {
 		AuditSnapshot:    cfg.Scheduler.AuditSnapshot,
 		ApprovalExpire:   cfg.Scheduler.ApprovalExpire,
 		ClusterThreshold: cfg.Guardrail.VectorReferenceThreshold,
-	}, deps.Middleware, deps.AlertSvc, deps.Audit, deps.Approval, log)
+	}, deps.Middleware, deps.AlertSvc, deps.Audit, deps.Approval, deps.Integration, log)
 	if err := scheduler.Start(); err != nil {
 		return fmt.Errorf("启动定时任务: %w", err)
 	}

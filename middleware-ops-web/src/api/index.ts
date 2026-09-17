@@ -23,6 +23,7 @@ import type {
   IntegrationInput,
   IntegrationOverview,
   IntegrationView,
+  IntegrationSelfCheck,
   KnowledgeEntry,
   LogCollectInput,
   LogCollectPlan,
@@ -123,6 +124,10 @@ export const integrationApi = {
   // 重新应用：远程部署需要 SSH 凭据（凭据仅本次使用，平台不落库）。
   apply: (id: number, payload: AccountSecurePayload = {}) =>
     post<IntegrationView>(`/api/integrations/${id}/apply`, payload),
+  // 重新核验：只按 Prometheus 现状刷新状态，不重装、不需要凭据。
+  verify: (id: number) => post<IntegrationView>(`/api/integrations/${id}/verify`),
+  // 端到端自检：分环节给出"哪一环断了 + 下一步做什么"。
+  selfCheck: (id: number) => post<IntegrationSelfCheck>(`/api/integrations/${id}/selfcheck`),
   /** 监控账号管理：查看平台代管的只读账号；轮换口令（账号改自己口令，无需管理员凭据）。 */
   accounts: () => get<{ items: IntegrationAccount[] }>('/api/integrations/accounts'),
   /**

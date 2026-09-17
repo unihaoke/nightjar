@@ -176,6 +176,39 @@ func (h *Handler) ApplyIntegration(c *gin.Context) {
 	response.OK(c, item)
 }
 
+// VerifyIntegration 按 Prometheus 现状重新核验（无副作用：不重装、不需要凭据）。
+//
+// 用于"外部原因已经修好，但状态还停在待处理"：核验只在部署后跑几次，
+// 之后不会自己再核对；这个接口让使用者（以及前端按钮）随时刷新状态。
+func (h *Handler) VerifyIntegration(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	item, err := h.deps.Integration.VerifyNow(c.Request.Context(), id, h.operator(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, item)
+}
+
+// SelfCheckIntegration 端到端自检：按环节给出"哪一环断了 + 下一步做什么"。
+//
+// 只读、不需要凭据、不重装：回答"Exporter 还在不在、Prometheus 抓没抓到、指标是否真的有数据"。
+func (h *Handler) SelfCheckIntegration(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	result, err := h.deps.Integration.SelfCheck(c.Request.Context(), id)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
 // ListIntegrationAccounts 汇总各集成的只读监控账号现状（平台代管与否、能否轮换）。
 func (h *Handler) ListIntegrationAccounts(c *gin.Context) {
 	items, err := h.deps.Integration.ListAccounts(c.Request.Context(), h.scope(c))

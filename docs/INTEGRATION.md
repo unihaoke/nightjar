@@ -56,7 +56,7 @@ mwops-prometheus ──http_sd(30s)──▶ GET http://backend:8080/api/sd/inte
 | 云控制台字段 | 本平台字段 | 落地位置 | 注意 |
 |---|---|---|---|
 | 名称 | `name` | 纳管实例名 + Prometheus `instance_name` 标签 + 容器名 | 唯一；正则 `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`，与云控制台一致 |
-| 地址 | `address` | 实例 `host:port`（TCP 探测）+ Exporter 抓取目标 | 端口可省略（取模板默认值）；URL 型组件支持 `http://host:port/path` |
+| 地址 | `address` | 实例 `host:port`（平台侧 TCP 探测）+ **Exporter 侧连接地址** | 端口可省略（取模板默认值）；URL 型组件支持 `http://host:port/path`。**远程部署时这个地址是「目标机视角」**——见下方说明 |
 | 用户名 | `username` | Exporter 的 `REDIS_USER` / DSN / `--es.username` | MySQL/PG 需预建只读账号并授权 |
 | 密码 | `password` | Exporter 的 `REDIS_PASSWORD` / DSN 口令 | AES-256-GCM 加密存储；生成的配置里只出现 `${MONITOR_PASSWORD}` 占位 |
 | 标签 | `labels` | 服务发现的 labels（自定义指标标签） | 不能覆盖 `job`/`instance`/`instance_name`/`mw_type` |
@@ -64,6 +64,29 @@ mwops-prometheus ──http_sd(30s)──▶ GET http://backend:8080/api/sd/inte
 | Exporter 配置（MySQL）| `options`（`target=arg`）| Exporter 命令行开关 `--collect.*` | 上游默认开启的项被关闭时输出 `--no-xxx`（否则"关了没关掉"） |
 | 查看监控 | 实例详情 / 统一监控 | 平台监控页 + 组件对应 Grafana 大盘 ID | 卡片上给出大盘编号 |
 | 配置告警 | 自动创建推荐规则 | `alert_rules` | 保存时勾选「自动创建推荐告警规则」 |
+
+### 2.1 「地址」的两种视角（远程部署必读）
+
+同一个「地址」字段对两个角色含义不同：
+
+| 角色 | 它需要什么 | 谁来用 |
+|---|---|---|
+| **平台** | 平台自己能连到它（TCP 探测） | 健康巡检、纳管列表状态 |
+| **Exporter** | **Exporter 所在机器**能连到它 | 抓取指标（`redis_up` / `mysql_up` …） |
+
+远程部署时 Exporter 跑在**目标机**上。如果被管实例也在这台机器上，那么：
+
+- ❌ 填**公网 IP**（如 `203.195.191.75:6379`）：Exporter 打自己的公网 IP 要走 hairpin NAT
+  并穿过安全组，云上常被拦；日志会写
+  `Couldn't connect to redis instance (redis://203.195.191.75:6379)`，指标 `redis_up 0`；
+- ✅ 填 **`127.0.0.1:6379`**：回环永远可用，也不经公网。
+
+平台从 r5 起会自动处理这种情况：**当「地址」里的主机就是目标机本身时**，渲染给 Exporter 的
+地址自动改成 `127.0.0.1`（部署说明里会写明这次改写），平台侧记录与你填的值保持不变。
+另外，若你把地址填成回环（远程集成），平台**不再对它做 TCP 探测**——那会打到平台自己，
+健康一律以 Exporter 指标为准（`redis_up` / `mysql_up` / `pg_up`）。
+
+> 被管实例在**别的机器**上时，填那台机器的 IP/域名即可（Exporter 能直连，不涉及上面这些问题）。
 
 ---
 
@@ -224,13 +247,25 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 
 **账号管理（集成中心 → 监控账号）**：
 
+表格里给的是**现状**；点任一操作按钮会先弹出一个「账号操作」窗口，
+在里面填齐凭据后**由该窗口的主按钮触发请求**（口令/私钥、管理员账号口令都在同一处，
+仅本次使用、不落库）。
+
 | 能力 | 实现 | 是否需要管理员凭据 |
 |---|---|---|
-| 查看账号现状 | `GET /api/integrations/accounts`：账号名、来源（平台创建/外部账号）、权限摘要、最近轮换时间、集成当前错误 | 否 |
-| **失败重试** | `POST /api/integrations/:id/account/retry`：带凭据 → 幂等重跑建号 SQL；不带 → 只测连接；两种情况都会**带上本次的 SSH 凭据**重建 Exporter 并核验。返回 `created` / `connected` / `message`，前端就地显示"还差什么" | 可选 |
+| 查看账号现状 | `GET /api/integrations/accounts`：账号名、来源（平台创建/外部账号/不需要）、权限摘要、最近轮换时间、集成当前错误 | 否 |
+| **失败重试** | `POST /api/integrations/:id/account/retry`：带凭据 → 幂等重跑建号 SQL；不带 → 只测连接；两种情况都会**带上本次的 SSH 凭据**重建 Exporter 并核验。返回 `created` / `connected` / `message` | 可选 |
 | 连接测试 | `POST /api/integrations/:id/account/probe`：用监控账号执行 `SELECT 1`（MySQL 另附 `SHOW GRANTS`），只读、不改配置 | 否 |
 | 轮换口令 | `POST /api/integrations/:id/account/rotate`：账号**改自己的**口令（MySQL `ALTER USER USER()` / PG `ALTER ROLE CURRENT_USER`），随后自动重建 Exporter | **不需要**（平台持有该账号口令） |
 | 删除账号 | `POST /api/integrations/:id/account/drop`：`DROP USER IF EXISTS` / `DROP ROLE IF EXISTS` | 需要；prod 转审批工单 |
+
+> **「不需要账号」不是「未托管」**：Redis / Kafka / Nginx / Elasticsearch 等组件的模板
+> `monitor_user` 为空——平台本来就不代管它们的账号，界面上显示「不需要」才是正常状态；
+> 只有 MySQL / PostgreSQL 才有「平台创建 / 外部账号」之分。
+>
+> **远程部署的 Exporter 也不会显示「未托管」**：容器在目标机上、平台没有那台机器的 docker 通道，
+> 因此界面直接标成「远程（目标机）」，运行状态看抓取指标（`redis_up` / `mysql_up`）或到目标机
+> `docker ps`；只有「本机」部署才显示容器状态。
 
 **失败可重试的设计要点**（为什么不需要重填整个集成表单）：
 
@@ -246,19 +281,19 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 - 保存/重新应用都是**异步**的：发起时会立刻清掉上一次的失败原因（只剩"⏳ 已开始…"），
   新的失败在后台任务结束时才写入。所以"刚填完凭据保存却先弹旧错误"这种情况不会再出现。
 
-### 两个入口的分工（不是重复）
+### 三个入口的分工（不是重复）
 
-| | 「重新应用」 | 「重试建号 / 连接」 |
-|---|---|---|
-| 做什么 | 重写抓取配置 + 在目标机重装/重建 Exporter | **建号/重置口令** + 连接测试 + 重建 Exporter |
-| 凭据 | 远程：SSH（口令或私钥） | 建号：管理员账号口令；远程另需 SSH |
-| 适用 | 部署面问题：装了起不来、端口不通、容器被删、改了地址/端口、上次安装失败修好了外部原因 | 账号面问题：还没有账号、口令不一致（NOAUTH/WRONGPASS）、权限不足 |
-| 是否写被管库 | 否 | 是（仅幂等的建号/授权语句） |
+| | 「重新核验」 | 「重新应用」 | 「重试建号 / 连接」 |
+|---|---|---|---|
+| 做什么 | 只按 Prometheus 现状刷新状态 | 重写抓取配置 + 重装/重建 Exporter | **建号/重置口令** + 连接测试 + 重建 Exporter |
+| 凭据 | **不需要** | 远程：SSH（口令或私钥） | 建号：管理员账号口令；远程另需 SSH |
+| 副作用 | **无** | 会重建 Exporter | 会写被管库（仅幂等建号/授权语句） |
+| 适用 | 外部原因已修好、状态没跟上（核验只在部署后跑几次，之后不会自己再核对） | 部署面问题：装了起不来、端口不通、容器被删、改了地址/端口 | 账号面问题：还没有账号、口令不一致（NOAUTH/WRONGPASS）、权限不足 |
 
-「重试建号」是「重新应用」的**超集**（多做了账号 SQL，代价是要管理员凭据）。
-两个都必须保留：去掉「重新应用」就得为了重装 Exporter 而索要 root 口令；
-去掉「重试建号」则没有任何入口能创建账号。真正要修的是**入口的完整性**（各自都能就地补齐凭据）
-与**指路唯一性**（待处理项只推荐一个动作）。
+**「待处理」消失了怎么办**：先点**重新核验**（零代价）。它不通再按原因选：
+部署类 → 重新应用；账号类 → 重试建号。平台从 r6 起还会**周期自愈**——
+每分钟对处于「待处理」的集成重新核对一次，明确看到抓取目标 `up` 就自动清除
+（读不到 Prometheus 时保持原状，绝不凭空造错）。
 
 > 轮换为什么不需要管理员凭据：SQL 标准与两个数据库都允许账号修改自己的口令，
 > 因此"平台托管的账号"可以自助轮换，避免了每次轮换都要向用户再要一次 root 口令。
@@ -307,12 +342,31 @@ dial unix /var/run/docker.sock: connect: permission denied
 | 集成保存成功但监控页没有数据 | 实例详情 → **接入自检**：`job_up=null` 说明没有该 job（检查 Prometheus 配置里是否有 `middleware-integration`）；`job_up=1` 且 `matched=0` 说明标签对不上（检查集成名称是否被改过） |
 | 服务发现不生效 | 后端容器内 `curl -s http://127.0.0.1:8080/api/sd/integrations`；Prometheus 容器内 `wget -qO- http://backend:8080/api/sd/integrations`；Prometheus 的 /targets 页看 `middleware-integration` 下的 target（`refresh_interval` 默认 30s） |
 | Exporter 容器起来了但 up=0 | Exporter 连不上被管实例：核对地址/账号口令、网络是否两张都挂上（`docker inspect <容器> | grep -A5 Networks`） |
-| **Redis：`redis_up 0` 且 `last_scrape_error` 形如 `dial redis: unknown network redis`** | 地址带了 scheme。`REDIS_ADDR` 按官方文档 `redis://host:port` 也算合法，但 redis_exporter v1.66 在单实例路径上把 scheme 当成了**网络类型**。平台从 r4 起按 **`host:port`（不带 scheme）** 注入；已有集成点一次「重新应用」刷新 env 文件即可。核对：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' <容器>` 里 `REDIS_ADDR` 不应含 `://` |
+| **Redis：Exporter 日志写 `Couldn't connect to redis instance (redis://<公网IP>:6379)`、`redis_up 0`** | Exporter 打的是自己的**公网 IP**：被管实例与 Exporter 同机时应填 `127.0.0.1`（公网 IP 要走 hairpin + 安全组，云上常被拦）。平台 r5 起会在「地址主机 == 目标机」时自动改用回环并写进部署说明；也可直接检查容器拿到的变量：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' <容器>` 里 `REDIS_ADDR` 应是 `127.0.0.1:6379` |
+| **Redis：`redis_up 0` 且 `last_scrape_error` 形如 `dial redis: unknown network redis`** | **这是马甲，不是根因**：redis_exporter 先用 `redis://` 连接，失败后按 `://` 拆开重试（`Dial("redis", "host:port")`），于是把 scheme 当成了网络类型，**真正的失败原因被吞掉**。真实原因通常是：① 地址/端口不通（端口只绑在 `127.0.0.1` 却填了公网 IP）；② 口令不一致，或目标没设口令却传了口令（`ERR Client sent AUTH, but no password is set`）；③ 多填了 ACL 用户名。拿真实原因：给容器加 `REDIS_EXPORTER_DEBUG=true` 看日志里的 `DialURL() failed, err:`，或在被管机上 `redis-cli -h <地址> -p <端口> [-a <口令>] ping`。平台从 r4 起按不带 scheme 的 `host:port` 注入，兜底路径会走回 tcp 分支，真实错误不再被吞 |
 | **容器在跑，但 `docker ps` 的 PORTS 列是空的** | **正常现象，不是故障**：只有做端口映射（`-p`/NAT）的容器才在这一列显示端口。远程安装与主机监控都用 `--network host`，容器直接使用宿主网络命名空间、Exporter 绑的就是宿主端口，因此没有映射可显示。按下面三条确认它真的在听：<br>`docker inspect -f '{{.HostConfig.NetworkMode}}' <容器>` → `host`<br>`ss -ltnp \| grep <Exporter端口>` → 看到 `redis_exporter`/`mysqld_exporter` 在听<br>`curl -s http://127.0.0.1:<Exporter端口>/metrics \| grep -E '^redis_up\|^mysql_up'` → `1` 才算真的通 |
 | 远程安装 Ansible 成功但平台报"探测失败" | 平台从**平台侧**探目标机的 Exporter 端口：云主机要在安全组/防火墙对平台出口 IP 放通该端口（9121/9104/9187/9100） |
 | 一键部署报错 | 集成列表里该行会显示「待处理」与失败原因；`INTEGRATION_DOCKER_ENABLED` 与 socket 挂载是否都就绪 |
 | MySQL 某个采集项"关了没关掉" | 开关是否渲染成 `--no-collect.xxx`（抽屉里看 compose 片段） |
 | 想彻底重来 | 列表行 →「重新应用」（重写服务发现 + 重建容器），或删除后重新集成 |
+| **不确定到底是哪一环的问题** | 列表行 →「**自检**」：按环节给出结论，不用翻日志（见下） |
+
+### 8.1 集成自检（一次点击，按环节给结论）
+
+点集成列表行或待处理横幅上的「自检」，平台按链路顺序检查四段，每段给 状态 + 依据 + 下一步：
+
+| 环节 | 判据 | 失败时的动作 |
+|---|---|---|
+| ① 平台 → Exporter 端口 | 平台 TCP 探测抓取目标（本机：容器名:端口；远程：目标IP:端口） | 本机：重新应用；**远程：放通安全组/防火墙**（平台侧无动作可点） |
+| ② Exporter 是否在位 | 本机：`docker inspect` 容器状态；**远程：如实说明平台看不到那台机器的容器**，以端口可达作为证据 | 重新应用 |
+| ③ Prometheus 是否已抓取 | 按**本实例那条 target** 判 `health` / `lastError`（不是 job 级 up） | 重新应用（或等 30s 让 http_sd 刷新） |
+| ④ 业务指标是否真的在流 | 直接查组件自身的 up（`redis_up` / `mysql_up` / `pg_up`；node 看抓取目标的 `up`）+ 命中了多少指标 | 测试连接 / 重试建号 |
+
+结论行会写明「在『哪一环』断了」，并给出与待处理横幅一致的动作按钮。
+
+> 为什么要有这个：以前排查一个集成要在四处各看一段 —— 平台端口、Prometheus target、`redis_up`、
+> Exporter 日志 —— 而且"Exporter 是否还在托管""状态是否正确"没有一处能直接回答。
+> 自检把这三件事分开回答：**在位**（②）、**被抓到**（③）、**真的有数据**（④）。
 
 ---
 

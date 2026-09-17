@@ -75,6 +75,18 @@ func (p *promClient) Healthy(ctx context.Context) bool {
 // Selector 返回该实例的 PromQL 标签匹配串（实现 SelectorReporter）。
 func (p *promClient) Selector(target Target) string { return buildSelector(target, p.jobPrefix) }
 
+// QueryValue 执行 PromQL 并返回标量（无结果返回 (nil, nil)，便于自检区分"查到 0"与"没查到"）。
+func (p *promClient) QueryValue(ctx context.Context, expr string) (*float64, error) {
+	value, err := p.queryValue(ctx, expr)
+	if errors.Is(err, errEmptyResult) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
 // Endpoint 返回 Prometheus 查询地址（实现 EndpointReporter）。
 func (p *promClient) Endpoint() string { return p.baseURL }
 
@@ -227,8 +239,41 @@ func (p *promClient) Snapshot(ctx context.Context, target Target) (*Snapshot, er
 
 	// 探测 job 是否被 Prometheus 抓取：区分「job 未配置」与「标签对不上」。
 	snapshot.JobUp = p.probeJobUp(ctx, target)
-	snapshot.Note = buildSnapshotNote(selector, jobOf(target, p.jobPrefix), snapshot.JobUp, snapshot.Matched, emptyCnt, failedCnt)
+	// 已经知道 lastError 就别让使用者再去 /targets 页面翻：平台自己把那行翻译过来。
+	targetErr := p.targetLastError(ctx, target)
+	snapshot.Note = buildSnapshotNote(selector, jobOf(target, p.jobPrefix), snapshot.JobUp, snapshot.Matched, emptyCnt, failedCnt, targetErr)
 	return snapshot, nil
+}
+
+// targetLastError 返回**本实例那条 target** 的抓取失败原因（已翻译成结论）。
+//
+// 为什么单独取：job 级 up=0 只说明"这个 job 下有目标抓不到"，而使用者要的是
+// "我这一条为什么抓不到"。Prometheus 的 lastError 就写了原因（连接被拒、超时、
+// 认证失败…），平台既然已经调了 /api/v1/targets，就没有理由让使用者自己去翻。
+//
+// 取不到（Prometheus 不可达、没有匹配目标）时返回空串，由调用方退回通用文案。
+func (p *promClient) targetLastError(ctx context.Context, target Target) string {
+	statuses, err := p.Targets(ctx, jobOf(target, p.jobPrefix))
+	if err != nil {
+		return ""
+	}
+	// 优先匹配本实例（instance_name 或 instance 标签），其次退回唯一那条 down 的。
+	fallback := ""
+	for _, status := range statuses {
+		if status.Health == "up" {
+			continue
+		}
+		if fallback == "" {
+			fallback = status.LastError
+		}
+		if status.Labels["instance_name"] == target.Name || status.Instance == target.Name {
+			return DescribeTargetError(status.LastError)
+		}
+	}
+	if fallback != "" {
+		return DescribeTargetError(fallback)
+	}
+	return ""
 }
 
 // probeJobUp 查询 up{job="..."}，返回 nil 表示该 job 在 Prometheus 中不存在。
@@ -245,7 +290,9 @@ func (p *promClient) probeJobUp(ctx context.Context, target Target) *float64 {
 }
 
 // buildSnapshotNote 依据采集结果生成人可读的诊断说明；一切正常时返回空串。
-func buildSnapshotNote(selector, job string, jobUp *float64, matched, emptyCnt, failedCnt int) string {
+//
+// targetErr 是本实例那条 target 的 lastError（已翻译），为空表示平台没取到。
+func buildSnapshotNote(selector, job string, jobUp *float64, matched, emptyCnt, failedCnt int, targetErr string) string {
 	if matched > 0 {
 		if emptyCnt > 0 || failedCnt > 0 {
 			return fmt.Sprintf("选择器 {%s} 命中 %d 项，另有 %d 项无数据、%d 项查询失败（多为该实例未暴露对应指标，属正常现象）",
@@ -258,7 +305,15 @@ func buildSnapshotNote(selector, job string, jobUp *float64, matched, emptyCnt, 
 		return fmt.Sprintf("Prometheus 可达，但选择器 {%s} 未匹配到任何时序，且 up{job=%q} 也不存在：该 job 尚未在 Prometheus 中配置。请确认抓取配置已挂载并重建 Prometheus 容器。",
 			selector, job)
 	case *jobUp == 0:
-		return fmt.Sprintf("Prometheus 已配置 job=%q，但该 target 抓取失败（up=0）：Exporter 未启动或连不上被管中间件。请查看 Prometheus /targets 页面的 lastError 与 Exporter 容器日志。", job)
+		// 把 lastError 直接摆在这里：平台已经取到了，没有理由再让使用者去 /targets 翻。
+		detail := "平台未取到该 target 的 lastError（Prometheus 的 /api/v1/targets 不可达或没有匹配目标）。"
+		if targetErr != "" {
+			detail = "该 target 的 lastError：" + targetErr
+		}
+		return fmt.Sprintf("Prometheus 已配置 job=%q，但该 target 抓取失败（up=0）。%s"+
+			"最常见的两种情况：① Prometheus 容器到目标端口不通（云主机安全组/防火墙没对**平台出口 IP** 放通，"+
+			"或平台与被管机是同一台而走公网 IP 被 hairpin 拦住）；② Exporter 容器没起来（在该机上 `docker ps` 与 `ss -ltnp` 核对端口）。",
+			job, detail)
 	default:
 		// 注意措辞：up{job} 是 **job 级**判定，同 job 下只要有一个 target 是 up 就返回 1。
 		// 一个 job 里通常有多个集成，因此绝不能写成"已正常抓取"——那会把使用者

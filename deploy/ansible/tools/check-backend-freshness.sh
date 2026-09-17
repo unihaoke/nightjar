@@ -19,11 +19,11 @@ ARTIFACT="/app/data/integrations/ansible/${INTEGRATION}.yml"
 # 与 Go 侧 integration.PlaybookRendererVersion 对应；版本升级时同步改这里。
 EXPECTED_RENDERER="mwops-playbook v5"
 # 与 Go 侧 service.CodeRevision 对应：平台自身行为（错误呈现/诊断）的修订号。
-EXPECTED_REVISION="r4"
+EXPECTED_REVISION="r7"
 # 该变量名是 v3 才引入的：二进制里搜到它，说明镜像至少是 v3。
 RENDERER_MARKER="exporter_docker_bin"
 # 各修订号的"独有标记"：用来判断镜像里到底有没有这一版修复（只增不改写）。
-REVISION_MARKERS="r1:ansibleFailureExcerpt r2:exporterPortConflictFix r3:classifyNextAction r4:redisAddr"
+REVISION_MARKERS="r1:ansibleFailureExcerpt r2:exporterPortConflictFix r3:classifyNextAction r4:redisAddr r5:exporterSideAddress r6:ReverifyIntegrations r7:componentUpExpr"
 
 pass=0
 fail=0

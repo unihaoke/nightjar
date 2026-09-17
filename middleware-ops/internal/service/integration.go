@@ -787,11 +787,17 @@ func (s *IntegrationService) scheduleVerify(instanceID int64, name, job string) 
 				return
 			case <-time.After(delay):
 			}
-			reason := s.probeIntegration(ctx, job, name)
-			if reason == "" {
+			reason, verified := s.probeIntegration(ctx, job, name)
+			if verified && reason == "" {
 				s.markApplied(context.Background(), instanceID)
 				s.log.Info("集成核验通过", zap.String("integration", name), zap.String("job", job))
 				return
+			}
+			if !verified {
+				// 无法判定（Prometheus 不可达）：保持原状态，别把"待处理"抹掉也别新造失败。
+				s.log.Debug("集成核验：暂时无法判定，稍后由周期自愈重试", zap.String("integration", name))
+				delay = 25 * time.Second
+				continue
 			}
 			if attempt == 3 {
 				s.markError(context.Background(), instanceID, reason)
@@ -806,35 +812,50 @@ func (s *IntegrationService) scheduleVerify(instanceID int64, name, job string) 
 
 // probeIntegration 核验某个集成的抓取目标是否已 up。
 //
-// 返回空串表示通过；否则返回可读的失败原因（已翻译 lastError）。
-func (s *IntegrationService) probeIntegration(ctx context.Context, job, name string) string {
+// 返回 (原因, 是否已判定)：
+//   - ("", true)   通过；
+//   - (原因, true) 明确失败（目标 up=0 / 目标缺失）；
+//   - ("", false)  **无法判定**（Prometheus 查询失败）——调用方不得据此改状态，
+//     否则一次 Prometheus 抖动就会把"待处理"抹掉或凭空造出失败。
+func (s *IntegrationService) probeIntegration(ctx context.Context, job, name string) (string, bool) {
 	reporter, ok := s.monitor.(monitor.TargetReporter)
 	if !ok {
-		return ""
+		return "", false
 	}
 	targets, err := reporter.Targets(ctx, job)
 	if err != nil {
 		// 查询本身失败（如 Prometheus 暂时不可达）不该判定为"集成失败"，
 		// 这类问题由接入自检负责呈现。
 		s.log.Debug("集成核验：查询 Prometheus 目标失败", zap.Error(err))
-		return ""
+		return "", false
 	}
-	found := false
-	for _, target := range targets {
-		// 同一 job（middleware-integration）下会有多个集成，按 instance_name 区分。
-		if target.Labels["instance_name"] != "" && target.Labels["instance_name"] != name {
-			continue
-		}
-		found = true
-		if target.Health != "up" {
-			return "Exporter 未跑通（up=0）：" + monitor.DescribeTargetError(target.LastError)
-		}
-	}
+	status, found := pickTargetStatus(targets, name)
 	if !found {
 		return "Prometheus 中还没有该集成对应的抓取目标：确认抓取配置里有 middleware-integration 任务（http_sd 默认 30s 刷新），" +
-			"必要时执行「重新应用」"
+			"必要时执行「重新应用」", true
 	}
-	return ""
+	if status.Health != "up" {
+		return "Exporter 未跑通（up=0）：" + monitor.DescribeTargetError(status.LastError), true
+	}
+	return "", true
+}
+
+// pickTargetStatus 从 job 下的全部目标里找出**本集成**那一条。
+//
+// 同一 job（middleware-integration）下通常有多个集成，因此优先用 instance_name 精确匹配。
+// 只有在"无法区分"时才兜底：job 下**唯一**一条且它**没有** instance_name 标签
+// （早期产物或人工配置）。唯一但名字是别人的，绝不认领——那会把别的集成的待处理清掉，
+// 真正的故障就静默消失了。
+func pickTargetStatus(statuses []monitor.TargetStatus, name string) (monitor.TargetStatus, bool) {
+	for _, status := range statuses {
+		if label := strings.TrimSpace(status.Labels["instance_name"]); label == name {
+			return status, true
+		}
+	}
+	if len(statuses) == 1 && strings.TrimSpace(statuses[0].Labels["instance_name"]) == "" {
+		return statuses[0], true
+	}
+	return monitor.TargetStatus{}, false
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,6 +1870,10 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 	// 远程模式：不在本机起容器，改由 Ansible 安装到目标服务器——因此**不需要** docker.sock。
 	if meta, ok := IntegrationMetaOf(*item); ok && meta.DeployTarget == DeployTargetRemote {
 		portNote := s.fixRemoteExporterPortConflict(ctx, item, &meta, tpl, instance, params.creds.Host)
+		// Exporter 侧用「目标机视角」的地址：同机时改用回环，避免打自己的公网 IP
+		//（hairpin + 安全组，云上常被拦）。平台侧记录（item.Host）保持用户填的值不变。
+		fixedAddr, addrNote := exporterSideAddress(instance.Address, meta.TargetHost)
+		instance.Address = fixedAddr
 		if err := s.deployRemote(ctx, item, tpl, instance, meta, params.creds, params.operator); err != nil {
 			s.setDeployNote(ctx, item.ID, "远程安装失败："+err.Error())
 			return err
@@ -1861,6 +1886,9 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 			integration.JoinHostPort(meta.TargetHost, meta.ExporterHostPort))
 		if portNote != "" {
 			done += "；" + portNote
+		}
+		if addrNote != "" {
+			done += "；" + addrNote
 		}
 		// 主动解释一个必然被问到的现象：host 网络下 `docker ps` 的 PORTS 列是空的。
 		// docker 只在做端口映射（-p/NAT）时才在那一列显示端口；host 网络下容器直接用宿主

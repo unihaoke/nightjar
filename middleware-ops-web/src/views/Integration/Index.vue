@@ -12,7 +12,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { integrationApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationOverview, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
+import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationOverview, IntegrationSelfCheck, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
 import { envLabels, formatTime } from '@/utils/format'
 
 const router = useRouter()
@@ -175,9 +175,148 @@ const applyVisible = ref(false)
 const applying = ref(false)
 const applyTarget = ref<IntegrationView | null>(null)
 const applySsh = reactive({ user: '', method: 'password' as 'password' | 'key', password: '', key: '', port: 22 })
+/** 正在"重新核验"的集成 ID。 */
+const verifyingId = ref<number | null>(null)
 const probingId = ref<number | null>(null)
 /** 最近一次重试/探测的结论（就地展示失败原因，而不是只弹一条 toast）。 */
 const accountResult = ref<{ ok: boolean; title: string; detail: string } | null>(null)
+/**
+ * 「账号操作」弹窗：**先收齐凭据，再在弹窗里点按钮触发请求**。
+ *
+ * 为什么这样改（真实反馈：点了重试"好像没啥用"）：旧流程是
+ *   点「重试建号」→ 先弹两个输入框问管理员账号口令 → 最后才发现抽屉顶部的 SSH 字段没填
+ *   → 中止，什么也没发生。
+ * 使用者填了半天却被一句"请先填写 SSH 凭据"打回，而凭据散落在两个地方。
+ * 现在统一成一个弹窗：SSH（远程时）+ 管理员（建号/删号时）都收齐，
+ * 校验通过后由弹窗里的主按钮触发请求，结果也显示在同一个弹窗里。
+ */
+const accountActionVisible = ref(false)
+const accountActionRow = ref<IntegrationAccount | null>(null)
+const accountActionKind = ref<'probe' | 'retry' | 'rotate' | 'drop'>('probe')
+const accountActionLoading = ref(false)
+const accountAdmin = reactive({ user: 'root', password: '' })
+
+/** 动作是否需要管理员凭据（建号 / 删号是写操作）。 */
+const accountActionNeedsAdmin = computed(() => accountActionKind.value === 'retry' || accountActionKind.value === 'drop')
+
+/** 弹窗标题与主按钮文案。 */
+const accountActionTitle = computed(() => {
+  switch (accountActionKind.value) {
+    case 'retry':
+      return '重试建号 / 连接'
+    case 'rotate':
+      return '轮换监控账号口令'
+    case 'drop':
+      return '删除监控账号'
+    default:
+      return '测试连接'
+  }
+})
+const accountActionConfirmLabel = computed(() => {
+  switch (accountActionKind.value) {
+    case 'retry':
+      return accountAdmin.password ? '由平台重建并测试' : '只测连接并重建 Exporter'
+    case 'rotate':
+      return '轮换口令'
+    case 'drop':
+      return '确认删除'
+    default:
+      return '开始测试'
+  }
+})
+
+/** 打开账号操作弹窗（凭据每次清空：不跨动作、跨集成复用）。 */
+function openAccountAction(row: IntegrationAccount, kind: 'probe' | 'retry' | 'rotate' | 'drop'): void {
+  accountActionRow.value = row
+  accountActionKind.value = kind
+  accountSsh.user = ''
+  accountSsh.method = 'password'
+  accountSsh.password = ''
+  accountSsh.key = ''
+  accountSsh.port = 22
+  accountAdmin.user = 'root'
+  accountAdmin.password = ''
+  accountResult.value = null
+  accountActionVisible.value = true
+}
+
+/** 弹窗内提交：先本地校验，再带着**同一份**凭据发请求。 */
+async function submitAccountAction(): Promise<void> {
+  const row = accountActionRow.value
+  if (!row) {
+    return
+  }
+  if (row.deploy_target === 'remote' && !sshCredsReady(accountSsh)) {
+    ElMessage({ type: 'warning', message: '这是远程部署：请填写 SSH 用户名，并选择口令或私钥其中一种认证方式' })
+    return
+  }
+  if (accountActionKind.value === 'drop' && !accountAdmin.password) {
+    ElMessage({ type: 'warning', message: '删除账号需要管理员口令（仅本次使用，不落库）' })
+    return
+  }
+  if (accountActionKind.value === 'drop') {
+    const confirmed = await ElMessageBox.confirm(
+      `删除 ${row.name} 上的监控账号后，该实例将不再有指标。是否继续？`,
+      '删除监控账号',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    ).catch(() => false)
+    if (!confirmed) {
+      return
+    }
+  }
+  accountActionLoading.value = true
+  retryingId.value = row.integration_id
+  probingId.value = row.integration_id
+  try {
+    const payload = buildSshPayload(accountSsh)
+    if (accountActionKind.value === 'probe') {
+      const result = await integrationApi.probeAccount(row.integration_id, payload)
+      accountResult.value = {
+        ok: result.ok,
+        title: result.ok ? `${row.name}：连接正常` : `${row.name}：连接失败`,
+        detail: result.ok ? result.output || result.message : result.message,
+      }
+    } else if (accountActionKind.value === 'retry') {
+      // 填了管理员口令 → 幂等重跑建号 SQL；没填 → 只测连接并重建 Exporter。
+      const result = await integrationApi.retryAccount(row.integration_id, {
+        admin_username: accountAdmin.password ? accountAdmin.user : '',
+        admin_password: accountAdmin.password,
+        ...payload,
+      })
+      accountResult.value = {
+        ok: result.ok,
+        title: result.ok ? `${row.name}：账号已就绪` : `${row.name}：仍未就绪`,
+        detail: result.message,
+      }
+      await Promise.all([loadAccounts(), load()])
+    } else if (accountActionKind.value === 'rotate') {
+      const result = await integrationApi.rotateAccount(row.integration_id, payload)
+      accountResult.value = {
+        ok: true,
+        title: `${row.name}：口令已轮换`,
+        detail:
+          `新口令（只显示这一次，手工执行 Exporter 的 compose/docker run 时需要它）：\n${result.new_password}\n\n` +
+          `平台已用新口令重建 Exporter；账号未过期，业务侧无需改动。`,
+      }
+      await Promise.all([loadAccounts(), load()])
+    } else {
+      await integrationApi.dropAccount(row.integration_id, {
+        admin_username: accountAdmin.user,
+        admin_password: accountAdmin.password,
+        ...payload,
+      })
+      accountResult.value = { ok: true, title: `${row.name}：监控账号已删除`, detail: '如需恢复，请重新保存该集成并勾选自动建号。' }
+      await Promise.all([loadAccounts(), load()])
+    }
+    accountActionVisible.value = false
+  } catch (error) {
+    toastError(error)
+  } finally {
+    accountActionLoading.value = false
+    retryingId.value = null
+    probingId.value = null
+  }
+}
 /**
  * 远程集成的账号操作在**目标主机**上执行（只经 SSH + Ansible，不依赖平台 Docker），
  * 因此需要在弹窗里填一次 SSH 凭据；凭据仅本次使用、平台不落库。
@@ -185,16 +324,8 @@ const accountResult = ref<{ ok: boolean; title: string; detail: string } | null>
  */
 const accountSsh = reactive({ user: '', method: 'password' as 'password' | 'key', password: '', key: '', port: 22 })
 
-/** 账号清单里是否存在远程部署的集成（决定是否显示 SSH 凭据输入）。 */
+/** 账号清单里是否存在远程部署的集成（决定是否显示 SSH 凭据提示）。 */
 const hasRemoteAccount = computed(() => accounts.value.some((row) => row.deploy_target === 'remote'))
-
-/** 组装 SSH 凭据载荷（本机集成返回空对象）。 */
-function sshPayload(row: IntegrationAccount): AccountSecurePayload {
-  if (row.deploy_target !== 'remote') {
-    return {}
-  }
-  return buildSshPayload(accountSsh)
-}
 
 /**
  * 把界面上的 SSH 输入组装成后端载荷。
@@ -219,22 +350,6 @@ function sshCredsReady(src: { user: string; method: 'password' | 'key'; password
   return src.method === 'key' ? src.key.trim().length > 0 : src.password.length > 0
 }
 
-/** 远程集成必须先填 SSH 凭据，否则明确提示（而不是等服务端报错）。 */
-function ensureSshCreds(row: IntegrationAccount): boolean {
-  if (row.deploy_target !== 'remote') {
-    return true
-  }
-  if (!sshCredsReady(accountSsh)) {
-    ElMessage({
-      type: 'warning',
-      message: `「${row.name}」是远程部署：请先在弹窗顶部填写 SSH 用户名与口令或私钥（账号操作在目标机上执行）`,
-      grouping: true,
-    })
-    return false
-  }
-  return true
-}
-
 /** 载入账号清单。 */
 async function loadAccounts(): Promise<void> {
   accountsLoading.value = true
@@ -255,149 +370,24 @@ function openAccounts(): void {
   void loadAccounts()
 }
 
-/** 测试连接：只探测，不改配置。 */
-async function handleProbeAccount(row: IntegrationAccount): Promise<void> {
-  probingId.value = row.integration_id
-  accountResult.value = null
-  try {
-    if (!ensureSshCreds(row)) {
-      return
-    }
-    const result = await integrationApi.probeAccount(row.integration_id, sshPayload(row))
-    accountResult.value = {
-      ok: result.ok,
-      title: result.ok ? `${row.name}：连接正常` : `${row.name}：连接失败`,
-      detail: result.ok ? result.output || result.message : result.message,
-    }
-  } catch (error) {
-    toastError(error)
-  } finally {
-    probingId.value = null
-  }
+/** 测试连接：只探测，不改配置。凭据在弹窗里收齐后才发请求。 */
+function handleProbeAccount(row: IntegrationAccount): void {
+  openAccountAction(row, 'probe')
 }
 
-/**
- * 重试建号/连接：失败后不必重填整个表单。
- *
- * 带管理凭据 → 平台幂等重跑建号 SQL（不存在则建、存在则重置口令并授权）；
- * 不带 → 只测试连接并重建 Exporter。
- */
-async function handleRetryAccount(row: IntegrationAccount): Promise<void> {
-  const retryWithCreds = await ElMessageBox.confirm(
-    `重试 ${row.name} 的监控账号 ${row.username}。\n\n` +
-      `选「由平台重建」会幂等重跑建号 SQL（需要一次管理员凭据，口令不落库）；\n` +
-      `选「只测连接」则只测试现有账号并重建 Exporter。`,
-    '重试建号 / 连接',
-    { confirmButtonText: '由平台重建', cancelButtonText: '只测连接', distinguishCancelAndClose: true },
-  ).then(() => true).catch((action) => (action === 'cancel' ? false : null))
-  if (retryWithCreds === null) {
-    return
-  }
-
-  let adminUser = ''
-  let adminPassword = ''
-  if (retryWithCreds) {
-    const user = await ElMessageBox.prompt('管理员账号（仅本次使用）：', '重试建号', {
-      inputPlaceholder: '如 root', inputValue: 'root', confirmButtonText: '下一步', cancelButtonText: '取消',
-    }).catch(() => ({ value: '' }))
-    if (!user.value) {
-      return
-    }
-    const pass = await ElMessageBox.prompt('管理员口令（仅本次使用，不落库、不写审计）：', '重试建号', {
-      inputType: 'password', confirmButtonText: '开始重试', cancelButtonText: '取消',
-    }).catch(() => ({ value: '' }))
-    if (!pass.value) {
-      return
-    }
-    adminUser = user.value
-    adminPassword = pass.value
-  }
-
-  retryingId.value = row.integration_id
-  accountResult.value = null
-  if (!ensureSshCreds(row)) {
-    return
-  }
-  try {
-    const result = await integrationApi.retryAccount(row.integration_id, {
-      admin_username: adminUser,
-      admin_password: adminPassword,
-      ...sshPayload(row),
-    })
-    accountResult.value = {
-      ok: result.ok,
-      title: result.ok ? `${row.name}：账号已就绪` : `${row.name}：仍未就绪`,
-      detail: result.message,
-    }
-    await Promise.all([loadAccounts(), load()])
-  } catch (error) {
-    toastError(error)
-  } finally {
-    retryingId.value = null
-  }
+/** 重试建号 / 连接：凭据在弹窗里收齐后由弹窗按钮触发。 */
+function handleRetryAccount(row: IntegrationAccount): void {
+  openAccountAction(row, "retry")
 }
 
 /** 轮换口令：账号改自己的口令，不需要管理员凭据。 */
-async function handleRotateAccount(row: IntegrationAccount): Promise<void> {
-  const confirmed = await ElMessageBox.confirm(
-    `将为 ${row.name} 的监控账号 ${row.username} 生成新口令，并立即用新口令重建 Exporter。` +
-      `旧口令作废（业务侧无需改动）。是否继续？`,
-    '轮换监控账号口令',
-    { type: 'warning', confirmButtonText: '轮换', cancelButtonText: '取消' },
-  ).catch(() => false)
-  if (!confirmed) {
-    return
-  }
-  try {
-    if (!ensureSshCreds(row)) {
-      return
-    }
-    const result = await integrationApi.rotateAccount(row.integration_id, sshPayload(row))
-    accountResult.value = {
-      ok: true,
-      title: `${row.name}：口令已轮换`,
-      detail:
-        `新口令（只显示这一次，手工执行 Exporter 的 compose/docker run 时需要它）：\n${result.new_password}\n\n` +
-        `平台已用新口令重建 Exporter；账号未过期，业务侧无需改动。`,
-    }
-    await Promise.all([loadAccounts(), load()])
-  } catch (error) {
-    toastError(error)
-  }
+function handleRotateAccount(row: IntegrationAccount): void {
+  openAccountAction(row, "rotate")
 }
 
-/** 删除账号：破坏性写操作，需要管理员凭据。 */
-async function handleDropAccount(row: IntegrationAccount): Promise<void> {
-  const { value: adminUser } = await ElMessageBox.prompt(
-    `删除 ${row.name} 上的监控账号 ${row.username} 后，该实例将不再有指标。\n请填写管理员账号：`,
-    '删除监控账号',
-    { inputPlaceholder: '如 root', inputValue: 'root', confirmButtonText: '下一步', cancelButtonText: '取消' },
-  ).catch(() => ({ value: '' }))
-  if (!adminUser) {
-    return
-  }
-  const { value: adminPassword } = await ElMessageBox.prompt(
-    '请填写管理员口令（仅本次使用，不落库、不写审计）：',
-    '删除监控账号',
-    { inputType: 'password', confirmButtonText: '删除', cancelButtonText: '取消' },
-  ).catch(() => ({ value: '' }))
-  if (!adminPassword) {
-    return
-  }
-  if (!ensureSshCreds(row)) {
-    return
-  }
-  try {
-    await integrationApi.dropAccount(row.integration_id, {
-      admin_username: adminUser,
-      admin_password: adminPassword,
-      ...sshPayload(row),
-    })
-    ElMessage.success('已删除监控账号')
-    await Promise.all([loadAccounts(), load()])
-  } catch (error) {
-    toastError(error)
-  }
+/** 删除账号：破坏性写操作，需要管理员凭据（弹窗里填、弹窗里确认）。 */
+function handleDropAccount(row: IntegrationAccount): void {
+  openAccountAction(row, "drop")
 }
 
 /** 载入概览与列表。 */
@@ -603,6 +593,83 @@ async function submitApply(): Promise<void> {
     return
   }
   await runApply(applyTarget.value, buildSshPayload(applySsh))
+}
+
+/**
+ * 集成自检：一次点击按**环节**回答"哪一环断了"。
+ *
+ * 覆盖：平台→Exporter 端口、Exporter 是否在位、Prometheus 是否已抓取、业务指标是否真的有数据。
+ * 只读、不需要凭据、不重装 —— 比"翻日志猜"直接得多（真实反馈）。
+ */
+const selfCheckVisible = ref(false)
+const selfCheckLoading = ref(false)
+const selfCheckResult = ref<IntegrationSelfCheck | null>(null)
+const selfCheckName = ref('')
+
+async function handleSelfCheck(item: IntegrationView): Promise<void> {
+  selfCheckName.value = item.name
+  selfCheckResult.value = null
+  selfCheckVisible.value = true
+  selfCheckLoading.value = true
+  try {
+    selfCheckResult.value = await integrationApi.selfCheck(item.instance_id)
+  } catch (error) {
+    toastError(error)
+  } finally {
+    selfCheckLoading.value = false
+  }
+}
+
+/** 自检结果里的状态 → 标签样式/图标。 */
+function selfCheckTagType(status: string): 'success' | 'warning' | 'danger' {
+  if (status === 'ok') return 'success'
+  if (status === 'warn') return 'warning'
+  return 'danger'
+}
+function selfCheckTagText(status: string): string {
+  if (status === 'ok') return '通过'
+  if (status === 'warn') return '无法判定'
+  return '失败'
+}
+
+/** 按自检结论的 next_action 跳转（与待处理横幅同一套判定）。 */
+function followSelfCheckAction(): void {
+  const row = items.value.find((item) => item.name === selfCheckName.value)
+  if (!row) {
+    return
+  }
+  selfCheckVisible.value = false
+  if (selfCheckResult.value?.next_action === 'retry_account') {
+    openAccounts()
+    return
+  }
+  void handleApply(row)
+}
+
+/**
+ * 重新核验：按 Prometheus 现状刷新状态。
+ *
+ * 为什么需要这个按钮（真实反馈：Redis 已经正常被监控了，状态却一直是「待处理」）：
+ * 核验只在**部署之后**跑几次（约 35s/60s/85s），之后不再自动核对；
+ * 若外部原因在那之后才修好（改地址、放通安全组、Exporter 自己起来了），
+ * 状态就会一直停在待处理。重新应用能解决，但它要重填 SSH 凭据、还会真的重装——
+ * 代价完全不成比例。这个按钮不需要凭据、没有副作用，只是"再看一眼"。
+ */
+async function handleVerify(item: IntegrationView): Promise<void> {
+  verifyingId.value = item.instance_id
+  try {
+    const saved = await integrationApi.verify(item.instance_id)
+    if (saved.last_error) {
+      ElMessage({ type: 'warning', message: '仍未通过：' + saved.last_error })
+    } else {
+      ElMessage({ type: 'success', message: '核验通过：抓取目标已 up，待处理已清除' })
+    }
+    await load()
+  } catch (error) {
+    toastError(error)
+  } finally {
+    verifyingId.value = null
+  }
 }
 
 /** 按类型取模板。 */
@@ -819,9 +886,20 @@ onMounted(load)
           <el-table-column label="环境/分组" width="130">
             <template #default="{ row }">{{ envLabels[row.environment] || row.environment }} / {{ row.group_name || '-' }}</template>
           </el-table-column>
-          <el-table-column label="Exporter" width="120">
+          <el-table-column label="Exporter" width="140">
             <template #default="{ row }">
-              <el-tooltip v-if="row.deploy_note" :content="row.deploy_note" placement="top">
+              <!-- 远程部署：容器在**目标机**上，平台没有那台机器的 docker 通道，
+                   因此 container_status 必然为空——此时说「未托管」是误导（真实反馈）。 -->
+              <el-tooltip
+                v-if="row.deploy_target === 'remote'"
+                placement="top"
+                :content="`由平台经 Ansible 安装到 ${row.target_host || '目标机'}:${row.exporter_host_port || ''}，` +
+                  `容器归那台机器管理${row.remote_installed_at ? '（' + formatTime(row.remote_installed_at) + ' 安装）' : ''}。` +
+                  `平台无法 inspect 它，运行状态请看抓取指标（如 redis_up）或到目标机 docker ps。`"
+              >
+                <el-tag size="small" type="info" effect="plain">远程（目标机）</el-tag>
+              </el-tooltip>
+              <el-tooltip v-else-if="row.deploy_note" :content="row.deploy_note" placement="top">
                 <el-tag v-if="row.container_status" size="small" :type="row.container_status === 'running' ? 'success' : 'danger'">
                   {{ row.container_status }}
                 </el-tag>
@@ -837,7 +915,10 @@ onMounted(load)
           </el-table-column>
           <el-table-column label="状态" min-width="150">
             <template #default="{ row }">
-              <el-tag v-if="row.last_error" size="small" type="danger" effect="light">待处理</el-tag>
+              <!-- 待处理必须能就地看到原因：否则只能去底部横幅猜是哪一条（真实反馈）。 -->
+              <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
+                <el-tag size="small" type="danger" effect="light">待处理</el-tag>
+              </el-tooltip>
               <el-tag v-else-if="row.applied_at" size="small" type="success" effect="light">已应用</el-tag>
               <el-tag v-else size="small" effect="plain">待应用</el-tag>
             </template>
@@ -852,6 +933,13 @@ onMounted(load)
               <el-button text size="small" @click="goDetail(row)">监控/自检</el-button>
               <el-button text size="small" @click="handleShowArtifacts(row)">配置</el-button>
               <el-button text size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button
+                text
+                size="small"
+                :loading="verifyingId === row.instance_id"
+                @click="handleVerify(row)"
+              >重新核验</el-button>
+              <el-button text size="small" @click="handleSelfCheck(row)">自检</el-button>
               <el-button text size="small" @click="handleApply(row)">重新应用</el-button>
               <el-button text size="small" type="danger" @click="handleDelete(row)">删除</el-button>
             </template>
@@ -860,6 +948,14 @@ onMounted(load)
       </div>
       <div v-if="pendingItem" class="pending-row">
         <span class="muted">待处理项：{{ pendingItem.last_error }}</span>
+        <!-- 先给"零代价"的核验：外部原因若已修好，点一下就清除，不必重填凭据重装。 -->
+        <el-button
+          text
+          size="small"
+          :loading="verifyingId === pendingItem.instance_id"
+          @click="handleVerify(pendingItem)"
+        >重新核验</el-button>
+        <el-button text size="small" @click="handleSelfCheck(pendingItem)">自检</el-button>
         <!-- 按钮由后端的 next_action 决定：部署类失败→重新应用（远程会先问 SSH 凭据），
              账号类失败→去重试建号。避免两个入口互相推诿、让人以为功能重复。 -->
         <el-button
@@ -1245,50 +1341,16 @@ onMounted(load)
         class="mb"
         title="这些只读账号由平台创建并托管（口令加密存储）。建号/连接失败时可直接在这里重试；轮换口令不需要管理员凭据；删除账号是破坏性操作，需要管理员凭据（生产环境会转成审批工单）。"
       />
-      <!-- 远程集成的账号操作在目标主机上执行：需要一次 SSH 凭据（仅本次使用） -->
-      <div v-if="hasRemoteAccount" class="remote-creds">
-        <el-alert type="warning" :closable="false" show-icon
-          title="有远程部署的集成：账号操作在目标主机上执行，需要 SSH 凭据">
-          <p class="field-hint">
-            远程集成的建号 / 轮换 / 删除 / 连接测试都由平台 SSH 到目标机执行
-            （只经 SSH + Ansible，<b>不依赖平台 Docker</b>）。凭据仅本次使用、不落库、不回显。
-          </p>
-        </el-alert>
-        <el-row :gutter="12" class="mt">
-          <el-col :xs="24" :sm="8">
-            <el-form-item label="SSH 用户">
-              <el-input v-model="accountSsh.user" placeholder="如 ops" />
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="4">
-            <el-form-item label="SSH 端口">
-              <el-input-number v-model="accountSsh.port" :min="1" :max="65535" class="mobile-block" />
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="认证方式">
-              <el-radio-group v-model="accountSsh.method">
-                <el-radio value="password">口令</el-radio>
-                <el-radio value="key">私钥</el-radio>
-              </el-radio-group>
-            </el-form-item>
-          </el-col>
-        </el-row>
-        <el-row :gutter="12">
-          <el-col v-if="accountSsh.method === 'password'" :span="24">
-            <el-form-item label="SSH 口令（仅本次使用）">
-              <el-input v-model="accountSsh.password" type="password" show-password
-                placeholder="不落库、不写审计、不回显；平台镜像需含 sshpass" />
-            </el-form-item>
-          </el-col>
-          <el-col v-else :span="24">
-            <el-form-item label="SSH 私钥（仅本次使用）">
-              <el-input v-model="accountSsh.key" type="textarea" :rows="3"
-                placeholder="粘贴私钥全文（-----BEGIN OPENSSH PRIVATE KEY----- …）；不需要 sshpass" />
-            </el-form-item>
-          </el-col>
-        </el-row>
-      </div>
+      <!-- 凭据不再散落在抽屉里：每个动作点开自己的弹窗，在弹窗内填齐再触发（真实反馈：旧流程
+           先弹两个输入框、最后才检查这里的 SSH 字段，没填就中止，等于什么也没做）。 -->
+      <el-alert
+        v-if="hasRemoteAccount"
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="有远程部署的集成：点任一操作后，在弹窗里填写 SSH 凭据（口令或私钥，仅本次使用、不落库）"
+      />
       <el-alert
         v-if="accountResult"
         :type="accountResult.ok ? 'success' : 'error'"
@@ -1366,6 +1428,124 @@ onMounted(load)
         当前「一键部署」不可用（未挂载 docker.sock 或 integration.docker_enabled=false），
         无法由平台执行建号/重试/轮换/删除；请在平台 .env 打开后重建 backend 容器。
       </p>
+    </el-dialog>
+
+    <!-- 账号操作：先在这一处收齐凭据，再由本弹窗的主按钮触发请求（真实反馈：旧流程把输入拆成
+         多个系统弹框、最后才发现缺 SSH 凭据而中止，等于什么也没做）。 -->
+    <el-dialog
+      v-model="accountActionVisible"
+      :title="`${accountActionTitle} · ${accountActionRow?.name || ''}`"
+      width="640px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb"
+        :title="`${accountActionRow?.component || accountActionRow?.mw_type || ''} · ${accountActionRow?.address || ''}`"
+      >
+        <p class="field-hint">
+          <template v-if="accountActionRow?.deploy_target === 'remote'">
+            该集成是<b>远程部署</b>：账号操作由平台 SSH 到目标机执行（只经 SSH + Ansible，不依赖平台 Docker），
+            因此需要一次 SSH 凭据。<br />
+          </template>
+          <template v-if="accountActionNeedsAdmin">
+            建号 / 删号是<b>写被管库</b>的操作，需要一次管理员凭据。<br />
+          </template>
+          所有凭据仅本次使用、<b>不落库、不写审计、不回显</b>；填完点下方按钮才会发请求。
+        </p>
+      </el-alert>
+
+      <template v-if="accountActionRow?.deploy_target === 'remote'">
+        <el-divider content-position="left">SSH 凭据</el-divider>
+        <el-row :gutter="12">
+          <el-col :xs="24" :sm="10">
+            <el-form-item label="SSH 用户">
+              <el-input v-model="accountSsh.user" placeholder="如 root" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="6">
+            <el-form-item label="SSH 端口">
+              <el-input-number v-model="accountSsh.port" :min="1" :max="65535" class="mobile-block" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="8">
+            <el-form-item label="认证方式">
+              <el-radio-group v-model="accountSsh.method">
+                <el-radio value="password">口令</el-radio>
+                <el-radio value="key">私钥</el-radio>
+              </el-radio-group>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item v-if="accountSsh.method === 'password'" label="SSH 口令">
+          <el-input v-model="accountSsh.password" type="password" show-password placeholder="不落库、不回显" />
+        </el-form-item>
+        <el-form-item v-else label="SSH 私钥">
+          <el-input v-model="accountSsh.key" type="textarea" :rows="3"
+            placeholder="粘贴私钥全文（-----BEGIN OPENSSH PRIVATE KEY----- …）；不需要 sshpass" />
+        </el-form-item>
+      </template>
+
+      <template v-if="accountActionNeedsAdmin">
+        <el-divider content-position="left">管理员凭据（写被管库）</el-divider>
+        <el-row :gutter="12">
+          <el-col :xs="24" :sm="10">
+            <el-form-item label="管理员账号">
+              <el-input v-model="accountAdmin.user" placeholder="如 root" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="14">
+            <el-form-item :label="accountActionKind === 'retry' ? '管理员口令（留空=只测连接，不建号）' : '管理员口令'">
+              <el-input v-model="accountAdmin.password" type="password" show-password placeholder="仅本次使用、不落库" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </template>
+
+      <el-divider content-position="left">本次将要执行</el-divider>
+      <p class="field-hint">
+        <template v-if="accountActionKind === 'probe'">
+          只读探测：用现有监控账号执行 `SELECT 1`（MySQL 另附 `SHOW GRANTS`），<b>不改任何配置</b>。
+        </template>
+        <template v-else-if="accountActionKind === 'retry'">
+          <template v-if="accountAdmin.password">
+            幂等重跑建号 SQL（不存在则建、存在则重置口令并授权），随后测试连接并重建 Exporter。
+          </template>
+          <template v-else>
+            不带管理员口令 → <b>只测试连接并重建 Exporter</b>（不会建号）。
+          </template>
+        </template>
+        <template v-else-if="accountActionKind === 'rotate'">
+          账号改自己的口令（`ALTER USER USER()` / `ALTER ROLE CURRENT_USER`），随后用新口令自动重建 Exporter。<b>不需要管理员凭据</b>。
+        </template>
+        <template v-else>
+          删除平台创建的监控账号（`DROP USER/ROLE IF EXISTS`）；生产环境会转成审批工单。
+        </template>
+      </p>
+
+      <el-alert
+        v-if="accountResult"
+        :type="accountResult.ok ? 'success' : 'error'"
+        :closable="true"
+        show-icon
+        class="mt"
+        :title="accountResult.title"
+        @close="accountResult = null"
+      >
+        <p class="field-hint" style="white-space: pre-wrap">{{ accountResult.detail }}</p>
+      </el-alert>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <div class="spacer" />
+          <el-button @click="accountActionVisible = false">取消</el-button>
+          <el-button type="primary" :loading="accountActionLoading" @click="submitAccountAction">
+            {{ accountActionConfirmLabel }}
+          </el-button>
+        </div>
+      </template>
     </el-dialog>
     <!-- 日志接入：从被管容器的 docker 配置反查日志位置（读不到不允许配置） -->
     <el-dialog v-model="logDialogVisible" title="日志接入" width="720px" :close-on-click-modal="false">
@@ -1488,6 +1668,50 @@ onMounted(load)
           <div class="spacer" />
           <el-button @click="applyVisible = false">取消</el-button>
           <el-button type="primary" :loading="applying" @click="submitApply">开始重新应用</el-button>
+        </div>
+      </template>
+    </el-dialog>
+    <!-- 集成自检：分环节给结论，替代"翻日志猜" -->
+    <el-dialog
+      v-model="selfCheckVisible"
+      :title="`集成自检 · ${selfCheckName}`"
+      width="720px"
+    >
+      <el-alert
+        v-loading="selfCheckLoading"
+        v-if="selfCheckResult"
+        :type="selfCheckResult.ok ? 'success' : 'error'"
+        :closable="false"
+        show-icon
+        class="mb"
+        :title="selfCheckResult.summary"
+      />
+      <div v-else-if="selfCheckLoading" class="muted">正在按环节检查（平台端口 → Exporter → Prometheus → 业务指标）…</div>
+
+      <el-table v-if="selfCheckResult" :data="selfCheckResult.stages" size="small" :show-header="false">
+        <el-table-column label="环节" width="210">
+          <template #default="{ row }">
+            <el-tag size="small" :type="selfCheckTagType(row.status)" effect="light">{{ selfCheckTagText(row.status) }}</el-tag>
+            <span class="ml">{{ row.title }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="依据与动作">
+          <template #default="{ row }">
+            <div>{{ row.detail }}</div>
+            <div v-if="row.advice" class="field-hint">→ {{ row.advice }}</div>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <div class="spacer" />
+          <el-button @click="selfCheckVisible = false">关闭</el-button>
+          <el-button
+            v-if="selfCheckResult && !selfCheckResult.ok && selfCheckResult.next_action"
+            type="primary"
+            @click="followSelfCheckAction"
+          >{{ selfCheckResult.next_action_label || '按建议处理' }}</el-button>
         </div>
       </template>
     </el-dialog>

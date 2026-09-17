@@ -320,7 +320,10 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	r2：Exporter 端口与实例端口同机冲突时自动改用模板默认端口（INC-010）。
 //	r3：重新应用接受 SSH 凭据（口令/私钥）、发起新尝试时清掉上次失败、待处理项只推荐一个动作（INC-011）。
 //	r4：Redis 的 REDIS_ADDR 改为不带 scheme 的 host:port（INC-012）。
-const CodeRevision = "r4"
+//	r5：Exporter 侧地址按「目标机视角」渲染（同机改用回环）；远程回环地址不再做平台侧探测（INC-013）。
+//	r6：新增「重新核验」接口与周期自愈；核验返回"是否已判定"，Prometheus 抖动不再误改状态（INC-015）。
+//	r7：新增「集成自检」：平台端口 → Exporter 在位 → Prometheus 抓取 → 业务指标，分环节给结论与动作。
+const CodeRevision = "r7"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

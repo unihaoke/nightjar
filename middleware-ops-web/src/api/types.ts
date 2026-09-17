@@ -288,6 +288,27 @@ export interface IntegrationView {
   has_password: boolean
 }
 
+/** 集成中心：端到端自检的一个环节。 */
+export interface IntegrationSelfCheckStage {
+  key: string
+  title: string
+  /** ok | warn | fail */
+  status: string
+  detail: string
+  advice?: string
+}
+
+/** 集成中心：端到端自检结论（哪一环断了 + 下一步动作）。 */
+export interface IntegrationSelfCheck {
+  instance_id: number
+  name: string
+  ok: boolean
+  summary: string
+  stages: IntegrationSelfCheckStage[]
+  next_action?: string
+  next_action_label?: string
+}
+
 /** 远程集成的账号操作所需 SSH 凭据（仅本次请求使用，平台不落库、不回显）。 */
 export interface AccountSecurePayload {
   ssh_user?: string

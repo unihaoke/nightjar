@@ -106,6 +106,10 @@ func New(opt Options) *gin.Engine {
 		integrations.POST("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateIntegration)
 		integrations.PUT("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.UpdateIntegration)
 		integrations.POST("/:id/apply", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.ApplyIntegration)
+		// 重新核验：只读 Prometheus 现状刷新状态，不重装、不需要凭据（读权限即可）
+		integrations.POST("/:id/verify", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.VerifyIntegration)
+		// 端到端自检：分环节给出结论与下一步（同样只读）
+		integrations.POST("/:id/selfcheck", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.SelfCheckIntegration)
 		integrations.POST("/:id/account/rotate", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.RotateIntegrationAccount)
 		// 失败重试：带管理凭据=幂等重建账号；不带=只测连接 + 重建 Exporter
 		integrations.POST("/:id/account/retry", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.RetryIntegrationAccount)

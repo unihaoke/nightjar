@@ -248,6 +248,10 @@ func (s *MiddlewareService) TestEndpoint(ctx context.Context, in MiddlewareInput
 // probe 执行 TCP 连通性探测（端口可达 + 耗时）。
 func (s *MiddlewareService) probe(ctx context.Context, item *model.MiddlewareInstance) (*TestResult, error) {
 	endpoint := net.JoinHostPort(item.Host, fmt.Sprintf("%d", item.Port))
+	// 远程集成的地址是目标机视角：回环地址在平台侧探测没有意义（会打到平台自己）。
+	if reason, skip := platformSideProbeSkipReason(*item); skip {
+		return &TestResult{Endpoint: endpoint, Success: true, Message: reason}, nil
+	}
 	start := time.Now()
 	dialer := &net.Dialer{Timeout: 3 * time.Second}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)

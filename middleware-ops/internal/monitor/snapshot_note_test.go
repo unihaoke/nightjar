@@ -15,7 +15,7 @@ import (
 func TestSnapshotNoteJobUpIsNotInstanceUp(t *testing.T) {
 	jobUp := 1.0
 	note := buildSnapshotNote(`job="middleware-integration",instance_name="legacy-redis"`,
-		"middleware-integration", &jobUp, 0, 0, 0)
+		"middleware-integration", &jobUp, 0, 0, 0, "")
 
 	if !strings.Contains(note, "job 级 up=1") {
 		t.Fatalf("必须点明这是 job 级判定，实际：%s", note)
@@ -32,20 +32,39 @@ func TestSnapshotNoteJobUpIsNotInstanceUp(t *testing.T) {
 	}
 }
 
+// up=0 时必须把平台已经取到的 lastError 直接摆出来，
+// 而不是让使用者"去 Prometheus /targets 页面翻"（真实反馈）。
+func TestSnapshotNoteShowsTargetLastError(t *testing.T) {
+	zero := 0.0
+	translated := "原因：监控账号或口令不一致，或该账号缺少 PROCESS / REPLICATION CLIENT 权限。"
+	note := buildSnapshotNote("s", "middleware-integration", &zero, 0, 0, 0, translated)
+	if !strings.Contains(note, translated) {
+		t.Fatalf("应内联展示 lastError 的结论，实际：%s", note)
+	}
+	if strings.Contains(note, "/targets 页面翻") {
+		t.Fatalf("不应再让使用者自己去翻 lastError，实际：%s", note)
+	}
+	// 取不到 lastError 时要说清"没取到"，并给出两种常见情况的排查方向。
+	note = buildSnapshotNote("s", "middleware-integration", &zero, 0, 0, 0, "")
+	if !strings.Contains(note, "未取到") || !strings.Contains(note, "安全组") {
+		t.Fatalf("取不到 lastError 时应说明并给出排查方向，实际：%s", note)
+	}
+}
+
 func TestSnapshotNoteCoversJobMissingAndTargetDown(t *testing.T) {
-	if note := buildSnapshotNote("s", "j", nil, 0, 0, 0); !strings.Contains(note, "尚未在 Prometheus 中配置") {
+	if note := buildSnapshotNote("s", "j", nil, 0, 0, 0, ""); !strings.Contains(note, "尚未在 Prometheus 中配置") {
 		t.Fatalf("job 不存在时应直接指出，实际：%s", note)
 	}
 	zero := 0.0
-	if note := buildSnapshotNote("s", "j", &zero, 0, 0, 0); !strings.Contains(note, "up=0") {
+	if note := buildSnapshotNote("s", "j", &zero, 0, 0, 0, ""); !strings.Contains(note, "up=0") {
 		t.Fatalf("target 挂掉时应指出 up=0，实际：%s", note)
 	}
 	// 有命中且没有缺失项 → 不打扰使用者（这是既有契约）。
-	if note := buildSnapshotNote("s", "j", &zero, 3, 0, 0); note != "" {
+	if note := buildSnapshotNote("s", "j", &zero, 3, 0, 0, ""); note != "" {
 		t.Fatalf("指标齐备时不应输出结论，实际：%s", note)
 	}
 	// 有命中但有缺失项 → 只做信息性说明，不误导排查方向。
-	if note := buildSnapshotNote("s", "j", &zero, 3, 1, 1); !strings.Contains(note, "命中 3 项") {
+	if note := buildSnapshotNote("s", "j", &zero, 3, 1, 1, ""); !strings.Contains(note, "命中 3 项") {
 		t.Fatalf("有缺失项时应说明命中与缺失数量，实际：%s", note)
 	}
 }

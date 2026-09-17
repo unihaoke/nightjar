@@ -16,8 +16,10 @@ type Scheduler struct {
 	alerts     *AlertService
 	audit      *AuditService
 	approvals  *ApprovalService
-	log        *zap.Logger
-	cfg        SchedulerConfig
+	// integration 用于集成核验自愈（把"已修好但状态还停在待处理"的集成纠正回来）。
+	integration *IntegrationService
+	log         *zap.Logger
+	cfg         SchedulerConfig
 }
 
 // SchedulerConfig 是调度参数。
@@ -33,11 +35,12 @@ type SchedulerConfig struct {
 }
 
 // NewScheduler 构造调度器。
-func NewScheduler(cfg SchedulerConfig, middleware *MiddlewareService, alerts *AlertService, audit *AuditService, approvals *ApprovalService, log *zap.Logger) *Scheduler {
+func NewScheduler(cfg SchedulerConfig, middleware *MiddlewareService, alerts *AlertService, audit *AuditService, approvals *ApprovalService, integration *IntegrationService, log *zap.Logger) *Scheduler {
 	return &Scheduler{
 		cron:       cron.New(cron.WithSeconds()),
 		middleware: middleware, alerts: alerts, audit: audit, approvals: approvals,
-		log: log, cfg: cfg,
+		integration: integration,
+		log:         log, cfg: cfg,
 	}
 }
 
@@ -72,6 +75,25 @@ func (s *Scheduler) Start() error {
 		s.log.Info("健康巡检完成", zap.Int("online", online), zap.Int("total", total))
 	}); err != nil {
 		return fmt.Errorf("注册健康巡检任务: %w", err)
+	}
+
+	// 集成核验自愈：把"外部原因已修好但状态还停在待处理"的集成自动纠正回来。
+	// 只在明确看到抓取目标 up 时才清除错误（见 integration_verify.go 的语义约定）。
+	if s.integration != nil {
+		if _, err := s.cron.AddFunc("@every "+durationSpec(s.cfg.HealthProbe), func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			checked, cleared, reverifyErr := s.integration.ReverifyIntegrations(ctx)
+			if reverifyErr != nil {
+				s.log.Warn("集成核验自愈失败", zap.Error(reverifyErr))
+				return
+			}
+			if cleared > 0 {
+				s.log.Info("集成核验自愈完成", zap.Int("checked", checked), zap.Int("cleared", cleared))
+			}
+		}); err != nil {
+			return fmt.Errorf("注册集成核验自愈任务: %w", err)
+		}
 	}
 
 	// 阈值评估：PromQL 指标 → 告警规则（4.4 主链路）。
