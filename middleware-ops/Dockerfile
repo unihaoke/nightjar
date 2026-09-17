@@ -25,9 +25,11 @@ ARG ALPINE_VERSION="3.20"
 
 # 显式写入 main + community 两个源：
 #   - community 是 ansible 所在仓库，Alpine 默认 /etc/apk/repositories 里**没有**它；
-#   - 国内构建时把 dl-cdn 换成镜像源（ALPINE_MIRROR），否则 apk 拉包经常只有几十 KB/s。
-RUN if [ -n "$ALPINE_MIRROR" ]; then BASE="https://${ALPINE_MIRROR}/alpine"; \
-    else BASE="https://dl-cdn.alpinelinux.org/alpine"; fi && \
+#   - ALPINE_MIRROR 支持宽松写法（带不带 https://、带不带 /alpine 都行），
+#     国内构建务必设置，否则 apk 拉几个小包都可能要几分钟。
+RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}"; \
+    if [ -n "$M" ]; then BASE="https://${M}/alpine"; \
+    else BASE="http://mirrors.ustc.edu.cn/alpine"; fi && \
     printf '%s\n' "${BASE}/v${ALPINE_VERSION}/main" "${BASE}/v${ALPINE_VERSION}/community" > /etc/apk/repositories && \
     apk add --no-cache git ca-certificates tzdata
 
@@ -70,8 +72,9 @@ ARG ALPINE_VERSION="3.20"
 
 # 注意层次顺序：**先装 ansible（最贵、最稳定的一层），再创建用户与目录**。
 # 这样改业务代码、改用户/目录都不会导致重新下载 ansible 包。
-RUN if [ -n "$ALPINE_MIRROR" ]; then BASE="https://${ALPINE_MIRROR}/alpine"; \
-    else BASE="https://dl-cdn.alpinelinux.org/alpine"; fi && \
+RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}"; \
+    if [ -n "$M" ]; then BASE="https://${M}/alpine"; \
+    else BASE="http://mirrors.ustc.edu.cn/alpine"; fi && \
     printf '%s\n' "${BASE}/v${ALPINE_VERSION}/main" "${BASE}/v${ALPINE_VERSION}/community" > /etc/apk/repositories && \
     apk add --no-cache ca-certificates tzdata curl && \
     if [ "$WITH_ANSIBLE" = "true" ]; then \
