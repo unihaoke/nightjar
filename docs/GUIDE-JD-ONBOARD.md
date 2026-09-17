@@ -128,6 +128,7 @@ cd <nightjar>
 | 集成报「无法确定目标所在网络」 | 地址里的名字与 docker 里的容器名/服务名/别名都不匹配，或平台没挂 docker.sock | 报错里会列出候选容器名；`./scripts/setup-jd-link.sh` 会自动放开 docker.sock |
 | 集成报「解析不了 jd-mysql / server misbehaving」 | 用的是**旧架构的人工别名**（jd 侧已不再提供） | 把地址改成容器名 `interview-mysql:3306` / `interview-redis:6379`，重新保存即可（平台会自动接入 `jd_jd-data`） |
 | 集成保存成功但指标为空（`job_up=0`） | Exporter 连不上目标：账号没建 / 口令不一致 / 目标容器没运行 | 集成列表下方「待处理项」旁的 **「去重试 / 测试连接」**：带 root 凭据点「重试建号」（幂等重跑建号 SQL），或先点「测试连接」看账号到底能不能连 |
+| 提示"job 已抓取（up=1）但匹配不到时序" | **`up{job=…}` 是 job 级判定**：同 job 里 MySQL 正常就会返回 1，即使本实例的 Exporter 已挂 | 新版自检会按**本实例那条 target** 给结论：① target 不是 up → 直接给 lastError（多半是 Exporter 没起来/连不上目标）；② target up=1 但只有抓取元指标、没有 `redis_*` → Exporter 起来了但连不上中间件（看 `redis_up`/`mysql_up`）；③ 真的 `instance_name` 不一致 → 提示改成实际取值 |
 | 建号失败（权限不足、实例只读、凭据不对） | 建号 SQL 需要 CREATE USER / GRANT 权限 | 修好外部原因后**不必重填集成表单**：集成中心右上角「监控账号」→「重试建号」，失败原因就地显示；建号语句幂等，可反复重试 |
 | 报 `Access denied for user 'exporter'` | 只读账号不存在或口令不一致 | 重新保存并勾选「由平台创建只读监控账号」（等效手工：见 `INTEGRATION.md` 的模板 SQL） |
 | 报 `invalid DSN` | 旧版 Exporter 配置在拼 `DATA_SOURCE_NAME` | 已被官方方式取代（`--mysqld.username` + `MYSQLD_EXPORTER_PASSWORD`）；重建 Exporter 即可 |

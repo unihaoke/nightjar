@@ -260,7 +260,13 @@ func buildSnapshotNote(selector, job string, jobUp *float64, matched, emptyCnt, 
 	case *jobUp == 0:
 		return fmt.Sprintf("Prometheus 已配置 job=%q，但该 target 抓取失败（up=0）：Exporter 未启动或连不上被管中间件。请查看 Prometheus /targets 页面的 lastError 与 Exporter 容器日志。", job)
 	default:
-		return fmt.Sprintf("Prometheus 已正常抓取 job=%q（up=1），但选择器 {%s} 匹配不到时序：请让「实例名称」与 Prometheus 标签 instance_name 完全一致，或改用「Prometheus instance」精确指定；两者只能用一个（填了 Prometheus instance 会忽略实例名）。",
+		// 注意措辞：up{job} 是 **job 级**判定，同 job 下只要有一个 target 是 up 就返回 1。
+		// 一个 job 里通常有多个集成，因此绝不能写成"已正常抓取"——那会把使用者
+		// 引到"改实例名"上去，而真正的原因往往是本实例的 Exporter 已挂。
+		return fmt.Sprintf("Prometheus 中 job=%q 有抓取目标处于 up（job 级 up=1），但选择器 {%s} 匹配不到时序。"+
+			"注意：同 job 下其他实例正常也会让 job 级 up=1，本实例的 Exporter 仍可能没起来。"+
+			"平台「接入自检」会按**本实例那条 target** 给出 up / lastError / 实际标签；"+
+			"若确属标签问题，请让「实例名称」与 instance_name 完全一致，或改用「Prometheus instance」（两者只能用一个）。",
 			job, selector)
 	}
 }

@@ -245,7 +245,111 @@ func (s *MetricsService) Diagnose(ctx context.Context, instanceID int64, scope S
 	result.Hints = append(result.Hints, s.augmentLabelHints(ctx, item, result)...)
 	// 容器网络/DNS 判定：这一步能确定地区分"网络挂错"与"Prometheus 自身问题"。
 	result.Hints = append(result.Hints, s.augmentEndpointHints(ctx, result)...)
+	// **按实例定位 target**：这是最关键的一步，能纠正"job 整体 up=1"带来的误导。
+	result.Hints = append(result.Hints, s.augmentTargetHints(ctx, item, result)...)
 	return result, nil
+}
+
+// augmentTargetHints 用 Prometheus 里**本实例那一条** target 的状态来解释"查不到数据"。
+//
+// 为什么必须按实例定位：`up{job="middleware-integration"}` 在同 job 下只要有**任何**
+// 一个 target 是 up 的就返回 1。一个 job 里通常有多个集成（MySQL + Redis …），
+// 于是本实例 Exporter 已经挂了，界面却显示"已正常抓取（up=1）"，并误导使用者去改实例名。
+// 这里把 target 状态取回来，按"本实例自己的 up / lastError / 实际标签"给出结论。
+func (s *MetricsService) augmentTargetHints(ctx context.Context, item *model.MiddlewareInstance, result *DiagnoseResult) []string {
+	if result == nil || result.MonitorKind != "prometheus" || result.Selector == "" {
+		return nil
+	}
+	reporter, ok := s.monitor.(monitor.TargetReporter)
+	if !ok {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	statuses, err := reporter.Targets(probeCtx, jobOfTarget(item))
+	if err != nil || len(statuses) == 0 {
+		return nil
+	}
+	// 先精确匹配本次诊断的实例；找不到再用 instance 字段匹配（用户填了 Prometheus instance）。
+	var mine *monitor.TargetStatus
+	for i := range statuses {
+		status := statuses[i]
+		if item.PromInstance != "" && status.Labels["instance"] == item.PromInstance {
+			mine = &status
+			break
+		}
+		if status.Labels["instance_name"] == item.Name {
+			mine = &status
+			break
+		}
+	}
+	if mine == nil {
+		// 该 job 下根本没有属于本实例的 target：列出现有取值，便于对齐或确认 SD 是否生效。
+		names := make([]string, 0, len(statuses))
+		for _, status := range statuses {
+			if name := status.Labels["instance_name"]; name != "" {
+				names = appendUnique(names, name)
+			}
+		}
+		note := fmt.Sprintf("job %q 下没有属于本实例（instance_name=%q）的抓取目标", jobOfTarget(item), item.Name)
+		if len(names) > 0 {
+			note += "；该 job 现有的 instance_name 取值：" + strings.Join(names, "、")
+		}
+		result.Note = note + "。请确认集成已保存（服务发现 30s 刷新），或把「实例名称」改成上面的取值之一。"
+		return []string{result.Note}
+	}
+
+	actual := mine.Labels["instance_name"]
+	if mine.Health != "up" {
+		result.Note = fmt.Sprintf("本实例的抓取目标未就绪（up=0）：%s 抓取地址 %s。"+
+			"注意：同 job 下其他实例正常时 job 级 up 仍为 1，不代表本实例正常。",
+			monitor.DescribeTargetError(mine.LastError), mine.ScrapeURL)
+		hints := []string{result.Note}
+		if actual != "" && actual != item.Name {
+			hints = append(hints, fmt.Sprintf("另外该目标的 instance_name 实际是 %q（当前实例名 %q）：修好 Exporter 后如仍查不到，请对齐这两者。", actual, item.Name))
+		}
+		return hints
+	}
+	// 目标本身 up=1 却查不到时序：要么标签对不上，要么 Exporter 起来了但连不上被管中间件
+	//（此时只会剩抓取元指标，业务指标如 redis_up 一条都没有）。
+	// 先把真实标签写进结论，再用 __name__ 列出"这个实例到底暴露了哪些指标"。
+	labelPairs := make([]string, 0, len(mine.Labels))
+	for key, value := range mine.Labels {
+		labelPairs = append(labelPairs, key+"="+value)
+	}
+	sort.Strings(labelPairs)
+	result.Note = fmt.Sprintf("本实例目标 up=1（抓取地址 %s），Exporter 进程正常。该 target 的实际标签：%s",
+		mine.ScrapeURL, strings.Join(labelPairs, ", "))
+	hints := []string{result.Note}
+	if actual != "" && actual != item.Name {
+		alignment := fmt.Sprintf("其中 instance_name=%q 与实例名 %q 不一致 → 把「实例名称」改成 %q（或改用「Prometheus instance」精确指定）。",
+			actual, item.Name, actual)
+		result.Note += "；" + alignment
+		hints = append(hints, alignment)
+	}
+	if labelReporter, ok := s.monitor.(monitor.LabelReporter); ok {
+		if names, nameErr := labelReporter.LabelValues(ctx, "__name__", result.Selector); nameErr == nil && len(names) > 0 {
+			sort.Strings(names)
+			limit := names
+			if len(limit) > 12 {
+				limit = limit[:12]
+			}
+			hasBusiness := false
+			for _, name := range names {
+				if strings.Contains(name, "_up") || strings.HasSuffix(name, "_total") {
+					hasBusiness = true
+					break
+				}
+			}
+			hint := fmt.Sprintf("该实例当前暴露的指标（%d 个）：%s", len(names), strings.Join(limit, "、"))
+			if !hasBusiness {
+				hint += "。只有抓取元指标、没有业务指标 → Exporter 进程在跑但**连不上被管中间件**" +
+					"（如 redis_up=0 / mysql_up=0）：核对地址、账号口令与网络。"
+			}
+			hints = append(hints, hint)
+		}
+	}
+	return hints
 }
 
 // augmentEndpointHints 在自检里做一次容器内 DNS 实测。
