@@ -82,8 +82,9 @@ func TestRemoteTargetUsesHostPortAndNetworkMode(t *testing.T) {
 	if strings.Contains(art.Playbook, "-p {{ exporter_port }}") {
 		t.Fatalf("host 网络下不应生成 -p 映射：\n%s", art.Playbook)
 	}
-	// 等待就绪的端口断言。
-	if !strings.Contains(art.Playbook, "port: {{ exporter_port }}") {
+	// 等待就绪的端口断言（必须带引号，否则 YAML 会把它当 flow mapping；
+	// yamlScalar 产出单引号形式）。
+	if !strings.Contains(art.Playbook, "port: '{{ exporter_port }}'") {
 		t.Fatalf("playbook 应等待 Exporter 端口就绪：\n%s", art.Playbook)
 	}
 	// 命令里不得出现凭据。
@@ -328,6 +329,63 @@ func TestAnonymousInstancesCanBeSaved(t *testing.T) {
 		Address: mustAddress(t, "10.0.0.12:3306", 3306), Environment: "dev",
 	}); err == nil {
 		t.Fatal("MySQL 未填监控账号名时应报错（平台要按该名字建号）")
+	}
+}
+
+// TestRenderedPlaybooksQuoteJinjaValues 锁定：YAML 里以 {{ }} 开头的值必须加引号。
+//
+// 真实故障：生成的 playbook 里写了 `port: {{ exporter_port }}`，YAML 把行首的 `{{`
+// 当成 flow mapping 解析，ansible 直接报
+//   found unacceptable key (unhashable type: 'AnsibleMapping')
+// 整个远程安装（含建号）全部失败。这里对所有渲染产物做一遍扫描，防止再犯。
+func TestRenderedPlaybooksQuoteJinjaValues(t *testing.T) {
+	for _, mwType := range []string{TypeRedis, TypeMySQL, TypeNode} {
+		tpl, _ := TemplateOf(mwType)
+		address := mustAddress(t, "10.0.0.31:9100", tpl.DefaultPort)
+		for _, mode := range []string{InstallModeDocker, InstallModeDockerSystemd, InstallModeBinary} {
+			opts := remoteTestOptions()
+			opts.InstallMode = mode
+			art, err := RenderRemoteInstall(tpl, Instance{
+				Name: mwType + "-01", MWType: mwType, Address: address,
+				Username: "mwops_exporter", Password: "pw", Environment: "dev",
+			}, opts)
+			if err != nil {
+				t.Fatalf("%s/%s 渲染失败：%v", mwType, mode, err)
+			}
+			assertJinjaValuesQuoted(t, mwType+"/"+mode, art.Playbook)
+		}
+	}
+	accountArt, err := RenderAccountSQL(AccountSQLRequest{
+		Name: "acct", MWType: TypeMySQL, DBHost: "127.0.0.1", DBPort: 3306,
+		ExecUser: "root", ExecPassword: "pw",
+		Statements: []string{"SELECT 1"},
+	})
+	if err != nil {
+		t.Fatalf("账号 playbook 渲染失败：%v", err)
+	}
+	assertJinjaValuesQuoted(t, "account-sql", accountArt.Playbook)
+}
+
+// assertJinjaValuesQuoted 检查每一行里"冒号后的值"若以 {{ 开头则必须带引号。
+//
+// 只检查裸标量位置：shell/command 的值里出现 {{ 是合法的（如 `docker pull {{ img }}`），
+// 因为 {{ 不在标量起始位置、不会被 YAML 当成 flow mapping。
+func assertJinjaValuesQuoted(t *testing.T, label, playbook string) {
+	t.Helper()
+	for i, line := range strings.Split(playbook, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		idx := strings.Index(trimmed, ": ")
+		if idx < 0 {
+			continue
+		}
+		value := strings.TrimSpace(trimmed[idx+2:])
+		if strings.HasPrefix(value, "{{") && !strings.HasPrefix(value, "\"") {
+			t.Fatalf("%s 第 %d 行：以 {{ 开头的 YAML 值必须加引号，否则 ansible 报 unhashable type：%s",
+				label, i+1, trimmed)
+		}
 	}
 }
 

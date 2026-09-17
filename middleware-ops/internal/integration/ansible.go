@@ -201,7 +201,9 @@ func renderRemotePlaybook(in remotePlaybookInput) string {
 	b.WriteString("    - name: 等待 Exporter 端口就绪\n")
 	b.WriteString("      ansible.builtin.wait_for:\n")
 	b.WriteString("        host: 127.0.0.1\n")
-	b.WriteString("        port: {{ exporter_port }}\n")
+	// 必须加引号：YAML 里以 {{ 开头的裸标量会被当成 flow mapping 解析，
+	// ansible 会报 "found unacceptable key (unhashable type: 'AnsibleMapping')"。
+	b.WriteString("        port: " + yamlScalar("{{ exporter_port }}") + "\n")
 	b.WriteString("        timeout: 60\n")
 	return b.String()
 }
