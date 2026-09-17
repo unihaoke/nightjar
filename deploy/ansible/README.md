@@ -58,7 +58,7 @@ WITH_ANSIBLE=false docker compose up -d --build backend
 ```dockerfile
 ARG WITH_ANSIBLE=true
 RUN if [ "$WITH_ANSIBLE" = "true" ]; then \
-      apk add --no-cache --repository=http://mirrors.ustc.edu.cn/alpine/v3.20/community ansible && \
+      apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/v3.20/community ansible && \
       ansible-playbook --version >/dev/null; \
     fi
 ```

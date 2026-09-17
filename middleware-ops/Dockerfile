@@ -29,7 +29,7 @@ ARG ALPINE_VERSION="3.20"
 #     国内构建务必设置，否则 apk 拉几个小包都可能要几分钟。
 RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}"; \
     if [ -n "$M" ]; then BASE="https://${M}/alpine"; \
-    else BASE="http://mirrors.ustc.edu.cn/alpine"; fi && \
+    else BASE="https://dl-cdn.alpinelinux.org/alpine"; fi && \
     printf '%s\n' "${BASE}/v${ALPINE_VERSION}/main" "${BASE}/v${ALPINE_VERSION}/community" > /etc/apk/repositories && \
     apk add --no-cache git ca-certificates tzdata
 
@@ -74,7 +74,7 @@ ARG ALPINE_VERSION="3.20"
 # 这样改业务代码、改用户/目录都不会导致重新下载 ansible 包。
 RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}"; \
     if [ -n "$M" ]; then BASE="https://${M}/alpine"; \
-    else BASE="http://mirrors.ustc.edu.cn/alpine"; fi && \
+    else BASE="https://dl-cdn.alpinelinux.org/alpine"; fi && \
     printf '%s\n' "${BASE}/v${ALPINE_VERSION}/main" "${BASE}/v${ALPINE_VERSION}/community" > /etc/apk/repositories && \
     apk add --no-cache ca-certificates tzdata curl && \
     if [ "$WITH_ANSIBLE" = "true" ]; then \
