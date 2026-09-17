@@ -10,6 +10,7 @@ import { useRouter } from 'vue-router'
 import { metricsApi, middlewareApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { MetricSnapshot, MiddlewareInstance } from '@/api/types'
+import EmptyGuide from '@/components/EmptyGuide.vue'
 import MetricChart from '@/components/MetricChart.vue'
 import { envLabels, formatNumber, mwTypeLabels } from '@/utils/format'
 
@@ -38,6 +39,9 @@ const metricOptions = computed(() => {
 })
 
 const selectedSpec = computed(() => snapshot.value?.metrics?.find((item) => item.name === query.metric) || null)
+
+/** 一个实例都没有：下拉是空的，先给出接入入口。 */
+const noInstances = computed(() => instances.value.length === 0)
 
 /** 加载实例下拉。 */
 async function loadInstances(): Promise<void> {
@@ -130,6 +134,17 @@ onMounted(async () => {
       </div>
     </div>
 
+    <EmptyGuide
+      v-if="noInstances"
+      class="mb"
+      title="还没有可查看的实例"
+      description="统一监控展示的是纳管实例的指标。先接入一个中间件实例，指标会在约 30 秒内出现。"
+      primary-text="去集成中心接入"
+      primary-to="integrations"
+      secondary-text="手工纳管实例"
+      secondary-to="middlewares"
+    />
+
     <div class="card filters">
       <el-select v-model="query.instance_id" placeholder="选择实例" filterable class="filter-item" @change="loadSnapshot">
         <el-option
@@ -206,6 +221,10 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.mb {
+  margin-bottom: 12px;
+}
+
 .filters {
   display: flex;
   gap: 8px;

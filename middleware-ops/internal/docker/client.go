@@ -189,6 +189,9 @@ func (c *Client) Ensure(ctx context.Context, spec ContainerSpec) (string, string
 		}
 		action = "recreated"
 	}
+	if err := c.EnsureImage(ctx, spec.Image); err != nil {
+		return "", "", err
+	}
 	id, err := c.create(ctx, spec)
 	if err != nil {
 		return "", "", err
@@ -388,6 +391,9 @@ func (c *Client) RunOnce(ctx context.Context, spec ContainerSpec, timeout time.D
 	// 同名残留先清掉，保证可重复执行
 	if existing, err := c.Inspect(ctx, spec.Name); err == nil && existing != nil {
 		_ = c.Remove(ctx, spec.Name)
+	}
+	if err := c.EnsureImage(ctx, spec.Image); err != nil {
+		return "", err
 	}
 	id, err := c.create(ctx, spec)
 	if err != nil {
@@ -701,6 +707,51 @@ func (c *Client) inspectNetworks(ctx context.Context, id string) (map[string][]s
 		out[name] = network.Aliases
 	}
 	return out, nil
+}
+
+// EnsureImage 确保镜像在本地存在，不存在则拉取。
+//
+// 为什么必须显式做：Docker 的 `POST /containers/create` **不会自动拉取镜像**，
+// 镜像缺失时直接返回 404 `No such image`。`docker compose up` 会替你拉，
+// 但平台走的是 Engine API，所以这一步得自己补——否则"一键拉起 Exporter"
+// 在没预先 pull 过镜像的机器上永远失败。
+//
+// 拉取响应是一个进度流，必须读完：客户端提前断开会让 Docker 中断拉取。
+func (c *Client) EnsureImage(ctx context.Context, ref string) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil)
+	if err != nil {
+		return err
+	}
+	status := resp.StatusCode
+	_ = resp.Body.Close()
+	switch {
+	case status == http.StatusOK:
+		return nil
+	case status != http.StatusNotFound && status != http.StatusNotImplemented:
+		// 其它状态（如某些实现不支持该查询）不阻断创建流程，交给 create 去报真实错误。
+		return nil
+	}
+
+	name, tag := ref, "latest"
+	if idx := strings.LastIndex(ref, ":"); idx > strings.LastIndex(ref, "/") {
+		name, tag = ref[:idx], ref[idx+1:]
+	}
+	pullResp, err := c.do(ctx, http.MethodPost,
+		"/images/create?fromImage="+url.QueryEscape(name)+"&tag="+url.QueryEscape(tag), nil)
+	if err != nil {
+		return fmt.Errorf("拉取镜像 %s 失败: %w", ref, err)
+	}
+	defer func() { _ = pullResp.Body.Close() }()
+	// 必须把进度流读干净，否则拉取会被中断。
+	_, _ = io.Copy(io.Discard, pullResp.Body)
+	if pullResp.StatusCode >= 400 {
+		return fmt.Errorf("拉取镜像 %s 失败：HTTP %d", ref, pullResp.StatusCode)
+	}
+	return nil
 }
 
 // InspectDetail 返回容器的详细配置（网络、挂载、环境变量）。

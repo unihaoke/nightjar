@@ -3,18 +3,22 @@
  * 全局大盘（8.2 系统模块）。
  *
  * 数据来源：/api/system/overview（实例健康、告警趋势、诊断质量与成本、平台自检）。
- * 刷新策略：进入页面即拉取；提供手动刷新；不依赖常驻轮询，避免无谓的后端压力。
+ * 刷新策略：进入页面即拉取；提供手动刷新；60s 静默轮询兼顾大盘延迟目标，
+ * 但页面处于后台标签页时暂停轮询，回到前台立即补刷一次。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { systemApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { Overview } from '@/api/types'
+import EmptyGuide from '@/components/EmptyGuide.vue'
 import StatCard from '@/components/StatCard.vue'
 import MetricChart from '@/components/MetricChart.vue'
+import { useUserStore } from '@/stores/user'
 import { formatDuration, formatNumber, formatPercent, mwTypeLabels } from '@/utils/format'
 
 const router = useRouter()
+const store = useUserStore()
 const loading = ref(false)
 const overview = ref<Overview | null>(null)
 const refreshedAt = ref<string>('')
@@ -36,6 +40,17 @@ async function load(): Promise<void> {
 const alertSeries = computed(() =>
   (overview.value?.alerts.trend || []).map((item) => ({ timestamp: item.label, value: item.total })),
 )
+
+/**
+ * 是否处于「全新系统」状态：一个实例都还没有。
+ *
+ * 这时大盘全是 0 与空图，用户看不出下一步该点哪——必须显式给出接入引导，
+ * 并说明「集成中心」与「中间件纳管」两条路径的区别（这是首次使用最常走错的地方）。
+ */
+const isFresh = computed(() => Boolean(overview.value) && (overview.value?.instances.total ?? 0) === 0)
+
+/** 引导入口按权限收敛：没有资源读权限就不展示跳转按钮（只读角色也能看大盘）。 */
+const canAccessResources = computed(() => store.can('middleware:read'))
 
 /** 中间件类型分布。 */
 const typeDistribution = computed(() => {
@@ -75,16 +90,30 @@ const alertStatus = computed<'ok' | 'warning' | 'critical'>(() => {
 
 let timer: number | undefined
 
+/** 切回前台立即补刷一次；后台标签页不主动轮询。 */
+function onVisibilityChange(): void {
+  if (document.hidden) {
+    return
+  }
+  void load()
+}
+
 onMounted(async () => {
   await load()
   // 大盘延迟目标 ≤30s（设计文档 10），这里用 60s 轮询兼顾成本。
-  timer = window.setInterval(() => void load(), 60_000)
+  timer = window.setInterval(() => {
+    if (!document.hidden) {
+      void load()
+    }
+  }, 60_000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
 })
 
 onBeforeUnmount(() => {
   if (timer) {
     window.clearInterval(timer)
   }
+  document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>
 
@@ -105,6 +134,23 @@ onBeforeUnmount(() => {
         <el-button :icon="'Refresh'" size="small" @click="load">刷新</el-button>
       </div>
     </div>
+
+    <!-- 全新系统：先告诉用户下一步该点哪，而不是留一堆 0 和空图 -->
+    <EmptyGuide
+      v-if="isFresh"
+      class="mb"
+      title="还没有纳管任何中间件实例"
+      description="推荐用「集成中心」接入：平台会一并完成只读监控账号、Exporter 与 Prometheus 抓取目标；「中间件纳管」只做登记，适合已有 Exporter 且 Prometheus 已经抓得到的实例。"
+      :steps="[
+        '在集成中心选择组件（Redis / MySQL / PostgreSQL / Kafka / Elasticsearch / Nginx）',
+        '填写连接地址与账号，可勾选由平台代建只读监控账号',
+        '保存后约 30 秒，指标出现在「统一监控」，即可使用 AI 诊断',
+      ]"
+      :primary-text="canAccessResources ? '去集成中心接入' : ''"
+      primary-to="integrations"
+      :secondary-text="canAccessResources ? '手工纳管实例' : ''"
+      secondary-to="middlewares"
+    />
 
     <!-- 关键指标 -->
     <el-row :gutter="12">
@@ -273,6 +319,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .mt {
   margin-top: 12px;
+}
+
+.mb {
+  margin-bottom: 12px;
 }
 
 .dist-list {

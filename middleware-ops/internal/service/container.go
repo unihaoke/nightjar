@@ -103,7 +103,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 		opt.Monitor, deps.Engine, deps.Notifier, deps.Audit, opt.Log)
 	deps.KnowledgeSvc = NewKnowledgeService(deps.Knowledge, deps.Diagnoses, deps.Audit, opt.Log)
 	deps.Approval = NewApprovalService(deps.Approvals, deps.Notifier, deps.Audit, opt.Log)
-	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, opt.Log)
+	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, deps.AlertSvc, opt.Log)
 	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos, deps.Audit, opt.Log)
 	// 集成中心：把 Exporter 暴露 + Prometheus 抓取 + 实例纳管 + 告警规则串成一次点击。
 	deps.Integration = NewIntegrationService(cfg, deps.Instances, deps.Servers, opt.Cipher,

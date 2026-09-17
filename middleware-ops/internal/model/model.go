@@ -262,6 +262,8 @@ type Approval struct {
 	ApplicantID  int64      `gorm:"index" json:"applicant_id"`
 	ApproverID   int64      `json:"approver_id"`
 	InstanceID   int64      `gorm:"index" json:"instance_id"`
+	AlertID      int64      `gorm:"index" json:"alert_id"`
+	DiagnosisID  int64      `json:"diagnosis_id"`
 	Environment  string     `gorm:"size:16" json:"environment"`
 	ActionType   string     `gorm:"size:64" json:"action_type"`
 	ActionDetail JSONMap    `gorm:"type:text" json:"action_detail"`
@@ -282,6 +284,8 @@ type FixRecord struct {
 	TicketID     string  `gorm:"size:40;index" json:"ticket_id"`
 	UserID       int64   `gorm:"index" json:"user_id"`
 	InstanceID   int64   `gorm:"index" json:"instance_id"`
+	AlertID      int64   `json:"alert_id"`
+	DiagnosisID  int64   `json:"diagnosis_id"`
 	ActionType   string  `gorm:"size:64" json:"action_type"`
 	Level        string  `gorm:"size:4" json:"level"`
 	Command      string  `gorm:"size:512" json:"command"`

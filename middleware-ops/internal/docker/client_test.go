@@ -22,6 +22,9 @@ type engineStub struct {
 	createdBody map[string]any
 	calls       []string
 	networks    []string
+	// imagePresent 表示本地已有镜像；pulled 记录被拉取的镜像引用。
+	imagePresent bool
+	pulled       []string
 }
 
 func (s *engineStub) handler() http.HandlerFunc {
@@ -30,6 +33,20 @@ func (s *engineStub) handler() http.HandlerFunc {
 		switch {
 		case r.URL.Path == "/_ping":
 			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/images/"):
+			// 镜像是否存在：缺失时 Docker 返回 404，平台据此决定是否拉取。
+			if s.imagePresent {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"Id":"sha256:stub"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/images/create":
+			s.pulled = append(s.pulled, r.URL.Query().Get("fromImage")+":"+r.URL.Query().Get("tag"))
+			// 真实接口是进度流，平台必须读干净；这里给两行 JSON 模拟。
+			_, _ = w.Write([]byte("{\"status\":\"Pulling\"}\n{\"status\":\"Download complete\"}\n"))
 			return
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
 			if !s.exists {
@@ -110,6 +127,25 @@ func TestEnsureCreatesContainerWithNetworkAndEnv(t *testing.T) {
 	labels, _ := stub.createdBody["Labels"].(map[string]any)
 	if labels["mwops.managed"] != "true" {
 		t.Fatalf("平台管理的容器必须带 mwops.managed 标签（便于清理），实际 %v", labels)
+	}
+	// 镜像缺失时必须先拉取：Engine API 的 /containers/create 不会自动 pull，
+	// 少了这一步「一键拉起 Exporter」在没预拉过镜像的机器上永远失败。
+	if len(stub.pulled) != 1 || stub.pulled[0] != "oliver006/redis_exporter:v1.66.0" {
+		t.Fatalf("镜像缺失时应先拉取该镜像，实际 %v", stub.pulled)
+	}
+}
+
+// TestEnsureImagePulledOnlyWhenMissing 锁定：镜像已存在时不重复拉取（避免每次保存都打网络）。
+func TestEnsureImagePulledOnlyWhenMissing(t *testing.T) {
+	stub := &engineStub{imagePresent: true}
+	client := newStubClient(t, stub)
+	if _, _, err := client.Ensure(context.Background(), ContainerSpec{
+		Name: "mwops-exporter-cached", Image: "oliver006/redis_exporter:v1.66.0", Networks: []string{"mwops"},
+	}); err != nil {
+		t.Fatalf("Ensure 失败：%v", err)
+	}
+	if len(stub.pulled) != 0 {
+		t.Fatalf("镜像已存在时不应拉取，实际 %v", stub.pulled)
 	}
 }
 

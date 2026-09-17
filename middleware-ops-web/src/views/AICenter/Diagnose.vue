@@ -14,12 +14,16 @@ import { aiApi, diagnoseStream, middlewareApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { DiagnosisResponse, MiddlewareInstance } from '@/api/types'
 import DiagnosisReport from '@/components/DiagnosisReport.vue'
+import EmptyGuide from '@/components/EmptyGuide.vue'
 import { envLabels, mwTypeLabels } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const route = useRoute()
 const router = useRouter()
 const store = useUserStore()
+
+/** 来源告警（告警中心一键诊断带入；随诊断写回 Alert.diagnosis_id）。 */
+const alertId = ref<number>(Number(route.query.alert_id) || 0)
 
 const instances = ref<MiddlewareInstance[]>([])
 const loadingInstances = ref(false)
@@ -44,6 +48,9 @@ const presets = [
 ]
 
 const canSubmit = computed(() => form.question.trim().length >= 2 && !streaming.value)
+
+/** 一个实例都没有：下拉是空的，必须先告诉用户去哪接入。 */
+const noInstances = computed(() => !loadingInstances.value && instances.value.length === 0)
 
 /** 加载实例下拉。 */
 async function loadInstances(): Promise<void> {
@@ -79,6 +86,7 @@ function startDiagnose(): void {
       instance_id: form.instance_id || undefined,
       question: form.question.trim(),
       skip_cache: form.skip_cache,
+      alert_id: alertId.value || undefined,
     },
     {
       onMeta: (meta) => {
@@ -126,6 +134,7 @@ async function runSync(): Promise<void> {
       instance_id: form.instance_id || undefined,
       question: form.question.trim(),
       skip_cache: form.skip_cache,
+      alert_id: alertId.value || undefined,
     })
     rawOutput.value = result.value.raw || ''
   } catch (error) {
@@ -133,6 +142,23 @@ async function runSync(): Promise<void> {
   } finally {
     streaming.value = false
   }
+}
+
+/** 携带上下文跳到修复执行（闭合 告警 → 诊断 → 修复工单 链路）。 */
+function goFix(): void {
+  if (!result.value) {
+    return
+  }
+  const params: Record<string, string> = {
+    instance_id: String(result.value.meta.instance_id || form.instance_id),
+  }
+  if (alertId.value) {
+    params.alert_id = String(alertId.value)
+  }
+  if (result.value.diagnosis_id) {
+    params.diagnosis_id = String(result.value.diagnosis_id)
+  }
+  void router.push({ name: 'fix', query: params })
 }
 
 /** 提交反馈。 */
@@ -167,6 +193,17 @@ onMounted(loadInstances)
         <el-button size="small" @click="router.push({ name: 'ai-history' })">诊断历史</el-button>
       </div>
     </div>
+
+    <EmptyGuide
+      v-if="noInstances"
+      class="mb"
+      title="还没有可诊断的实例"
+      description="AI 诊断需要基于纳管实例的指标与上下文。先接入一个中间件实例，再回来提问。"
+      primary-text="去集成中心接入"
+      primary-to="integrations"
+      secondary-text="手工纳管实例"
+      secondary-to="middlewares"
+    />
 
     <div class="card">
       <el-form label-position="top">
@@ -237,6 +274,7 @@ onMounted(loadInstances)
           <el-tag v-if="result.meta?.cache_hit" size="small" type="success" effect="light">缓存命中</el-tag>
           <el-tag size="small" effect="plain">#{{ result.diagnosis_id }}</el-tag>
           <el-button text size="small" @click="router.push({ name: 'ai-history' })">查看历史</el-button>
+          <el-button size="small" type="primary" plain :icon="'Tools'" @click="goFix">生成修复工单</el-button>
         </div>
       </h3>
       <DiagnosisReport
@@ -262,6 +300,10 @@ onMounted(loadInstances)
 </template>
 
 <style scoped>
+.mb {
+  margin-bottom: 12px;
+}
+
 .card + .card {
   margin-top: 12px;
 }

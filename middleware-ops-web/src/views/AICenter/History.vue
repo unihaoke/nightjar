@@ -1,43 +1,26 @@
 <script setup lang="ts">
 /** 诊断历史：检索、查看详情、复用结论。 */
-import { onMounted, reactive, ref } from 'vue'
+import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { aiApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { DiagnosisRecord, DiagnosisResponse } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import DiagnosisReport from '@/components/DiagnosisReport.vue'
 import { feedbackLabels, formatTime, mwTypeLabels } from '@/utils/format'
 
 const router = useRouter()
 
-const loading = ref(false)
-const items = ref<DiagnosisRecord[]>([])
-const total = ref(0)
 const detailVisible = ref(false)
 const detailLoading = ref(false)
 const current = ref<DiagnosisRecord | null>(null)
 
-const query = reactive({
-  keyword: '',
-  mw_type: '',
-  feedback: '',
-  page: 1,
-  page_size: 20,
+const list = useListPage<DiagnosisRecord>({
+  fetch: (params, signal) => aiApi.history(params, signal),
+  defaults: { keyword: '', mw_type: '', feedback: '', page: 1, page_size: 20 },
 })
-
-/** 加载历史。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const result = await aiApi.history({ ...query })
-    items.value = result.list || []
-    total.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
+const { query, items, total, loading, error } = list
 
 /** 查看详情。 */
 async function openDetail(row: DiagnosisRecord): Promise<void> {
@@ -61,7 +44,7 @@ async function handleFeedback(value: 'useful' | 'useless' | 'adopted'): Promise<
   try {
     await aiApi.feedback(current.value.id, value)
     current.value.feedback = value
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -100,8 +83,6 @@ function asResponse(row: DiagnosisRecord): DiagnosisResponse | null {
     duration_ms: row.duration_ms,
   }
 }
-
-onMounted(load)
 </script>
 
 <template>
@@ -114,26 +95,60 @@ onMounted(load)
       <el-button type="primary" :icon="'MagicStick'" @click="router.push({ name: 'ai-diagnose' })">新建诊断</el-button>
     </div>
 
-    <div class="card filters">
-      <el-input v-model="query.keyword" placeholder="按问题关键词搜索" clearable class="filter-item" @keyup.enter="load" />
-      <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
-        <el-option label="Redis" value="redis" />
-        <el-option label="Kafka" value="kafka" />
-        <el-option label="MySQL" value="mysql" />
-        <el-option label="PostgreSQL" value="pg" />
-        <el-option label="Elasticsearch" value="es" />
-        <el-option label="Nginx" value="nginx" />
-      </el-select>
-      <el-select v-model="query.feedback" placeholder="全部反馈" clearable class="filter-item">
-        <el-option label="有用" value="useful" />
-        <el-option label="没用" value="useless" />
-        <el-option label="已采纳" value="adopted" />
-      </el-select>
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-    </div>
+    <ResponsiveList
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="暂无诊断记录"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-input v-model="query.keyword" placeholder="按问题关键词搜索" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
+          <el-option label="Redis" value="redis" />
+          <el-option label="Kafka" value="kafka" />
+          <el-option label="MySQL" value="mysql" />
+          <el-option label="PostgreSQL" value="pg" />
+          <el-option label="Elasticsearch" value="es" />
+          <el-option label="Nginx" value="nginx" />
+        </el-select>
+        <el-select v-model="query.feedback" placeholder="全部反馈" clearable class="filter-item">
+          <el-option label="有用" value="useful" />
+          <el-option label="没用" value="useless" />
+          <el-option label="已采纳" value="adopted" />
+        </el-select>
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <div class="card" v-loading="loading">
-      <ul v-if="items.length > 0" class="history-list">
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="history-title">
+          <el-tag size="small" effect="plain">{{ mwTypeLabels[row.mw_type] || row.mw_type }}</el-tag>
+          <span class="question">{{ row.user_query }}</span>
+        </div>
+        <p class="history-summary">{{ row.report?.root_cause || '（无结构化结论）' }}</p>
+        <div class="history-meta">
+          <span class="muted">{{ formatTime(row.created_at) }}</span>
+          <span class="muted">置信度 {{ Math.round((row.report?.confidence || 0) * 100) }}%</span>
+          <el-tag v-if="row.feedback" size="small" effect="plain">
+            {{ feedbackLabels[row.feedback] || row.feedback }}
+          </el-tag>
+        </div>
+        <div class="history-actions is-card">
+          <el-button size="small" @click="openDetail(row)">详情</el-button>
+          <el-button size="small" @click="rediagnose(row)">重新诊断</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：列表 -->
+      <template #table>
+        <ul class="history-list">
         <li v-for="item in items" :key="item.id">
           <div class="history-main">
             <div class="history-title">
@@ -159,20 +174,9 @@ onMounted(load)
             <el-button text size="small" @click="rediagnose(item)">重新诊断</el-button>
           </div>
         </li>
-      </ul>
-      <el-empty v-else description="暂无诊断记录" />
-
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        class="pager"
-        @current-change="load"
-        @size-change="load"
-      />
-    </div>
+        </ul>
+      </template>
+    </ResponsiveList>
 
     <el-drawer v-model="detailVisible" title="诊断详情" :size="'720px'" direction="rtl">
       <div v-loading="detailLoading">
@@ -198,13 +202,6 @@ onMounted(load)
 </template>
 
 <style scoped>
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
 .filter-item {
   width: 200px;
 }
@@ -272,9 +269,11 @@ onMounted(load)
   flex: 0 0 auto;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+/* 卡片模式下横向排布 */
+.history-actions.is-card {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .detail-meta {
@@ -302,13 +301,5 @@ onMounted(load)
   font-size: 12px;
 }
 
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
 
-  .history-list li {
-    flex-direction: column;
-  }
-}
 </style>

@@ -289,16 +289,60 @@ func (s *IntegrationService) Get(ctx context.Context, id int64, scope Scope) (*I
 // 预览与保存
 // ---------------------------------------------------------------------------
 
+// asyncBudget 是后台"重活"的时间预算。
+//
+// 为什么需要后台：创建 Exporter / 建号都要经过 Docker，**首次还要拉镜像**
+//（mysqld-exporter、mysql 客户端镜像动辄上百 MB）。这些同步做完会超过
+// 前端 60s 的请求超时，表现为"点击集成→请求超时，然后 target up=0"。
+// 因此写库与产物落盘照旧同步完成，重活交给后台，接口立刻返回并给出进度说明。
+const asyncBudget = 10 * time.Minute
+
+// runAsync 在后台执行重活，并把结果写回集成的备注/状态。
+func (s *IntegrationService) runAsync(instanceID int64, name, what string, fn func(ctx context.Context) error) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), asyncBudget)
+		defer cancel()
+		if err := fn(ctx); err != nil {
+			s.log.Warn("集成：后台任务失败",
+				zap.String("integration", name), zap.String("task", what), zap.Error(err))
+			s.setDeployNote(context.Background(), instanceID, what+"失败："+err.Error())
+			s.markError(context.Background(), instanceID, what+"失败："+err.Error())
+			return
+		}
+		s.log.Info("集成：后台任务完成", zap.String("integration", name), zap.String("task", what))
+	}()
+}
+
+// pendingNote 是在后台任务完成前给使用者看的进度说明。
+func pendingNote(what string) string {
+	return "⏳ 已开始" + what + "（后台执行，首次会拉取镜像，通常 10–60 秒；完成后此处显示结果，可点「刷新」查看）"
+}
+
 // Preview 只做校验与渲染，不落库、不部署（供表单一键预览生成的配置）。
-func (s *IntegrationService) Preview(in IntegrationInput) (*integration.Artifacts, error) {
+//
+// 会带上**自动发现到的目标网络**：手工执行这段 compose 时，Exporter 必须能解析
+// 被管实例的主机名，而平台网络里通常没有这个名字——只列平台网络的产物是跑不通的。
+func (s *IntegrationService) Preview(ctx context.Context, in IntegrationInput) (*integration.Artifacts, error) {
 	tpl, instance, err := s.build(in)
 	if err != nil {
 		return nil, err
 	}
-	artifacts, err := integration.Render(tpl, instance, s.jobName(), s.fileSDPath(), s.exporterNetwork())
+	networks := append([]string{}, s.exporterNetworks()...)
+	discoveredNote := ""
+	if s.docker != nil {
+		res, note := s.resolveTarget(ctx, instance.Address.Host)
+		if res != nil && res.Container != "" {
+			for _, name := range res.Networks {
+				networks = appendUnique(networks, name)
+			}
+			discoveredNote = note
+		}
+	}
+	artifacts, err := integration.Render(tpl, instance, s.jobName(), s.fileSDPath(), strings.Join(networks, ","))
 	if err != nil {
 		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
 	}
+	artifacts.NetworkNote = discoveredNote
 	return &artifacts, nil
 }
 
@@ -361,12 +405,23 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 	// 落盘 file_sd：写入失败不回滚实例，但把原因回传给调用方（可重试"重新应用"）。
 	syncErr := s.SyncFileSD(ctx)
 
-	// 顺序很重要：先建只读账号，再拉起 Exporter。
-	// 反过来的话 Exporter 会因认证失败反复重启（虽然 restart 策略最终能恢复，但日志会很难看）。
-	bootstrapNote, bootstrapErr, bootstrapped := s.bootstrapAccount(ctx, item, tpl, instance, in, operator)
-	deployErr := s.deploy(ctx, item, tpl, instance)
-	if bootstrapNote != "" {
-		s.setDeployNote(ctx, item.ID, bootstrapNote)
+	// 重活（建号 → 拉 Exporter）放后台：见 asyncBudget 的说明。
+	// 顺序很重要：先建只读账号，再拉起 Exporter；反过来的话 Exporter 会因认证失败反复重启。
+	if s.deployEnabled(in) || s.shouldBootstrapAccount(in, tpl.Type) {
+		s.setDeployNote(ctx, item.ID, pendingNote("创建只读账号并拉起 Exporter"))
+		s.runAsync(item.ID, item.Name, "创建只读账号并拉起 Exporter", func(bgCtx context.Context) error {
+			bootstrapNote, bootstrapErr, _ := s.bootstrapAccount(bgCtx, item, tpl, instance, in, operator)
+			if bootstrapNote != "" {
+				s.setDeployNote(context.Background(), item.ID, bootstrapNote)
+			}
+			deployErr := s.deploy(bgCtx, item, tpl, instance)
+			if err := firstErr(bootstrapErr, deployErr); err != nil {
+				return err
+			}
+			s.markApplied(context.Background(), item.ID)
+			s.scheduleVerify(item.ID, item.Name, s.jobName())
+			return nil
+		})
 	}
 
 	if s.shouldCreateRules(in) {
@@ -378,19 +433,18 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 		"name": item.Name, "mw_type": tpl.Type, "address": instance.Address.Raw,
 		"deploy": s.deployEnabled(in), "labels": instance.Labels,
 		// 只记录"是否代为建号"与账号名，**绝不记录口令**
-		"bootstrap_account": bootstrapped, "monitor_user": instance.Username,
+		"bootstrap_account": s.shouldBootstrapAccount(in, tpl.Type), "monitor_user": instance.Username,
 	})
 
-	if err := firstErr(syncErr, bootstrapErr, deployErr); err != nil {
-		s.markError(ctx, item.ID, err.Error())
+	if syncErr != nil {
+		s.markError(ctx, item.ID, syncErr.Error())
 		view := s.toView(ctx, *item)
-		view.LastError = err.Error()
+		view.LastError = syncErr.Error()
 		return &view, nil
 	}
-	s.markApplied(ctx, item.ID)
 	// 保存即"声明成功"是不够的：Exporter 起没起来、Prometheus 抓没抓到，
 	// 只有核验过才知道。异步核验失败会把原因写回 LastError，前端直接可见。
-	s.scheduleVerify(item.ID, item.Name, s.jobName())
+	// （核验在后台任务完成时触发，见上面的 runAsync。）
 	view := s.toView(ctx, *item)
 	return &view, nil
 }
@@ -461,19 +515,33 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
 	syncErr := s.SyncFileSD(ctx)
-	deployErr := s.deploy(ctx, item, tpl, instance)
+	// 重活放后台（与 Create 一致）：编辑保存同样会重建 Exporter/建号。
+	if s.deployEnabled(in) || s.shouldBootstrapAccount(in, tpl.Type) {
+		s.setDeployNote(ctx, item.ID, pendingNote("重建账号与 Exporter"))
+		s.runAsync(item.ID, item.Name, "重建账号与 Exporter", func(bgCtx context.Context) error {
+			bootstrapNote, bootstrapErr, _ := s.bootstrapAccount(bgCtx, item, tpl, instance, in, operator)
+			if bootstrapNote != "" {
+				s.setDeployNote(context.Background(), item.ID, bootstrapNote)
+			}
+			deployErr := s.deploy(bgCtx, item, tpl, instance)
+			if err := firstErr(bootstrapErr, deployErr); err != nil {
+				return err
+			}
+			s.markApplied(context.Background(), item.ID)
+			s.scheduleVerify(item.ID, item.Name, s.jobName())
+			return nil
+		})
+	}
 	s.record(ctx, operator, item.ID, "integration_update", map[string]any{
 		"name": item.Name, "mw_type": tpl.Type, "address": instance.Address.Raw,
 		"password_changed": in.Password != "",
 	})
 	view := s.toView(ctx, *item)
-	if err := firstErr(syncErr, deployErr); err != nil {
-		s.markError(ctx, item.ID, err.Error())
-		view.LastError = err.Error()
+	if syncErr != nil {
+		s.markError(ctx, item.ID, syncErr.Error())
+		view.LastError = syncErr.Error()
 		return &view, nil
 	}
-	s.markApplied(ctx, item.ID)
-	s.scheduleVerify(item.ID, item.Name, s.jobName())
 	return &view, nil
 }
 
@@ -508,22 +576,30 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 		Environment: item.Environment, GroupName: item.GroupName,
 	}
 	syncErr := s.SyncFileSD(ctx)
-	deployErr := s.deploy(ctx, item, tpl, instance)
 	// 「重新应用」没有管理凭据，建不了号；这里把"还差什么"直接写进备注，
 	// 让使用者知道该去「监控账号」点「重试建号」，而不是反复点重新应用。
 	if !meta.AccountManaged && tpl.MonitorUser != "" {
 		s.setDeployNote(ctx, item.ID,
 			"该实例的只读监控账号尚未由平台创建：到「监控账号」点「重试建号」并填一次管理员凭据即可")
+	} else {
+		s.setDeployNote(ctx, item.ID, pendingNote("重建 Exporter"))
 	}
+	// 重建 Exporter 同样要经过 Docker（可能还要拉镜像）→ 放后台，避免请求超时。
+	s.runAsync(item.ID, item.Name, "重建 Exporter", func(bgCtx context.Context) error {
+		if err := s.deploy(bgCtx, item, tpl, instance); err != nil {
+			return err
+		}
+		s.markApplied(context.Background(), item.ID)
+		s.scheduleVerify(item.ID, item.Name, s.jobName())
+		return nil
+	})
 	s.record(ctx, operator, item.ID, "integration_apply", map[string]any{"name": item.Name})
-	if err := firstErr(syncErr, deployErr); err != nil {
-		s.markError(ctx, item.ID, err.Error())
+	if syncErr != nil {
+		s.markError(ctx, item.ID, syncErr.Error())
 		view := s.toView(ctx, *item)
-		view.LastError = err.Error()
+		view.LastError = syncErr.Error()
 		return &view, nil
 	}
-	s.markApplied(ctx, item.ID)
-	s.scheduleVerify(item.ID, item.Name, s.jobName())
 	return s.Get(ctx, id, Scope{})
 }
 
@@ -884,12 +960,22 @@ func (s *IntegrationService) ListAccounts(ctx context.Context, scope Scope) ([]A
 	return out, nil
 }
 
+// AccountRotateResult 是轮换口令的结果。
+//
+// NewPassword **只在这一次响应里出现**：平台不提供"查看已存口令"的接口（安全约定），
+// 但使用者需要它来手工执行 Exporter 的 compose/docker run，所以轮换时给一次明文。
+type AccountRotateResult struct {
+	View *IntegrationView `json:"view"`
+	// NewPassword 为本次轮换后的新口令，仅此一次返回；页面提示复制保存。
+	NewPassword string `json:"new_password"`
+}
+
 // RotateAccountPassword 轮换平台托管的监控账号口令。
 //
 // 为什么不需要管理凭据：MySQL / PostgreSQL 都允许**账号修改自己的口令**，
 // 而平台加密保存着该账号的口令，因此可以自助完成轮换——
 // 轮换后立即重建 Exporter，使它用新口令抓取。
-func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64, operator Operator) (*IntegrationView, error) {
+func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64, operator Operator) (*AccountRotateResult, error) {
 	item, err := s.integrationInstance(ctx, id)
 	if err != nil {
 		return nil, err
@@ -950,8 +1036,8 @@ func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64
 		"name": item.Name, "monitor_user": item.Username,
 	})
 	s.scheduleVerify(item.ID, item.Name, s.jobName())
-	view := s.toView(ctx, *item)
-	return &view, nil
+	// 明文口令只在这一个响应里返回（审计里仍然只有账号名）。
+	return &AccountRotateResult{View: s.viewOf(ctx, *item), NewPassword: newPassword}, nil
 }
 
 // DropAccountInput 是删除监控账号的入参（需要管理凭据）。

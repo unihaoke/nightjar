@@ -116,9 +116,22 @@ export async function request<T>(config: AxiosRequestConfig): Promise<T> {
   return body.data as T
 }
 
-/** GET 请求。 */
-export function get<T>(url: string, params?: Record<string, unknown>): Promise<T> {
-  return request<T>({ method: 'GET', url, params })
+/** 把可选的取消信号包装成 axios 配置（无信号时返回 undefined，不影响既有调用）。 */
+export function withSignal(signal?: AbortSignal): AxiosRequestConfig | undefined {
+  return signal ? { signal } : undefined
+}
+
+/**
+ * GET 请求。
+ *
+ * config 用于透传 `signal` 等 axios 配置（列表页切换条件时中断在途请求，避免旧响应覆盖新数据）。
+ */
+export function get<T>(
+  url: string,
+  params?: Record<string, unknown>,
+  config?: AxiosRequestConfig,
+): Promise<T> {
+  return request<T>({ method: 'GET', url, params, ...config })
 }
 
 /** POST 请求。 */
@@ -129,6 +142,17 @@ export function post<T>(url: string, data?: unknown): Promise<T> {
 /** PUT 请求。 */
 export function put<T>(url: string, data?: unknown): Promise<T> {
   return request<T>({ method: 'PUT', url, data })
+}
+
+/**
+ * 慢 POST：用于"要跟 Docker 打交道"的操作（重试建号 / 测试连接 / 轮换 / 删除账号）。
+ *
+ * 这类操作首次可能要拉镜像，几十秒很正常；默认 60s 超时会让使用者看到
+ * "请求超时"却不知道后台是否成功。这里单独放宽到 5 分钟，
+ * 而创建/编辑/重新应用已经改成后台执行、立即返回，不需要放宽。
+ */
+export function postSlow<T>(url: string, data?: unknown): Promise<T> {
+  return request<T>({ method: 'POST', url, data, timeout: 300_000 })
 }
 
 /** DELETE 请求。 */

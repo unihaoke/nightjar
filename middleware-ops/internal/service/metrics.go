@@ -361,3 +361,23 @@ func (s *MetricsService) PrometheusJobs(ctx context.Context) []string {
 	}
 	return jobs
 }
+
+// PrometheusInstanceNames 返回 Prometheus 里已存在的 instance_name 取值。
+//
+// 这就是「实例名称」应该填的东西——**平台集成写入的服务发现标签**，
+// 取值等于「集成中心」里的集成名称（如 jd-redis / jd-mysql）。
+// 界面把它做成下拉候选，使用者不必再去 Prometheus 页面翻标签。
+func (s *MetricsService) PrometheusInstanceNames(ctx context.Context) []string {
+	reporter, ok := s.monitor.(monitor.LabelReporter)
+	if !ok {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	names, err := reporter.LabelValues(probeCtx, "instance_name")
+	if err != nil {
+		s.log.Debug("查询 Prometheus instance_name 列表失败（表单将退化为手工输入）", zap.Error(err))
+		return nil
+	}
+	return names
+}

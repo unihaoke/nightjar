@@ -87,6 +87,13 @@ func labelHints(ctx context.Context, reporter monitor.LabelReporter, item *model
 		default:
 			hints = append(hints, "该 job 的 target 虽为 up，但取不到标签取值：确认 Prometheus 版本 ≥ 2.24（label values 的 match[] 支持）与网络连通。")
 		}
+		// 关键答疑：使用者常问"那 instance_name 到底该填什么"。
+		// 直接把 Prometheus 里现有的取值列出来（平台集成写入的就是集成名称）。
+		if all, allErr := reporter.LabelValues(ctx, "instance_name"); allErr == nil && len(all) > 0 {
+			hints = append(hints, "「实例名称」= 集成名称，也是 Prometheus 的 instance_name 标签值。"+
+				"平台当前写入的取值有："+strings.Join(all, "、")+
+				"；把「实例名称」改成其中之一，或把「Prometheus job」改成平台集成任务名（默认 middleware-integration）。")
+		}
 	}
 
 	// ③ job 存在但 target 抓取失败（up=0）：把 Prometheus 记录的 lastError 取回来并翻译。

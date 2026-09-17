@@ -24,6 +24,8 @@ type Artifacts struct {
 	DeployCmd   string            `json:"deploy_cmd"`
 	Selector    string            `json:"selector"`
 	VerifySteps []string          `json:"verify_steps"`
+	// NetworkNote 说明"平台为这个集成发现了哪些网络"，手工执行时对照使用。
+	NetworkNote string `json:"network_note"`
 }
 
 // FileSDEntry 是 file_sd 文件里的一条目标记录。
@@ -150,6 +152,14 @@ func renderCompose(tpl Template, in Instance, env map[string]string, args []stri
 	container := ContainerName(in.Name)
 	b.WriteString("  # 集成：" + in.Name + "（" + tpl.Name + "）—— 由平台「集成中心」生成\n")
 	b.WriteString("  # 合并进 docker-compose.yml 后执行：docker compose up -d " + container + "\n")
+	b.WriteString("  #\n")
+	b.WriteString("  # 手工执行前必读两条：\n")
+	b.WriteString("  #   1) 口令占位 ${MONITOR_PASSWORD}：换成为监控账号设置的口令。\n")
+	b.WriteString("  #      账号由平台代建时口令也由平台持有——想手工用，先到「监控账号 → 轮换口令」，\n")
+	b.WriteString("  #      新口令会在页面上显示一次，复制保存后（或直接用你自己填的口令重新保存集成）。\n")
+	b.WriteString("  #   2) 网络：下面的列表含「平台网络 + 平台发现到的目标网络」。\n")
+	b.WriteString("  #      若你的环境与发现结果不同，务必让 Exporter 能解析 " + in.Address.Host + "：\n")
+	b.WriteString("  #      要么把它接入目标容器所在网络，要么用 `docker network connect <平台网络> <目标容器>`。\n")
 	b.WriteString("  " + container + ":\n")
 	b.WriteString("    image: " + tpl.Image + "\n")
 	b.WriteString("    container_name: " + container + "\n")
@@ -215,6 +225,8 @@ func renderDeployCmd(tpl Template, in Instance, env map[string]string, args []st
 func verifySteps(tpl Template, in Instance, jobName, sdFilePath string) []string {
 	target := in.Address.HostPort()
 	steps := []string{
+		fmt.Sprintf("口令：把产物里的 ${MONITOR_PASSWORD} 换成为监控账号设置的口令（平台代建的账号可在「监控账号 → 轮换口令」处一次性查看新口令）"),
+		fmt.Sprintf("网络：确认 Exporter 能解析 %s —— 产物里已列出平台发现到的网络；若不同，需把 Exporter 接入目标网络，或把目标容器接入平台网络", in.Address.Host),
 		fmt.Sprintf("确认 Exporter 容器在运行：docker ps --filter name=%s", ContainerName(in.Name)),
 		fmt.Sprintf("直连 Exporter 拉取原始指标：curl -s http://<exporter-host>:%d%s | head", tpl.ExporterPort, metricsPath(tpl)),
 		fmt.Sprintf("Prometheus 目标页确认该 target 为 up：抓取任务 %s（file_sd：%s，refresh_interval 到期后自动生效）", jobName, sdFilePath),

@@ -1,27 +1,36 @@
 <script setup lang="ts">
 /** 用户与角色管理（6.1 RBAC + 数据权限）。 */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { userApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { Role, User } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { formatTime } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const store = useUserStore()
 
-const loading = ref(false)
 const submitting = ref(false)
 const dialogVisible = ref(false)
 const roleDialogVisible = ref(false)
 const editing = ref<User | null>(null)
 const editingRole = ref<Role | null>(null)
-const users = ref<User[]>([])
-const total = ref(0)
 const roles = ref<Role[]>([])
 const permissionGroups = ref<{ group: string; items: { code: string; name: string }[] }[]>([])
 
-const query = reactive({ keyword: '', page: 1, page_size: 20 })
+// 用户列表与角色列表一并取：改完角色后需要立刻看到最新权限点。
+const list = useListPage<User>({
+  fetch: async (params, signal) => {
+    const [userList, roleList] = await Promise.all([userApi.list(params, signal), userApi.roles()])
+    roles.value = roleList.list || []
+    permissionGroups.value = roleList.permissions || []
+    return userList
+  },
+  defaults: { keyword: '', page: 1, page_size: 20 },
+})
+const { query, items: users, total, loading, error } = list
 
 const form = reactive({
   username: '',
@@ -37,22 +46,6 @@ const form = reactive({
 const roleForm = reactive({ name: '', description: '', permissions: [] as string[], levels: [] as string[] })
 
 const canManage = computed(() => store.can('user:manage'))
-
-/** 加载用户与角色。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const [userList, roleList] = await Promise.all([userApi.list({ ...query }), userApi.roles()])
-    users.value = userList.list || []
-    total.value = userList.total || 0
-    roles.value = roleList.list || []
-    permissionGroups.value = roleList.permissions || []
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
 
 /** 打开用户表单。 */
 function openForm(user?: User): void {
@@ -89,7 +82,7 @@ async function saveUser(): Promise<void> {
     }
     ElMessage({ type: 'success', message: '已保存' })
     dialogVisible.value = false
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   } finally {
@@ -111,7 +104,7 @@ async function removeUser(user: User): Promise<void> {
   try {
     await userApi.remove(user.id)
     ElMessage({ type: 'success', message: '已删除' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -139,19 +132,17 @@ async function saveRole(): Promise<void> {
     await userApi.updateRole(editingRole.value.id, { ...roleForm })
     ElMessage({ type: 'success', message: '角色已更新' })
     roleDialogVisible.value = false
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   } finally {
     submitting.value = false
   }
 }
-
-onMounted(load)
 </script>
 
 <template>
-  <div class="page" v-loading="loading">
+  <div class="page">
     <div class="page-header">
       <div>
         <h2 class="page-title">用户与角色</h2>
@@ -162,14 +153,45 @@ onMounted(load)
       <el-button v-if="canManage" type="primary" :icon="'Plus'" @click="openForm()">新增用户</el-button>
     </div>
 
-    <div class="card filters">
-      <el-input v-model="query.keyword" placeholder="搜索用户名/昵称/邮箱" clearable class="filter-item" @keyup.enter="load" />
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-    </div>
+    <ResponsiveList
+      :items="users"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      title="用户列表"
+      empty-text="没有匹配的用户"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-input v-model="query.keyword" placeholder="搜索用户名/昵称/邮箱" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <div class="card">
-      <h3 class="card-title">用户列表</h3>
-      <div class="table-scroll">
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="user-head">
+          <span class="user-name">{{ row.nickname || row.username }}</span>
+          <el-tag size="small" effect="plain">{{ row.role_code }}</el-tag>
+          <el-tag size="small" :type="row.status === 1 ? 'success' : 'danger'" effect="light">
+            {{ row.status === 1 ? '启用' : '禁用' }}
+          </el-tag>
+        </div>
+        <p class="user-meta muted">{{ row.username }}<span v-if="row.email"> · {{ row.email }}</span></p>
+        <p class="user-meta muted">最近登录 {{ formatTime(row.last_login) }}</p>
+        <div v-if="canManage" class="user-actions">
+          <el-button size="small" @click="openForm(row)">编辑</el-button>
+          <el-button size="small" type="danger" @click="removeUser(row)">删除</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：表格 -->
+      <template #table>
+        <div class="table-scroll">
         <el-table :data="users" size="default">
           <el-table-column prop="username" label="用户名" min-width="130" />
           <el-table-column prop="nickname" label="昵称" min-width="120" />
@@ -207,16 +229,9 @@ onMounted(load)
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="query.page"
-        :page-size="query.page_size"
-        :total="total"
-        layout="total, prev, pager, next"
-        class="pager"
-        @current-change="load"
-      />
-    </div>
+        </div>
+      </template>
+    </ResponsiveList>
 
     <div class="card">
       <h3 class="card-title">角色与权限点</h3>
@@ -346,13 +361,6 @@ onMounted(load)
 </template>
 
 <style scoped>
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
 .filter-item {
   width: 260px;
 }
@@ -361,9 +369,29 @@ onMounted(load)
   margin-right: 4px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+/* 移动端卡片：用户条目 */
+.user-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.user-name {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.user-meta {
+  margin: 6px 0 0;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.user-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .note {
@@ -386,9 +414,4 @@ onMounted(load)
   color: var(--c-text-3);
 }
 
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
-}
 </style>

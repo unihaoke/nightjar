@@ -5,35 +5,31 @@
  * 只追加语义：平台不提供审计日志的修改/删除接口；
  * 支持哈希链校验与每日快照生成，异常篡改可检出。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { auditApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { AuditLog, AuditSnapshot } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { formatTime, prettyJSON } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const store = useUserStore()
 
-const loading = ref(false)
 const verifying = ref(false)
 const snapshotting = ref(false)
-const items = ref<AuditLog[]>([])
-const total = ref(0)
 const snapshots = ref<AuditSnapshot[]>([])
 const verifyResult = ref<{ verified: boolean; broken_id: number; message: string } | null>(null)
 const detailVisible = ref(false)
 const current = ref<AuditLog | null>(null)
 
-const query = reactive({
-  keyword: '',
-  action_type: '',
-  level: '',
-  result: '',
-  instance_id: 0,
-  page: 1,
-  page_size: 20,
+const list = useListPage<AuditLog>({
+  fetch: (params, signal) => auditApi.logs(params, signal),
+  defaults: { keyword: '', action_type: '', level: '', result: '', instance_id: 0, page: 1, page_size: 20 },
+  numberKeys: ['instance_id'],
 })
+const { query, items, total, loading, error } = list
 
 const canSnapshot = computed(() => store.can('audit:snapshot'))
 
@@ -61,20 +57,6 @@ const actionOptions = [
   'ai_code_analyze',
   'sql_query',
 ]
-
-/** 加载审计日志。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const result = await auditApi.logs({ ...query })
-    items.value = result.list || []
-    total.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
 
 /** 加载快照列表。 */
 async function loadSnapshots(): Promise<void> {
@@ -124,8 +106,8 @@ async function openDetail(row: AuditLog): Promise<void> {
   }
 }
 
-onMounted(async () => {
-  await Promise.all([load(), loadSnapshots()])
+onMounted(() => {
+  void loadSnapshots()
 })
 </script>
 
@@ -156,25 +138,58 @@ onMounted(async () => {
       class="mb"
     />
 
-    <div class="card filters">
-      <el-input v-model="query.keyword" placeholder="搜索操作者或路由" clearable class="filter-item" @keyup.enter="load" />
-      <el-select v-model="query.action_type" placeholder="全部操作类型" clearable filterable class="filter-item">
-        <el-option v-for="item in actionOptions" :key="item" :label="item" :value="item" />
-      </el-select>
-      <el-select v-model="query.level" placeholder="全部级别" clearable class="filter-item">
-        <el-option label="L0" value="L0" />
-        <el-option label="L1" value="L1" />
-        <el-option label="L2" value="L2" />
-      </el-select>
-      <el-select v-model="query.result" placeholder="全部结果" clearable class="filter-item">
-        <el-option label="成功" value="success" />
-        <el-option label="失败" value="failed" />
-      </el-select>
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-    </div>
+    <ResponsiveList
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="没有匹配的审计记录"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-input v-model="query.keyword" placeholder="搜索操作者或路由" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-select v-model="query.action_type" placeholder="全部操作类型" clearable filterable class="filter-item">
+          <el-option v-for="item in actionOptions" :key="item" :label="item" :value="item" />
+        </el-select>
+        <el-select v-model="query.level" placeholder="全部级别" clearable class="filter-item">
+          <el-option label="L0" value="L0" />
+          <el-option label="L1" value="L1" />
+          <el-option label="L2" value="L2" />
+        </el-select>
+        <el-select v-model="query.result" placeholder="全部结果" clearable class="filter-item">
+          <el-option label="成功" value="success" />
+          <el-option label="失败" value="failed" />
+        </el-select>
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <div class="card" v-loading="loading">
-      <div class="table-scroll">
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="log-head">
+          <el-tag size="small" :type="row.level === 'L2' ? 'danger' : row.level === 'L1' ? 'warning' : 'info'" effect="plain">
+            {{ row.level }}
+          </el-tag>
+          <span class="mono">{{ row.action_type }}</span>
+          <el-tag size="small" :type="row.result === 'success' ? 'success' : 'danger'" effect="light">{{ row.result }}</el-tag>
+        </div>
+        <p class="log-meta muted">
+          {{ row.username || `#${row.user_id}` }} · {{ formatTime(row.created_at) }}
+          <span v-if="row.instance_id"> · #{{ row.instance_id }}</span>
+        </p>
+        <p class="log-route muted">{{ row.route || '-' }}</p>
+        <div class="log-actions">
+          <el-button size="small" @click="openDetail(row)">详情</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：表格 -->
+      <template #table>
+        <div class="table-scroll">
         <el-table :data="items" size="default" @row-click="openDetail">
           <el-table-column label="时间" width="170">
             <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
@@ -208,18 +223,9 @@ onMounted(async () => {
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        class="pager"
-        @current-change="load"
-        @size-change="load"
-      />
-    </div>
+        </div>
+      </template>
+    </ResponsiveList>
 
     <div class="card">
       <h3 class="card-title">审计快照</h3>
@@ -276,20 +282,33 @@ onMounted(async () => {
   margin-bottom: 12px;
 }
 
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
 .filter-item {
   width: 190px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+/* 移动端卡片内的审计条目 */
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.log-meta {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+
+.log-route {
+  margin: 4px 0 0;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.log-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .stack {
@@ -327,11 +346,5 @@ onMounted(async () => {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-}
-
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
 }
 </style>

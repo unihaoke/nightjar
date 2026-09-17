@@ -209,8 +209,14 @@ async function handleRotateAccount(row: IntegrationAccount): Promise<void> {
     return
   }
   try {
-    await integrationApi.rotateAccount(row.integration_id)
-    ElMessage.success('已轮换口令并重建 Exporter')
+    const result = await integrationApi.rotateAccount(row.integration_id)
+    accountResult.value = {
+      ok: true,
+      title: `${row.name}：口令已轮换`,
+      detail:
+        `新口令（只显示这一次，手工执行 Exporter 的 compose/docker run 时需要它）：\n${result.new_password}\n\n` +
+        `平台已用新口令重建 Exporter；账号未过期，业务侧无需改动。`,
+    }
     await Promise.all([loadAccounts(), load()])
   } catch (error) {
     toastError(error)

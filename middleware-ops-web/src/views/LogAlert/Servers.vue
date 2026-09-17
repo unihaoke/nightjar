@@ -1,28 +1,36 @@
 <script setup lang="ts">
 /** 服务器与代码仓库映射：日志采集对象 + 出网白名单开关（6.5）。 */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { logAlertApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { CodeRepo, ServerInstance } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { envLabels, envTagType, formatTime } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const store = useUserStore()
 
-const loading = ref(false)
 const serverDialog = ref(false)
 const repoDialog = ref(false)
 const submitting = ref(false)
-const servers = ref<ServerInstance[]>([])
-const serverTotal = ref(0)
-const repos = ref<CodeRepo[]>([])
-const repoTotal = ref(0)
 const editingServer = ref<ServerInstance | null>(null)
 const editingRepo = ref<CodeRepo | null>(null)
 
-const serverQuery = reactive({ keyword: '', environment: '', page: 1, page_size: 20 })
-const repoQuery = reactive({ keyword: '', page: 1, page_size: 20 })
+// 同一页面两个列表：用 keyPrefix 隔离地址栏参数，避免互相覆盖 page / keyword。
+const serverList = useListPage<ServerInstance>({
+  fetch: (params, signal) => logAlertApi.servers(params, signal),
+  defaults: { keyword: '', environment: '', page: 1, page_size: 20 },
+  keyPrefix: 'srv_',
+})
+const repoList = useListPage<CodeRepo>({
+  fetch: (params, signal) => logAlertApi.codeRepos(params, signal),
+  defaults: { keyword: '', page: 1, page_size: 20 },
+  keyPrefix: 'repo_',
+})
+const { query: serverQuery, items: servers, total: serverTotal, loading: serverLoading, error: serverError } = serverList
+const { query: repoQuery, items: repos, total: repoTotal, loading: repoLoading, error: repoError } = repoList
 
 const serverForm = reactive({ name: '', ip: '', hostname: '', environment: 'dev', group_name: '', tags: [] as string[] })
 const repoForm = reactive({
@@ -35,28 +43,6 @@ const repoForm = reactive({
 })
 
 const canManage = computed(() => store.can('server:manage'))
-
-/** 加载服务器。 */
-async function loadServers(): Promise<void> {
-  try {
-    const result = await logAlertApi.servers({ ...serverQuery })
-    servers.value = result.list || []
-    serverTotal.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  }
-}
-
-/** 加载仓库映射。 */
-async function loadRepos(): Promise<void> {
-  try {
-    const result = await logAlertApi.codeRepos({ ...repoQuery })
-    repos.value = result.list || []
-    repoTotal.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  }
-}
 
 /** 保存服务器。 */
 async function saveServer(): Promise<void> {
@@ -73,7 +59,7 @@ async function saveServer(): Promise<void> {
     }
     ElMessage({ type: 'success', message: '已保存' })
     serverDialog.value = false
-    await loadServers()
+    await serverList.load()
   } catch (error) {
     toastError(error)
   } finally {
@@ -95,7 +81,7 @@ async function removeServer(item: ServerInstance): Promise<void> {
   try {
     await logAlertApi.removeServer(item.id)
     ElMessage({ type: 'success', message: '已删除' })
-    await loadServers()
+    await serverList.load()
   } catch (error) {
     toastError(error)
   }
@@ -112,7 +98,7 @@ async function saveRepo(): Promise<void> {
     await logAlertApi.saveCodeRepo(editingRepo.value?.id, { ...repoForm })
     ElMessage({ type: 'success', message: '已保存' })
     repoDialog.value = false
-    await loadRepos()
+    await repoList.load()
   } catch (error) {
     toastError(error)
   } finally {
@@ -147,16 +133,10 @@ function openRepo(item?: CodeRepo): void {
   })
   repoDialog.value = true
 }
-
-onMounted(async () => {
-  loading.value = true
-  await Promise.all([loadServers(), loadRepos()])
-  loading.value = false
-})
 </script>
 
 <template>
-  <div class="page" v-loading="loading">
+  <div class="page">
     <div class="page-header">
       <div>
         <h2 class="page-title">服务器与代码仓库</h2>
@@ -164,15 +144,46 @@ onMounted(async () => {
       </div>
     </div>
 
-    <div class="card">
-      <h3 class="card-title">
-        服务器实例
-        <div class="row">
-          <el-input v-model="serverQuery.keyword" size="small" placeholder="搜索名称或 IP" clearable class="search" @keyup.enter="loadServers" />
-          <el-button v-if="canManage" size="small" type="primary" :icon="'Plus'" @click="openServer()">新增</el-button>
+    <ResponsiveList
+      :items="servers"
+      :loading="serverLoading"
+      :error="serverError"
+      :total="serverTotal"
+      :page="serverQuery.page"
+      :page-size="serverQuery.page_size"
+      title="服务器实例"
+      empty-text="尚未登记服务器"
+      @update:page="serverList.setPage"
+      @update:page-size="serverList.setPageSize"
+      @retry="serverList.load"
+    >
+      <template #toolbar>
+        <el-input v-model="serverQuery.keyword" size="small" placeholder="搜索名称或 IP" clearable class="search" @keyup.enter="serverList.search" />
+        <el-button v-if="canManage" size="small" type="primary" :icon="'Plus'" @click="openServer()">新增</el-button>
+      </template>
+
+      <template #card="{ row }">
+        <div class="entity-head">
+          <span class="entity-name">{{ row.name }}</span>
+          <el-tag size="small" effect="plain" :type="envTagType[row.environment]">
+            {{ envLabels[row.environment] || row.environment }}
+          </el-tag>
+          <el-tag size="small" :type="row.status === 1 ? 'success' : 'info'" effect="light">
+            {{ row.status === 1 ? '在线' : '离线' }}
+          </el-tag>
         </div>
-      </h3>
-      <div class="table-scroll">
+        <p class="entity-meta mono">{{ row.ip }}<span v-if="row.hostname"> · {{ row.hostname }}</span></p>
+        <p class="entity-meta muted">
+          <span v-if="row.group_name">分组 {{ row.group_name }} · </span>心跳 {{ formatTime(row.last_seen_at) }}
+        </p>
+        <div v-if="canManage" class="entity-actions">
+          <el-button size="small" @click="openServer(row)">编辑</el-button>
+          <el-button size="small" type="danger" @click="removeServer(row)">删除</el-button>
+        </div>
+      </template>
+
+      <template #table>
+        <div class="table-scroll">
         <el-table :data="servers" size="small">
           <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip />
           <el-table-column prop="ip" label="IP" width="140" />
@@ -200,26 +211,47 @@ onMounted(async () => {
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="serverQuery.page"
-        :page-size="serverQuery.page_size"
-        :total="serverTotal"
-        layout="total, prev, pager, next"
-        class="pager"
-        @current-change="loadServers"
-      />
-    </div>
-
-    <div class="card">
-      <h3 class="card-title">
-        服务 → 代码仓库映射
-        <div class="row">
-          <el-input v-model="repoQuery.keyword" size="small" placeholder="搜索服务或仓库" clearable class="search" @keyup.enter="loadRepos" />
-          <el-button v-if="canManage" size="small" type="primary" :icon="'Plus'" @click="openRepo()">新增</el-button>
         </div>
-      </h3>
-      <div class="table-scroll">
+      </template>
+    </ResponsiveList>
+
+    <ResponsiveList
+      :items="repos"
+      :loading="repoLoading"
+      :error="repoError"
+      :total="repoTotal"
+      :page="repoQuery.page"
+      :page-size="repoQuery.page_size"
+      title="服务 → 代码仓库映射"
+      empty-text="尚未配置仓库映射"
+      @update:page="repoList.setPage"
+      @update:page-size="repoList.setPageSize"
+      @retry="repoList.load"
+    >
+      <template #toolbar>
+        <el-input v-model="repoQuery.keyword" size="small" placeholder="搜索服务或仓库" clearable class="search" @keyup.enter="repoList.search" />
+        <el-button v-if="canManage" size="small" type="primary" :icon="'Plus'" @click="openRepo()">新增</el-button>
+      </template>
+
+      <template #card="{ row }">
+        <div class="entity-head">
+          <span class="entity-name">{{ row.service_name }}</span>
+          <el-tag size="small" :type="row.allow_third_party ? 'warning' : 'info'" effect="light">
+            {{ row.allow_third_party ? '出网已开启' : '出网未开启' }}
+          </el-tag>
+        </div>
+        <p class="entity-meta mono">{{ row.repo_url || '（未填写仓库地址）' }}</p>
+        <p class="entity-meta muted">
+          {{ row.branch }}<span v-if="row.language"> · {{ row.language }}</span>
+          <span v-if="row.local_path"> · {{ row.local_path }}</span>
+        </p>
+        <div v-if="canManage" class="entity-actions">
+          <el-button size="small" @click="openRepo(row)">编辑</el-button>
+        </div>
+      </template>
+
+      <template #table>
+        <div class="table-scroll">
         <el-table :data="repos" size="small">
           <el-table-column prop="service_name" label="服务名" min-width="140" show-overflow-tooltip />
           <el-table-column prop="repo_url" label="仓库地址" min-width="220" show-overflow-tooltip />
@@ -239,16 +271,9 @@ onMounted(async () => {
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="repoQuery.page"
-        :page-size="repoQuery.page_size"
-        :total="repoTotal"
-        layout="total, prev, pager, next"
-        class="pager"
-        @current-change="loadRepos"
-      />
-    </div>
+        </div>
+      </template>
+    </ResponsiveList>
 
     <el-dialog v-model="serverDialog" :title="editingServer ? '编辑服务器' : '新增服务器'" width="520px">
       <el-form label-position="top">
@@ -348,9 +373,29 @@ onMounted(async () => {
   width: 200px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+/* 移动端卡片：服务器 / 仓库条目 */
+.entity-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.entity-name {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.entity-meta {
+  margin: 6px 0 0;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.entity-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .hint {

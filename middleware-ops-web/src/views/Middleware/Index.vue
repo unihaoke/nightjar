@@ -2,39 +2,33 @@
 /**
  * 中间件纳管列表（4.1）。
  *
- * 移动端适配：
- *   - <768px 时把表格切换为卡片列表，避免横向滚动找不到操作入口；
- *   - 表格模式使用横向滚动容器承载较多列。
+ * 列表骨架（加载/错误/分页/筛选同步地址栏/移动端卡片）由
+ * `useListPage` + `ResponsiveList` 承担，本页只描述「有哪些筛选条件」与「每行长什么样」。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { middlewareApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { MiddlewareInstance } from '@/api/types'
-import { useAppStore } from '@/stores/app'
+import { useListPage } from '@/composables/useListPage'
+import EmptyGuide from '@/components/EmptyGuide.vue'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { useUserStore } from '@/stores/user'
 import { envLabels, envTagType, formatTime, mwTypeLabels, mwTypeTagType } from '@/utils/format'
 import FormDialog from './FormDialog.vue'
 
 const router = useRouter()
-const app = useAppStore()
 const store = useUserStore()
 
-const loading = ref(false)
-const items = ref<MiddlewareInstance[]>([])
-const total = ref(0)
+const list = useListPage<MiddlewareInstance>({
+  fetch: (params, signal) => middlewareApi.list(params, signal),
+  defaults: { keyword: '', mw_type: '', environment: '', group: '', page: 1, page_size: 20 },
+})
+const { query, items, total, loading, error } = list
+
 const dialogVisible = ref(false)
 const editing = ref<MiddlewareInstance | null>(null)
-
-const query = reactive({
-  keyword: '',
-  mw_type: '',
-  environment: '',
-  group: '',
-  page: 1,
-  page_size: 20,
-})
 
 const typeOptions = [
   { value: 'redis', label: 'Redis' },
@@ -49,29 +43,10 @@ const typeOptions = [
 /** 是否可写。 */
 const canWrite = computed(() => store.can('middleware:write'))
 
-/** 加载列表。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const result = await middlewareApi.list({ ...query })
-    items.value = result.list || []
-    total.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
-
-/** 重置筛选。 */
-function resetQuery(): void {
-  query.keyword = ''
-  query.mw_type = ''
-  query.environment = ''
-  query.group = ''
-  query.page = 1
-  void load()
-}
+/** 是否设置了业务筛选（用于区分"筛选无结果"与"系统里没有实例"）。 */
+const hasFilter = computed(() =>
+  Boolean(query.keyword || query.mw_type || query.environment || query.group),
+)
 
 /** 打开新增/编辑。 */
 function openForm(item?: MiddlewareInstance): void {
@@ -102,10 +77,10 @@ async function handleDelete(item: MiddlewareInstance): Promise<void> {
     } else {
       ElMessage({ type: 'success', message: '实例已删除' })
     }
-    await load()
-  } catch (error) {
-    if (error !== 'cancel') {
-      toastError(error)
+    await list.load()
+  } catch (err) {
+    if (err !== 'cancel') {
+      toastError(err)
     }
   }
 }
@@ -114,8 +89,6 @@ async function handleDelete(item: MiddlewareInstance): Promise<void> {
 function openDetail(item: MiddlewareInstance): void {
   void router.push({ name: 'middleware-detail', params: { id: item.id } })
 }
-
-onMounted(load)
 </script>
 
 <template>
@@ -128,68 +101,82 @@ onMounted(load)
       <el-button v-if="canWrite" type="primary" :icon="'Plus'" @click="openForm()">新增实例</el-button>
     </div>
 
-    <div class="card filters">
-      <el-input v-model="query.keyword" placeholder="按名称或地址搜索" clearable class="filter-item" @keyup.enter="load">
-        <template #prefix><el-icon><Search /></el-icon></template>
-      </el-input>
-      <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
-        <el-option v-for="item in typeOptions" :key="item.value" :label="item.label" :value="item.value" />
-      </el-select>
-      <el-select v-model="query.environment" placeholder="全部环境" clearable class="filter-item">
-        <el-option label="开发" value="dev" />
-        <el-option label="预发" value="staging" />
-        <el-option label="生产" value="prod" />
-      </el-select>
-      <el-input v-model="query.group" placeholder="分组" clearable class="filter-item" @keyup.enter="load" />
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-      <el-button :icon="'RefreshLeft'" @click="resetQuery">重置</el-button>
-    </div>
+    <ResponsiveList
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="没有匹配的实例"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-input v-model="query.keyword" placeholder="按名称或地址搜索" clearable class="filter-item" @keyup.enter="list.search">
+          <template #prefix><el-icon><Search /></el-icon></template>
+        </el-input>
+        <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
+          <el-option v-for="item in typeOptions" :key="item.value" :label="item.label" :value="item.value" />
+        </el-select>
+        <el-select v-model="query.environment" placeholder="全部环境" clearable class="filter-item">
+          <el-option label="开发" value="dev" />
+          <el-option label="预发" value="staging" />
+          <el-option label="生产" value="prod" />
+        </el-select>
+        <el-input v-model="query.group" placeholder="分组" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <!-- 移动端：卡片列表 -->
-    <div v-if="app.isMobile" class="mobile-list" v-loading="loading">
-      <el-empty v-if="items.length === 0 && !loading" description="没有匹配的实例" />
-      <div v-for="item in items" :key="item.id" class="mw-card" @click="openDetail(item)">
-        <div class="mw-card-head">
-          <span class="mw-name">{{ item.name }}</span>
-          <el-tag size="small" :type="item.status === 1 ? 'success' : 'danger'" effect="light">
-            {{ item.status === 1 ? '在线' : '离线' }}
+      <!-- 空态：区分「筛选无结果」与「系统里根本没有实例」两种情况 -->
+      <template #empty>
+        <EmptyGuide
+          v-if="total === 0 && !hasFilter"
+          compact
+          title="还没有纳管任何实例"
+          description="如果希望平台自动创建只读监控账号、拉起 Exporter 并接入 Prometheus，请走集成中心；这里只登记实例信息。"
+          primary-text="去集成中心接入"
+          primary-to="integrations"
+          secondary-text="直接登记实例"
+          @secondary="openForm()"
+        />
+        <el-empty v-else description="没有匹配的实例，试试调整筛选条件" :image-size="72" />
+      </template>
+
+      <!-- 移动端：卡片列表 -->
+      <template #card="{ row }">
+        <div class="card-head" @click="openDetail(row)">
+          <span class="mw-name">{{ row.name }}</span>
+          <el-tag size="small" :type="row.status === 1 ? 'success' : 'danger'" effect="light">
+            {{ row.status === 1 ? '在线' : '离线' }}
           </el-tag>
         </div>
         <div class="mw-tags">
-          <el-tag size="small" effect="plain" :type="mwTypeTagType[item.mw_type] || 'info'">
-            {{ mwTypeLabels[item.mw_type] || item.mw_type }}
+          <el-tag size="small" effect="plain" :type="mwTypeTagType[row.mw_type] || 'info'">
+            {{ mwTypeLabels[row.mw_type] || row.mw_type }}
           </el-tag>
-          <el-tag size="small" effect="plain" :type="envTagType[item.environment]">
-            {{ envLabels[item.environment] }}
+          <el-tag size="small" effect="plain" :type="envTagType[row.environment]">
+            {{ envLabels[row.environment] }}
           </el-tag>
-          <el-tag v-if="item.group_name" size="small" effect="plain">{{ item.group_name }}</el-tag>
+          <el-tag v-if="row.group_name" size="small" effect="plain">{{ row.group_name }}</el-tag>
         </div>
-        <p class="mw-endpoint mono">{{ item.host }}:{{ item.port }}</p>
-        <p class="mw-message muted">{{ item.last_message || '尚未探测' }}</p>
-        <div class="mw-actions" @click.stop>
-          <el-button size="small" @click="openDetail(item)">详情</el-button>
-          <el-button v-if="canWrite" size="small" @click="openForm(item)">编辑</el-button>
-          <el-button v-if="canWrite" size="small" type="danger" plain @click="handleDelete(item)">
-            {{ item.environment === 'prod' ? '审批删除' : '删除' }}
+        <p class="mw-endpoint mono">{{ row.host }}:{{ row.port }}</p>
+        <p class="mw-message muted">{{ row.last_message || '尚未探测' }}</p>
+        <div class="mw-actions">
+          <el-button size="small" @click="openDetail(row)">详情</el-button>
+          <el-button v-if="canWrite" size="small" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" type="danger" plain @click="handleDelete(row)">
+            {{ row.environment === 'prod' ? '审批删除' : '删除' }}
           </el-button>
         </div>
-      </div>
-      <el-pagination
-        v-if="total > query.page_size"
-        v-model:current-page="query.page"
-        :page-size="query.page_size"
-        :total="total"
-        layout="prev, pager, next"
-        small
-        class="pager"
-        @current-change="load"
-      />
-    </div>
+      </template>
 
-    <!-- 桌面端：表格 -->
-    <div v-else class="card">
-      <div class="table-scroll">
-        <el-table :data="items" v-loading="loading" size="default" row-key="id" @row-click="openDetail">
+      <!-- 桌面端：表格 -->
+      <template #table>
+        <div class="table-scroll">
+        <el-table :data="items" size="default" row-key="id" @row-click="openDetail">
           <el-table-column prop="name" label="实例名称" min-width="160" show-overflow-tooltip />
           <el-table-column label="类型" width="120">
             <template #default="{ row }">
@@ -232,55 +219,22 @@ onMounted(load)
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        class="pager"
-        @current-change="load"
-        @size-change="load"
-      />
-    </div>
+        </div>
+      </template>
+    </ResponsiveList>
 
-    <FormDialog v-model="dialogVisible" :instance="editing" @saved="load" />
+    <FormDialog v-model="dialogVisible" :instance="editing" @saved="list.load" />
   </div>
 </template>
 
 <style scoped>
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  align-items: center;
-  margin-bottom: 12px;
-}
-
+/* 筛选控件宽度：插槽内容由本页编译，作用域样式仍然生效。
+   容器、分页与移动端适配由 ResponsiveList 负责。 */
 .filter-item {
   width: 180px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
-}
-
-.mobile-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.mw-card {
-  background: var(--c-surface);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-lg);
-  padding: 12px 14px;
-}
-
-.mw-card-head {
+.card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -322,11 +276,5 @@ onMounted(load)
   gap: 8px;
   margin-top: 10px;
   flex-wrap: wrap;
-}
-
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
 }
 </style>

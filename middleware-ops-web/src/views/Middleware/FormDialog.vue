@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /** 中间件实例表单对话框（新增/编辑/连接测试）。 */
 import { computed, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { middlewareApi } from '@/api'
 import { toastError } from '@/api/http'
@@ -17,10 +18,18 @@ const emit = defineEmits<{
   (e: 'saved'): void
 }>()
 
+const router = useRouter()
+
 const visible = computed({
   get: () => props.modelValue,
   set: (value: boolean) => emit('update:modelValue', value),
 })
+
+/** 转到集成中心（先关闭本弹窗，避免返回时还挂着）。 */
+function gotoIntegration(): void {
+  visible.value = false
+  void router.push({ name: 'integrations' })
+}
 
 const formRef = ref<FormInstance>()
 const submitting = ref(false)
@@ -30,6 +39,8 @@ const types = ref<{ value: string; label: string; port: number; phase: number }[
 const groups = ref<string[]>([])
 /** Prometheus 中实际存在的 job 名：直接给候选，避免把容器名当 job 名填。 */
 const promJobs = ref<string[]>([])
+/** Prometheus 里现有的 instance_name 取值（= 平台集成名称）。 */
+const promNames = ref<string[]>([])
 const environments = ref<{ value: string; label: string }[]>([
   { value: 'dev', label: '开发' },
   { value: 'staging', label: '预发' },
@@ -176,6 +187,7 @@ watch(
       types.value = options.types
       groups.value = options.groups
       promJobs.value = options.prom_jobs || []
+      promNames.value = options.prom_instance_names || []
       if (options.environments?.length) {
         environments.value = options.environments.map((value) => ({
           value,
@@ -191,12 +203,45 @@ watch(
 
 <template>
   <el-dialog v-model="visible" :title="isEdit ? '编辑中间件实例' : '新增中间件实例'" width="560px" :close-on-click-modal="false">
+    <!-- 新增时先说明两条路径的区别：这是首次使用最容易走错的地方 -->
+    <el-alert v-if="!isEdit" type="info" :closable="false" class="path-hint">
+      <template #title>
+        <span class="path-hint-title">本表单只「登记」实例，不负责搭采集链路</span>
+      </template>
+      <p class="path-hint-body">
+        如果你的实例还没有 Exporter，或希望平台自动创建只读监控账号、拉起 Exporter、写入 Prometheus
+        抓取目标并生成推荐告警规则，请改用
+        <el-button text type="primary" size="small" @click="gotoIntegration">集成中心</el-button>
+        。
+      </p>
+      <p class="path-hint-body muted">
+        已经有 Exporter 且 Prometheus 能抓到（即下面能选到对应 job）时，直接在这里登记即可。
+      </p>
+    </el-alert>
+
     <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
       <el-row :gutter="12">
         <el-col :xs="24" :sm="12">
           <el-form-item label="实例名称" prop="name">
-            <el-input v-model="form.name" placeholder="如 prod-redis-order" />
+            <!-- 平台用它与 Prometheus 的 instance_name 标签对齐，因此给出现有取值供选择 -->
+            <el-select
+              v-if="promNames.length"
+              v-model="form.name"
+              class="mobile-block"
+              filterable
+              allow-create
+              clearable
+              default-first-option
+              placeholder="从 Prometheus 现有 instance_name 中选，或直接输入"
+            >
+              <el-option v-for="item in promNames" :key="item" :label="item" :value="item" />
+            </el-select>
+            <el-input v-else v-model="form.name" placeholder="如 prod-redis-order" />
           </el-form-item>
+          <p v-if="promNames.length" class="field-hint">
+            「实例名称」就是 Prometheus 的 <span class="mono">instance_name</span> 标签值；
+            上面这些是平台当前写入的取值（等于「集成中心」里的集成名称）。名称对不上是最常见的"有数据但查不到"原因。
+          </p>
         </el-col>
         <el-col :xs="24" :sm="12">
           <el-form-item label="中间件类型" prop="mw_type">
@@ -308,6 +353,21 @@ watch(
 </template>
 
 <style scoped>
+.path-hint {
+  margin-bottom: var(--sp-3);
+}
+
+.path-hint-title {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.path-hint-body {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .field-hint {
   margin: 2px 0 0;
   font-size: 11.5px;

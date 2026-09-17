@@ -1,5 +1,5 @@
 /** 接口封装：与设计文档 8.2 接口总览一一对应。 */
-import { authHeaders, get, post, put, del, type PageResult } from './http'
+import { authHeaders, get, post, postSlow, put, del, withSignal, type PageResult } from './http'
 import type {
   Alert,
   AlertRule,
@@ -17,6 +17,7 @@ import type {
   IntegrationAccount,
   AccountProbeResult,
   AccountRetryResult,
+  AccountRotateResult,
   IntegrationArtifacts,
   IntegrationInput,
   IntegrationOverview,
@@ -59,7 +60,8 @@ export const authApi = {
 
 /** 中间件纳管（4.1）。 */
 export const middlewareApi = {
-  list: (params: PageQuery) => get<PageResult<MiddlewareInstance>>('/api/middlewares', params),
+  list: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<MiddlewareInstance>>('/api/middlewares', params, withSignal(signal)),
   detail: (id: number) =>
     get<{
       instance: MiddlewareInstance
@@ -77,6 +79,8 @@ export const middlewareApi = {
       status_options: { value: number; label: string }[]
       /** Prometheus 中实际存在的 job 名（查不到时为空数组）。 */
       prom_jobs?: string[]
+      /** Prometheus 中 instance_name 的实际取值（= 集成名称），用于把实例名对齐标签。 */
+      prom_instance_names?: string[]
     }>('/api/middlewares/options'),
   create: (payload: MiddlewareInput) => post<MiddlewareInstance>('/api/middlewares', payload),
   update: (id: number, payload: MiddlewareInput) => put<MiddlewareInstance>(`/api/middlewares/${id}`, payload),
@@ -118,15 +122,15 @@ export const integrationApi = {
   apply: (id: number) => post<IntegrationView>(`/api/integrations/${id}/apply`),
   /** 监控账号管理：查看平台代管的只读账号；轮换口令（账号改自己口令，无需管理员凭据）。 */
   accounts: () => get<{ items: IntegrationAccount[] }>('/api/integrations/accounts'),
-  rotateAccount: (id: number) => post<IntegrationView>(`/api/integrations/${id}/account/rotate`),
+  rotateAccount: (id: number) => postSlow<AccountRotateResult>(`/api/integrations/${id}/account/rotate`),
   /** 重试建号/连接：带管理凭据=幂等重建账号；不带=只测连接并重建 Exporter。 */
   retryAccount: (id: number, payload: { admin_username?: string; admin_password?: string }) =>
-    post<AccountRetryResult>(`/api/integrations/${id}/account/retry`, payload),
+    postSlow<AccountRetryResult>(`/api/integrations/${id}/account/retry`, payload),
   /** 只做连接测试（不建号、不改配置）。 */
-  probeAccount: (id: number) => post<AccountProbeResult>(`/api/integrations/${id}/account/probe`),
+  probeAccount: (id: number) => postSlow<AccountProbeResult>(`/api/integrations/${id}/account/probe`),
   /** 删除监控账号（L2：需被管实例的管理员凭据）。 */
   dropAccount: (id: number, payload: { admin_username: string; admin_password: string }) =>
-    post<IntegrationView>(`/api/integrations/${id}/account/drop`, payload),
+    postSlow<IntegrationView>(`/api/integrations/${id}/account/drop`, payload),
   remove: (id: number) => del<{ message: string }>(`/api/integrations/${id}`),
   /** 日志接入：读取被管容器的 docker 配置反查日志位置（读不到会报错，不猜路径）。 */
   previewLog: (payload: LogCollectInput) => post<LogCollectPlan>('/api/integrations/logs/preview', payload),
@@ -137,7 +141,8 @@ export const integrationApi = {
 export const aiApi = {
   diagnoseSync: (payload: { instance_id?: number; question: string; mw_type?: string; alert_id?: number; skip_cache?: boolean }) =>
     post<DiagnosisResponse>('/api/ai/diagnose/sync', payload),
-  history: (params: PageQuery) => get<PageResult<DiagnosisRecord>>('/api/ai/diagnosis-history', params),
+  history: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<DiagnosisRecord>>('/api/ai/diagnosis-history', params, withSignal(signal)),
   detail: (id: number) => get<{ diagnosis: DiagnosisRecord; knowledge_entries: KnowledgeEntry[] }>(`/api/ai/diagnosis/${id}`),
   feedback: (id: number, feedback: 'useful' | 'useless' | 'adopted') =>
     post<{ message: string }>(`/api/ai/diagnosis/${id}/feedback`, { diagnosis_id: id, feedback }),
@@ -155,7 +160,8 @@ export const aiApi = {
       '/api/ai/code-analyze',
       payload,
     ),
-  codeAnalyses: (params: PageQuery) => get<PageResult<CodeAnalysis>>('/api/ai/code-analyses', params),
+  codeAnalyses: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<CodeAnalysis>>('/api/ai/code-analyses', params, withSignal(signal)),
 }
 
 /** SSE 流式诊断。 */
@@ -262,7 +268,7 @@ function dispatchEvent(raw: string, handlers: DiagnoseStreamHandlers): void {
 
 /** 告警治理（4.4）。 */
 export const alertApi = {
-  list: (params: PageQuery) => get<PageResult<Alert>>('/api/alerts', params),
+  list: (params: PageQuery, signal?: AbortSignal) => get<PageResult<Alert>>('/api/alerts', params, withSignal(signal)),
   options: () =>
     get<{
       instances: { id: number; name: string; mw_type: string; environment: string }[]
@@ -271,7 +277,8 @@ export const alertApi = {
       channels: string[]
       notify_status: NotifyChannel[]
     }>('/api/alerts/options'),
-  rules: (params: PageQuery) => get<PageResult<AlertRule>>('/api/alerts/rules', params),
+  rules: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<AlertRule>>('/api/alerts/rules', params, withSignal(signal)),
   createRule: (payload: Partial<AlertRule>) => post<AlertRule>('/api/alerts/rules', payload),
   updateRule: (id: number, payload: Partial<AlertRule>) => put<AlertRule>(`/api/alerts/rules/${id}`, payload),
   removeRule: (id: number) => del<{ message: string }>(`/api/alerts/rules/${id}`),
@@ -289,7 +296,8 @@ export const alertApi = {
 
 /** 知识库（4.5）。 */
 export const knowledgeApi = {
-  list: (params: PageQuery) => get<PageResult<KnowledgeEntry>>('/api/knowledge', params),
+  list: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<KnowledgeEntry>>('/api/knowledge', params, withSignal(signal)),
   detail: (id: number) => get<KnowledgeEntry>(`/api/knowledge/${id}`),
   create: (payload: { title: string; content: string; mw_type?: string; tags?: string[]; status?: string }) =>
     post<KnowledgeEntry>('/api/knowledge', payload),
@@ -321,15 +329,20 @@ export const fixApi = {
     reason?: string
     dry_run?: boolean
     ticket_id?: string
+    /** 来源上下文（告警 / 诊断），随审批单与修复记录落库，用于回填来源告警）。 */
+    alert_id?: number
+    diagnosis_id?: number
   }) => post<FixExecuteResult>('/api/fix/execute', payload),
-  history: (params: PageQuery) => get<PageResult<FixRecord>>('/api/fix/history', params),
+  history: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<FixRecord>>('/api/fix/history', params, withSignal(signal)),
   validateSql: (sql: string) =>
     post<{ normalized_sql: string; notes: string[]; high_risk: boolean; high_risk_reason: string }>('/api/fix/validate-sql', { sql }),
 }
 
 /** 审批（6.2）。 */
 export const approvalApi = {
-  list: (params: PageQuery) => get<PageResult<Approval>>('/api/approvals', params),
+  list: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<Approval>>('/api/approvals', params, withSignal(signal)),
   detail: (id: number) => get<Approval>(`/api/approvals/${id}`),
   decide: (id: number, approved: boolean, comment: string) =>
     post<Approval>(`/api/approvals/${id}/decide`, { approved, comment }),
@@ -337,7 +350,8 @@ export const approvalApi = {
 
 /** 审计（4.7）。 */
 export const auditApi = {
-  logs: (params: PageQuery) => get<PageResult<AuditLog>>('/api/audit/logs', params),
+  logs: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<AuditLog>>('/api/audit/logs', params, withSignal(signal)),
   detail: (id: number) => get<AuditLog>(`/api/audit/logs/${id}`),
   verify: (params?: Record<string, unknown>) =>
     get<{ verified: boolean; broken_id: number; message: string }>('/api/audit/verify', params),
@@ -348,14 +362,17 @@ export const auditApi = {
 
 /** 日志告警与代码分析（4.8）。 */
 export const logAlertApi = {
-  events: (params: PageQuery) => get<PageResult<LogEvent>>('/api/log-alerts/events', params),
+  events: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<LogEvent>>('/api/log-alerts/events', params, withSignal(signal)),
   event: (id: number) => get<{ event: LogEvent; analysis: CodeAnalysis | null }>(`/api/log-alerts/events/${id}`),
   updateStatus: (id: number, status: string) => put<{ message: string }>(`/api/log-alerts/events/${id}/status`, { status }),
-  servers: (params: PageQuery) => get<PageResult<ServerInstance>>('/api/log-alerts/servers', params),
+  servers: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<ServerInstance>>('/api/log-alerts/servers', params, withSignal(signal)),
   createServer: (payload: Partial<ServerInstance>) => post<ServerInstance>('/api/log-alerts/servers', payload),
   updateServer: (id: number, payload: Partial<ServerInstance>) => put<ServerInstance>(`/api/log-alerts/servers/${id}`, payload),
   removeServer: (id: number) => del<{ message: string }>(`/api/log-alerts/servers/${id}`),
-  codeRepos: (params: PageQuery) => get<PageResult<CodeRepo>>('/api/log-alerts/code-repos', params),
+  codeRepos: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<CodeRepo>>('/api/log-alerts/code-repos', params, withSignal(signal)),
   saveCodeRepo: (id: number | undefined, payload: Partial<CodeRepo>) =>
     post<CodeRepo>(`/api/log-alerts/code-repos${id ? `?id=${id}` : ''}`, payload),
 }
@@ -369,7 +386,7 @@ export const systemApi = {
 
 /** 用户与角色（管理员）。 */
 export const userApi = {
-  list: (params: PageQuery) => get<PageResult<User>>('/api/users', params),
+  list: (params: PageQuery, signal?: AbortSignal) => get<PageResult<User>>('/api/users', params, withSignal(signal)),
   create: (payload: Partial<User> & { password: string }) => post<User>('/api/users', payload),
   update: (id: number, payload: Partial<User> & { password?: string }) => put<User>(`/api/users/${id}`, payload),
   remove: (id: number) => del<{ message: string }>(`/api/users/${id}`),

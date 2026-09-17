@@ -190,9 +190,9 @@ services:
       # 否则会报 "dial unix /var/run/docker.sock: connect: permission denied"。
       # DOCKER_GID 由 scripts/setup-jd-link.sh 自动探测写入，也可手工设置：
       #   stat -c '%g' /var/run/docker.sock
-      group_add:
+    group_add:
         - "${DOCKER_GID:-999}"
-      - /var/run/docker.sock:/var/run/docker.sock
+        - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - '8080'
     healthcheck:

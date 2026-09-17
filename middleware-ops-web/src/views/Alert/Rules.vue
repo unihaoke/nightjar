@@ -1,33 +1,32 @@
 <script setup lang="ts">
 /** 告警规则管理：CRUD、启用停用、通知渠道自检。 */
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { alertApi, metricsApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { AlertRule } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { alertLevelLabels, mwTypeLabels } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
-const route = useRoute()
 const store = useUserStore()
 
-const loading = ref(false)
 const submitting = ref(false)
 const dialogVisible = ref(false)
 const editing = ref<AlertRule | null>(null)
 const formRef = ref<FormInstance>()
-const items = ref<AlertRule[]>([])
-const total = ref(0)
 const instances = ref<{ id: number; name: string; mw_type: string; environment: string }[]>([])
 const metricOptions = ref<{ name: string; display_name: string }[]>([])
 const notifyChannels = ref<{ channel: string; enabled: boolean }[]>([])
 
-const query = reactive({
-  instance_id: Number(route.query.instance_id || 0),
-  page: 1,
-  page_size: 20,
+// instance_id 走地址栏：从实例详情「查看规则」跳过来时筛选自动生效，刷新也不丢。
+const list = useListPage<AlertRule>({
+  fetch: (params, signal) => alertApi.rules(params, signal),
+  defaults: { instance_id: 0, page: 1, page_size: 20 },
+  numberKeys: ['instance_id'],
 })
+const { query, items, total, loading, error } = list
 
 const canWrite = computed(() => store.can('alert:write'))
 
@@ -54,19 +53,7 @@ const rules: FormRules = {
   operator: [{ required: true, message: '请选择操作符', trigger: 'change' }],
 }
 
-/** 加载规则列表。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const result = await alertApi.rules({ ...query })
-    items.value = result.list || []
-    total.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
+
 
 /** 加载选项。 */
 async function loadOptions(): Promise<void> {
@@ -157,7 +144,7 @@ async function submit(): Promise<void> {
       ElMessage({ type: 'success', message: '规则已创建' })
     }
     dialogVisible.value = false
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   } finally {
@@ -179,7 +166,7 @@ async function remove(rule: AlertRule): Promise<void> {
   try {
     await alertApi.removeRule(rule.id)
     ElMessage({ type: 'success', message: '规则已删除' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -189,7 +176,7 @@ async function remove(rule: AlertRule): Promise<void> {
 async function toggle(rule: AlertRule): Promise<void> {
   try {
     await alertApi.updateRule(rule.id, { ...rule, enabled: !rule.enabled })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -205,9 +192,8 @@ async function testNotify(channel: string): Promise<void> {
   }
 }
 
-onMounted(async () => {
-  await loadOptions()
-  await load()
+onMounted(() => {
+  void loadOptions()
 })
 </script>
 
@@ -238,20 +224,53 @@ onMounted(async () => {
       </el-tag>
     </div>
 
-    <div class="card filters">
-      <el-select v-model="query.instance_id" placeholder="全部实例" clearable filterable class="filter-item" @change="load">
-        <el-option
-          v-for="item in instances"
-          :key="item.id"
-          :label="`${item.name}（${mwTypeLabels[item.mw_type] || item.mw_type}）`"
-          :value="item.id"
-        />
-      </el-select>
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-    </div>
+    <ResponsiveList
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="没有匹配的规则"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-select v-model="query.instance_id" placeholder="全部实例" clearable filterable class="filter-item" @change="list.search">
+          <el-option
+            v-for="item in instances"
+            :key="item.id"
+            :label="`${item.name}（${mwTypeLabels[item.mw_type] || item.mw_type}）`"
+            :value="item.id"
+          />
+        </el-select>
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <div class="card" v-loading="loading">
-      <div class="table-scroll">
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="rule-head">
+          <span class="rule-name">{{ row.name }}</span>
+          <el-tag size="small" :type="row.level === 'critical' ? 'danger' : 'warning'" effect="light">
+            {{ alertLevelLabels[row.level] || row.level }}
+          </el-tag>
+        </div>
+        <p class="rule-cond mono">{{ row.metric_name }} {{ row.operator }} {{ row.threshold }}</p>
+        <div class="rule-meta muted">
+          实例 #{{ row.instance_id }} · 窗口 {{ row.time_window }}m · 冷却 {{ row.cooldown }}m
+        </div>
+        <div class="rule-actions">
+          <el-switch v-if="canWrite" size="small" :model-value="row.enabled" @change="toggle(row)" />
+          <el-button v-if="canWrite" size="small" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" type="danger" @click="remove(row)">删除</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：表格 -->
+      <template #table>
+        <div class="table-scroll">
         <el-table :data="items" size="default">
           <el-table-column prop="name" label="规则名称" min-width="150" show-overflow-tooltip />
           <el-table-column label="实例" width="90">
@@ -289,16 +308,9 @@ onMounted(async () => {
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        layout="total, prev, pager, next"
-        class="pager"
-        @current-change="load"
-      />
-    </div>
+        </div>
+      </template>
+    </ResponsiveList>
 
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑告警规则' : '新建告警规则'" width="600px">
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
@@ -398,13 +410,6 @@ onMounted(async () => {
   cursor: pointer;
 }
 
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
 .filter-item {
   width: 260px;
 }
@@ -413,14 +418,36 @@ onMounted(async () => {
   margin-right: 4px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+/* 移动端卡片：规则条目 */
+.rule-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
+.rule-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rule-cond {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+}
+
+.rule-meta {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+}
+
+.rule-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
 }
 </style>

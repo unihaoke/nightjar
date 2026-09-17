@@ -36,6 +36,9 @@ type ApprovalRequest struct {
 	ActionDetail map[string]any `json:"action_detail"`
 	Preview      map[string]any `json:"preview"`
 	Reason       string         `json:"reason"`
+	// AlertID / DiagnosisID 为来源上下文（告警 / 诊断），用于审批通过后回填来源告警，闭合处置链路。
+	AlertID     int64 `json:"alert_id"`
+	DiagnosisID int64 `json:"diagnosis_id"`
 }
 
 // Create 创建审批工单。
@@ -44,6 +47,8 @@ func (s *ApprovalService) Create(ctx context.Context, in ApprovalRequest, operat
 		TicketID:     "AP" + utils.Fingerprint(in.ActionType, operator.Username, time.Now().UTC().Format(time.RFC3339Nano))[:12],
 		ApplicantID:  operator.UserID,
 		InstanceID:   in.InstanceID,
+		AlertID:      in.AlertID,
+		DiagnosisID:  in.DiagnosisID,
 		Environment:  in.Environment,
 		ActionType:   in.ActionType,
 		ActionDetail: model.JSONMap(in.ActionDetail),
@@ -58,6 +63,7 @@ func (s *ApprovalService) Create(ctx context.Context, in ApprovalRequest, operat
 	s.auditRecord(ctx, operator, ticket.InstanceID, "approval_create", map[string]any{
 		"ticket_id": ticket.TicketID, "action_type": ticket.ActionType,
 		"environment": ticket.Environment, "reason": ticket.Reason,
+		"alert_id": ticket.AlertID, "diagnosis_id": ticket.DiagnosisID,
 	})
 	if s.notifier != nil {
 		s.notifier.NotifyApproval(ctx, ticket, "created")

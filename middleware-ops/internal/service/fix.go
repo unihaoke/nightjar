@@ -87,6 +87,7 @@ type FixService struct {
 	sqlGuard  *guardrail.SQLGuard
 	registry  *guardrail.ToolRegistry
 	executor  Executor
+	alerts    *AlertService
 	log       *zap.Logger
 }
 
@@ -99,6 +100,7 @@ func NewFixService(
 	sqlGuard *guardrail.SQLGuard,
 	registry *guardrail.ToolRegistry,
 	executor Executor,
+	alerts *AlertService,
 	log *zap.Logger,
 ) *FixService {
 	if executor == nil {
@@ -106,7 +108,7 @@ func NewFixService(
 	}
 	return &FixService{
 		instances: instances, fixes: fixes, approvals: approvals, audit: audit,
-		sqlGuard: sqlGuard, registry: registry, executor: executor, log: log,
+		sqlGuard: sqlGuard, registry: registry, executor: executor, alerts: alerts, log: log,
 	}
 }
 
@@ -138,6 +140,9 @@ type FixRequest struct {
 	DryRun bool `json:"dry_run"`
 	// TicketID 为审批通过后执行时携带的工单号。
 	TicketID string `json:"ticket_id"`
+	// AlertID / DiagnosisID 为来源上下文（告警 / 诊断），随审批单与修复记录落库，用于回填来源告警。
+	AlertID     int64 `json:"alert_id"`
+	DiagnosisID int64 `json:"diagnosis_id"`
 }
 
 // Preview 生成修复预览并返回操作级别判定（L0）。
@@ -236,6 +241,8 @@ func (s *FixService) Execute(ctx context.Context, in FixRequest, session *Sessio
 				ActionType:   in.ActionType,
 				ActionDetail: in.Params,
 				Reason:       in.Reason,
+				AlertID:      in.AlertID,
+				DiagnosisID:  in.DiagnosisID,
 			}, operator)
 			if ticketErr != nil {
 				return nil, ticketErr
@@ -277,6 +284,7 @@ func (s *FixService) Execute(ctx context.Context, in FixRequest, session *Sessio
 
 	record := &model.FixRecord{
 		TicketID: in.TicketID, UserID: operator.UserID, InstanceID: instance.ID,
+		AlertID: in.AlertID, DiagnosisID: in.DiagnosisID,
 		ActionType: in.ActionType, Level: level,
 		Command:      stringOf(in.Params["command"]),
 		ActionDetail: model.JSONMap(in.Params),
@@ -295,6 +303,13 @@ func (s *FixService) Execute(ctx context.Context, in FixRequest, session *Sessio
 	if in.TicketID != "" && s.approvals != nil {
 		if err := s.approvals.MarkExecuted(ctx, in.TicketID, status, result); err != nil {
 			s.log.Warn("回填工单执行结果失败", zap.Error(err))
+		}
+	}
+	// 闭环回填：修复执行真正成功（非 dry-run / noop / 失败）时，自动标记来源告警已解决。
+	// 默认 dry-run 执行器不会返回 success/executed，故不会误标；仅当接入真实执行客户端且执行成功才触发。
+	if in.AlertID > 0 && (status == "success" || status == "executed") && s.alerts != nil {
+		if rErr := s.alerts.Resolve(ctx, in.AlertID, operator); rErr != nil {
+			s.log.Warn("自动回填来源告警失败", zap.Int64("alert_id", in.AlertID), zap.Error(rErr))
 		}
 	}
 	s.auditRecord(ctx, operator, instance.ID, "fix_execute", level, map[string]any{

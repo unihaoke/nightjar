@@ -11,31 +11,32 @@ import MarkdownIt from 'markdown-it'
 import { knowledgeApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { KnowledgeEntry } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { formatTime, knowledgeStatusLabels, mwTypeLabels } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const store = useUserStore()
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
 
-const loading = ref(false)
 const submitting = ref(false)
 const dialogVisible = ref(false)
 const detailVisible = ref(false)
 const editing = ref<KnowledgeEntry | null>(null)
 const current = ref<KnowledgeEntry | null>(null)
-const items = ref<KnowledgeEntry[]>([])
-const total = ref(0)
 const stats = ref<{ total: number; by_status: Record<string, number>; adoption_rate: number } | null>(null)
 const statusOptions = ref<{ value: string; label: string }[]>([])
 
-const query = reactive({
-  keyword: '',
-  mw_type: '',
-  status: '',
-  source: '',
-  page: 1,
-  page_size: 20,
+const list = useListPage<KnowledgeEntry>({
+  // 列表与统计一并取：统计跟随筛选口径变化，选项（状态字典）只加载一次。
+  fetch: async (params, signal) => {
+    const [page, statistics] = await Promise.all([knowledgeApi.list(params, signal), knowledgeApi.stats()])
+    stats.value = statistics
+    return page
+  },
+  defaults: { keyword: '', mw_type: '', status: '', source: '', page: 1, page_size: 20 },
 })
+const { query, items, total, loading, error } = list
 
 const canWrite = computed(() => store.can('knowledge:write'))
 
@@ -52,23 +53,13 @@ function renderMarkdown(content: string): string {
   return md.render(content || '')
 }
 
-/** 加载列表与统计。 */
-async function load(): Promise<void> {
-  loading.value = true
+/** 加载状态字典（与筛选无关，只需一次）。 */
+async function loadOptions(): Promise<void> {
   try {
-    const [list, statistics, options] = await Promise.all([
-      knowledgeApi.list({ ...query }),
-      knowledgeApi.stats(),
-      knowledgeApi.options(),
-    ])
-    items.value = list.list || []
-    total.value = list.total || 0
-    stats.value = statistics
+    const options = await knowledgeApi.options()
     statusOptions.value = options.statuses || []
   } catch (error) {
     toastError(error)
-  } finally {
-    loading.value = false
   }
 }
 
@@ -109,7 +100,7 @@ async function submit(): Promise<void> {
       ElMessage({ type: 'success', message: '条目已创建' })
     }
     dialogVisible.value = false
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   } finally {
@@ -122,7 +113,7 @@ async function adopt(entry: KnowledgeEntry): Promise<void> {
   try {
     await knowledgeApi.adopt(entry.id)
     ElMessage({ type: 'success', message: '已采纳，该条目权重已提升' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -133,7 +124,7 @@ async function publish(entry: KnowledgeEntry): Promise<void> {
   try {
     await knowledgeApi.update(entry.id, { status: 'published' })
     ElMessage({ type: 'success', message: '草稿已转为已发布，将参与检索' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -153,13 +144,15 @@ async function remove(entry: KnowledgeEntry): Promise<void> {
   try {
     await knowledgeApi.remove(entry.id)
     ElMessage({ type: 'success', message: '条目已删除' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  void loadOptions()
+})
 </script>
 
 <template>
@@ -196,31 +189,75 @@ onMounted(load)
       </el-col>
     </el-row>
 
-    <div class="card filters mt">
-      <el-input v-model="query.keyword" placeholder="搜索标题或内容" clearable class="filter-item" @keyup.enter="load" />
-      <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
-        <el-option label="Redis" value="redis" />
-        <el-option label="Kafka" value="kafka" />
-        <el-option label="MySQL" value="mysql" />
-        <el-option label="PostgreSQL" value="pg" />
-        <el-option label="Elasticsearch" value="es" />
-        <el-option label="Nginx" value="nginx" />
-      </el-select>
-      <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-item">
-        <el-option v-for="item in statusOptions" :key="item.value" :label="item.label" :value="item.value" />
-      </el-select>
-      <el-select v-model="query.source" placeholder="全部来源" clearable class="filter-item">
-        <el-option label="人工录入" value="manual" />
-        <el-option label="AI 诊断沉淀" value="auto" />
-      </el-select>
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-    </div>
+    <ResponsiveList
+      class="mt"
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="知识库暂无条目"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-input v-model="query.keyword" placeholder="搜索标题或内容" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
+          <el-option label="Redis" value="redis" />
+          <el-option label="Kafka" value="kafka" />
+          <el-option label="MySQL" value="mysql" />
+          <el-option label="PostgreSQL" value="pg" />
+          <el-option label="Elasticsearch" value="es" />
+          <el-option label="Nginx" value="nginx" />
+        </el-select>
+        <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-item">
+          <el-option v-for="item in statusOptions" :key="item.value" :label="item.label" :value="item.value" />
+        </el-select>
+        <el-select v-model="query.source" placeholder="全部来源" clearable class="filter-item">
+          <el-option label="人工录入" value="manual" />
+          <el-option label="AI 诊断沉淀" value="auto" />
+        </el-select>
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <div class="card" v-loading="loading">
-      <div v-if="items.length === 0">
-        <el-empty description="知识库暂无条目" />
-      </div>
-      <ul v-else class="kb-list">
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="kb-head">
+          <span class="kb-title" @click="openDetail(row)">{{ row.title }}</span>
+        </div>
+        <div class="kb-tags">
+          <el-tag size="small" effect="plain">{{ mwTypeLabels[row.mw_type] || row.mw_type || '通用' }}</el-tag>
+          <el-tag
+            size="small"
+            :type="row.status === 'published' ? 'success' : row.status === 'draft' ? 'warning' : 'info'"
+            effect="light"
+          >
+            {{ knowledgeStatusLabels[row.status] || row.status }}
+          </el-tag>
+          <el-tag size="small" effect="plain" :type="row.source === 'auto' ? 'info' : 'primary'">
+            {{ row.source === 'auto' ? 'AI 沉淀' : '人工录入' }}
+          </el-tag>
+        </div>
+        <p class="kb-excerpt">{{ row.content.replace(/[#*`>-]/g, '').slice(0, 120) }}</p>
+        <div class="kb-meta">
+          <span class="muted">{{ formatTime(row.created_at) }}</span>
+          <span class="muted">采纳 {{ row.adopt_count }} 次 · 引用 {{ row.use_count }} 次</span>
+        </div>
+        <div class="kb-actions is-card">
+          <el-button size="small" @click="openDetail(row)">查看</el-button>
+          <el-button v-if="canWrite" size="small" type="primary" @click="adopt(row)">采纳</el-button>
+          <el-button v-if="canWrite && row.status === 'draft'" size="small" @click="publish(row)">转正</el-button>
+          <el-button v-if="canWrite" size="small" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" type="danger" @click="remove(row)">删除</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：列表 -->
+      <template #table>
+        <ul class="kb-list">
         <li v-for="item in items" :key="item.id">
           <div class="kb-main">
             <div class="kb-head">
@@ -252,19 +289,9 @@ onMounted(load)
             <el-button v-if="canWrite" text size="small" type="danger" @click="remove(item)">删除</el-button>
           </div>
         </li>
-      </ul>
-
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        class="pager"
-        @current-change="load"
-        @size-change="load"
-      />
-    </div>
+        </ul>
+      </template>
+    </ResponsiveList>
 
     <!-- 编辑对话框 -->
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑知识条目' : '录入知识条目'" width="680px">
@@ -351,13 +378,6 @@ onMounted(load)
   font-variant-numeric: tabular-nums;
 }
 
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
 .filter-item {
   width: 180px;
 }
@@ -430,9 +450,19 @@ onMounted(load)
   gap: 2px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+/* 卡片模式下横向排布并换行，避免按钮挤出屏幕 */
+.kb-actions.is-card {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.kb-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
 }
 
 .kb-detail-meta {
@@ -473,19 +503,4 @@ onMounted(load)
   overflow-x: auto;
 }
 
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
-
-  .kb-list li {
-    flex-direction: column;
-  }
-
-  .kb-actions {
-    flex-direction: row;
-    align-items: center;
-    flex-wrap: wrap;
-  }
-}
 </style>

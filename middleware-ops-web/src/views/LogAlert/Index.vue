@@ -5,49 +5,36 @@
  * 采集入口（HTTP Hook / Agent）说明：应用 POST 到 /api/hooks/logs，
  * 平台按「错误指纹 + 5 分钟窗口」去重聚合，冷却期内不重复通知。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { aiApi, logAlertApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { CodeAnalysis, LogEvent } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import RefreshControl from '@/components/RefreshControl.vue'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import { formatTime } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
 
 const store = useUserStore()
 
-const loading = ref(false)
 const analyzing = ref(false)
-const items = ref<LogEvent[]>([])
-const total = ref(0)
 const detailVisible = ref(false)
 const current = ref<LogEvent | null>(null)
 const analysis = ref<CodeAnalysis | null>(null)
 const analyzeResult = ref<Record<string, unknown> | null>(null)
 
-const query = reactive({
-  keyword: '',
-  service: '',
-  status: '',
-  alert_type: '',
-  page: 1,
-  page_size: 20,
+/** 日志事件由应用主动上报，靠轮询才能看到最新的，默认开启。 */
+const POLL_INTERVAL = 60_000
+
+const list = useListPage<LogEvent>({
+  fetch: (params, signal) => logAlertApi.events(params, signal),
+  defaults: { keyword: '', service: '', status: '', alert_type: '', page: 1, page_size: 20 },
+  pollInterval: POLL_INTERVAL,
 })
+const { query, items, total, loading, error, polling, lastLoadedAt } = list
 
 const canWrite = computed(() => store.can('logalert:write'))
-
-/** 加载事件列表。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const result = await logAlertApi.events({ ...query })
-    items.value = result.list || []
-    total.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
 
 /** 查看详情。 */
 async function openDetail(event: LogEvent): Promise<void> {
@@ -74,7 +61,7 @@ async function analyze(): Promise<void> {
     ElMessage({ type: 'success', message: '代码分析完成' })
     const detail = await logAlertApi.event(current.value.id)
     analysis.value = detail.analysis
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   } finally {
@@ -91,7 +78,7 @@ async function updateStatus(status: string): Promise<void> {
     await logAlertApi.updateStatus(current.value.id, status)
     ElMessage({ type: 'success', message: '状态已更新' })
     current.value.status = status
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -110,8 +97,6 @@ async function copyHookExample(): Promise<void> {
     ElMessage({ type: 'info', message: example })
   }
 }
-
-onMounted(load)
 </script>
 
 <template>
@@ -126,25 +111,70 @@ onMounted(load)
       <el-button size="small" :icon="'CopyDocument'" @click="copyHookExample">复制接入示例</el-button>
     </div>
 
-    <div class="card filters">
-      <el-input v-model="query.keyword" placeholder="搜索堆栈或指纹" clearable class="filter-item" @keyup.enter="load" />
-      <el-input v-model="query.service" placeholder="服务名" clearable class="filter-item" @keyup.enter="load" />
-      <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-item">
-        <el-option label="待处理" value="pending" />
-        <el-option label="分析中" value="analyzing" />
-        <el-option label="已解决" value="resolved" />
-        <el-option label="已忽略" value="ignored" />
-      </el-select>
-      <el-select v-model="query.alert_type" placeholder="全部类型" clearable class="filter-item">
-        <el-option label="异常报错" value="error" />
-        <el-option label="异常堆栈" value="stack" />
-        <el-option label="GC 日志" value="gc" />
-      </el-select>
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
+    <div class="row toolbar-row">
+      <RefreshControl
+        v-model="polling"
+        :interval-ms="POLL_INTERVAL"
+        :last-loaded-at="lastLoadedAt"
+        @refresh="list.load()"
+      />
     </div>
 
-    <div class="card" v-loading="loading">
-      <div class="table-scroll">
+    <ResponsiveList
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="暂无日志告警事件"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-input v-model="query.keyword" placeholder="搜索堆栈或指纹" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-input v-model="query.service" placeholder="服务名" clearable class="filter-item" @keyup.enter="list.search" />
+        <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-item">
+          <el-option label="待处理" value="pending" />
+          <el-option label="分析中" value="analyzing" />
+          <el-option label="已解决" value="resolved" />
+          <el-option label="已忽略" value="ignored" />
+        </el-select>
+        <el-select v-model="query.alert_type" placeholder="全部类型" clearable class="filter-item">
+          <el-option label="异常报错" value="error" />
+          <el-option label="异常堆栈" value="stack" />
+          <el-option label="GC 日志" value="gc" />
+        </el-select>
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
+
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="event-head">
+          <span class="event-service">{{ row.service_name }}</span>
+          <el-tag size="small" :type="row.severity === 'critical' ? 'danger' : 'warning'" effect="plain">
+            {{ row.severity }}
+          </el-tag>
+          <el-tag size="small" :type="row.error_count > 10 ? 'danger' : row.error_count > 3 ? 'warning' : 'info'" effect="light">
+            {{ row.error_count }} 次
+          </el-tag>
+        </div>
+        <p class="event-stack">{{ row.raw_stacktrace || '（无堆栈）' }}</p>
+        <div class="event-meta muted">
+          <code>{{ (row.error_signature || '').slice(0, 8) }}</code>
+          <span>{{ row.alert_type }}</span>
+          <span>{{ formatTime(row.last_seen_at) }}</span>
+        </div>
+        <div class="event-actions">
+          <el-button size="small" @click="openDetail(row)">详情</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：表格 -->
+      <template #table>
+        <div class="table-scroll">
         <el-table :data="items" size="default" @row-click="openDetail">
           <el-table-column prop="service_name" label="服务" min-width="140" show-overflow-tooltip />
           <el-table-column label="指纹" width="130">
@@ -184,18 +214,9 @@ onMounted(load)
             </template>
           </el-table-column>
         </el-table>
-      </div>
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        class="pager"
-        @current-change="load"
-        @size-change="load"
-      />
-    </div>
+        </div>
+      </template>
+    </ResponsiveList>
 
     <el-drawer v-model="detailVisible" title="日志事件详情" size="720px" direction="rtl">
       <div v-if="current" class="stack">
@@ -271,20 +292,47 @@ onMounted(load)
 </template>
 
 <style scoped>
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
 .filter-item {
   width: 180px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
+.toolbar-row {
+  margin-bottom: 12px;
+}
+
+/* 移动端卡片：日志事件 */
+.event-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.event-service {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.event-stack {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.event-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11.5px;
+}
+
+.event-actions {
+  margin-top: 8px;
 }
 
 .stack {
@@ -348,9 +396,4 @@ onMounted(load)
   padding-top: 1px;
 }
 
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
-}
 </style>

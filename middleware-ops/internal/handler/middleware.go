@@ -181,6 +181,9 @@ func (h *Handler) MiddlewareOptions(c *gin.Context) {
 		"types": types, "groups": groups, "environments": envs,
 		// Prometheus 中实际存在的 job 名：表单直接给候选，避免把容器名当 job 名填。
 		"prom_jobs": h.deps.Metrics.PrometheusJobs(c.Request.Context()),
+		// instance_name 的实际取值（= 集成名称）：表单给候选，
+		// 避免"实例名填成 Exporter 容器名"这类对不上标签的经典故障。
+		"prom_instance_names": h.deps.Metrics.PrometheusInstanceNames(c.Request.Context()),
 		"status_options": []map[string]any{
 			{"value": 1, "label": "在线"}, {"value": 0, "label": "离线"},
 		},

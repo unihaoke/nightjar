@@ -112,7 +112,7 @@ func (h *Handler) PreviewIntegration(c *gin.Context) {
 	if !bindJSON(c, &in) {
 		return
 	}
-	artifacts, err := h.deps.Integration.Preview(in)
+	artifacts, err := h.deps.Integration.Preview(c.Request.Context(), in)
 	if err != nil {
 		response.Fail(c, err)
 		return

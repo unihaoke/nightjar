@@ -1,11 +1,14 @@
 <script setup lang="ts">
 /** 告警中心：告警列表、确认/恢复、AI 诊断入口、离线语义聚类。 */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { alertApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { Alert } from '@/api/types'
+import { useListPage } from '@/composables/useListPage'
+import RefreshControl from '@/components/RefreshControl.vue'
+import ResponsiveList from '@/components/ResponsiveList.vue'
 import StatCard from '@/components/StatCard.vue'
 import { alertLevelLabels, alertStatusLabels, formatNumber, formatTime, mwTypeLabels } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
@@ -13,19 +16,18 @@ import { useUserStore } from '@/stores/user'
 const router = useRouter()
 const store = useUserStore()
 
-const loading = ref(false)
 const clustering = ref(false)
-const items = ref<Alert[]>([])
-const total = ref(0)
 
-const query = reactive({
-  level: '',
-  status: '',
-  mw_type: '',
-  instance_id: 0,
-  page: 1,
-  page_size: 20,
+/** 告警是"等事件发生"的页面，默认开启自动刷新。 */
+const POLL_INTERVAL = 60_000
+
+const list = useListPage<Alert>({
+  fetch: (params, signal) => alertApi.list(params, signal),
+  defaults: { level: '', status: '', mw_type: '', instance_id: 0, page: 1, page_size: 20 },
+  numberKeys: ['instance_id'],
+  pollInterval: POLL_INTERVAL,
 })
+const { query, items, total, loading, error, polling, lastLoadedAt } = list
 
 const canWrite = computed(() => store.can('alert:write'))
 
@@ -36,26 +38,12 @@ const stats = computed(() => ({
   acknowledged: items.value.filter((item) => item.status === 'acknowledged').length,
 }))
 
-/** 加载告警。 */
-async function load(): Promise<void> {
-  loading.value = true
-  try {
-    const result = await alertApi.list({ ...query })
-    items.value = result.list || []
-    total.value = result.total || 0
-  } catch (error) {
-    toastError(error)
-  } finally {
-    loading.value = false
-  }
-}
-
 /** 确认告警（L1）。 */
 async function ack(alert: Alert): Promise<void> {
   try {
     await alertApi.ack(alert.id)
     ElMessage({ type: 'success', message: '告警已确认' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -66,7 +54,7 @@ async function resolve(alert: Alert): Promise<void> {
   try {
     await alertApi.resolve(alert.id)
     ElMessage({ type: 'success', message: '告警已标记恢复' })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -85,7 +73,7 @@ async function evaluate(): Promise<void> {
       type: 'success',
       message: `评估完成：规则 ${result.evaluated} 条，触发 ${result.triggered} 条，合并 ${result.merged} 条，静默 ${result.suppressed} 条`,
     })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   }
@@ -97,15 +85,13 @@ async function cluster(): Promise<void> {
   try {
     const result = await alertApi.cluster()
     ElMessage({ type: 'success', message: `聚类完成：处理 ${result.processed} 条向量，生成 ${result.clusters.length} 个聚类` })
-    await load()
+    await list.load()
   } catch (error) {
     toastError(error)
   } finally {
     clustering.value = false
   }
 }
-
-onMounted(load)
 </script>
 
 <template>
@@ -122,6 +108,15 @@ onMounted(load)
       </div>
     </div>
 
+    <div class="row toolbar-row">
+      <RefreshControl
+        v-model="polling"
+        :interval-ms="POLL_INTERVAL"
+        :last-loaded-at="lastLoadedAt"
+        @refresh="list.load()"
+      />
+    </div>
+
     <el-row :gutter="12">
       <el-col :xs="12" :sm="8">
         <StatCard label="当前页待处理" :value="stats.active" :status="stats.active > 0 ? 'warning' : 'ok'" />
@@ -134,32 +129,67 @@ onMounted(load)
       </el-col>
     </el-row>
 
-    <div class="card filters mt">
-      <el-select v-model="query.level" placeholder="全部级别" clearable class="filter-item">
-        <el-option label="警告" value="warning" />
-        <el-option label="严重" value="critical" />
-      </el-select>
-      <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-item">
-        <el-option label="待处理" value="active" />
-        <el-option label="已确认" value="acknowledged" />
-        <el-option label="已恢复" value="resolved" />
-      </el-select>
-      <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
-        <el-option label="Redis" value="redis" />
-        <el-option label="Kafka" value="kafka" />
-        <el-option label="MySQL" value="mysql" />
-        <el-option label="PostgreSQL" value="pg" />
-        <el-option label="Elasticsearch" value="es" />
-        <el-option label="Nginx" value="nginx" />
-      </el-select>
-      <el-button type="primary" :icon="'Search'" @click="load">查询</el-button>
-    </div>
+    <ResponsiveList
+      class="mt"
+      :items="items"
+      :loading="loading"
+      :error="error"
+      :total="total"
+      :page="query.page"
+      :page-size="query.page_size"
+      empty-text="没有匹配的告警"
+      @update:page="list.setPage"
+      @update:page-size="list.setPageSize"
+      @retry="list.load"
+    >
+      <template #filters>
+        <el-select v-model="query.level" placeholder="全部级别" clearable class="filter-item">
+          <el-option label="警告" value="warning" />
+          <el-option label="严重" value="critical" />
+        </el-select>
+        <el-select v-model="query.status" placeholder="全部状态" clearable class="filter-item">
+          <el-option label="待处理" value="active" />
+          <el-option label="已确认" value="acknowledged" />
+          <el-option label="已恢复" value="resolved" />
+        </el-select>
+        <el-select v-model="query.mw_type" placeholder="全部类型" clearable class="filter-item">
+          <el-option label="Redis" value="redis" />
+          <el-option label="Kafka" value="kafka" />
+          <el-option label="MySQL" value="mysql" />
+          <el-option label="PostgreSQL" value="pg" />
+          <el-option label="Elasticsearch" value="es" />
+          <el-option label="Nginx" value="nginx" />
+        </el-select>
+        <el-button type="primary" :icon="'Search'" @click="list.search">查询</el-button>
+        <el-button :icon="'RefreshLeft'" @click="list.reset">重置</el-button>
+      </template>
 
-    <div class="card" v-loading="loading">
-      <div v-if="items.length === 0">
-        <el-empty description="没有匹配的告警" />
-      </div>
-      <ul v-else class="alert-list">
+      <!-- 移动端：卡片 -->
+      <template #card="{ row }">
+        <div class="alert-head">
+          <el-tag size="small" :type="row.alert_level === 'critical' ? 'danger' : 'warning'" effect="light">
+            {{ alertLevelLabels[row.alert_level] || row.alert_level }}
+          </el-tag>
+          <el-tag size="small" effect="plain">{{ mwTypeLabels[row.mw_type] || row.mw_type }}</el-tag>
+          <el-tag size="small" effect="plain">{{ alertStatusLabels[row.status] || row.status }}</el-tag>
+          <el-tag v-if="row.cluster_id" size="small" type="info" effect="plain">聚类 {{ row.cluster_id }}</el-tag>
+        </div>
+        <p class="alert-message">{{ row.alert_message }}</p>
+        <div class="alert-meta">
+          <span class="muted">实例 #{{ row.instance_id }}</span>
+          <span class="muted">当前值 {{ formatNumber(row.metric_value) }}</span>
+          <span class="muted">{{ formatTime(row.triggered_at) }}</span>
+        </div>
+        <div class="alert-actions is-card">
+          <el-button size="small" @click="diagnose(row)">AI 诊断</el-button>
+          <el-button v-if="canWrite && row.status === 'active'" size="small" @click="ack(row)">确认</el-button>
+          <el-button v-if="canWrite && row.status !== 'resolved'" size="small" @click="resolve(row)">标记恢复</el-button>
+        </div>
+      </template>
+
+      <!-- 桌面端：列表 -->
+      <template #table>
+        <ul class="alert-list">
         <li v-for="item in items" :key="item.id" :class="item.alert_level">
           <div class="alert-main">
             <div class="alert-head">
@@ -185,19 +215,9 @@ onMounted(load)
             <el-button v-if="canWrite && item.status !== 'resolved'" text size="small" @click="resolve(item)">标记恢复</el-button>
           </div>
         </li>
-      </ul>
-
-      <el-pagination
-        v-model:current-page="query.page"
-        v-model:page-size="query.page_size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        class="pager"
-        @current-change="load"
-        @size-change="load"
-      />
-    </div>
+        </ul>
+      </template>
+    </ResponsiveList>
   </div>
 </template>
 
@@ -206,10 +226,7 @@ onMounted(load)
   margin-top: 12px;
 }
 
-.filters {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+.toolbar-row {
   margin-bottom: 12px;
 }
 
@@ -279,23 +296,10 @@ onMounted(load)
   gap: 4px;
 }
 
-.pager {
-  margin-top: 12px;
-  justify-content: flex-end;
-}
-
-@media (max-width: 767px) {
-  .filter-item {
-    width: 100%;
-  }
-
-  .alert-list li {
-    flex-direction: column;
-  }
-
-  .alert-actions {
-    flex-direction: row;
-    align-items: center;
-  }
+/* 卡片模式下操作按钮横向排布（列表模式为纵向贴右）。 */
+.alert-actions.is-card {
+  flex-direction: row;
+  align-items: center;
+  margin-top: 8px;
 }
 </style>

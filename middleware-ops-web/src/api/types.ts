@@ -309,6 +309,12 @@ export interface AccountRetryResult {
   view: IntegrationView
 }
 
+/** 集成中心：轮换口令的结果（新口令只在此响应里出现一次）。 */
+export interface AccountRotateResult {
+  view: IntegrationView
+  new_password: string
+}
+
 /** 集成中心：单次连接测试结果。 */
 export interface AccountProbeResult {
   ok: boolean
@@ -556,6 +562,10 @@ export interface Approval {
   applicant_id: number
   approver_id: number
   instance_id: number
+  /** 来源告警（修复工单 / 诊断带入，用于审批通过后回填）。 */
+  alert_id: number
+  /** 来源诊断。 */
+  diagnosis_id: number
   environment: string
   action_type: string
   action_detail: Record<string, unknown> | null
@@ -577,6 +587,10 @@ export interface FixRecord {
   ticket_id: string
   user_id: number
   instance_id: number
+  /** 来源告警。 */
+  alert_id: number
+  /** 来源诊断。 */
+  diagnosis_id: number
   action_type: string
   level: string
   command: string
