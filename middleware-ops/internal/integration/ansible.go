@@ -218,8 +218,20 @@ func renderRemotePlaybook(in remotePlaybookInput) string {
 
 // writeDockerTasks 渲染「官方镜像跑容器」的任务；docker-systemd 模式额外生成 systemd 单元。
 func writeDockerTasks(b *strings.Builder, in remotePlaybookInput) {
-	b.WriteString("    - name: 校验目标机器上的 Docker 可用\n")
-	b.WriteString("      ansible.builtin.command: docker version --format '{{.Server.Version}}'\n")
+	// 注意：这里**不能**用 docker 的 Go 模板格式串（如 `--format '{{.Server.Version}}'`）。
+	// playbook 的每个值都会先被 Ansible 当 Jinja 模板渲染，`{{.Server.Version}}` 里的
+	// 行首 `.` 不是合法 Jinja 表达式，ansible 会直接报
+	//   template error while templating string: unexpected '.'.
+	// 因此这里用 `command -v` 取绝对路径（systemd 单元的 ExecStart 必须是绝对路径），
+	// 再用不带格式串的 `docker version` 校验守护进程可用性——输出更全，且没有模板歧义。
+	b.WriteString("    - name: 校验目标机器已安装 docker\n")
+	// 必须用 shell 模块：`command -v` 是 shell 内建命令，而 ansible.builtin.command
+	// 不经 shell 执行（直接 execvp），会以 "No such file or directory: b'command'" 失败。
+	b.WriteString("      ansible.builtin.shell: command -v docker\n")
+	b.WriteString("      changed_when: false\n")
+	b.WriteString("      register: exporter_docker_bin\n")
+	b.WriteString("    - name: 校验 docker 守护进程可用\n")
+	b.WriteString("      ansible.builtin.command: docker version\n")
 	b.WriteString("      changed_when: false\n")
 	b.WriteString("    - name: 写入 Exporter 环境变量（含口令，权限 0600）\n")
 	b.WriteString("      ansible.builtin.copy:\n")
@@ -274,9 +286,9 @@ func writeBinaryTasks(b *strings.Builder, in remotePlaybookInput) {
 	b.WriteString("      changed_when: false\n")
 	b.WriteString("    - name: 归一化架构名（amd64 / arm64）\n")
 	b.WriteString("      ansible.builtin.set_fact:\n")
-	b.WriteString("        exporter_arch: >-\n")
-	b.WriteString("          {{ 'amd64' if exporter_uname.stdout | trim in ['x86_64','amd64'] " +
-		"else ('arm64' if exporter_uname.stdout | trim in ['aarch64','arm64'] else 'amd64') }}\n")
+	// 用引号包成单行标量并显式加括号：括号消除 `x | trim in [...]` 的优先级歧义，
+	// 引号避免 YAML 把行首 {{ 当 flow mapping（同 INC-005）。
+	b.WriteString("        exporter_arch: \"{{ 'arm64' if (exporter_uname.stdout | trim) in ['aarch64', 'arm64'] else 'amd64' }}\"\n")
 	b.WriteString("    - name: 创建安装目录\n")
 	b.WriteString("      ansible.builtin.file:\n")
 	b.WriteString("        path: " + yamlScalar(in.InstallDir) + "\n")
@@ -318,12 +330,25 @@ func writeBinaryTasks(b *strings.Builder, in remotePlaybookInput) {
 	b.WriteString("      ansible.builtin.copy:\n")
 	b.WriteString("        dest: " + yamlScalar(in.InstallDir+"/INSTALLED_FROM") + "\n")
 	b.WriteString("        mode: '0644'\n")
-	b.WriteString("        content: " + yamlScalar("url: "+url+"\nversion: "+version+"\n") + "\n")
+	// 必须用块标量：单引号包住多行文本时 YAML 会把换行折叠成空格，
+	// url 与 version 会挤成一行（url: … version: …），审计信息就废了。
+	b.WriteString("        content: |\n")
+	b.WriteString("          url: " + url + "\n")
+	b.WriteString("          version: " + version + "\n")
 }
 
 // dockerRunLine 生成 docker run 命令行（host 网络下端口即 Exporter 自身端口，无需 -p）。
 func dockerRunLine(in remotePlaybookInput) string {
-	line := "docker run -d --name {{ exporter_container }} --restart unless-stopped --network " + networkOrDefault(in.Network)
+	return dockerRunLineWith("docker", in)
+}
+
+// dockerRunLineWith 用指定的 docker 可执行文件生成 docker run 命令行。
+//
+// 为什么需要这个参数：systemd 单元的 ExecStart 必须是**绝对路径**，
+// 写裸 `docker` 时 systemd 会以 "Executable path is not absolute" 拒绝加载单元
+//（而在 shell 任务里用裸 `docker` 走 PATH 是正常的）。
+func dockerRunLineWith(bin string, in remotePlaybookInput) string {
+	line := bin + " run -d --name {{ exporter_container }} --restart unless-stopped --network " + networkOrDefault(in.Network)
 	line += hostModeDockerFlags(in)
 	if networkOrDefault(in.Network) != "host" {
 		line += " -p {{ exporter_port }}:" + strconv.Itoa(in.ContainerPort)
@@ -455,6 +480,9 @@ func releaseBinary(tpl Template) string {
 
 // systemdUnitLines 生成 systemd 单元内容（用容器承载，避免引入发行版相关的二进制打包）。
 func systemdUnitLines(in remotePlaybookInput) []string {
+	// Exec* 必须是绝对路径：用 playbook 里 `command -v docker` 注册到的实际路径，
+	// 而不是硬编码 /usr/bin/docker（docker 也可能装在 /usr/local/bin）。
+	dockerBin := "{{ exporter_docker_bin.stdout | trim }}"
 	return []string{
 		"[Unit]",
 		"Description=mwops exporter " + in.Name,
@@ -462,9 +490,9 @@ func systemdUnitLines(in remotePlaybookInput) []string {
 		"Requires=docker.service",
 		"[Service]",
 		"Restart=always",
-		"ExecStartPre=-/usr/bin/docker rm -f " + in.Container,
-		"ExecStart=" + strings.ReplaceAll(dockerRunLine(in), "{{ exporter_container }}", in.Container),
-		"ExecStop=/usr/bin/docker stop " + in.Container,
+		"ExecStartPre=-" + dockerBin + " rm -f " + in.Container,
+		"ExecStart=" + strings.ReplaceAll(dockerRunLineWith(dockerBin, in), "{{ exporter_container }}", in.Container),
+		"ExecStop=" + dockerBin + " stop " + in.Container,
 		"[Install]",
 		"WantedBy=multi-user.target",
 	}

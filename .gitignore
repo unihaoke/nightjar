@@ -8,6 +8,9 @@ middleware-ops/agent.yaml
 # 本地构建输出
 .build/
 
+# 渲染产物审计（go run ./cmd/renderdump 的输出，随时可重新生成）
+render-artifacts/
+
 # 前端
 middleware-ops-web/node_modules/
 middleware-ops-web/dist/

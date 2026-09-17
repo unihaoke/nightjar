@@ -5,6 +5,67 @@
 
 ---
 
+## INC-006 · docker 的 Go 模板串被 Ansible 当 Jinja 渲染，远程安装第一步即失败
+
+**首次暴露**：2026-09-18，修完 INC-005 重建镜像后，同一操作换了一种报错：
+
+```
+TASK [校验目标机器上的 Docker 可用] ***
+fatal: [203.195.191.75]: FAILED! => {"msg": "template error while templating string:
+  unexpected '.'. String: docker version --format '{{.Server.Version}}'. unexpected '.'"}
+```
+
+**定位过程**
+
+1. 好消息是 INC-005 已修好：这次是 `PLAY` / `TASK` 正常展开，说明 YAML 解析通过、
+   镜像也已重建——报错发生在**执行**阶段而不是加载阶段；
+2. 失败的第一个任务就是「校验目标机器上的 Docker 可用」，目标机的 SSH、sudo、Python
+   都还没被考验到；
+3. 报错句子本身给了答案：`template error while templating string`。
+   playbook 是 Ansible 的 Jinja 模板，**每个值**在交给模块前都会先渲染一遍；
+   `{{.Server.Version}}` 是 docker 的 **Go 模板**语法，行首的点号在 Jinja 里不是合法表达式
+   → `unexpected '.'`；
+4. YAML 层面它完全合法（`{{` 不在标量起始位置），PyYAML 实测也照过；
+   INC-005 新增的「渲染后自校验」因此抓不到它——**校验 YAML 合法 ≠ 校验 Jinja 合法**。
+
+**根因**
+
+渲染器把"给 docker 看的模板串"和"给 Ansible 看的模板串"混在了同一个字符串里。
+这类跨层字符串（YAML → Jinja → docker/Go 模板 → shell）每多一层就多一次转义语义，
+而当时的模板没有任何针对 Jinja 层的守卫。
+
+**修复**
+
+1. 该校验任务改为 `command -v docker` + 裸 `docker version`：既拿到绝对路径
+   （systemd 单元的 `ExecStart` 必须是绝对路径），又不再产生 `{{.`；
+   **注意必须用 `ansible.builtin.shell`**——`command -v` 是 shell 内建命令，而
+   `ansible.builtin.command` 不经 shell（直接 execvp），会以
+   `No such file or directory: b'command'` 失败；顺带把账号 SQL 里两处同样的
+   `command -v mysql` / `command -v docker` 探测一并改为 `shell`（它们在客户端缺失时
+   还会让注册变量没有 `rc`，后续 `when: account_client.rc != 0` 直接报"字典没有该属性"）；
+2. `playbook_validate.go` 增加 Jinja 层检查：扫描未被 `{% raw %}…{% endraw %}` 包裹的
+   `{{.X}}` 并报「第 N 行含 Go 模板语法」，渲染阶段就把问题挡在平台侧；
+3. 顺带修掉同一轮审计发现的两处相邻缺陷：
+   - `docker-systemd` 模式的 `ExecStart=docker run …` 用的是相对路径，
+     systemd 会以 "Executable path is not absolute" 拒绝加载单元 → 改用 `command -v` 的结果；
+   - `binary` 模式的 `INSTALLED_FROM` 用单引号包多行文本，YAML 会把换行**折叠成空格**
+     （PyYAML 实测：两行挤成 `url: … version: …`），改为块标量 `content: |`。
+
+**防复发**
+
+1. `TestRenderedPlaybooksHaveNoGoTemplate`：全组件 × 全安装方式扫描产物里的裸 `{{.`；
+2. `TestCommandModuleAvoidsShellFeatures`：断言 `ansible.builtin.command` 的值里不出现
+   shell 内建与 `|` `>` `;` `&&` 等元字符（[command 模块不经 shell](https://docs.ansible.com/ansible/latest/collections/ansible/builtin/command_module.html)）；
+3. `TestSystemdUnitUsesAbsoluteExecPath`：断言每个 `Exec*` 的首个 token 是绝对路径或解析出的变量；
+4. `TestPlaybookHasNoMultilineQuotedScalar`：断言引号标量都在同一行闭合（防 YAML 折叠）；
+5. `TestValidatePlaybookYAML` 增加 Go 模板样例（并断言 `{% raw %}` 包裹后可通过）；
+6. 以上守卫逐个用「注入原始缺陷」验证确实会红，不是空跑；
+7. 审计方法固化：渲染器单测只能证明"我们渲染得对"，证明不了"下游工具怎么读"。
+   本轮改用**下游解析器交叉验证**（PyYAML 复核全部产物）+ 人工逐行读渲染结果 +
+   查下游官方文档确认语义，一次性找出 4 个同类问题，详见 `deploy/ansible/README.md` §6.4。
+
+---
+
 ## INC-005 · 生成的 playbook 中裸 `{{ }}` 让远程安装整体失败，且报错与根因无关
 
 **首次暴露**：2026-09-18，在「集成中心」对 `jd-redis` 勾选「创建只读账号并拉起 Exporter」时报
@@ -249,3 +310,9 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
    渲染后先本地解析一遍，把「第几行、原文、为什么错」直接还给使用者（INC-005）。
    同时产物要写渲染器版本戳，否则「模板有缺陷」与「镜像/产物是旧的」无法区分——
    后者在现场排查中占了大半时间。
+6. **跨层字符串要逐层验证，测试要用下游的解析器**：playbook 同时被 YAML、Jinja、
+   docker/Go 模板、shell 四层解析，一层合法不代表下一层合法（INC-006：
+   YAML 合法的 `{{.Server.Version}}` 被 Jinja 拒绝）。只测"我渲染出的字符串对不对"
+   是自证；要拿**下游真正使用的解析器**复核（PyYAML/`--syntax-check`），
+   并至少在一个真机上跑通一次完整流程。INC-005 与 INC-006 是同一个缺陷的两次暴露，
+   说明当时只补了"这一行"而没补"这一类"。

@@ -99,6 +99,9 @@ INTEGRATION_ANSIBLE_BECOME=true
 ## 3. 目标机要求
 
 - 可通过 SSH 登录（口令或私钥），有 sudo 权限（`--become`，默认开）；
+- 目标机需有 **Python 3**：除 `command`/`shell`/`raw` 外，`copy`/`file`/`systemd`/`wait_for`
+  等模块都在目标机上以 Python 执行（`ansible_python_interpreter=auto_silent` 只是"找不到时不警告"，
+  并不会免掉这个依赖）。CentOS 7 自带的 python2 不满足新版 ansible-core，需装 `python3`；
 - `docker` / `docker-systemd` 安装方式：目标机需已安装 Docker（`docker version` 可用）；
   **`binary` 方式不需要目标机有 Docker**（下载官方 release 二进制 + 原生 systemd 服务）；
 - 建号/改号时：目标机需有 `mysql` / `psql` 客户端，或退回到它自己的 docker；
@@ -176,7 +179,7 @@ The error appears to be in '/app/data/integrations/ansible/<集成名>.yml': lin
 先确认**是哪一种**（这一步能省掉大量瞎猜）：
 
 ```bash
-# ① 跑的是哪一版渲染器？字段缺失或不是 mwops-playbook v2 → 后端镜像是旧的
+# ① 跑的是哪一版渲染器？字段缺失或低于代码里的 PlaybookRendererVersion（当前 v3）→ 后端镜像是旧的
 curl -s http://127.0.0.1:8080/healthz
 # ② 落盘的 playbook 第 3 行应带同一个版本戳
 docker exec mwops-backend sed -n '1,6p' /app/data/integrations/ansible/<集成名>.yml
@@ -188,7 +191,7 @@ docker exec mwops-backend sed -n '1,6p' /app/data/integrations/ansible/<集成�
   ```bash
   cd nightjar
   docker compose build backend && docker compose up -d backend
-  curl -s http://127.0.0.1:8080/healthz   # 应看到 "playbook_renderer": "mwops-playbook v2"
+  curl -s http://127.0.0.1:8080/healthz   # 应看到 "playbook_renderer": "mwops-playbook v3"
   ```
 
   然后在集成详情页点「重新应用」，重新生成并执行 playbook。
@@ -199,13 +202,68 @@ docker exec mwops-backend sed -n '1,6p' /app/data/integrations/ansible/<集成�
 > v2 渲染器起，平台在把 playbook 交给 `ansible-playbook` **之前**会自己用 YAML 解析器
 > 校验一遍（`internal/integration/playbook_validate.go`）：真出错时界面直接提示
 > 「第 N 行不是合法 YAML」，不会再抛 ansible 那句 unhashable type。
-> 因此**只要还看到这个原始报错，就说明跑的不是 v2 渲染器，即镜像未重建**。
+> 因此**只要还看到这个原始报错，就说明跑的不是 v2 及以后的渲染器，即镜像未重建**。
 
-### 6.2 重建后仍未生效的常见原因
+### 6.2 `template error while templating string: unexpected '.'`
+
+完整报错形如（`exit status 2`）：
+
+```
+TASK [校验目标机器上的 Docker 可用] ***
+fatal: [203.195.191.75]: FAILED! => {"msg": "template error while templating string:
+  unexpected '.'. String: docker version --format '{{.Server.Version}}'. unexpected '.'"}
+```
+
+这条**不是**目标机的问题：playbook 里出现的 `{{.Server.Version}}` 是 **docker 的 Go 模板**
+语法，而 playbook 里所有 `{{ }}` 都会**先被 Ansible 当 Jinja 表达式渲染**，
+行首的点号在 Jinja 里非法，于是第一个任务（校验 Docker）就直接失败，
+后面的建号与安装一步都没跑。
+
+- 现象：报错里出现 `template error while templating string`、`unexpected '.'`；
+- 处理：属平台模板缺陷（INC-006）。v3 渲染器起已改为 `command -v docker` + 裸 `docker version`
+  （不再用 `--format`），并在渲染后自校验——真出错时界面提示「第 N 行含 Go 模板语法」。
+  与 6.1 一样，先 `curl /healthz` 确认 `playbook_renderer` 是否已是最新（`mwops-playbook v3`）。
+
+在目标机上复现同类问题的通用判据：playbook 里**任何一个** `{{ … }}` 都会被 Ansible 渲染，
+所以只能写 Jinja 表达式；要保留字面量 `{{ }}`（如 docker/Go 模板串）必须用
+`{% raw %}…{% endraw %}` 包裹。
+
+同一类"跨层语义"的坑还有两个，遇到时先怀疑它们：
+
+| 现象 | 原因 | 正确写法 |
+|------|------|----------|
+| `No such file or directory: b'command'` | `ansible.builtin.command` **不经 shell**，`command -v` 是 shell 内建 | 探测用 `ansible.builtin.shell: command -v xxx` |
+| `Executable path is not absolute` | systemd 单元的 `ExecStart` 不接受裸 `docker` | 用 `command -v docker` 解析出的绝对路径 |
+| `内容本该两行却挤成一行` | YAML 把多行**引号**标量折叠成空格 | 多行内容用块标量 `content: \|` |
+
+### 6.3 重建后仍未生效的常见原因
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `docker compose up -d` 后行为没变 | 该命令不重建镜像 | 用 `docker compose build backend` 或 `up -d --build backend` |
 | 构建很快但代码没变 | 构建上下文不是当前工作区（换了目录/机器） | `docker compose build --progress=plain backend` 看 `COPY` 的源；确认 `docker compose config \| grep context` |
 | 改了 `.env` 没生效 | 环境变量在容器创建时注入 | `docker compose up -d --force-recreate backend` |
+
+### 6.4 怀疑产物本身有问题时
+
+平台内部的渲染后自校验用的是 Go 的 YAML 解析器，而 ansible 用的是 PyYAML（同族、不同实现），
+所以怀疑产物时可以**用下游的解析器复核**。仓库里带了工具，不需要连任何主机：
+
+```bash
+cd middleware-ops
+go run ./cmd/renderdump ../render-artifacts      # 渲染全部组件 × 全部安装方式的产物
+cd ..
+python3 deploy/ansible/tools/check_artifacts.py ./render-artifacts   # 用 PyYAML 逐个复核
+```
+
+产物里的口令都是 `${MONITOR_PASSWORD}` 占位（渲染器只输出脱敏版本），可安全留存与比对。
+在真机上进一步验证：
+
+```bash
+ansible-playbook --syntax-check -i <inventory> <playbook>
+```
+
+> 这套流程是 INC-006 之后固化下来的：渲染器单测只能证明「我们渲染得对不对」，
+> 证明不了「下游工具怎么读」——playbook 要同时穿过 YAML → Jinja → docker/Go 模板 → shell
+> 四层，本轮 4 个缺陷全是在下游那一侧暴露的。
 

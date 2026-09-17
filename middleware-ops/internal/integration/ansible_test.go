@@ -410,6 +410,170 @@ func TestRemoteBridgeModeAddsPortMapping(t *testing.T) {
 	}
 }
 
+// remoteInstanceFor 按组件类型构造一个合法的远程实例（各模板对账号的要求不同）。
+func remoteInstanceFor(t *testing.T, mwType string) Instance {
+	t.Helper()
+	tpl, ok := TemplateOf(mwType)
+	if !ok {
+		t.Fatalf("模板缺失：%s", mwType)
+	}
+	address, err := ParseAddress("10.0.0.31:9100", tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+	if err != nil {
+		t.Fatalf("地址解析失败：%v", err)
+	}
+	return Instance{
+		Name: mwType + "-01", MWType: mwType, Address: address,
+		Username: "mwops_exporter", Password: "pw", Environment: "dev",
+	}
+}
+
+// TestRenderedPlaybooksHaveNoGoTemplate 锁定：产物里不得出现未转义的 Go 模板语法。
+//
+// 真实故障 INC-006：模板里写了 `docker version --format '{{.Server.Version}}'`——
+// YAML 合法、ansible 能解析，但模板渲染阶段把 `{{.` 当 Jinja 表达式，
+// 直接报 `template error while templating string: unexpected '.'`，
+// 「校验 Docker 可用」这一步就挂了，后面的建号与安装一步没跑。
+func TestRenderedPlaybooksHaveNoGoTemplate(t *testing.T) {
+	for _, mwType := range []string{TypeRedis, TypeMySQL, TypeNode} {
+		tpl, _ := TemplateOf(mwType)
+		for _, mode := range []string{InstallModeDocker, InstallModeDockerSystemd, InstallModeBinary} {
+			opts := remoteTestOptions()
+			opts.InstallMode = mode
+			art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, mwType), opts)
+			if err != nil {
+				t.Fatalf("%s/%s 渲染失败：%v", mwType, mode, err)
+			}
+			for i, line := range strings.Split(art.Playbook, "\n") {
+				if strings.Contains(line, "{{.") || strings.Contains(line, "{{ .") {
+					t.Fatalf("%s/%s 第 %d 行含 Go 模板语法（会被 Ansible 当 Jinja 渲染而报错）：%s",
+						mwType, mode, i+1, strings.TrimSpace(line))
+				}
+			}
+		}
+	}
+}
+
+// TestSystemdUnitUsesAbsoluteExecPath 锁定 systemd 单元的 Exec* 必须是绝对路径。
+//
+// systemd 拒绝加载 ExecStart=docker run …（"Executable path is not absolute"），
+// 因此模板改用 `command -v docker` 注册到的实际路径 `{{ exporter_docker_bin.stdout | trim }}`。
+func TestSystemdUnitUsesAbsoluteExecPath(t *testing.T) {
+	tpl, _ := TemplateOf(TypeRedis)
+	opts := remoteTestOptions()
+	opts.InstallMode = InstallModeDockerSystemd
+	art, err := RenderRemoteInstall(tpl, remoteTestInstance(t), opts)
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	if !strings.Contains(art.Playbook, "command -v docker") {
+		t.Fatalf("应先解析 docker 绝对路径：\n%s", art.Playbook)
+	}
+	execs := 0
+	for _, line := range strings.Split(art.Playbook, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "Exec") {
+			continue
+		}
+		execs++
+		value := trimmed[strings.Index(trimmed, "=")+1:]
+		value = strings.TrimPrefix(value, "-") // ExecStartPre=-/path 表示忽略失败
+		first := strings.SplitN(strings.TrimSpace(value), " ", 2)[0]
+		if !strings.HasPrefix(first, "/") && !strings.HasPrefix(first, "{{") {
+			t.Fatalf("Exec* 首个 token 必须是绝对路径或解析出的变量，实际是 %q：\n%s", first, art.Playbook)
+		}
+	}
+	if execs < 3 {
+		t.Fatalf("应生成 ExecStartPre/ExecStart/ExecStop 三条，实际 %d：\n%s", execs, art.Playbook)
+	}
+}
+
+// TestPlaybookHasNoMultilineQuotedScalar 锁定：产物里不得用引号包住多行值。
+//
+// YAML 会把多行引号标量里的换行**折叠成空格**，于是
+// `content: 'url: …\nversion: …'` 写进目标机就变成挤在一行（PyYAML 实测确认），
+// 审计信息直接失真。多行内容必须用块标量（`content: |`）。
+func TestPlaybookHasNoMultilineQuotedScalar(t *testing.T) {
+	for _, mode := range []string{InstallModeDocker, InstallModeDockerSystemd, InstallModeBinary} {
+		tpl, _ := TemplateOf(TypeNode)
+		opts := remoteTestOptions()
+		opts.InstallMode = mode
+		art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, TypeNode), opts)
+		if err != nil {
+			t.Fatalf("%s 渲染失败：%v", mode, err)
+		}
+		for i, line := range strings.Split(art.Playbook, "\n") {
+			idx := strings.Index(line, ": ")
+			if idx < 0 {
+				continue
+			}
+			value := strings.TrimSpace(line[idx+2:])
+			if value == "" || (value[0] != '\'' && value[0] != '"') {
+				continue
+			}
+			if !strings.Contains(value[1:], string(value[0])) {
+				t.Fatalf("%s 第 %d 行：引号标量未在同一行闭合，YAML 会把换行折叠成空格：%s",
+					mode, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+// TestCommandModuleAvoidsShellFeatures 锁定：ansible.builtin.command 只用于真正的可执行文件。
+//
+// ansible.builtin.command **不经 shell** 执行（直接 execvp），因此
+//   - shell 内建（`command -v`、`cd`、`source`）会以 "No such file or directory: b'command'" 失败；
+//   - 管道/重定向/`;`/`&&` 会被当成普通参数传给程序（`>` 变成字面量）。
+// 需要这些能力必须用 ansible.builtin.shell。
+func TestCommandModuleAvoidsShellFeatures(t *testing.T) {
+	const prefix = "ansible.builtin.command:"
+	shellBuiltins := []string{"command ", "cd ", "source ", "export ", ". ", "eval ", "exec ", "command -v"}
+	metachars := []string{"|", ">", "<", ";", "&&", "||", "$("}
+	for _, mwType := range []string{TypeRedis, TypeMySQL, TypeNode} {
+		tpl, _ := TemplateOf(mwType)
+		for _, mode := range []string{InstallModeDocker, InstallModeDockerSystemd, InstallModeBinary} {
+			opts := remoteTestOptions()
+			opts.InstallMode = mode
+			art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, mwType), opts)
+			if err != nil {
+				t.Fatalf("%s/%s 渲染失败：%v", mwType, mode, err)
+			}
+			for i, line := range strings.Split(art.Playbook, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if !strings.HasPrefix(trimmed, prefix) {
+					continue
+				}
+				value := strings.TrimSpace(trimmed[len(prefix):])
+				for _, builtin := range shellBuiltins {
+					if strings.HasPrefix(value, builtin) {
+						t.Fatalf("%s/%s 第 %d 行：command 模块不能用 shell 内建（%q），请改用 shell 模块：%s",
+							mwType, mode, i+1, builtin, trimmed)
+					}
+				}
+				for _, meta := range metachars {
+					if strings.Contains(value, meta) {
+						t.Fatalf("%s/%s 第 %d 行：command 模块不解析 %q（不经 shell），请改用 shell 模块：%s",
+							mwType, mode, i+1, meta, trimmed)
+					}
+				}
+			}
+		}
+	}
+
+	// 客户端探测依赖 shell 内建，必须是 shell 模块。
+	accountArt, err := RenderAccountSQL(AccountSQLRequest{
+		Name: "acct", MWType: TypeMySQL, DBHost: "127.0.0.1", DBPort: 3306,
+		ExecUser: "root", ExecPassword: "pw", Statements: []string{"SELECT 1"},
+	})
+	if err != nil {
+		t.Fatalf("账号 playbook 渲染失败：%v", err)
+	}
+	if !strings.Contains(accountArt.Playbook, "ansible.builtin.shell: command -v mysql") {
+		t.Fatalf("探测客户端必须用 shell 模块：\n%s", accountArt.Playbook)
+	}
+	if strings.Contains(accountArt.Playbook, "ansible.builtin.command: command -v") {
+		t.Fatalf("command 模块不能用 shell 内建 command -v：\n%s", accountArt.Playbook)
+	}
+}
+
 // TestValidatePlaybookYAML 锁定运行时自校验（INC-005 的第二道防线）。
 //
 // 回归测试只能守住"当前模板"；渲染器还要在执行前自己解析一遍，
@@ -451,6 +615,22 @@ func TestValidatePlaybookYAML(t *testing.T) {
 	// 其它结构性错误交给真正的 YAML 解析器兜住。
 	if err := validatePlaybookYAML("远程安装", "key: [unclosed\n"); err == nil {
 		t.Fatal("非法 YAML 结构应被解析器拦下")
+	}
+
+	// Go 模板语法必须被拦下（INC-006）：YAML 合法，但会被 Ansible 当 Jinja 渲染而报错。
+	goTpl := "- name: 安装\n  hosts: all\n  tasks:\n    - name: 校验 docker\n" +
+		"      ansible.builtin.command: docker version --format '{{.Server.Version}}'\n"
+	goErr := validatePlaybookYAML("远程安装", goTpl)
+	if goErr == nil {
+		t.Fatal("Go 模板语法 {{.X}} 必须被拦下，否则 Ansible 报 unexpected '.'")
+	}
+	if !strings.Contains(goErr.Error(), "第 5 行") || !strings.Contains(goErr.Error(), "Jinja") {
+		t.Fatalf("错误信息应给出行号并说明会被当 Jinja 渲染：%v", goErr)
+	}
+	// 用 {% raw %} 包裹是合法写法，不得误报。
+	raw := strings.Replace(goTpl, "'{{.Server.Version}}'", "'{% raw %}{{.Server.Version}}{% endraw %}'", 1)
+	if err := validatePlaybookYAML("远程安装", raw); err != nil {
+		t.Fatalf("{%% raw %%} 包裹后应通过：%v", err)
 	}
 }
 
