@@ -560,8 +560,13 @@ func renderInventory(host string, opts RemoteOptions, password string) string {
 		b.WriteString(" ansible_ssh_private_key_file=" + opts.SSHKeyFile)
 	} else if password != "" {
 		b.WriteString(" ansible_password=" + password)
+		// become 口令与 SSH 口令同源：登录用户就是 root 时 sudo 用不到它，
+		// 但登录普通用户 + sudo 需要密码时，缺这一项 ansible 会直接报 "Missing sudo password"。
+		// 展示用版本（password 为空）不写，避免把口令带到界面/日志。
+		b.WriteString(" ansible_become_password=" + password)
 	} else {
 		b.WriteString(" ansible_password=${SSH_PASSWORD}")
+		b.WriteString(" ansible_become_password=${SSH_PASSWORD}")
 	}
 	b.WriteString("\n[exporter_target:vars]\nansible_python_interpreter=auto_silent\n")
 	return b.String()

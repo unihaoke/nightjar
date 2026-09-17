@@ -21,6 +21,7 @@ import (
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/db"
 	"middleware-ops/internal/engine"
+	"middleware-ops/internal/integration"
 	"middleware-ops/internal/logger"
 	"middleware-ops/internal/monitor"
 	"middleware-ops/internal/pkg/cache"
@@ -73,7 +74,10 @@ func run(configPath string) error {
 	log.Info("中间件智能问题解决平台启动中",
 		zap.String("version", version),
 		zap.String("mode", cfg.App.Mode),
-		zap.String("config", configPath))
+		zap.String("config", configPath),
+		// 渲染器版本写进启动日志：远程安装报 YAML/Jinja 类错误时，
+		// 先看这一行就能判断「平台模板有缺陷」还是「镜像没重建、仍在跑旧代码」（INC-005/006）。
+		zap.String("playbook_renderer", integration.PlaybookRendererVersion))
 
 	// 数据库
 	gdb, err := db.New(cfg, &db.Logger{SQLVerbose: cfg.App.Mode == "debug"})

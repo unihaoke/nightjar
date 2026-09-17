@@ -5,6 +5,56 @@
 
 ---
 
+## INC-007 · 平台镜像缺 sshpass，口令方式的远程安装卡在连接阶段
+
+**首次暴露**：2026-09-18，修完 INC-005/006 并重建镜像后，同一操作第三次报错（这次已经能连到目标机）：
+
+```
+fatal: [203.195.191.75]: FAILED! => {"msg": "to use the 'ssh' connection type with
+  passwords or pkcs11_provider, you must install the sshpass program"}
+```
+
+**定位过程**
+
+1. 报错阶段变了：playbook 渲染通过、`TASK` 正常展开、开始建连——说明前两轮的修复已生效，
+   问题换到了下一层；
+2. 主语是谁？这句话里没有"目标机"：`ansible` 的 ssh 连接插件（`ansible.builtin.ssh`）
+   本身不实现认证，它调用 **OpenSSH**，而 OpenSSH 不接受命令行口令，
+   必须由 `sshpass` 代答——**缺的是平台容器里的程序**；
+3. 平台镜像 `WITH_ANSIBLE=true` 只装了 `ansible`，Alpine 的 `ansible` 包并不拉 `sshpass`
+   （也没有 `openssh-client` 依赖保证），于是"默认开箱可用"的承诺在口令认证下不成立；
+4. sshpass 在 Alpine 3.20 的 **main** 仓库（不是 community），镜像里 main+community 都已配置，
+   因此 `apk add sshpass` 可直接装上。
+
+**根因**
+
+Dockerfile 把"装 ansible"等同于"能远程安装"，漏掉了 ssh 认证链路上的外部依赖；
+而平台在凭据层允许"用户名 + 口令"这种默认用法，两者不匹配。
+
+**修复**
+
+1. Dockerfile：`apk add --no-cache ansible openssh-client sshpass`，
+   并在构建期校验 `ansible-playbook` / `ssh` / `sshpass` 都存在（装不上就让构建失败）；
+2. `remote.go` 增加前置检查 `checkSSHPass`：口令认证且平台无 sshpass 时，**执行前**就返回
+   「平台容器内缺少 sshpass…① 重建镜像 ② 改用私钥认证」，不再把 ansible 原话抛给使用者；
+3. inventory 现在同时写 `ansible_become_password`（与 SSH 口令同源）：
+   登录普通用户 + sudo 需要密码时，缺它会报 `Missing sudo password`，属于同一条链路上的坑；
+4. `/healthz` 暴露 `sshpass: true|false`，排障脚本与使用者都能一眼判断镜像能力
+   （它与"镜像新旧"无关：同一版渲染器可能来自装了 sshpass 的新镜像）。
+
+**防复发**
+
+1. `internal/service/remote_sshpass_test.go`：用替身 `lookPath` 覆盖三种情形——
+   口令认证缺 sshpass 必须拦下且提示包含两条出路、私钥认证不得因此被拦（且不该去查 sshpass）、
+   有 sshpass 时放行；断言错误信息不回显口令；
+2. `TestRemotePlaybookNeverContainsSecrets` 增加 `ansible_become_password` 断言，
+   并继续保证展示版 inventory 里没有明文；
+3. `deploy/ansible/tools/check-backend-freshness.sh` 增加 `ssh` / `sshpass` 与 `/healthz` 能力位检查；
+4. 文档：README §3 明确"平台侧靠 sshpass 支撑口令认证"，§6.3 给出该报错的两种解法
+   （**改用私钥可立即绕过，无需重建**）。
+
+---
+
 ## INC-006 · docker 的 Go 模板串被 Ansible 当 Jinja 渲染，远程安装第一步即失败
 
 **首次暴露**：2026-09-18，修完 INC-005 重建镜像后，同一操作换了一种报错：
@@ -316,3 +366,7 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
    是自证；要拿**下游真正使用的解析器**复核（PyYAML/`--syntax-check`），
    并至少在一个真机上跑通一次完整流程。INC-005 与 INC-006 是同一个缺陷的两次暴露，
    说明当时只补了"这一行"而没补"这一类"。
+7. **"装了工具"不等于"链路可用"**：外部能力（ansible、docker、systemd）都有一条依赖链，
+   链上任意一环缺失都会在**最远端**以一句与使用者无关的报错暴露（INC-007：装了 ansible
+   但没装 sshpass，口令认证直接不可用）。做法有两条：构建期把链上关键程序都校验一遍
+   （`command -v ssh sshpass`），运行期在**动手之前**做前置检查并把两条出路写进错误信息。

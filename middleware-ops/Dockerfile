@@ -78,8 +78,9 @@ RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}
     printf '%s\n' "${BASE}/v${ALPINE_VERSION}/main" "${BASE}/v${ALPINE_VERSION}/community" > /etc/apk/repositories && \
     apk add --no-cache ca-certificates tzdata curl && \
     if [ "$WITH_ANSIBLE" = "true" ]; then \
-      apk add --no-cache ansible && \
-      ansible-playbook --version >/dev/null; \
+      apk add --no-cache ansible openssh-client sshpass && \
+      ansible-playbook --version >/dev/null && \
+      command -v ssh >/dev/null && command -v sshpass >/dev/null; \
     fi
 
 RUN addgroup -S mwops && adduser -S -G mwops mwops && \

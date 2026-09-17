@@ -62,6 +62,43 @@ func (s *IntegrationService) remoteReady() error {
 	return nil
 }
 
+// lookPath 是 exec.LookPath 的替身点（便于测试"平台缺 sshpass"这条分支）。
+var lookPath = exec.LookPath
+
+// checkSSHPass 校验平台侧具备"用口令 SSH 登录"的能力。
+//
+// 为什么需要这个前置检查：ansible 的 ssh 连接插件本身不实现认证，它把口令交给
+// OpenSSH，而 OpenSSH 不接受命令行口令——必须由 sshpass 代答。镜像里缺 sshpass 时
+// ansible 只在执行阶段抛一句
+//
+//	to use the 'ssh' connection type with passwords or pkcs11_provider,
+//	you must install the sshpass program
+//
+// 这句话既没提"平台"，也没告诉使用者该怎么办（真实故障 INC-007）。
+// 私钥认证不经过 sshpass，因此只在口径令认证时检查。
+func (s *IntegrationService) checkSSHPass(creds RemoteCreds) error {
+	if strings.TrimSpace(creds.Password) == "" {
+		return nil
+	}
+	if _, err := lookPath("sshpass"); err != nil {
+		return fmt.Errorf("平台容器内缺少 sshpass，无法用「SSH 口令」登录目标机。两种解法：" +
+			"① 重建平台镜像（WITH_ANSIBLE=true 会一并安装 sshpass 与 openssh-client）：" +
+			"docker compose build backend && docker compose up -d backend；" +
+			"② 或改用「SSH 私钥」认证——私钥路径不依赖 sshpass，当前镜像即可执行")
+	}
+	return nil
+}
+
+// SSHPassAvailable 报告平台容器内是否具备 sshpass。
+//
+// /healthz 与 deploy/ansible/tools/check-backend-freshness.sh 用它判断镜像能力：
+// 口令方式远程安装要求平台侧有 sshpass，而这与"镜像新旧"无关（同一版渲染器
+// 可能来自装了 sshpass 的新镜像，也可能来自没装它的旧镜像）。
+func SSHPassAvailable() bool {
+	_, err := lookPath("sshpass")
+	return err == nil
+}
+
 // deployRemote 渲染并执行远程安装。
 //
 // 返回 nil 表示安装命令成功且端口可达；否则返回可读原因（会被写进集成备注与待处理）。
@@ -100,6 +137,9 @@ func (s *IntegrationService) deployRemote(
 	if !creds.provided() {
 		return fmt.Errorf("远程安装需要 SSH 凭据（用户名 + 口令或私钥）：编辑该集成并填写后保存。" +
 			"凭据只在本次请求中使用、不落库，因此「重新应用」无法复用上一次的凭据")
+	}
+	if err := s.checkSSHPass(creds); err != nil {
+		return err
 	}
 
 	// 渲染产物
@@ -217,6 +257,9 @@ func (s *IntegrationService) accountSQLRemote(
 	if !creds.provided() {
 		return "", fmt.Errorf("远程建号/改号需要在目标机上执行 SQL，但本次没有 SSH 凭据：" +
 			"请在集成表单里填写 SSH 用户名与口令后重新保存（凭据不落库，因此「重新应用」无法复用）")
+	}
+	if err := s.checkSSHPass(creds); err != nil {
+		return "", err
 	}
 	host := strings.TrimSpace(creds.Host)
 	if host == "" {

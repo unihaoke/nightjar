@@ -70,9 +70,10 @@ func (h *Handler) SystemInfo(c *gin.Context) {
 
 // Health 健康检查（无需认证）。
 //
-// playbook_renderer 是「远程安装 playbook 渲染器」的版本号：远程安装报 YAML 语法错时，
+// playbook_renderer 是「远程安装 playbook 渲染器」的版本号：远程安装报 YAML/Jinja 语法错时，
 // 先 curl 这个端点即可判断跑的是不是旧镜像（字段缺失或版本低于代码里的常量
-// 就说明后端镜像没重建，见 docs/POSTMORTEM.md INC-005）。
+// 就说明后端镜像没重建，见 docs/POSTMORTEM.md INC-005/INC-006）。
+// sshpass 是平台侧"能否用口令 SSH 登录目标机"的能力位（INC-007）。
 func (h *Handler) Health(c *gin.Context) {
 	response.OK(c, gin.H{
 		"status":            "healthy",
@@ -80,6 +81,9 @@ func (h *Handler) Health(c *gin.Context) {
 		"uptime":            nowUnix() - h.deps.StartedAt,
 		"engine":            service.WatchEngineStatus(h.deps.Engine),
 		"playbook_renderer": integration.PlaybookRendererVersion,
+		// 口令方式远程安装依赖平台侧的 sshpass：这里直接暴露探测结果，
+		// 排障时一眼看出是"镜像旧"还是"镜像没装 sshpass"（见 INC-007）。
+		"sshpass": service.SSHPassAvailable(),
 	})
 }
 

@@ -99,6 +99,8 @@ INTEGRATION_ANSIBLE_BECOME=true
 ## 3. 目标机要求
 
 - 可通过 SSH 登录（口令或私钥），有 sudo 权限（`--become`，默认开）；
+- **平台侧**（不是目标机）用口令认证时依赖 `sshpass`：镜像默认已装（`WITH_ANSIBLE=true`），
+  自建镜像请确保包含它，否则报 §6.3 那句 `you must install the sshpass program`；
 - 目标机需有 **Python 3**：除 `command`/`shell`/`raw` 外，`copy`/`file`/`systemd`/`wait_for`
   等模块都在目标机上以 Python 执行（`ansible_python_interpreter=auto_silent` 只是"找不到时不警告"，
   并不会免掉这个依赖）。CentOS 7 自带的 python2 不满足新版 ansible-core，需装 `python3`；
@@ -236,7 +238,39 @@ fatal: [203.195.191.75]: FAILED! => {"msg": "template error while templating str
 | `Executable path is not absolute` | systemd 单元的 `ExecStart` 不接受裸 `docker` | 用 `command -v docker` 解析出的绝对路径 |
 | `内容本该两行却挤成一行` | YAML 把多行**引号**标量折叠成空格 | 多行内容用块标量 `content: \|` |
 
-### 6.3 重建后仍未生效的常见原因
+### 6.3 `you must install the sshpass program`
+
+完整报错形如：
+
+```
+fatal: [203.195.191.75]: FAILED! => {"msg": "to use the 'ssh' connection type with
+  passwords or pkcs11_provider, you must install the sshpass program"}
+```
+
+这条报错说的是**平台容器**，不是目标机：ansible 的 ssh 连接插件不自己实现认证，
+它把口令交给 OpenSSH，而 OpenSSH **不接受命令行口令**，必须由 `sshpass` 代答。
+镜像里缺 `sshpass` 时，连接阶段直接失败——注意此时 playbook 已经渲染成功、
+SSH 也已经连过（失败发生在认证），跟"模板对不对"无关。
+
+```bash
+# 平台侧自查（两条都应输出路径）
+docker exec mwops-backend sh -c 'command -v ssh; command -v sshpass'
+curl -s http://127.0.0.1:8080/healthz   # 应包含 "sshpass":true
+```
+
+两条出路：
+
+| 方案 | 适用 | 做法 |
+|------|------|------|
+| 改用「SSH 私钥」认证 | 想立刻跑通，**不需要重建镜像** | 集成表单的凭据方式选「私钥」，粘贴目标机的私钥 |
+| 重建镜像 | 想继续用口令 | `docker compose build backend && docker compose up -d backend`（`WITH_ANSIBLE=true` 会一并安装 `sshpass` 与 `openssh-client`，构建期校验存在） |
+
+> v3 起平台会在**执行前**自己检查：口令认证 + 平台无 `sshpass` → 直接返回
+> 「平台容器内缺少 sshpass…① 重建镜像 ② 改用私钥」，不再把 ansible 的原话丢给使用者（INC-007）。
+> 另外 inventory 现在会同时写 `ansible_become_password`：登录普通用户且 sudo 需要密码时，
+> 缺这一项会报 `Missing sudo password`。
+
+### 6.4 重建后仍未生效的常见原因
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
@@ -244,7 +278,7 @@ fatal: [203.195.191.75]: FAILED! => {"msg": "template error while templating str
 | 构建很快但代码没变 | 构建上下文不是当前工作区（换了目录/机器） | `docker compose build --progress=plain backend` 看 `COPY` 的源；确认 `docker compose config \| grep context` |
 | 改了 `.env` 没生效 | 环境变量在容器创建时注入 | `docker compose up -d --force-recreate backend` |
 
-### 6.4 怀疑产物本身有问题时
+### 6.5 怀疑产物本身有问题时
 
 平台内部的渲染后自校验用的是 Go 的 YAML 解析器，而 ansible 用的是 PyYAML（同族、不同实现），
 所以怀疑产物时可以**用下游的解析器复核**。仓库里带了工具，不需要连任何主机：

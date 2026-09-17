@@ -59,6 +59,10 @@ func TestRemotePlaybookNeverContainsSecrets(t *testing.T) {
 	if !strings.Contains(art.Inventory, "ansible_password=ssh-secret") {
 		t.Fatalf("inventory 应包含 SSH 口令：%s", art.Inventory)
 	}
+	// sudo 需要密码时（登录普通用户），缺 become 口令会报 "Missing sudo password"。
+	if !strings.Contains(art.Inventory, "ansible_become_password=ssh-secret") {
+		t.Fatalf("inventory 应为 sudo 提供 become 口令：%s", art.Inventory)
+	}
 	// 展示版必须是占位符。
 	if !strings.Contains(art.MaskedInventory, "${SSH_PASSWORD}") {
 		t.Fatalf("展示用 inventory 应使用占位符：%s", art.MaskedInventory)
