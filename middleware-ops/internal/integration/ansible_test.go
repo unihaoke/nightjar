@@ -97,8 +97,12 @@ func TestRemoteTargetUsesHostPortAndNetworkMode(t *testing.T) {
 	}
 }
 
-// TestRemoteEnvFileEscapesQuotes 锁定：含单引号/空格的口令必须被安全转义，
-// 否则写进目标机的 env 文件会破坏内容甚至形成命令注入。
+// TestRemoteEnvFileEscapesQuotes 锁定：含单引号/空格的口令**原样**写进 env 文件。
+//
+// 这里曾经做 shell 引号转义（按 shell 习惯给含特殊字符的值加引号），
+// 但 env 文件的两个消费者都不经 shell
+// （docker `--env-file`、systemd `EnvironmentFile=`），转义符会变成口令的一部分
+// → Exporter 认证失败。正确做法是原样落盘，只处理换行（多行值两者都无法表示）。
 func TestRemoteEnvFileEscapesQuotes(t *testing.T) {
 	tpl, _ := TemplateOf(TypeRedis)
 	in := remoteTestInstance(t)
@@ -107,14 +111,26 @@ func TestRemoteEnvFileEscapesQuotes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("渲染失败：%v", err)
 	}
-	if !strings.Contains(art.VarsFile, `'\''`) {
-		t.Fatalf("单引号应被转义：%s", art.VarsFile)
+	if strings.Contains(art.VarsFile, `'\''`) {
+		t.Fatalf("不得做 shell 转义（转义符会进口令）：%s", art.VarsFile)
 	}
-	// 转义后不能出现"裸的"单引号结尾导致内容逃逸：整行必须仍是以成对引号包裹的赋值。
+	var got string
 	for _, line := range strings.Split(art.VarsFile, "\n") {
-		if strings.HasPrefix(line, "  REDIS_PASSWORD=") && !strings.HasPrefix(line, "  REDIS_PASSWORD='") {
-			t.Fatalf("口令赋值必须整体加引号：%s", line)
+		if strings.HasPrefix(line, "  REDIS_PASSWORD=") {
+			got = strings.TrimPrefix(line, "  ")
 		}
+	}
+	if want := `REDIS_PASSWORD=p'w d"x`; got != want {
+		t.Fatalf("口令应原样写入：want %q, got %q\n%s", want, got, art.VarsFile)
+	}
+	// 换行会让 env 文件结构失效，必须被替换掉。
+	in.Password = "line1\nline2"
+	art, err = RenderRemoteInstall(tpl, in, remoteTestOptions())
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	if strings.Contains(art.VarsFile, "line1\nline2") {
+		t.Fatalf("值内的换行必须被处理：\n%s", art.VarsFile)
 	}
 }
 
@@ -576,6 +592,135 @@ func TestCommandModuleAvoidsShellFeatures(t *testing.T) {
 	if strings.Contains(accountArt.Playbook, "ansible.builtin.command: command -v") {
 		t.Fatalf("command 模块不能用 shell 内建 command -v：\n%s", accountArt.Playbook)
 	}
+}
+
+// TestRemotePlaybookPreparesConfigDir 锁定：写 env 文件之前必须先建好配置目录。
+//
+// 真实故障 INC-008：docker 模式没有创建 <安装目录>，写 env 的 copy 任务直接失败，
+// 而该任务带 no_log，使用者只看到一行 censored，完全无法定位。
+func TestRemotePlaybookPreparesConfigDir(t *testing.T) {
+	for _, mode := range []string{InstallModeDocker, InstallModeDockerSystemd, InstallModeBinary} {
+		tpl, _ := TemplateOf(TypeNode)
+		opts := remoteTestOptions()
+		opts.InstallMode = mode
+		art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, TypeNode), opts)
+		if err != nil {
+			t.Fatalf("%s 渲染失败：%v", mode, err)
+		}
+		dirAt := strings.Index(art.Playbook, "准备 Exporter 配置目录")
+		envAt := strings.Index(art.Playbook, "写入 Exporter 环境变量")
+		if dirAt < 0 {
+			t.Fatalf("%s 模式应先创建配置目录：\n%s", mode, art.Playbook)
+		}
+		if dirAt > envAt {
+			t.Fatalf("%s 模式的目录创建必须在写入 env 之前：\n%s", mode, art.Playbook)
+		}
+		if n := strings.Count(art.Playbook, "state: directory"); n != 1 {
+			t.Fatalf("%s 模式的目录创建任务应恰好一条，实际 %d 条：\n%s", mode, n, art.Playbook)
+		}
+	}
+}
+
+// TestEnvFileIsNotShellQuoted 锁定：env 文件的值不做 shell 引号转义。
+//
+// 该文件由 docker `--env-file` 与 systemd `EnvironmentFile=` 消费，两者都不经 shell：
+// 引号会被当成值的一部分。Postgres 的 DATA_SOURCE_NAME 含 ? 与 :，
+// 一旦被包成 '…' → Postgres Exporter 报 invalid DSN、up=0；
+// 口令里含 ' 或空格时同样会让 Exporter 认证失败。
+func TestEnvFileIsNotShellQuoted(t *testing.T) {
+	tpl, _ := TemplateOf(TypePG)
+	address, err := ParseAddress("10.0.0.9:5432", tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+	if err != nil {
+		t.Fatalf("地址解析失败：%v", err)
+	}
+	art, err := RenderRemoteInstall(tpl, Instance{
+		Name: "pg-01", MWType: TypePG, Address: address,
+		Username: "mwops_exporter", Password: "p@ss w'ord:1?", Environment: "dev",
+	}, remoteTestOptions())
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	line := ""
+	for _, l := range strings.Split(art.VarsFile, "\n") {
+		if strings.HasPrefix(l, "  DATA_SOURCE_NAME=") {
+			line = strings.TrimPrefix(l, "  ")
+		}
+	}
+	if line == "" {
+		t.Fatalf("vars 文件里应有 DATA_SOURCE_NAME：\n%s", art.VarsFile)
+	}
+	if strings.Contains(line, `'\''`) || strings.HasPrefix(line, "DATA_SOURCE_NAME='") {
+		t.Fatalf("env 值不得做 shell 转义（引号会进值）：%s", line)
+	}
+	// 口令里的单引号与空格都原样保留（不经 shell，无需转义）。
+	if want := `DATA_SOURCE_NAME=postgresql://mwops_exporter:p@ss w'ord:1?@10.0.0.9:5432/postgres?sslmode=disable`; line != want {
+		t.Fatalf("DSN 应原样输出：want %q, got %q", want, line)
+	}
+
+	// 不带引号的口令：整行不得出现任何引号（这正是 DSN 曾经被破坏的原因）。
+	art2, err := RenderRemoteInstall(tpl, Instance{
+		Name: "pg-02", MWType: TypePG, Address: address,
+		Username: "mwops_exporter", Password: "p@ss word:1?", Environment: "dev",
+	}, remoteTestOptions())
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	for _, l := range strings.Split(art2.VarsFile, "\n") {
+		if strings.HasPrefix(l, "  DATA_SOURCE_NAME=") && strings.Contains(l, "'") {
+			t.Fatalf("不含引号的口令不应产生任何引号：%s", l)
+		}
+	}
+}
+
+// TestNoLogOnlyOnSecretTasks 锁定：no_log 只出现在真正含密的任务上。
+//
+// 含密任务必须 no_log（否则口令随 module args 回显），但**多加** no_log 会把
+// "容器起不来""单元写不进去"这类真实原因也替换成 censored —— 使用者只能看到一行
+// 没有信息量的报错（INC-008）。判断标准很简单：任务体里出现口令变量才允许遮蔽。
+func TestNoLogOnlyOnSecretTasks(t *testing.T) {
+	for _, mwType := range []string{TypeRedis, TypeMySQL, TypePG, TypeNode} {
+		tpl, _ := TemplateOf(mwType)
+		for _, mode := range []string{InstallModeDocker, InstallModeDockerSystemd, InstallModeBinary} {
+			opts := remoteTestOptions()
+			opts.InstallMode = mode
+			art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, mwType), opts)
+			if err != nil {
+				t.Fatalf("%s/%s 渲染失败：%v", mwType, mode, err)
+			}
+			for _, task := range splitTasks(art.Playbook) {
+				hasSecret := strings.Contains(task, "exporter_env_content")
+				hasNoLog := strings.Contains(task, "no_log: true")
+				switch {
+				case hasSecret && !hasNoLog:
+					t.Fatalf("%s/%s 含口令的任务必须 no_log：%s", mwType, mode, taskName(task))
+				case !hasSecret && hasNoLog:
+					t.Fatalf("%s/%s 任务 %q 不含口令却带 no_log，失败原因会被吞掉",
+						mwType, mode, taskName(task))
+				}
+			}
+		}
+	}
+}
+
+// splitTasks 按任务名切分渲染出的 playbook（每个任务以 "    - name: " 开头）。
+func splitTasks(playbook string) []string {
+	parts := strings.Split(playbook, "\n    - name: ")
+	out := make([]string, 0, len(parts))
+	for i, part := range parts {
+		if i == 0 {
+			continue // 头部（注释 + play 定义）
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+// taskName 取任务块的第一行作为可读名称。
+func taskName(task string) string {
+	if idx := strings.IndexByte(task, '\n'); idx >= 0 {
+		return task[:idx]
+	}
+	return task
 }
 
 // TestValidatePlaybookYAML 锁定运行时自校验（INC-005 的第二道防线）。

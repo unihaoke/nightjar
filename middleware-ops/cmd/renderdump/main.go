@@ -52,6 +52,7 @@ func main() {
 		{integration.TypeRedis, integration.InstallModeDocker, 9121, "host", "127.0.0.1:6379", ""},
 		{integration.TypeRedis, integration.InstallModeDockerSystemd, 9121, "host", "127.0.0.1:6379", ""},
 		{integration.TypeMySQL, integration.InstallModeDocker, 9104, "bridge", "127.0.0.1:3306", "bridge 才有端口映射"},
+		{integration.TypePG, integration.InstallModeDocker, 9187, "host", "127.0.0.1:5432", "DATA_SOURCE_NAME 经 env 文件传递"},
 		{integration.TypeNode, integration.InstallModeDocker, 9100, "host", "127.0.0.1:9100", ""},
 		{integration.TypeNode, integration.InstallModeBinary, 9100, "host", "127.0.0.1:9100", "无需目标机 docker"},
 	}

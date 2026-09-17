@@ -18,10 +18,11 @@ import (
 // 版本历史：
 //   - v2：YAML 引号修复（INC-005）+ 渲染后自校验 + 版本戳；
 //   - v3：去掉 docker 的 Go 模板格式串（INC-006）、systemd 单元改用 docker 绝对路径、
-//     INSTALLED_FROM 改块标量。
+//     INSTALLED_FROM 改块标量；
+//   - v4：公共前置任务「准备 Exporter 配置目录」（INC-008），env 文件改为不做 shell 引号转义。
 //
 // 变更渲染模板时请同步 +1，并在 docs/POSTMORTEM.md 里记录原因。
-const PlaybookRendererVersion = "mwops-playbook v3"
+const PlaybookRendererVersion = "mwops-playbook v4"
 
 // yamlLinePattern 从 yaml.v3 的错误文本里抠出行号（形如 "yaml: line 33: ..."）。
 var yamlLinePattern = regexp.MustCompile(`line (\d+)`)

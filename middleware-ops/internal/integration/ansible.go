@@ -201,6 +201,14 @@ func renderRemotePlaybook(in remotePlaybookInput) string {
 	b.WriteString("    exporter_env_file: " + yamlScalar(in.EnvFile) + "\n")
 	b.WriteString("    exporter_port: " + strconv.Itoa(in.Port) + "\n")
 	b.WriteString("  tasks:\n")
+	// 两种模式都要先把配置目录建出来：env 文件与 systemd 单元都要写进 <安装目录>。
+	// 这一条同时是**可读的失败点**：写 env 的任务带 no_log，失败时 ansible 只会回一句
+	// censored，什么也看不出来（真实故障 INC-008：docker 模式漏了这条，报错被整体隐藏）。
+	b.WriteString("    - name: 准备 Exporter 配置目录\n")
+	b.WriteString("      ansible.builtin.file:\n")
+	b.WriteString("        path: " + yamlScalar(in.InstallDir) + "\n")
+	b.WriteString("        state: directory\n")
+	b.WriteString("        mode: '0755'\n")
 	if in.Mode == InstallModeBinary {
 		writeBinaryTasks(&b, in)
 	} else {
@@ -240,13 +248,20 @@ func writeDockerTasks(b *strings.Builder, in remotePlaybookInput) {
 	b.WriteString("        content: \"{{ exporter_env_content }}\"\n")
 	b.WriteString("      no_log: true\n")
 	b.WriteString("    - name: 拉取官方镜像\n")
+	// 国内目标机拉 Docker Hub 常见超时/限流：重试 3 次，避免一次抖动就整体失败。
+	// 仍失败时按 README §6 给 dockerd 配镜像加速（该任务不带 no_log，报错可读）。
 	b.WriteString("      ansible.builtin.command: docker pull {{ exporter_image }}\n")
 	b.WriteString("      changed_when: false\n")
+	b.WriteString("      register: exporter_pull\n")
+	b.WriteString("      retries: 3\n")
+	b.WriteString("      delay: 10\n")
+	b.WriteString("      until: exporter_pull.rc == 0\n")
 	b.WriteString("    - name: 重建并启动 Exporter 容器\n")
+	// 这里**不加** no_log：本任务只是 docker run（口令在 0600 的 env 文件里，命令本身不含密），
+	// 加 no_log 会把"容器起不来"的真实原因也吞掉（INC-008 的教训：日志遮蔽要配套可读失败点）。
 	b.WriteString("      ansible.builtin.shell: |\n")
 	b.WriteString("        docker rm -f {{ exporter_container }} >/dev/null 2>&1 || true\n")
 	b.WriteString("        " + dockerRunLine(in) + "\n")
-	b.WriteString("      no_log: true\n")
 	if in.Mode != InstallModeDockerSystemd {
 		return
 	}
@@ -258,7 +273,6 @@ func writeDockerTasks(b *strings.Builder, in remotePlaybookInput) {
 	for _, line := range systemdUnitLines(in) {
 		b.WriteString("          " + line + "\n")
 	}
-	b.WriteString("      no_log: true\n")
 	b.WriteString("    - name: 启动并设置开机自启\n")
 	b.WriteString("      ansible.builtin.systemd:\n")
 	b.WriteString("        name: " + yamlScalar(in.Unit) + "\n")
@@ -289,11 +303,6 @@ func writeBinaryTasks(b *strings.Builder, in remotePlaybookInput) {
 	// 用引号包成单行标量并显式加括号：括号消除 `x | trim in [...]` 的优先级歧义，
 	// 引号避免 YAML 把行首 {{ 当 flow mapping（同 INC-005）。
 	b.WriteString("        exporter_arch: \"{{ 'arm64' if (exporter_uname.stdout | trim) in ['aarch64', 'arm64'] else 'amd64' }}\"\n")
-	b.WriteString("    - name: 创建安装目录\n")
-	b.WriteString("      ansible.builtin.file:\n")
-	b.WriteString("        path: " + yamlScalar(in.InstallDir) + "\n")
-	b.WriteString("        state: directory\n")
-	b.WriteString("        mode: '0755'\n")
 	b.WriteString("    - name: 下载官方二进制包\n")
 	b.WriteString("      ansible.builtin.get_url:\n")
 	b.WriteString("        url: " + yamlScalar(url) + "\n")
@@ -518,6 +527,14 @@ func renderVarsFile(env map[string]string) string {
 }
 
 // renderEnvFile 渲染 KEY=VALUE 形式的 env 文件内容（排序保证幂等，便于审计 diff）。
+//
+// **不能用 shell 引号转义**：这个文件有两个消费者，都不经 shell——
+//   - docker 模式的 `--env-file`：引号会被当成值的一部分；
+//   - systemd 的 `EnvironmentFile=`：只有成对引号才被剥掉，半截引号同样进值。
+//
+// 于是 `DATA_SOURCE_NAME=postgresql://…?sslmode=disable` 曾被包成 '…'，
+// Postgres Exporter 拿到带引号的 DSN → invalid DSN、up=0；口令里的 ' 与空格同理。
+// 这里与本机 Docker 路径保持一致，统一用 SanitizeEnvValue（只处理换行）。
 func renderEnvFile(env map[string]string) string {
 	keys := make([]string, 0, len(env))
 	for key := range env {
@@ -526,7 +543,7 @@ func renderEnvFile(env map[string]string) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, key := range keys {
-		b.WriteString(key + "=" + shellArg(env[key]) + "\n")
+		b.WriteString(key + "=" + SanitizeEnvValue(env[key]) + "\n")
 	}
 	return b.String()
 }

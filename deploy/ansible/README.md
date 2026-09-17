@@ -107,7 +107,11 @@ INTEGRATION_ANSIBLE_BECOME=true
 - `docker` / `docker-systemd` 安装方式：目标机需已安装 Docker（`docker version` 可用）；
   **`binary` 方式不需要目标机有 Docker**（下载官方 release 二进制 + 原生 systemd 服务）；
 - 建号/改号时：目标机需有 `mysql` / `psql` 客户端，或退回到它自己的 docker；
-- 平台能访问目标机的 Exporter 端口（安装后平台会主动探一次，探不通会在集成备注里写明）。
+- 平台能访问目标机的 Exporter 端口（安装后平台会主动探一次，探不通会在集成备注里写明）：
+  云主机记得在**安全组/防火墙**里对"平台所在机器的出口 IP"放通该端口（如 9121/9104/9100）；
+- 目标机要能拉取镜像（`docker` 方式）：国内直连 Docker Hub 常超时，建议给目标机的 dockerd
+  配镜像加速（`/etc/docker/daemon.json` 的 `registry-mirrors`）；平台侧已对 `docker pull`
+  做了 3 次重试，失败时报错可读（该任务不带 `no_log`）；
 
 ## 4. 安全约定（重要）
 
@@ -181,7 +185,7 @@ The error appears to be in '/app/data/integrations/ansible/<集成名>.yml': lin
 先确认**是哪一种**（这一步能省掉大量瞎猜）：
 
 ```bash
-# ① 跑的是哪一版渲染器？字段缺失或低于代码里的 PlaybookRendererVersion（当前 v3）→ 后端镜像是旧的
+# ① 跑的是哪一版渲染器？字段缺失或低于代码里的 PlaybookRendererVersion（当前 v4）→ 后端镜像是旧的
 curl -s http://127.0.0.1:8080/healthz
 # ② 落盘的 playbook 第 3 行应带同一个版本戳
 docker exec mwops-backend sed -n '1,6p' /app/data/integrations/ansible/<集成名>.yml
@@ -193,7 +197,7 @@ docker exec mwops-backend sed -n '1,6p' /app/data/integrations/ansible/<集成�
   ```bash
   cd nightjar
   docker compose build backend && docker compose up -d backend
-  curl -s http://127.0.0.1:8080/healthz   # 应看到 "playbook_renderer": "mwops-playbook v3"
+  curl -s http://127.0.0.1:8080/healthz   # 应看到 "playbook_renderer": "mwops-playbook v4"
   ```
 
   然后在集成详情页点「重新应用」，重新生成并执行 playbook。
@@ -224,7 +228,7 @@ fatal: [203.195.191.75]: FAILED! => {"msg": "template error while templating str
 - 现象：报错里出现 `template error while templating string`、`unexpected '.'`；
 - 处理：属平台模板缺陷（INC-006）。v3 渲染器起已改为 `command -v docker` + 裸 `docker version`
   （不再用 `--format`），并在渲染后自校验——真出错时界面提示「第 N 行含 Go 模板语法」。
-  与 6.1 一样，先 `curl /healthz` 确认 `playbook_renderer` 是否已是最新（`mwops-playbook v3`）。
+  与 6.1 一样，先 `curl /healthz` 确认 `playbook_renderer` 是否已是最新（`mwops-playbook v4`）。
 
 在目标机上复现同类问题的通用判据：playbook 里**任何一个** `{{ … }}` 都会被 Ansible 渲染，
 所以只能写 Jinja 表达式；要保留字面量 `{{ }}`（如 docker/Go 模板串）必须用
@@ -270,7 +274,39 @@ curl -s http://127.0.0.1:8080/healthz   # 应包含 "sshpass":true
 > 另外 inventory 现在会同时写 `ansible_become_password`：登录普通用户且 sudo 需要密码时，
 > 缺这一项会报 `Missing sudo password`。
 
-### 6.4 重建后仍未生效的常见原因
+### 6.4 报错里只有 `censored`，看不到失败原因
+
+```
+TASK [写入 Exporter 环境变量（含口令，权限 0600）] ***
+fatal: [203.195.191.75]: FAILED! => {"censored": "the output has been hidden due to
+  the fact that 'no_log: true' was specified for this result", "changed": false}
+```
+
+含密任务必须 `no_log: true`（否则口令会随 module args 回显），代价就是失败结果被**整段**替换成
+`censored`——真实原因（目录不存在、权限不足、磁盘满）全被吞掉。平台的对策是把可能失败的前置步骤
+拆成**不含密**的独立任务，让它们自己报错：
+
+| 步骤 | 任务名 | 失败时是否可读 |
+|------|--------|----------------|
+| 建配置目录 | 准备 Exporter 配置目录 | ✅ 可读 |
+| docker 是否可用 | 校验目标机器已安装 docker / 校验 docker 守护进程可用 | ✅ 可读 |
+| 写 env 文件（含口令） | 写入 Exporter 环境变量 | ❌ no_log |
+| 拉镜像 / 起容器 | 拉取官方镜像 / 重建并启动 Exporter 容器 | 拉取可读，起容器 no_log |
+
+真遇到 `censored` 时（平台会同时附上这段指引），到目标机上手工确认：
+
+```bash
+ls -ld /opt/mwops-exporter        # 目录是否存在且可写
+df -h /opt                        # 磁盘是否满
+docker ps -a | grep mwops-exporter   # 容器是否创建成功
+docker logs <容器名>                 # Exporter 自身日志
+```
+
+> 历史故障（INC-008）：docker 模式漏了"建目录"这一步，env 文件写不进去，
+> 而报错恰好被 `no_log` 吞掉，使用者只看到一行 `censored`。v4 起该目录由**公共前置任务**创建，
+> 两种安装模式都覆盖。
+
+### 6.5 重建后仍未生效的常见原因
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
@@ -278,7 +314,7 @@ curl -s http://127.0.0.1:8080/healthz   # 应包含 "sshpass":true
 | 构建很快但代码没变 | 构建上下文不是当前工作区（换了目录/机器） | `docker compose build --progress=plain backend` 看 `COPY` 的源；确认 `docker compose config \| grep context` |
 | 改了 `.env` 没生效 | 环境变量在容器创建时注入 | `docker compose up -d --force-recreate backend` |
 
-### 6.5 怀疑产物本身有问题时
+### 6.6 怀疑产物本身有问题时
 
 平台内部的渲染后自校验用的是 Go 的 YAML 解析器，而 ansible 用的是 PyYAML（同族、不同实现），
 所以怀疑产物时可以**用下游的解析器复核**。仓库里带了工具，不需要连任何主机：

@@ -5,6 +5,66 @@
 
 ---
 
+## INC-008 · 漏建配置目录 + `no_log` 吞掉报错，且 env 文件被错误地做了 shell 转义
+
+**首次暴露**：2026-09-18，修完 INC-005/006/007 后，远程安装第一次真正跑起来：
+
+```
+TASK [校验目标机器已安装 docker] ***            ok: [203.195.191.75]
+TASK [校验 docker 守护进程可用] ***             ok: [203.195.191.75]
+TASK [写入 Exporter 环境变量（含口令，权限 0600）] ***
+fatal: [203.195.191.75]: FAILED! => {"censored": "the output has been hidden due to
+  the fact that 'no_log: true' was specified for this result", "changed": false}
+```
+
+**定位过程**
+
+1. 前三个任务全绿，说明渲染、SSH、sshpass、docker 都已就绪，问题只在写 env 文件这一步；
+2. 报错被 `no_log` 整段替换成 `censored`——这是**设计使然**（含密任务的 module args 会回显口令），
+   但也意味着使用者拿不到任何线索；
+3. 对照模板即可确认根因：env 文件路径是 `<安装目录>/<容器名>.env`，而 **docker 模式没有任何任务创建
+   `<安装目录>`**——只有 `binary` 模式有"创建安装目录"。`ansible.builtin.copy` 写一个不存在的目录
+   必然失败，报错恰好又被 no_log 吞掉；
+4. 顺带审计同一处 env 渲染逻辑时发现第二个更隐蔽的缺陷：`renderEnvFile` 用 `shellArg` 给值加
+   shell 引号，但这个文件的两个消费者**都不经 shell**——docker 的 `--env-file` 与 systemd 的
+   `EnvironmentFile=`。Postgres 的 `DATA_SOURCE_NAME` 含 `?` `:`，会被包成 `'postgresql://…'`，
+   Postgres Exporter 拿到带引号的 DSN → invalid DSN、`pg_up=0`；
+   本机 Docker 路径用的是 `SanitizeEnvValue`（不转义），两条路径行为不一致，正是"只在远程暴露"的原因。
+
+**根因**
+
+1. 模板把"写文件"和"建目录"拆在两个模式分支里，公共前提只写在了其中一个分支；
+2. `no_log` 的使用没有配套的**可读失败点**设计：失败被屏蔽时既没有前置检查，也没有排查指引；
+3. env 文件被当成 shell 片段转义，忽略了它真正的消费者是 docker / systemd 的**非 shell** 解析器；
+   该缺陷此前一直被"本机部署"路径掩盖（本机走 Docker API，直接传 env 数组，不生成文件）。
+
+**修复**
+
+1. 目录创建提升为**公共前置任务**「准备 Exporter 配置目录」（两种模式各恰好一条），
+   它本身不含密，失败时报错可读；
+2. `renderEnvFile` 改为 `SanitizeEnvValue`（原样输出、只处理换行），与本机路径一致；
+3. 平台在 ansible 输出出现 `censored` 时追加排查指引（该任务被隐藏、请看哪些文件/命令）；
+4. 渲染器版本升到 v4；`/healthz`、启动日志、自检脚本三处都能看到版本；
+5. 只给**真正含密**的任务加 `no_log`："重建并启动 Exporter 容器""systemd 单元写入"的命令里
+   本来就没有口令（口令在 0600 的 env 文件里），原先的 `no_log` 纯属多此一举，
+   却把"容器起不来"的原因一起吞了；同时给 `docker pull` 加 3 次重试（国内拉 Hub 易抖动）。
+
+**防复发**
+
+1. `TestRemotePlaybookPreparesConfigDir`：断言三种模式都有且只有一条目录创建任务，
+   并且**排在**写 env 之前（顺序错=白建）；
+2. `TestEnvFileIsNotShellQuoted`：断言 `DATA_SOURCE_NAME` 原样落盘（含 `?`/`:`/空格/单引号的口令
+   都不出现 `'\''` 或包裹引号），换行被处理；
+3. `TestRemoteEnvFileEscapesQuotes` 重写为"**原样**写入口令"（原断言锁定的正是错误行为——
+   这条测试曾经在保护 bug）；
+4. `TestCensoredHintOnlyForCensoredOutput`：断言只在 `censored` 时给指引，可读失败不追加噪音；
+5. `TestNoLogOnlyOnSecretTasks`：遍历全组件 × 全安装方式的任务块，断言
+   **含 `exporter_env_content` 的任务必须有 no_log、其余任务必须没有**——
+   把"不要过度遮蔽"变成可执行的约束，而不是靠人记得；
+6. 自检脚本增加"产物第 3 行版本戳必须等于期望版本"，避免"镜像新、产物旧"的混淆。
+
+---
+
 ## INC-007 · 平台镜像缺 sshpass，口令方式的远程安装卡在连接阶段
 
 **首次暴露**：2026-09-18，修完 INC-005/006 并重建镜像后，同一操作第三次报错（这次已经能连到目标机）：
@@ -370,3 +430,10 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
    链上任意一环缺失都会在**最远端**以一句与使用者无关的报错暴露（INC-007：装了 ansible
    但没装 sshpass，口令认证直接不可用）。做法有两条：构建期把链上关键程序都校验一遍
    （`command -v ssh sshpass`），运行期在**动手之前**做前置检查并把两条出路写进错误信息。
+8. **日志遮蔽要配套"可读失败点"**：`no_log` 保住了口令，也吞掉了根因（INC-008 只回了
+   一行 `censored`）。含密任务周围必须铺开不含密的前置检查（目录、权限、外部命令），
+   失败时至少能二分定位；平台侧再补一句"下一步看什么"。
+9. **转义要跟着消费者走，不是跟着"看起来危险"走**：同一个 `KEY=VALUE` 文件，
+   shell 需要引号转义，docker `--env-file` 与 systemd `EnvironmentFile=` 却把引号当值的一部分
+   （INC-008 的 PG DSN）。判断依据只能是"谁解析它"，并且**同一份数据的不同路径必须行为一致**
+   ——本机路径不转义、远程路径转义，这种不一致会让缺陷只在某一条路径上暴露。

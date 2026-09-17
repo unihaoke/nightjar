@@ -17,9 +17,9 @@ INTEGRATION="${2:-jd-redis}"
 BIN="/usr/local/bin/middleware-ops"
 ARTIFACT="/app/data/integrations/ansible/${INTEGRATION}.yml"
 # 与 Go 侧 integration.PlaybookRendererVersion 对应；版本升级时同步改这里。
-EXPECTED_RENDERER="mwops-playbook v3"
-# v3 才会写进 playbook 的变量名：二进制里搜到它，说明镜像确实是新的。
-V3_MARKER="exporter_docker_bin"
+EXPECTED_RENDERER="mwops-playbook v4"
+# 该变量名是 v3 才引入的：二进制里搜到它，说明镜像至少是 v3。
+RENDERER_MARKER="exporter_docker_bin"
 
 pass=0
 fail=0
@@ -45,11 +45,11 @@ info "容器所用镜像创建时间：$image_created"
 echo
 echo "== 2. 运行中的二进制是哪一版渲染器 =="
 # 用 -c 只取计数：busybox grep 不做二进制识别，GNU grep -c 对二进制也返回计数。
-marker=$(docker exec "$CONTAINER" grep -c "$V3_MARKER" "$BIN" 2>/dev/null | tr -d '[:space:]')
+marker=$(docker exec "$CONTAINER" grep -c "$RENDERER_MARKER" "$BIN" 2>/dev/null | tr -d '[:space:]')
 if [ "${marker:-0}" -gt 0 ] 2>/dev/null; then
-  ok "二进制含 v3 标记（$V3_MARKER × $marker）"
+  ok "二进制含 v3+ 标记（$RENDERER_MARKER × $marker）"
 else
-  no "二进制里没有 v3 标记（$V3_MARKER）→ **镜像确实是旧的**"
+  no "二进制里没有 $RENDERER_MARKER → **镜像至少落后一个版本，请重建**"
 fi
 
 echo
@@ -96,6 +96,11 @@ echo "== 6. 落盘产物（上次执行时生成的 playbook） =="
 if docker exec "$CONTAINER" test -f "$ARTIFACT" 2>/dev/null; then
   ver=$(docker exec "$CONTAINER" sed -n '3p' "$ARTIFACT" | tr -d '\r')
   info "第 3 行：$ver"
+  if echo "$ver" | grep -q "$EXPECTED_RENDERER"; then
+    ok "产物由 $EXPECTED_RENDERER 生成"
+  else
+    no "产物不是 $EXPECTED_RENDERER 生成的 → 这是上次执行时留下的旧产物（点「重新应用」会覆盖）"
+  fi
   if docker exec "$CONTAINER" grep -q "Server.Version" "$ARTIFACT" 2>/dev/null; then
     no "产物里仍有 Go 模板串 --format '{{.Server.Version}}' → 是旧渲染器生成的"
   else

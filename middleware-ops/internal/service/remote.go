@@ -212,7 +212,7 @@ func (s *IntegrationService) deployRemote(
 	output, runErr := cmd.CombinedOutput()
 	safe := redactSecrets(string(output), creds.Password, creds.Key)
 	if runErr != nil {
-		return fmt.Errorf("Ansible 执行失败：%w（输出：%s）", runErr, truncateText(safe, 600))
+		return fmt.Errorf("Ansible 执行失败：%w（输出：%s）%s", runErr, truncateText(safe, 600), censoredHint(safe))
 	}
 
 	// 安装完不等于可用：从平台侧探一次端口，把结论写回来。
@@ -223,6 +223,22 @@ func (s *IntegrationService) deployRemote(
 	s.log.Info("集成：远程 Exporter 安装完成",
 		zap.String("integration", item.Name), zap.String("host", host), zap.Int("port", port))
 	return nil
+}
+
+// censoredHint 在 ansible 输出被 no_log 整体屏蔽时补一句排查指引。
+//
+// 含密任务必须 no_log（否则口令会随 module args 回显），代价是失败结果被整段替换成
+// censored：真实原因（目标机目录不存在、磁盘满、权限不足）在使用者眼里全没了（INC-008）。
+// 平台已把可失败的前置步骤拆成不含密的独立任务（目录创建、docker 可用性），
+// 这里再给一句"下一步该看什么"，避免使用者只能看到一行 censored 干瞪眼。
+func censoredHint(output string) string {
+	if !strings.Contains(output, "censored") {
+		return ""
+	}
+	return "（该任务带 no_log，输出被整体隐藏以避免回显口令。平台已把安装目录创建、docker 可用性等" +
+		"前置步骤拆成不含密的独立任务，它们的报错是可见的；若仍卡在写入/启动步骤，请在目标机上执行：" +
+		"ls -ld /opt/mwops-exporter && df -h /opt && journalctl -u 'mwops-exporter-*' -n 50 --no-pager，" +
+		"或用 docker logs <容器名> 看 Exporter 自身日志）"
 }
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
