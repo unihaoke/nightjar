@@ -724,14 +724,30 @@ onMounted(load)
           </el-col>
           <template v-if="activeTemplate?.needs_auth">
             <el-col :xs="24" :sm="12">
-              <el-form-item label="用户名（只读监控账号）">
-                <el-input v-model="form.username" placeholder="如 exporter / monitor" />
+              <el-form-item label="只读监控账号（采集用）">
+                <el-input v-model="form.username" placeholder="留空用默认 mwops_exporter" />
               </el-form-item>
+              <p class="field-hint">
+                ① 这是<b>采集指标</b>用的账号：平台把它填进 Exporter，长期存在。
+                <template v-if="bootstrapSupported && form.bootstrap_account">
+                  勾选了下方「由平台建号」时，平台会按这个名字在建号 SQL 里创建它。
+                </template>
+                <template v-else-if="bootstrapSupported">未勾选建号时，它必须是<b>你已经建好</b>的账号。</template>
+              </p>
+              <p v-if="activeTemplate?.type === 'redis'" class="field-hint">
+                Redis 请<b>留空</b>：自建 Redis 通常只配了 requirepass（default 用户），
+                填了用户名会让 Exporter 发 <span class="mono">AUTH &lt;用户名&gt; &lt;口令&gt;</span>，
+                结果 <span class="mono">WRONGPASS</span>、<span class="mono">redis_up=0</span>。
+              </p>
             </el-col>
             <el-col :xs="24" :sm="12">
-              <el-form-item :label="isEdit ? '密码（留空表示不修改）' : '密码'">
+              <el-form-item :label="isEdit ? '口令（留空表示不修改）' : '口令（采集用账号的）'">
                 <el-input v-model="form.password" type="password" show-password placeholder="AES-256 加密存储" />
               </el-form-item>
+              <p class="field-hint">
+                ② 这是上面那个<b>只读监控账号</b>的口令，平台加密保存并注入 Exporter。
+                勾选建号且此处留空时，口令由平台生成。
+              </p>
             </el-col>
           </template>
           <el-col :xs="24" :sm="12">
@@ -758,25 +774,38 @@ onMounted(load)
         </div>
         <el-button text size="small" @click="addLabel">+ 添加标签</el-button>
 
-        <template v-if="(activeTemplate?.options || []).length > 0">
-          <el-divider content-position="left">Exporter 参数</el-divider>
-          <div v-for="option in activeTemplate?.options || []" :key="option.key" class="option-row">
-            <div class="option-main">
-              <span class="option-label">{{ option.label }}</span>
-              <el-tag size="small" effect="plain" type="info">
-                {{ option.target === 'env' ? '环境变量' : '命令行' }}
-              </el-tag>
-              <p class="field-hint">{{ option.help }}</p>
+        <!-- Exporter 参数：默认收起。绝大多数场景用模板默认值即可，
+             只有少数"看环境"的开关（云 Redis 集群架构、node 的挂载排除正则）才需要动。 -->
+        <el-collapse v-if="(activeTemplate?.options || []).length > 0" class="advanced-collapse">
+          <el-collapse-item name="exporter-options">
+            <template #title>
+              <span class="collapse-title">
+                高级：Exporter 参数（{{ (activeTemplate?.options || []).length }} 项，一般不用改）
+              </span>
+            </template>
+            <p class="field-hint">
+              默认值已按官方镜像适配，直接保存即可。只有这几类场景才需要调整：
+              云数据库的集群架构（Redis 的 SLOWLOG / LATENCY 命令不支持）、
+              主机监控的挂载排除正则、以及需要额外采集项时。
+            </p>
+            <div v-for="option in activeTemplate?.options || []" :key="option.key" class="option-row">
+              <div class="option-main">
+                <span class="option-label">{{ option.label }}</span>
+                <el-tag size="small" effect="plain" type="info">
+                  {{ option.target === 'env' ? '环境变量' : '命令行' }}
+                </el-tag>
+                <p class="field-hint">{{ option.help }}</p>
+              </div>
+              <el-switch
+                v-if="option.kind === 'bool'"
+                v-model="form.options[option.key]"
+                active-value="true"
+                inactive-value="false"
+              />
+              <el-input v-else v-model="form.options[option.key]" class="option-input" :placeholder="option.default" />
             </div>
-            <el-switch
-              v-if="option.kind === 'bool'"
-              v-model="form.options[option.key]"
-              active-value="true"
-              inactive-value="false"
-            />
-            <el-input v-else v-model="form.options[option.key]" class="option-input" :placeholder="option.default" />
-          </div>
-        </template>
+          </el-collapse-item>
+        </el-collapse>
 
         <el-divider content-position="left">Exporter 部署位置</el-divider>
         <el-form-item label="部署到">
@@ -876,6 +905,21 @@ onMounted(load)
         <!-- 账号托管：平台代为创建只读监控账号（写操作，需显式授权） -->
         <template v-if="bootstrapSupported">
           <el-divider content-position="left">监控账号</el-divider>
+          <el-alert type="info" :closable="false" show-icon class="mb"
+            title="两个「账号」不是一回事">
+            <p class="field-hint">
+              ① <b>只读监控账号</b>（上面的「只读监控账号」栏）：<b>采集用</b>，长期存在，
+              权限最小（MySQL 只授 PROCESS / REPLICATION CLIENT / SELECT），被填进 Exporter。
+            </p>
+            <p class="field-hint">
+              ② <b>管理员账号</b>（下面的「管理员账号」栏）：<b>建号用</b>，只在这次请求里用一次，
+              用来执行建号 SQL（CREATE USER / GRANT），<b>不落库、不写审计、用完即弃</b>。
+              它不是监控账号，也不会被存进平台。
+            </p>
+            <p class="field-hint">
+              所以：只想手工建好账号再用 → 只填①；想省事让平台建 → ①留空（用默认名）+ 填②。
+            </p>
+          </el-alert>
           <div class="switch-row">
             <el-switch v-model="form.bootstrap_account" :disabled="!dockerReady" />
             <span>由平台创建/更新只读监控账号（无需登录被管数据库手工建号）</span>
@@ -887,12 +931,12 @@ onMounted(load)
           </p>
           <el-row v-if="form.bootstrap_account" :gutter="12">
             <el-col :xs="24" :sm="12">
-              <el-form-item label="管理账号（仅本次使用）">
-                <el-input v-model="form.admin_username" placeholder="如 root" />
+              <el-form-item label="管理员账号（仅本次建号使用）">
+                <el-input v-model="form.admin_username" placeholder="如 root（不落库、不回显）" />
               </el-form-item>
             </el-col>
             <el-col :xs="24" :sm="12">
-              <el-form-item label="管理口令（仅本次使用）">
+              <el-form-item label="管理员口令（仅本次建号使用）">
                 <el-input v-model="form.admin_password" type="password" show-password placeholder="不落库、不写审计、不回显" />
               </el-form-item>
             </el-col>
@@ -1184,6 +1228,17 @@ onMounted(load)
   font-size: 11.5px;
   color: var(--c-text-muted);
   line-height: 1.6;
+}
+
+.advanced-collapse {
+  margin-top: 12px;
+  border-top: 1px solid var(--el-border-color-lighter);
+  border-bottom: none;
+}
+
+.collapse-title {
+  font-size: 12.5px;
+  color: var(--el-text-color-regular);
 }
 
 .note {
