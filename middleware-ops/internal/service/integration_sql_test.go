@@ -82,14 +82,70 @@ func TestRandomHexPasswordHasNoEscapeRisk(t *testing.T) {
 	}
 }
 
-func TestBootstrapDefaultsToOff(t *testing.T) {
+// TestBootstrapDefaultsByComponent 锁定「自动建号」的默认策略。
+//
+// 产品口径（用户明确要求）：**需要账号的组件默认由平台代建**，
+// 使用者不需要提前建号、也不需要自己想账号名与口令；
+// 只有显式传 false 才关闭，不需要账号的组件（Redis 等）恒为关闭。
+func TestBootstrapDefaultsByComponent(t *testing.T) {
 	svc := &IntegrationService{}
-	// 不勾选（字段缺省）时绝不动被管数据库。
-	if svc.shouldBootstrapAccount(IntegrationInput{}) {
-		t.Fatal("默认不应由平台创建账号（写操作需显式授权）")
+
+	for _, mwType := range []string{integration.TypeMySQL, integration.TypePG} {
+		if !svc.shouldBootstrapAccount(IntegrationInput{}, mwType) {
+			t.Fatalf("%s 默认应由平台自动建号（使用者不必提前建号）", mwType)
+		}
+	}
+	if svc.shouldBootstrapAccount(IntegrationInput{}, integration.TypeRedis) {
+		t.Fatal("Redis 口令由目标自身鉴权决定，不应默认建号")
+	}
+
+	off := false
+	if svc.shouldBootstrapAccount(IntegrationInput{BootstrapAccount: &off}, integration.TypeMySQL) {
+		t.Fatal("显式关闭后不得动被管数据库")
 	}
 	on := true
-	if !svc.shouldBootstrapAccount(IntegrationInput{BootstrapAccount: &on}) {
-		t.Fatal("显式勾选后应执行")
+	if !svc.shouldBootstrapAccount(IntegrationInput{BootstrapAccount: &on}, integration.TypeRedis) {
+		t.Fatal("显式开启后应执行（即使该组件默认不需要账号）")
+	}
+}
+
+// TestDefaultMonitorUserName 锁定：账号名留空时由模板给出默认值。
+func TestDefaultMonitorUserName(t *testing.T) {
+	for _, mwType := range []string{integration.TypeMySQL, integration.TypePG} {
+		tpl, ok := integration.TemplateOf(mwType)
+		if !ok {
+			t.Fatalf("模板 %s 应存在", mwType)
+		}
+		if tpl.MonitorUser == "" {
+			t.Fatalf("%s 应声明默认监控账号名（表单留空时自动填充）", mwType)
+		}
+	}
+	redisTpl, _ := integration.TemplateOf(integration.TypeRedis)
+	if redisTpl.MonitorUser != "" {
+		t.Fatal("Redis 不应声明默认监控账号名")
+	}
+}
+
+// TestRotateAndDropSQLAreSelfService 锁定轮换/删除 SQL 的语义：
+// 轮换必须是「账号改自己口令」（否则就要再要一次管理员凭据），删除必须幂等。
+func TestRotateAndDropSQLAreSelfService(t *testing.T) {
+	rotate, err := rotateAccountSQL(integration.TypeMySQL, "deadbeef")
+	if err != nil {
+		t.Fatalf("MySQL 轮换模板应可用：%v", err)
+	}
+	if !strings.Contains(rotate[0], "ALTER USER USER()") {
+		t.Fatalf("MySQL 轮换必须是 ALTER USER USER()（自助轮换的前提）：%v", rotate)
+	}
+	pgRotate, err := rotateAccountSQL(integration.TypePG, "deadbeef")
+	if err != nil || !strings.Contains(pgRotate[0], "ALTER ROLE CURRENT_USER") {
+		t.Fatalf("PostgreSQL 轮换必须是 ALTER ROLE CURRENT_USER：%v %v", pgRotate, err)
+	}
+	drop, err := dropAccountSQL(integration.TypeMySQL, "mwops_exporter")
+	if err != nil || !strings.Contains(drop[0], "DROP USER IF EXISTS") {
+		t.Fatalf("删除账号必须幂等（IF EXISTS）：%v %v", drop, err)
+	}
+	// 轮换模板绝不能带破坏性权限语句。
+	if strings.Contains(strings.ToUpper(strings.Join(rotate, ";")), "GRANT ") {
+		t.Fatal("轮换不应包含 GRANT")
 	}
 }

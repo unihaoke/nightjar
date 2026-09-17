@@ -222,6 +222,8 @@ export interface IntegrationTemplate {
   default_port: number
   metrics_path: string
   needs_auth: boolean
+  /** 平台支持代建只读监控账号时的默认账号名（空表示该组件不需要账号）。 */
+  monitor_user: string
   address_label: string
   address_hint: string
   address_is_url: boolean
@@ -266,10 +268,31 @@ export interface IntegrationView {
   image: string
   container_status: string
   deploy_note: string
+  /** 该集成是否勾选了「把目标容器接入平台网络」。 */
+  join_platform_network: boolean
   selector: string
   applied_at: string
   last_error: string
   has_password: boolean
+}
+
+/** 集成中心：平台代管的只读监控账号现状。 */
+export interface IntegrationAccount {
+  integration_id: number
+  name: string
+  mw_type: string
+  component: string
+  username: string
+  address: string
+  /** 该账号由平台创建（平台会记录在集成元信息里）。 */
+  managed: boolean
+  /** 平台持有该账号口令（加密存储），因此可自助轮换。 */
+  has_password: boolean
+  rotated_at: string
+  grants: string
+  /** 该组件是否支持平台代管账号（Redis 等不需要）。 */
+  supports_management: boolean
+  last_error: string
 }
 
 /** 集成中心：生成的采集配置。 */
@@ -301,6 +324,13 @@ export interface IntegrationInput {
   auto_rules?: boolean
   /** 由平台创建/更新只读监控账号（写操作，默认关闭）。 */
   bootstrap_account?: boolean
+  /**
+   * 反向接网：把**目标容器**接入平台网络（默认关闭）。
+   *
+   * 正常方向是平台把自己的 Exporter 接进目标网络（不改被管项目）；
+   * 勾选后平台会执行等价的 `docker network connect <平台网络> <目标容器>`。
+   */
+  join_platform_network?: boolean
   /** 被管实例的管理凭据：仅本次请求使用，平台不落库、不写审计、不回显。 */
   admin_username?: string
   admin_password?: string

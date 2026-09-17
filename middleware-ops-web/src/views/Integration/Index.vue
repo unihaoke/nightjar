@@ -12,7 +12,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { integrationApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
+import type { IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
 import { envLabels, formatTime } from '@/utils/format'
 
 const router = useRouter()
@@ -42,10 +42,12 @@ const form = reactive({
   group_name: '',
   deploy: false,
   auto_rules: true,
-  // 平台代建只读账号：默认关闭（写操作需显式授权），管理凭据仅本次提交使用
-  bootstrap_account: false,
+  // 自动建号：需要账号的组件**默认由平台创建**（使用者不必提前建号）
+  bootstrap_account: true,
   admin_username: '',
   admin_password: '',
+  // 反向接网：把**目标容器**接入平台网络。默认关闭（正常方向是平台自己接进目标网络）
+  join_platform_network: false,
   labels: [] as { key: string; value: string }[],
   options: {} as Record<string, string>,
 })
@@ -88,6 +90,82 @@ const dockerReady = computed(() => Boolean(overview.value?.docker_ok))
 /** 已集成总数。 */
 const total = computed(() => items.value.length)
 
+// ---------------------------------------------------------------------------
+// 监控账号管理（平台代管的只读账号：查看 / 轮换口令 / 删除）
+// ---------------------------------------------------------------------------
+const accountsVisible = ref(false)
+const accountsLoading = ref(false)
+const accounts = ref<IntegrationAccount[]>([])
+
+/** 载入账号清单。 */
+async function loadAccounts(): Promise<void> {
+  accountsLoading.value = true
+  try {
+    const result = await integrationApi.accounts()
+    accounts.value = result.items || []
+  } catch (error) {
+    toastError(error)
+  } finally {
+    accountsLoading.value = false
+  }
+}
+
+/** 打开账号管理弹窗。 */
+function openAccounts(): void {
+  accountsVisible.value = true
+  void loadAccounts()
+}
+
+/** 轮换口令：账号改自己的口令，不需要管理员凭据。 */
+async function handleRotateAccount(row: IntegrationAccount): Promise<void> {
+  const confirmed = await ElMessageBox.confirm(
+    `将为 ${row.name} 的监控账号 ${row.username} 生成新口令，并立即用新口令重建 Exporter。` +
+      `旧口令作废（业务侧无需改动）。是否继续？`,
+    '轮换监控账号口令',
+    { type: 'warning', confirmButtonText: '轮换', cancelButtonText: '取消' },
+  ).catch(() => false)
+  if (!confirmed) {
+    return
+  }
+  try {
+    await integrationApi.rotateAccount(row.integration_id)
+    ElMessage.success('已轮换口令并重建 Exporter')
+    await Promise.all([loadAccounts(), load()])
+  } catch (error) {
+    toastError(error)
+  }
+}
+
+/** 删除账号：破坏性写操作，需要管理员凭据。 */
+async function handleDropAccount(row: IntegrationAccount): Promise<void> {
+  const { value: adminUser } = await ElMessageBox.prompt(
+    `删除 ${row.name} 上的监控账号 ${row.username} 后，该实例将不再有指标。\n请填写管理员账号：`,
+    '删除监控账号',
+    { inputPlaceholder: '如 root', inputValue: 'root', confirmButtonText: '下一步', cancelButtonText: '取消' },
+  ).catch(() => ({ value: '' }))
+  if (!adminUser) {
+    return
+  }
+  const { value: adminPassword } = await ElMessageBox.prompt(
+    '请填写管理员口令（仅本次使用，不落库、不写审计）：',
+    '删除监控账号',
+    { inputType: 'password', confirmButtonText: '删除', cancelButtonText: '取消' },
+  ).catch(() => ({ value: '' }))
+  if (!adminPassword) {
+    return
+  }
+  try {
+    await integrationApi.dropAccount(row.integration_id, {
+      admin_username: adminUser,
+      admin_password: adminPassword,
+    })
+    ElMessage.success('已删除监控账号')
+    await Promise.all([loadAccounts(), load()])
+  } catch (error) {
+    toastError(error)
+  }
+}
+
 /** 载入概览与列表。 */
 async function load(): Promise<void> {
   loading.value = true
@@ -114,9 +192,10 @@ function openInstall(template: IntegrationTemplate, item?: IntegrationView): voi
   form.group_name = item?.group_name || ''
   form.deploy = dockerReady.value
   form.auto_rules = true
-  form.bootstrap_account = false
+  form.bootstrap_account = bootstrapSupported.value
   form.admin_username = ''
   form.admin_password = ''
+  form.join_platform_network = item?.join_platform_network ?? false
   form.labels = Object.entries(item?.labels || {}).map(([key, value]) => ({ key, value }))
   const options: Record<string, string> = {}
   for (const option of template.options) {
@@ -152,6 +231,8 @@ function buildPayload(): IntegrationInput {
     group_name: form.group_name,
     deploy: form.deploy,
     auto_rules: form.auto_rules,
+    // 始终显式提交，避免"取消勾选后编辑保存仍生效"
+    join_platform_network: form.join_platform_network,
   }
   // 代建账号：只有勾选时才提交管理凭据（否则一个字节也不上传）
   if (form.bootstrap_account) {
@@ -394,6 +475,7 @@ onMounted(load)
       <div class="row">
         <el-button size="small" @click="load">刷新</el-button>
         <el-button size="small" :disabled="!dockerReady" @click="openLogDialog">日志接入</el-button>
+        <el-button size="small" @click="openAccounts">监控账号</el-button>
         <el-tag size="small" :type="dockerReady ? 'success' : 'info'" effect="light">
           {{ dockerReady ? '一键部署已启用' : '仅生成配置' }}
         </el-tag>
@@ -587,6 +669,24 @@ onMounted(load)
           <span>自动创建推荐告警规则（{{ (activeTemplate?.alerts || []).length }} 条）</span>
         </div>
 
+        <!-- 网络接入方向：默认由平台把自己的 Exporter 接进目标网络（不动被管项目） -->
+        <div class="switch-row">
+          <el-switch v-model="form.join_platform_network" :disabled="!dockerReady" />
+          <span>改为把「目标容器」接入平台网络（仅在平台接不进去时使用）</span>
+        </div>
+        <el-alert v-if="form.join_platform_network" type="warning" :closable="false" show-icon class="mt"
+          title="这是反向接网：会修改被管容器的网络配置">
+          <p class="field-hint">
+            平台将执行等价于 <code>docker network connect &lt;平台网络&gt; &lt;目标容器&gt;</code> 的操作。
+            默认方向本来就是「平台自动接进目标网络」，正常情况下不需要勾选它。
+          </p>
+          <p class="field-hint">
+            务必注意：若目标容器原本只在 internal 网络里（例如 jd 的 jd-data，刻意做成无出网），
+            接入平台网络后它会多一条出网路径，数据面隔离随之失效。
+            地址填的是外部地址（非容器名）时无需勾选。
+          </p>
+        </el-alert>
+
         <!-- 账号托管：平台代为创建只读监控账号（写操作，需显式授权） -->
         <template v-if="bootstrapSupported">
           <el-divider content-position="left">监控账号</el-divider>
@@ -594,6 +694,11 @@ onMounted(load)
             <el-switch v-model="form.bootstrap_account" :disabled="!dockerReady" />
             <span>由平台创建/更新只读监控账号（无需登录被管数据库手工建号）</span>
           </div>
+          <p v-if="form.bootstrap_account" class="field-hint">
+            账号名留空即用默认值 <span class="mono">{{ activeTemplate?.monitor_user || 'mwops_exporter' }}</span>，
+            口令由平台生成十六进制随机串并加密存储；你只需要填一次管理员凭据。
+            未填凭据时不会报错，只会在集成备注里提示「填凭据后点重新应用」。
+          </p>
           <el-row v-if="form.bootstrap_account" :gutter="12">
             <el-col :xs="24" :sm="12">
               <el-form-item label="管理账号（仅本次使用）">
@@ -671,6 +776,59 @@ onMounted(load)
         </el-tabs>
       </template>
     </el-drawer>
+    <!-- 监控账号管理：平台代管的只读账号 -->
+    <el-dialog v-model="accountsVisible" title="监控账号管理" width="820px">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="这些只读账号由平台创建并托管（口令加密存储）。轮换口令不需要管理员凭据——账号可以修改自己的口令；删除账号是破坏性操作，需要填写管理员凭据（生产环境会转成审批工单）。"
+      />
+      <el-table v-loading="accountsLoading" :data="accounts" size="small">
+        <el-table-column prop="name" label="集成" min-width="130" show-overflow-tooltip />
+        <el-table-column label="组件" width="100">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.component || row.mw_type }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="username" label="监控账号" width="140" />
+        <el-table-column label="来源" width="110">
+          <template #default="{ row }">
+            <el-tag v-if="row.managed" size="small" type="success" effect="light">平台创建</el-tag>
+            <el-tag v-else-if="row.supports_management" size="small" effect="plain">外部账号</el-tag>
+            <span v-else class="muted">不需要</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="grants" label="权限" width="200" show-overflow-tooltip />
+        <el-table-column label="最近轮换" width="150">
+          <template #default="{ row }">
+            <span class="muted">{{ row.rotated_at ? formatTime(row.rotated_at) : '-' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="160" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              text
+              size="small"
+              :disabled="!row.has_password || !row.supports_management || !dockerReady"
+              @click="handleRotateAccount(row)"
+            >轮换口令</el-button>
+            <el-button
+              text
+              size="small"
+              type="danger"
+              :disabled="!row.supports_management || !dockerReady"
+              @click="handleDropAccount(row)"
+            >删除账号</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p v-if="!dockerReady" class="muted note">
+        当前「一键部署」不可用（未挂载 docker.sock 或 integration.docker_enabled=false），
+        无法由平台执行建号/轮换/删除；请在平台 .env 打开后重建 backend 容器。
+      </p>
+    </el-dialog>
     <!-- 日志接入：从被管容器的 docker 配置反查日志位置（读不到不允许配置） -->
     <el-dialog v-model="logDialogVisible" title="日志接入" width="720px" :close-on-click-modal="false">
       <el-alert

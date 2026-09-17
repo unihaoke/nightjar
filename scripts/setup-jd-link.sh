@@ -461,9 +461,10 @@ WEB_PORT_OUT=$(env_get "$NJ" WEB_PORT); [ -z "$WEB_PORT_OUT" ] && WEB_PORT_OUT=8
 GRAF_PORT_OUT=$(env_get "$NJ" GRAFANA_PORT); [ -z "$GRAF_PORT_OUT" ] && GRAF_PORT_OUT=3000
 printf '\n%s接下来（全部在平台上点，被管项目无需任何改动）%s\n' "$C_CYAN" "$C_RESET"
 printf '  1. 平台入口   http://127.0.0.1:%s（管理员 %s）\n' "$WEB_PORT_OUT" "$(env_get "$NJ" ADMIN_USER)"
-printf '  2. 集成 MySQL  名称 jd-mysql，地址 interview-mysql:3306，勾选「由平台创建只读监控账号」+「一键拉起 Exporter」\n'
+printf '  2. 集成 MySQL  名称 jd-mysql，地址 interview-mysql:3306（只读账号 mwops_exporter 自动创建，只需填一次 root 凭据）\n'
 printf '  3. 集成 Redis  名称 jd-redis，地址 interview-redis:6379，口令填被管项目的 REDIS_PASSWORD\n'
 printf '  4. 日志接入    目标容器名 interview-backend\n'
+printf '  5. 账号管理    集成中心 → 监控账号（查看来源 / 轮换口令 / 删除账号）\n'
 printf '  5. 看大盘      http://127.0.0.1:%s（数据源已自动配置）\n' "$GRAF_PORT_OUT"
 printf '  6. 逐项体检    %s/scripts/doctor-jd-link.sh\n' "$NIGHTJAR_DIR"
 

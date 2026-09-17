@@ -116,6 +116,14 @@ type IntegrationInput struct {
 	AutoRules *bool `json:"auto_rules"`
 	// BootstrapAccount 表示由平台创建/更新只读监控账号（需要管理凭据）。
 	BootstrapAccount *bool `json:"bootstrap_account"`
+	// JoinPlatformNetwork 表示**把目标容器接入平台网络**（反向接网），默认关闭。
+	//
+	// 默认方向是平台把自己的 Exporter 接进目标网络（不改被管项目）。
+	// 这个开关是给"平台接不进去"的场景留的人工兜底：例如目标在网络命名空间上受限、
+	// 或运维明确要求所有被管容器都挂在平台网络上。
+	// 代价：目标容器会因此获得平台网络的可达性（若它原本只在 internal 网络里，
+	// 等于多了一条出网路径），所以必须由用户显式勾选。
+	JoinPlatformNetwork *bool `json:"join_platform_network"`
 	// AdminUsername / AdminPassword 为被管实例的管理凭据，仅用于执行固定模板 SQL。
 	//
 	// 安全约定：只在本次请求内存中使用，绝不落库、绝不写审计、绝不回显；
@@ -144,11 +152,13 @@ type IntegrationView struct {
 	// ContainerStatus 为 Exporter 容器状态（未启用一键部署时为空）。
 	ContainerStatus string `json:"container_status"`
 	// DeployNote 记录平台"为你做了什么"：一键部署结果，以及在哪个网络上发现了目标容器。
-	DeployNote  string `json:"deploy_note"`
-	Selector    string `json:"selector"`
-	AppliedAt   string `json:"applied_at"`
-	LastError   string `json:"last_error"`
-	HasPassword bool   `json:"has_password"`
+	DeployNote string `json:"deploy_note"`
+	// JoinPlatformNetwork 表示该集成是否勾选了「把目标容器接入平台网络」。
+	JoinPlatformNetwork bool   `json:"join_platform_network"`
+	Selector            string `json:"selector"`
+	AppliedAt           string `json:"applied_at"`
+	LastError           string `json:"last_error"`
+	HasPassword         bool   `json:"has_password"`
 }
 
 // IntegrationOverview 是集成中心的概览（用于卡片上的角标）。
@@ -270,9 +280,10 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 		return nil, apperr.Newf(apperr.CodeInvalidParam, "集成名称 %q 已存在（集成名称需全局唯一）", instance.Name)
 	}
 
-	// 平台托管账号：勾选"由平台创建只读账号"且未填口令时，口令由平台生成。
-	// 好处是使用者不需要自己编口令——十六进制随机串天然不含需要转义的字符。
-	bootstrap := s.shouldBootstrapAccount(in)
+	// 平台托管账号：需要账号的组件默认由平台代建（见 shouldBootstrapAccount）。
+	// 口令留空时由平台生成——十六进制随机串天然不含需要转义的字符，
+	// 使用者因此**不需要提前建号、也不需要自己想口令**。
+	bootstrap := s.shouldBootstrapAccount(in, tpl.Type) && hasAdminCreds(in)
 	if bootstrap && strings.TrimSpace(instance.Password) == "" {
 		instance.Password = randomHexPassword(24)
 	}
@@ -301,7 +312,8 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 		Template: tpl.Type, Address: instance.Address.Raw, Labels: instance.Labels,
 		Options: instance.Options, Job: s.jobName(), Image: tpl.Image,
 		Container: integration.ContainerName(instance.Name), ExporterPort: tpl.ExporterPort,
-		CreatedBy: operator.Username, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		JoinPlatformNetwork: s.shouldJoinPlatformNetwork(in),
+		CreatedBy:           operator.Username, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	item.Config["integration"] = meta.toMap()
 	if err := s.instances.Create(ctx, item); err != nil {
@@ -313,37 +325,7 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 
 	// 顺序很重要：先建只读账号，再拉起 Exporter。
 	// 反过来的话 Exporter 会因认证失败反复重启（虽然 restart 策略最终能恢复，但日志会很难看）。
-	var bootstrapNote string
-	var bootstrapErr error
-	if bootstrap {
-		// 生产环境：代管账号是**写被管数据库**，属 L2 高危 → 只创建审批工单，不执行。
-		// 工单里带上将执行的固定 SQL（不含口令），审批通过后由运维执行或再次保存触发。
-		if instance.Environment == model.EnvProd && s.approval != nil {
-			ticket, ticketErr := s.approval.Create(ctx, ApprovalRequest{
-				InstanceID:  item.ID,
-				Environment: instance.Environment,
-				ActionType:  "integration_bootstrap",
-				ActionDetail: map[string]any{
-					"name": item.Name, "mw_type": tpl.Type,
-					"address": instance.Address.Raw, "monitor_user": instance.Username,
-					"sql": monitoringAccountSQLForDisplay(tpl.Type, instance.Username),
-				},
-				Reason: "生产环境由平台创建只读监控账号（L2）",
-			}, operator)
-			if ticketErr != nil {
-				bootstrapErr = fmt.Errorf("创建审批工单失败：%w", ticketErr)
-			} else {
-				bootstrapNote = "生产环境需审批：已创建工单 " + ticket.TicketID +
-					"（工单内含将执行的 SQL）；审批通过后请点「重新应用」由平台建号"
-			}
-		} else {
-			bootstrapNote, bootstrapErr = s.ensureMonitoringAccount(ctx, instance, tpl, in.AdminUsername, in.AdminPassword)
-			if bootstrapErr != nil {
-				s.log.Warn("集成：创建只读监控账号失败",
-					zap.String("integration", item.Name), zap.Error(bootstrapErr))
-			}
-		}
-	}
+	bootstrapNote, bootstrapErr, bootstrapped := s.bootstrapAccount(ctx, item, tpl, instance, in, operator)
 	deployErr := s.deploy(ctx, item, tpl, instance)
 	if bootstrapNote != "" {
 		s.setDeployNote(ctx, item.ID, bootstrapNote)
@@ -358,7 +340,7 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 		"name": item.Name, "mw_type": tpl.Type, "address": instance.Address.Raw,
 		"deploy": s.deployEnabled(in), "labels": instance.Labels,
 		// 只记录"是否代为建号"与账号名，**绝不记录口令**
-		"bootstrap_account": bootstrap, "monitor_user": instance.Username,
+		"bootstrap_account": bootstrapped, "monitor_user": instance.Username,
 	})
 
 	if err := firstErr(syncErr, bootstrapErr, deployErr); err != nil {
@@ -423,6 +405,10 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 	meta.Image = tpl.Image
 	meta.Container = integration.ContainerName(instance.Name)
 	meta.ExporterPort = tpl.ExporterPort
+	// 编辑时若前端没带该字段（nil）则沿用原值，避免"编辑一次就把勾选丢掉"。
+	if in.JoinPlatformNetwork != nil {
+		meta.JoinPlatformNetwork = *in.JoinPlatformNetwork
+	}
 	meta.UpdatedBy = operator.Username
 	meta.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	if item.Config == nil {
@@ -697,6 +683,37 @@ func monitoringAccountSQL(mwType, username, password string) ([]string, error) {
 	}
 }
 
+// rotateAccountSQL 返回「账号改自己口令」的模板 SQL。
+//
+// 关键点：不需要管理员权限——MySQL 允许 ALTER USER USER()、PostgreSQL 允许
+// ALTER ROLE CURRENT_USER，因此平台可以自助轮换（不要求使用者再填管理员凭据）。
+func rotateAccountSQL(mwType, newPassword string) ([]string, error) {
+	switch mwType {
+	case integration.TypeMySQL:
+		return []string{
+			fmt.Sprintf("ALTER USER USER() IDENTIFIED WITH mysql_native_password BY '%s'", newPassword),
+		}, nil
+	case integration.TypePG:
+		return []string{
+			fmt.Sprintf("ALTER ROLE CURRENT_USER PASSWORD '%s'", newPassword),
+		}, nil
+	default:
+		return nil, fmt.Errorf("%s 没有平台托管的只读账号，无需轮换", mwType)
+	}
+}
+
+// dropAccountSQL 返回删除监控账号的模板 SQL（破坏性，需管理凭据）。
+func dropAccountSQL(mwType, username string) ([]string, error) {
+	switch mwType {
+	case integration.TypeMySQL:
+		return []string{fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", username)}, nil
+	case integration.TypePG:
+		return []string{fmt.Sprintf("DROP ROLE IF EXISTS %s", username)}, nil
+	default:
+		return nil, fmt.Errorf("%s 没有平台托管的只读账号，无需删除", mwType)
+	}
+}
+
 // bootstrapClientImage 是执行模板 SQL 用的一次性客户端镜像。
 //
 // 选官方客户端镜像而不是引入 mysql/postgres 驱动：平台二进制保持无数据库驱动依赖，
@@ -730,6 +747,277 @@ func bootstrapCommand(mwType string, address integration.Address, adminUser, adm
 	}
 	return args, []string{"MYSQL_PWD=" + adminPassword}
 }
+
+// bootstrapAccount 执行「由平台创建只读监控账号」，返回说明、错误与是否真的执行了写操作。
+//
+// 三条路径共用（新建 / 编辑 / 重新应用），行为一致：
+//   - 组件不需要账号（如 Redis）→ 什么都不做；
+//   - 需要账号但本次没给管理凭据 → **不报错**，只提示"填凭据后点重新应用"，
+//     避免使用者因为没填凭据而存不下集成；
+//   - 生产环境 → 只创建审批工单（写被管库属 L2），不执行；
+//   - 其余 → 用一次性客户端容器执行内置模板 SQL。
+func (s *IntegrationService) bootstrapAccount(
+	ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template,
+	instance integration.Instance, in IntegrationInput, operator Operator,
+) (note string, err error, performed bool) {
+	if tpl.MonitorUser == "" {
+		return "", nil, false // 该组件不需要平台建号（Redis 等口令由目标自身鉴权决定）
+	}
+	if !hasAdminCreds(in) {
+		return "已跳过自动建号：本次未提供管理凭据（只需填一次管理员账号口令并点「重新应用」，平台即可自动建号）", nil, false
+	}
+	if instance.Environment == model.EnvProd && s.approval != nil {
+		ticket, ticketErr := s.approval.Create(ctx, ApprovalRequest{
+			InstanceID:  item.ID,
+			Environment: instance.Environment,
+			ActionType:  "integration_bootstrap",
+			ActionDetail: map[string]any{
+				"name": item.Name, "mw_type": tpl.Type,
+				"address": instance.Address.Raw, "monitor_user": instance.Username,
+				"sql": monitoringAccountSQLForDisplay(tpl.Type, instance.Username),
+			},
+			Reason: "生产环境由平台创建只读监控账号（L2）",
+		}, operator)
+		if ticketErr != nil {
+			return "", fmt.Errorf("创建审批工单失败：%w", ticketErr), false
+		}
+		return "生产环境需审批：已创建工单 " + ticket.TicketID +
+			"（工单内含将执行的 SQL）；审批通过后请点「重新应用」由平台建号", nil, false
+	}
+	note, err = s.ensureMonitoringAccount(ctx, instance, tpl, in.AdminUsername, in.AdminPassword)
+	if err != nil {
+		s.log.Warn("集成：创建只读监控账号失败",
+			zap.String("integration", item.Name), zap.Error(err))
+		return "", err, false
+	}
+	// 记下"该账号由平台代管"，供账号管理页展示与后续轮换/删除使用。
+	s.writeMeta(ctx, item, func(meta *IntegrationMeta) { meta.AccountManaged = true })
+	return note, nil, true
+}
+
+// AccountStatus 描述一个集成的监控账号现状（供「监控账号」管理界面）。
+type AccountStatus struct {
+	IntegrationID int64  `json:"integration_id"`
+	Name          string `json:"name"`
+	MWType        string `json:"mw_type"`
+	Component     string `json:"component"`
+	Username      string `json:"username"`
+	Address       string `json:"address"`
+	// Managed 表示该账号由平台创建（平台会记在集成元信息里）。
+	Managed bool `json:"managed"`
+	// HasPassword 表示平台持有该账号的口令（加密存储），因此可以自助轮换。
+	HasPassword   bool   `json:"has_password"`
+	RotatedAt     string `json:"rotated_at"`
+	Grants        string `json:"grants"`
+	SupportsMngmt bool   `json:"supports_management"`
+	// LastError 取自集成核验结论（Exporter up / 认证失败等）。
+	LastError string `json:"last_error"`
+}
+
+// ListAccounts 汇总所有集成的监控账号现状。
+func (s *IntegrationService) ListAccounts(ctx context.Context, scope Scope) ([]AccountStatus, error) {
+	items, err := s.List(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AccountStatus, 0, len(items))
+	for _, view := range items {
+		item, getErr := s.instances.Get(ctx, view.InstanceID)
+		if getErr != nil {
+			continue
+		}
+		meta, _ := IntegrationMetaOf(*item)
+		tpl, _ := integration.TemplateOf(meta.Template)
+		out = append(out, AccountStatus{
+			IntegrationID: view.InstanceID, Name: view.Name, MWType: view.MWType,
+			Component: view.Component, Username: view.Username, Address: view.Address,
+			Managed: meta.AccountManaged, HasPassword: view.HasPassword,
+			RotatedAt: meta.AccountRotatedAt, Grants: grantSummary(tpl.Type),
+			SupportsMngmt: tpl.MonitorUser != "",
+			LastError:     view.LastError,
+		})
+	}
+	return out, nil
+}
+
+// RotateAccountPassword 轮换平台托管的监控账号口令。
+//
+// 为什么不需要管理凭据：MySQL / PostgreSQL 都允许**账号修改自己的口令**，
+// 而平台加密保存着该账号的口令，因此可以自助完成轮换——
+// 轮换后立即重建 Exporter，使它用新口令抓取。
+func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64, operator Operator) (*IntegrationView, error) {
+	item, err := s.integrationInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	meta, ok := IntegrationMetaOf(*item)
+	if !ok {
+		return nil, apperr.New(apperr.CodeInvalidParam, "该实例不是通过集成中心创建的")
+	}
+	tpl, ok := integration.TemplateOf(meta.Template)
+	if !ok || tpl.MonitorUser == "" {
+		return nil, apperr.Newf(apperr.CodeInvalidParam, "%s 不支持平台代管账号", item.MWType)
+	}
+	if s.docker == nil {
+		return nil, apperr.New(apperr.CodeForbidden,
+			"轮换口令需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）")
+	}
+	oldPassword, err := s.decrypt(item.PasswordEncrypted)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, err)
+	}
+	address, err := integration.ParseAddress(meta.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+	if err != nil {
+		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+	newPassword := randomHexPassword(24)
+	instance := integration.Instance{
+		Name: item.Name, MWType: tpl.Type, Address: address,
+		Username: item.Username, Password: newPassword,
+		Labels: meta.Labels, Options: meta.Options,
+		Environment: item.Environment, GroupName: item.GroupName,
+	}
+	statements, err := rotateAccountSQL(tpl.Type, newPassword)
+	if err != nil {
+		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+	// 关键：用**账号自己**的旧口令登录后执行 ALTER，因此不需要管理员凭据。
+	if _, err := s.runClientSQL(ctx, instance, tpl, item.Username, oldPassword, statements); err != nil {
+		return nil, apperr.Wrap(apperr.CodeUpstream,
+			fmt.Errorf("轮换口令失败（可能账号已被删除，请重新保存并勾选自动建号）：%w", err))
+	}
+	encrypted, err := s.cipher.Encrypt(newPassword)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, err)
+	}
+	item.PasswordEncrypted = encrypted
+	if err := s.instances.Update(ctx, item); err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, err)
+	}
+	instance.Password = newPassword
+	deployErr := s.deploy(ctx, item, tpl, instance)
+	if deployErr != nil {
+		s.log.Warn("集成：轮换后重建 Exporter 失败", zap.String("integration", item.Name), zap.Error(deployErr))
+	}
+	s.writeMeta(ctx, item, func(m *IntegrationMeta) {
+		m.AccountRotatedAt = time.Now().UTC().Format(time.RFC3339)
+	})
+	s.record(ctx, operator, id, "integration_account_rotate", map[string]any{
+		"name": item.Name, "monitor_user": item.Username,
+	})
+	s.scheduleVerify(item.ID, item.Name, s.jobName())
+	view := s.toView(ctx, *item)
+	return &view, nil
+}
+
+// DropAccountInput 是删除监控账号的入参（需要管理凭据）。
+type DropAccountInput struct {
+	AdminUsername string `json:"admin_username"`
+	AdminPassword string `json:"admin_password"`
+}
+
+// DropAccount 删除由平台创建的只读监控账号。
+//
+// 这是**破坏性写操作**（被管库里少一个账号）：必须提供管理凭据；
+// 生产环境只创建审批工单，不直接执行。
+func (s *IntegrationService) DropAccount(
+	ctx context.Context, id int64, in DropAccountInput, operator Operator,
+) (*IntegrationView, error) {
+	item, err := s.integrationInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	meta, ok := IntegrationMetaOf(*item)
+	if !ok {
+		return nil, apperr.New(apperr.CodeInvalidParam, "该实例不是通过集成中心创建的")
+	}
+	tpl, ok := integration.TemplateOf(meta.Template)
+	if !ok || tpl.MonitorUser == "" {
+		return nil, apperr.Newf(apperr.CodeInvalidParam, "%s 不支持平台代管账号", item.MWType)
+	}
+	if s.docker == nil {
+		return nil, apperr.New(apperr.CodeForbidden,
+			"删除账号需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）")
+	}
+	if strings.TrimSpace(in.AdminUsername) == "" || strings.TrimSpace(in.AdminPassword) == "" {
+		return nil, apperr.New(apperr.CodeInvalidParam, "删除账号需要提供被管实例的管理账号与口令")
+	}
+	address, err := integration.ParseAddress(meta.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+	if err != nil {
+		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+	instance := integration.Instance{
+		Name: item.Name, MWType: tpl.Type, Address: address,
+		Username: item.Username, Labels: meta.Labels, Options: meta.Options,
+		Environment: item.Environment, GroupName: item.GroupName,
+	}
+	statements, err := dropAccountSQL(tpl.Type, item.Username)
+	if err != nil {
+		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+	if item.Environment == model.EnvProd && s.approval != nil {
+		ticket, ticketErr := s.approval.Create(ctx, ApprovalRequest{
+			InstanceID: item.ID, Environment: item.Environment,
+			ActionType: "integration_account_drop",
+			ActionDetail: map[string]any{
+				"name": item.Name, "mw_type": tpl.Type, "monitor_user": item.Username,
+				"sql": statements,
+			},
+			Reason: "生产环境由平台删除只读监控账号（L2）",
+		}, operator)
+		if ticketErr != nil {
+			return nil, apperr.Wrap(apperr.CodeInternal, fmt.Errorf("创建审批工单失败：%w", ticketErr))
+		}
+		view := s.toView(ctx, *item)
+		view.DeployNote = "生产环境需审批：已创建工单 " + ticket.TicketID + "（删除账号 " + item.Username + "）"
+		return &view, nil
+	}
+	if _, err := s.runClientSQL(ctx, instance, tpl, in.AdminUsername, in.AdminPassword, statements); err != nil {
+		return nil, apperr.Wrap(apperr.CodeUpstream, fmt.Errorf("删除监控账号失败：%w", err))
+	}
+	s.writeMeta(ctx, item, func(m *IntegrationMeta) {
+		m.AccountManaged = false
+		m.AccountRotatedAt = ""
+	})
+	s.record(ctx, operator, id, "integration_account_drop", map[string]any{
+		"name": item.Name, "monitor_user": item.Username,
+	})
+	view := s.toView(ctx, *item)
+	view.DeployNote = "已删除只读监控账号 " + item.Username + "；如需恢复请重新保存并勾选自动建号"
+	return &view, nil
+}
+
+// runClientSQL 用一次性客户端容器执行 SQL（口令走环境变量，不出现在命令行）。
+func (s *IntegrationService) runClientSQL(
+	ctx context.Context, instance integration.Instance, tpl integration.Template,
+	user, password string, statements []string,
+) (string, error) {
+	if s.docker == nil {
+		return "", fmt.Errorf("未启用一键部署（integration.docker_enabled=false）")
+	}
+	if len(statements) == 0 {
+		return "", nil
+	}
+	networks, resolvedHost, _ := s.targetNetworks(ctx, instance.Address.Host)
+	if resolvedHost != "" {
+		instance.Address.Host = resolvedHost
+	}
+	args, env := bootstrapCommand(tpl.Type, instance.Address, user, password, statements)
+	spec := docker.ContainerSpec{
+		Name:     integration.ContainerName(instance.Name) + "-sql",
+		Image:    bootstrapClientImage(tpl.Type),
+		Env:      env,
+		Cmd:      args,
+		Networks: networks,
+		Labels:   map[string]string{"mwops.integration": instance.Name, "mwops.role": "sql"},
+	}
+	output, err := s.docker.RunOnce(ctx, spec, 60*time.Second)
+	if err != nil {
+		return output, fmt.Errorf("%w%s（容器输出：%s）", err, dockerHint(err), truncateText(output, 300))
+	}
+	return output, nil
+}
+
 
 // ensureMonitoringAccount 由平台创建/更新只读监控账号。
 //
@@ -776,7 +1064,8 @@ func (s *IntegrationService) ensureMonitoringAccount(
 	}
 	output, err := s.docker.RunOnce(ctx, spec, 60*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("创建只读监控账号失败：%w（容器输出：%s）", err, truncateText(output, 400))
+		return "", fmt.Errorf("创建只读监控账号失败：%w%s（容器输出：%s）",
+			err, dockerHint(err), truncateText(output, 400))
 	}
 	s.log.Info("集成：只读监控账号已就绪",
 		zap.String("integration", in.Name), zap.String("mw_type", tpl.Type), zap.String("user", in.Username))
@@ -844,6 +1133,13 @@ type IntegrationMeta struct {
 	UpdatedBy    string            `json:"updated_by"`
 	UpdatedAt    string            `json:"updated_at"`
 	DeployNote   string            `json:"deploy_note"`
+	// JoinPlatformNetwork 记录用户是否显式要求「把目标容器接入平台网络」。
+	// 存起来是为了「重新应用」时行为可复现（平台每次都会重新接网）。
+	JoinPlatformNetwork bool `json:"join_platform_network"`
+	// AccountManaged 表示只读监控账号由平台创建（供账号管理界面展示）。
+	AccountManaged bool `json:"account_managed"`
+	// AccountRotatedAt 为最近一次口令轮换时间（RFC3339）。
+	AccountRotatedAt string `json:"account_rotated_at"`
 }
 
 func (m IntegrationMeta) toMap() map[string]any {
@@ -853,6 +1149,8 @@ func (m IntegrationMeta) toMap() map[string]any {
 		"applied_at": m.AppliedAt, "last_error": m.LastError,
 		"created_by": m.CreatedBy, "created_at": m.CreatedAt,
 		"updated_by": m.UpdatedBy, "updated_at": m.UpdatedAt, "deploy_note": m.DeployNote,
+		"join_platform_network": m.JoinPlatformNetwork,
+		"account_managed":       m.AccountManaged, "account_rotated_at": m.AccountRotatedAt,
 	}
 }
 
@@ -952,6 +1250,11 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 		Labels: in.Labels, Options: in.Options,
 		Environment: environment, GroupName: in.GroupName,
 	}
+	// 监控账号名留空时用模板默认值（如 mwops_exporter）：
+	// 使用者因此**不需要提前建号、也不需要自己想一个账号名**。
+	if instance.Username == "" && tpl.MonitorUser != "" {
+		instance.Username = tpl.MonitorUser
+	}
 	// 更新场景允许口令留空（表示沿用已存口令），因此这里按"空口令"再校验一次：
 	// 模板只需要账号非空，口令是否必填由 Validate 内部按组件类型判断。
 	if err := tpl.Validate(instance); err != nil {
@@ -992,11 +1295,17 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 	action, id, err := s.docker.Ensure(ctx, spec)
 	if err != nil {
 		s.setDeployNote(ctx, item.ID, "一键部署失败："+err.Error())
-		return fmt.Errorf("一键部署 Exporter 失败：%w", err)
+		return fmt.Errorf("一键部署 Exporter 失败：%w%s", err, dockerHint(err))
 	}
 	// 顺带把平台自己接进目标网络，纳管实例的 TCP 健康探测才能成功——
 	// 这一步同样是平台侧动作，被管项目无感。
 	s.attachSelf(ctx, instance.Address.Host)
+	joinNote := ""
+	// 反向接网（改被管容器）是用户显式勾选的可选项，值持久化在集成元信息里，
+	// 因此 Create / Update / 重新应用 三条路径行为一致。
+	if meta, ok := IntegrationMetaOf(*item); ok && meta.JoinPlatformNetwork {
+		joinNote = s.joinTargetToPlatformNetwork(ctx, instance.Address.Host)
+	}
 	if instance.Address.Host != item.Host && instance.Address.Host != "" {
 		// 纳管实例的连接地址也统一成可解析名，避免"平台能抓指标、但健康探测失败"。
 		item.Host = instance.Address.Host
@@ -1009,8 +1318,69 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 	if note != "" {
 		done += "；" + note
 	}
+	if joinNote != "" {
+		done += "；" + joinNote
+	}
 	s.setDeployNote(ctx, item.ID, done)
 	return nil
+}
+
+// joinTargetToPlatformNetwork 把目标容器接入平台网络（用户显式勾选时才调用）。
+//
+// 返回人可读说明；失败只记日志并把原因写进备注，不影响集成本身。
+func (s *IntegrationService) joinTargetToPlatformNetwork(ctx context.Context, host string) string {
+	if s.docker == nil {
+		return ""
+	}
+	res, _ := s.resolveTarget(ctx, host)
+	if res == nil || res.ContainerID == "" {
+		return "未找到目标容器，跳过「接入平台网络」"
+	}
+	platformNets := s.exporterNetworks()
+	for _, network := range platformNets {
+		if contains(res.Networks, network) {
+			continue // 已经在平台网络上
+		}
+		if err := s.docker.ConnectNetwork(ctx, res.ContainerID, network); err != nil {
+			s.log.Warn("集成：目标容器接入平台网络失败",
+				zap.String("container", res.Container), zap.String("network", network), zap.Error(err))
+			return fmt.Sprintf("目标容器 %s 接入平台网络 %s 失败：%s", res.Container, network, err)
+		}
+		s.log.Info("集成：已按要求把目标容器接入平台网络",
+			zap.String("container", res.Container), zap.String("network", network))
+	}
+	return fmt.Sprintf("已按勾选把目标容器 %s 接入平台网络（%s）——该容器因此能反向看到平台网络",
+		res.Container, strings.Join(platformNets, "、"))
+}
+
+// dockerHint 把 docker 调用失败翻译成可执行的下一步。
+//
+// 最常见的真实故障：平台容器里没有 /var/run/docker.sock（compose 里的挂载被注释着，
+// 或 rootless Docker 的 socket 在别的路径），表现为
+//   dial unix /var/run/docker.sock: connect: no such file or directory
+// 原始信息看不出"该怎么修"，因此在这里补上。
+func dockerHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "docker.sock") && strings.Contains(msg, "no such file"):
+		return "。原因：平台容器内找不到 docker.sock，因此无法创建任何容器。" +
+			"处理：在 docker-compose.yml 里取消 backend.volumes 的 " +
+			"`/var/run/docker.sock:/var/run/docker.sock` 注释，然后 " +
+			"`docker compose up -d --force-recreate backend`（或重跑 scripts/setup-jd-link.sh）。" +
+			"若使用 rootless Docker，socket 通常在 /run/user/<uid>/docker.sock，请把 " +
+			"INTEGRATION_DOCKER_HOST 指向它并挂载该路径"
+	case strings.Contains(msg, "permission denied") && strings.Contains(msg, "docker.sock"):
+		return "。原因：容器能读到 docker.sock 但无权访问。" +
+			"处理：确认 socket 属主（Linux 上通常 root:docker）并让平台容器以相应权限运行，" +
+			"或改用 socket 代理（见 docs/INTEGRATION.md 的安全边界）"
+	case strings.Contains(msg, "connection refused"):
+		return "。原因：docker 守护进程不可达（socket 路径不对或 daemon 未运行）。" +
+			"处理：核对 INTEGRATION_DOCKER_HOST 与宿主上实际路径"
+	}
+	return ""
 }
 
 // resolveTarget 用 docker 反查目标容器与其所在网络。
@@ -1190,15 +1560,34 @@ func (s *IntegrationService) deployEnabled(in IntegrationInput) bool {
 	return s.docker != nil
 }
 
-// shouldBootstrapAccount 判断本次是否由平台创建只读监控账号。
-//
-// 默认关闭：这是一次**写操作**（在被管库里建账号/授权）。
-// 只有使用者显式勾选时才执行，且必须提供管理凭据。
-func (s *IntegrationService) shouldBootstrapAccount(in IntegrationInput) bool {
-	if in.BootstrapAccount == nil {
+// shouldJoinPlatformNetwork 判断本次是否把目标容器接入平台网络（默认否）。
+func (s *IntegrationService) shouldJoinPlatformNetwork(in IntegrationInput) bool {
+	if in.JoinPlatformNetwork == nil {
 		return false
 	}
-	return *in.BootstrapAccount
+	return *in.JoinPlatformNetwork
+}
+
+// shouldBootstrapAccount 判断本次是否由平台创建只读监控账号。
+//
+// 默认策略：**需要账号的组件（MySQL / PostgreSQL）默认由平台代建**——
+// 使用者的预期是"我不建号，平台帮我建好"。显式传 false 才关闭。
+// 未提供管理凭据时不会硬失败，而是跳过并给出提示（见 Create/Update 的调用处）。
+func (s *IntegrationService) shouldBootstrapAccount(in IntegrationInput, mwType string) bool {
+	if in.BootstrapAccount != nil {
+		return *in.BootstrapAccount
+	}
+	switch mwType {
+	case integration.TypeMySQL, integration.TypePG:
+		return true
+	default:
+		return false
+	}
+}
+
+// hasAdminCreds 判断本次请求是否带了可用的管理凭据。
+func hasAdminCreds(in IntegrationInput) bool {
+	return strings.TrimSpace(in.AdminUsername) != "" && strings.TrimSpace(in.AdminPassword) != ""
 }
 
 // createRecommendedRules 按模板创建推荐告警规则（已存在同名规则则跳过）。
@@ -1246,6 +1635,7 @@ func (s *IntegrationService) toView(ctx context.Context, item model.MiddlewareIn
 		Environment: item.Environment, GroupName: item.GroupName,
 		Labels: meta.Labels, Options: meta.Options, JobName: meta.Job,
 		Container: meta.Container, Image: meta.Image, DeployNote: meta.DeployNote,
+		JoinPlatformNetwork: meta.JoinPlatformNetwork,
 		Selector:  integration.SelectorFor(integration.Instance{Name: item.Name, MWType: item.MWType}, meta.Job),
 		AppliedAt: meta.AppliedAt, LastError: meta.LastError,
 		HasPassword: item.PasswordEncrypted != "",

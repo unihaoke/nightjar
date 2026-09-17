@@ -188,8 +188,54 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops
 
 ---
 
-## 7. 权限、安全与审计
+## 6.1 反向接网（可选项，默认关闭）
 
+上面是默认方向：**平台动自己**。有些环境反过来更合适——例如目标容器在网络命名空间上受限，
+或运维要求"所有被管容器都挂在平台网络上"。此时可在集成表单勾选
+**「改为把目标容器接入平台网络」**（`join_platform_network=true`），平台会执行等价的：
+
+```bash
+docker network connect <平台网络> <目标容器>      # 例如 middleware-ops_mwops interview-mysql
+```
+
+代价与注意事项：
+
+- 这**修改了被管容器的网络配置**（默认方向不改被管容器）；
+- 若目标容器原本只在 `internal` 网络里（jd 的 `jd-data` 就是刻意做成无出网的），
+  接入非 internal 的平台网络后它会**多一条出网路径**，数据面隔离随之失效；
+- 地址填的是外部地址（非容器名）时不需要、也不应该勾选——平台连容器都找不到；
+- 勾选状态持久化在集成元信息里，「重新应用」会复现同样行为（取消勾选后保存即停止）。
+
+---
+
+## 6.2 监控账号：默认由平台代建 + 账号管理
+
+**默认策略：需要账号的组件（MySQL / PostgreSQL）由平台自动建号**，使用者不必提前建号、
+也不必自己想账号名与口令：
+
+- 账号名留空时用模板默认值（`templates[].monitor_user`，当前为 `mwops_exporter`）；
+- 口令由平台生成 24 字节十六进制随机串（无 `@ : / ?` 等字符，SQL/DSN/环境变量三层都不需要转义），
+  AES-256-GCM 加密后随实例存储；
+- 权限最小化：MySQL `PROCESS, REPLICATION CLIENT, SELECT` + `MAX_USER_CONNECTIONS 3`；
+  PostgreSQL `pg_monitor`；语句幂等（`CREATE USER IF NOT EXISTS` + `ALTER USER`）；
+- **需要一次管理员凭据**（建号是写被管库的操作）——未填写时**不会让集成保存失败**，
+  只把「已跳过自动建号，填凭据后点重新应用」写进集成备注；
+- 生产环境（`env=prod`）只创建审批工单（`integration_bootstrap`），不直接执行。
+
+**账号管理（集成中心 → 监控账号）**：
+
+| 能力 | 实现 | 是否需要管理员凭据 |
+|---|---|---|
+| 查看账号现状 | `GET /api/integrations/accounts`：账号名、来源（平台创建/外部账号）、权限摘要、最近轮换时间、集成当前错误 | 否 |
+| 轮换口令 | `POST /api/integrations/:id/account/rotate`：账号**改自己的**口令（MySQL `ALTER USER USER()` / PG `ALTER ROLE CURRENT_USER`），随后自动重建 Exporter | **不需要**（平台持有该账号口令） |
+| 删除账号 | `POST /api/integrations/:id/account/drop`：`DROP USER IF EXISTS` / `DROP ROLE IF EXISTS` | 需要；prod 转审批工单 |
+
+> 轮换为什么不需要管理员凭据：SQL 标准与两个数据库都允许账号修改自己的口令，
+> 因此"平台托管的账号"可以自助轮换，避免了每次轮换都要向用户再要一次 root 口令。
+
+---
+
+## 7. 权限、安全与审计
 - **权限**：与「中间件纳管」共用 `middleware:read`（查看/预览）与 `middleware:write`（增删改/应用）——
   集成产物本身就是一个纳管实例，不额外引入权限点。
 - **口令**：AES-256-GCM 加密存储（复用平台主密钥）；**生成的任何配置里都不出现明文**，

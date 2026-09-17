@@ -97,6 +97,8 @@ func New(opt Options) *gin.Engine {
 		integrations.GET("/overview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.IntegrationOverview)
 		integrations.GET("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.ListIntegrations)
 		integrations.GET("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.GetIntegration)
+		// 监控账号管理：查看 / 轮换口令（账号改自己口令，无需管理员凭据）/ 删除账号（需管理员凭据）
+		integrations.GET("/accounts", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.ListIntegrationAccounts)
 		integrations.POST("/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewIntegration)
 		// 日志接入：平台读取被管容器的 docker 配置反查日志位置，自建采集容器（被管项目零改动）
 		integrations.POST("/logs/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewLogCollect)
@@ -104,6 +106,8 @@ func New(opt Options) *gin.Engine {
 		integrations.POST("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateIntegration)
 		integrations.PUT("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.UpdateIntegration)
 		integrations.POST("/:id/apply", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.ApplyIntegration)
+		integrations.POST("/:id/account/rotate", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.RotateIntegrationAccount)
+		integrations.POST("/:id/account/drop", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.DropIntegrationAccount)
 		integrations.DELETE("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.DeleteIntegration)
 	}
 

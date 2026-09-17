@@ -485,6 +485,8 @@ type TargetResolution struct {
 	// Host 是可在 Networks 上解析的主机名。优先取容器名：容器名在同一个
 	// 用户自定义网络里一定能被内嵌 DNS 解析，比别名更可靠。
 	Host string
+	// ContainerID 是匹配到的容器 ID（供 /networks/{id}/connect 使用）。
+	ContainerID string
 	// Container 是匹配到的容器名；为空表示没找到。
 	Container string
 	// Networks 是该容器所在的真实 docker 网络名（如 `jd_jd-data`）。
@@ -499,6 +501,7 @@ type TargetResolution struct {
 
 // targetInfo 是解析过程中的单个容器快照。
 type targetInfo struct {
+	id      string
 	name    string
 	service string
 	aliases []string
@@ -557,6 +560,7 @@ func (c *Client) ResolveTarget(ctx context.Context, nameOrAlias string) (*Target
 		}
 		if res.Container == "" {
 			res.Container, res.MatchedBy, res.Running = info.name, matched, info.running
+			res.ContainerID = info.id
 			// 容器名是最稳的可解析名；用容器名覆盖用户输入（如输入的是别名）。
 			res.Host = info.name
 		}
@@ -601,6 +605,7 @@ func (c *Client) inspectTarget(ctx context.Context, id string) (*targetInfo, err
 		return nil, err
 	}
 	info := &targetInfo{
+		id:      id,
 		name:    strings.TrimPrefix(payload.Name, "/"),
 		service: payload.Config.Labels["com.docker.compose.service"],
 		running: payload.State.Running,

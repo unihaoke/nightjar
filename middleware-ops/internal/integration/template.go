@@ -94,6 +94,9 @@ type Template struct {
 	MetricsPath string `json:"metrics_path"`
 	// NeedsAuth 表示该组件通常需要账号口令。
 	NeedsAuth bool `json:"needs_auth"`
+	// MonitorUser 表示该组件支持**由平台代建只读监控账号**，并给出默认账号名。
+	// 为空表示不需要账号（如 Redis：口令由目标自身鉴权决定），或不支持代建。
+	MonitorUser string `json:"monitor_user"`
 	// AddressLabel / AddressHint 用于前端表单文案。
 	AddressLabel string `json:"address_label"`
 	AddressHint  string `json:"address_hint"`
@@ -164,6 +167,7 @@ var templates = map[string]Template{
 		Image:        "prom/mysqld-exporter:v0.15.1",
 		ExporterPort: 9104, DefaultPort: 3306, MetricsPath: "/metrics",
 		NeedsAuth:    true,
+		MonitorUser:  "mwops_exporter",
 		AddressLabel: "连接地址", AddressHint: "如 10.0.0.12:3306",
 		Options: []Option{
 			{Key: "collect.global_status", Label: "global_status", Target: TargetArg, Kind: "bool", Default: "true",
@@ -210,6 +214,7 @@ var templates = map[string]Template{
 		Image:        "prometheuscommunity/postgres-exporter:v0.16.0",
 		ExporterPort: 9187, DefaultPort: 5432, MetricsPath: "/metrics",
 		NeedsAuth:    true,
+		MonitorUser:  "mwops_exporter",
 		AddressLabel: "连接地址", AddressHint: "如 10.0.0.13:5432",
 		Options: []Option{
 			{Key: "auto-discover-databases", Label: "自动发现所有库", Target: TargetArg, Kind: "bool",

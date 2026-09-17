@@ -166,6 +166,51 @@ func (h *Handler) ApplyIntegration(c *gin.Context) {
 	response.OK(c, item)
 }
 
+// ListIntegrationAccounts 汇总各集成的只读监控账号现状（平台代管与否、能否轮换）。
+func (h *Handler) ListIntegrationAccounts(c *gin.Context) {
+	items, err := h.deps.Integration.ListAccounts(c.Request.Context(), h.scope(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{"items": items})
+}
+
+// RotateIntegrationAccount 轮换平台托管的监控账号口令。
+//
+// 不需要管理凭据：账号可以改自己的口令（MySQL ALTER USER USER() /
+// PostgreSQL ALTER ROLE CURRENT_USER），平台持有该账号口令即可自助完成。
+func (h *Handler) RotateIntegrationAccount(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	item, err := h.deps.Integration.RotateAccountPassword(c.Request.Context(), id, h.operator(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, item)
+}
+
+// DropIntegrationAccount 删除平台创建的监控账号（L2：破坏性写操作，需管理凭据）。
+func (h *Handler) DropIntegrationAccount(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	var in service.DropAccountInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	item, err := h.deps.Integration.DropAccount(c.Request.Context(), id, in, h.operator(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, item)
+}
+
 // DeleteIntegration 删除集成（L1）。
 func (h *Handler) DeleteIntegration(c *gin.Context) {
 	id, ok := idParam(c, "id")

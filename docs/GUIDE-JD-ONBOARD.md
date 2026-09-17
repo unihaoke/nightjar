@@ -80,9 +80,17 @@ cd <nightjar>
 
 | 步骤 | 集成中心操作 |
 |---|---|
-| ③ 集成 MySQL | 名称 `jd-mysql`、地址 `interview-mysql:3306`、监控账号 `exporter`、口令留空；勾选 **由平台创建只读监控账号**（填 root 管理凭据）+ **一键拉起 Exporter** |
-| ④ 集成 Redis | 名称 `jd-redis`、地址 `interview-redis:6379`、勾选一键拉起（Redis 无需建账号） |
+| ③ 集成 MySQL | 名称 `jd-mysql`、地址 `interview-mysql:3306`；**只读账号自动创建**（默认 `mwops_exporter`、口令平台生成），只需填一次 root 管理凭据 |
+| ④ 集成 Redis | 名称 `jd-redis`、地址 `interview-redis:6379`、口令填 `.env` 的 `REDIS_PASSWORD`（Redis 不需要建号） |
 | ⑤ 日志接入 | 目标容器名 `interview-backend`、服务名 `interview-review-backend`、级别 `ERROR` → 先「读取 docker 配置并预览」再「创建采集容器」 |
+
+账号相关补充：
+
+- **不需要提前建号**：MySQL/PostgreSQL 默认由平台代建（`CREATE USER IF NOT EXISTS` + `ALTER USER` + 最小授权），
+  口令 24 字节十六进制、加密存储；未填管理凭据时集成照常保存，只在备注里提示"填凭据后点重新应用"；
+- **账号管理**：集成中心右上角「监控账号」可查看来源/权限/最近轮换，
+  支持**轮换口令**（账号改自己的口令，不需要管理员凭据）与**删除账号**（破坏性，需管理员凭据；prod 转审批工单）；
+- 生产环境（`env=prod`）建号/删号只创建审批工单，不直接执行。
 
 保存集成的瞬间，平台会自己完成网络接入：反查 `interview-mysql` / `interview-redis`
 命中的容器 → 取得真实网络名 `jd_jd-data` → 把 Exporter 接成
@@ -113,6 +121,9 @@ cd <nightjar>
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 集成报 `dial unix /var/run/docker.sock: connect: no such file or directory` | 平台容器里**没有** docker.sock：compose 里的挂载还是注释状态，或平台容器早于该改动启动 | ① `docker inspect mwops-backend --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' \| grep docker.sock` 确认；② 重跑 `./scripts/setup-jd-link.sh`（它会自动放开注释）；③ `docker compose up -d --force-recreate backend`。rootless Docker 请把 `INTEGRATION_DOCKER_HOST` 指向 `/run/user/<uid>/docker.sock` 并挂载该路径 |
+| 集成报 `permission denied` 且提到 docker.sock | socket 已挂载但无权限 | 确认 socket 属主（通常 `root:docker`）与平台容器的用户/组，或改用 socket 代理 |
+| 集成报「Prometheus 已配置 job 但 target 抓取失败（up=0）」 | Exporter 容器根本没被创建（上一条 docker.sock 报错的连锁结果） | 先解决 docker.sock，再点该集的「重新应用」 |
 | 后端启动失败：`password authentication failed for user "mwo" (SQLSTATE 28P01)` | **Postgres 只在数据卷为空时应用 `POSTGRES_PASSWORD`**；卷早就初始化过，`setup` 脚本又轮换了 `.env` 的 `DB_PASSWORD`（旧版脚本的行为） | 重跑 `./scripts/setup-jd-link.sh`：第 5 步会用容器内 trust socket 把库内口令对齐到 `.env`（零数据损失）。详见 `OPERATIONS.md` §5.8 |
 | 集成报「无法确定目标所在网络」 | 地址里的名字与 docker 里的容器名/服务名/别名都不匹配，或平台没挂 docker.sock | 报错里会列出候选容器名；`./scripts/setup-jd-link.sh` 会自动放开 docker.sock |
 | 集成报「解析不了 jd-mysql / server misbehaving」 | 用的是**旧架构的人工别名**（jd 侧已不再提供） | 把地址改成容器名 `interview-mysql:3306` / `interview-redis:6379`，重新保存即可（平台会自动接入 `jd_jd-data`） |

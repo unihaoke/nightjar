@@ -14,6 +14,7 @@ import type {
   FixExecuteResult,
   FixPreview,
   FixRecord,
+  IntegrationAccount,
   IntegrationArtifacts,
   IntegrationInput,
   IntegrationOverview,
@@ -113,6 +114,12 @@ export const integrationApi = {
   create: (payload: IntegrationInput) => post<IntegrationView>('/api/integrations', payload),
   update: (id: number, payload: IntegrationInput) => put<IntegrationView>(`/api/integrations/${id}`, payload),
   apply: (id: number) => post<IntegrationView>(`/api/integrations/${id}/apply`),
+  /** 监控账号管理：查看平台代管的只读账号；轮换口令（账号改自己口令，无需管理员凭据）。 */
+  accounts: () => get<{ items: IntegrationAccount[] }>('/api/integrations/accounts'),
+  rotateAccount: (id: number) => post<IntegrationView>(`/api/integrations/${id}/account/rotate`),
+  /** 删除监控账号（L2：需被管实例的管理员凭据）。 */
+  dropAccount: (id: number, payload: { admin_username: string; admin_password: string }) =>
+    post<IntegrationView>(`/api/integrations/${id}/account/drop`, payload),
   remove: (id: number) => del<{ message: string }>(`/api/integrations/${id}`),
   /** 日志接入：读取被管容器的 docker 配置反查日志位置（读不到会报错，不猜路径）。 */
   previewLog: (payload: LogCollectInput) => post<LogCollectPlan>('/api/integrations/logs/preview', payload),

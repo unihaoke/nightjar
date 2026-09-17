@@ -166,8 +166,8 @@ services:
       MWOPS_INTEGRATION_JOB_NAME: ${INTEGRATION_JOB_NAME:-middleware-integration}
       MWOPS_INTEGRATION_SD_TOKEN: ${INTEGRATION_SD_TOKEN:-}
       MWOPS_INTEGRATION_AUTO_RULES: ${INTEGRATION_AUTO_RULES:-true}
-      # 一键拉起 Exporter 容器：需同时取消注释下面的 docker.sock 挂载
-      MWOPS_INTEGRATION_DOCKER_ENABLED: ${INTEGRATION_DOCKER_ENABLED:-false}
+      # 一键拉起 Exporter/代建账号/日志采集：默认开启（docker.sock 已默认挂载）
+      MWOPS_INTEGRATION_DOCKER_ENABLED: ${INTEGRATION_DOCKER_ENABLED:-true}
       MWOPS_INTEGRATION_DOCKER_HOST: ${INTEGRATION_DOCKER_HOST:-unix:///var/run/docker.sock}
       # 逗号分隔：第一个是监控面（Prometheus 所在网络）。
       # 目标容器所在的网络**不需要**写在这里：集成时会自动发现并接入。
@@ -180,8 +180,12 @@ services:
       # http://backend:8080/api/sd/integrations），因此不需要共享卷。
       # file_sd 文件作为副产物落在 backend-data 卷内：
       #   docker exec mwops-backend cat /app/data/integrations/integrations.json
-      # 可选：启用「一键部署 Exporter 容器」时取消注释（等于把宿主机 root 权限交给平台）
-      # - /var/run/docker.sock:/var/run/docker.sock
+      # docker.sock：**默认挂载**。集成中心的核心能力（自动发现目标容器所在网络、
+      # 一键拉起 Exporter、代建只读监控账号、创建日志采集容器）都依赖它。
+      # 安全边界：挂载 socket 等于把宿主机 root 权限交给平台容器；若合规不允许，
+      # 注释掉下面这行并把 INTEGRATION_DOCKER_ENABLED 设为 false，平台退化为
+      # 「只渲染配置 + 手工执行」模式（见 docs/INTEGRATION.md §4）。
+      - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - '8080'
     healthcheck:

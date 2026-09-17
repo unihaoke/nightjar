@@ -78,7 +78,10 @@
 | POST | `/api/integrations/preview` | `middleware:read` | L0 | **只渲染不落库**：服务发现 JSON / 显式 job / compose / docker run / 核对步骤 |
 | POST | `/api/integrations/logs/preview` | `middleware:read` | L0 | **日志接入探测**：读目标容器的 docker 配置反查日志位置；**读不到则返回 400，不猜路径** |
 | POST | `/api/integrations/logs` | `middleware:write` | L1 | 创建平台侧日志采集容器（复用平台镜像，`Entrypoint=mwops-agent`），并登记服务器 |
-| POST | `/api/integrations` | `middleware:write` | L1 | 新建集成：纳管实例 + 服务发现更新 + 可选拉起容器 + 可选推荐告警规则 |
+| POST | `/api/integrations` | `middleware:write` | L1 | 新建集成：纳管实例 + 服务发现更新 + 可选拉起容器 + 可选推荐告警规则；**需要账号的组件默认由平台代建只读账号**（传 `bootstrap_account=false` 可关闭） |
+| GET | `/api/integrations/accounts` | `middleware:read` | L0 | 监控账号清单：账号名、是否平台创建、权限摘要、最近轮换时间、能否自助轮换 |
+| POST | `/api/integrations/:id/account/rotate` | `middleware:write` | L1 | **轮换监控账号口令**：用账号自己的旧口令执行 `ALTER USER USER()` / `ALTER ROLE CURRENT_USER`（不需要管理员凭据），随后重建 Exporter |
+| POST | `/api/integrations/:id/account/drop` | `middleware:write` | L2 | **删除监控账号**：需 `admin_username` / `admin_password`（不落库）；生产环境只创建审批工单 |
 | PUT | `/api/integrations/:id` | `middleware:write` | L1 | 更新集成（改名会同步 instance_name 标签） |
 | POST | `/api/integrations/:id/apply` | `middleware:write` | L1 | 重新应用：重写产物 + 重建 Exporter 容器 |
 | DELETE | `/api/integrations/:id` | `middleware:write` | L1 | 删除集成（同时移除抓取目标与容器；历史告警/诊断保留） |
@@ -109,6 +112,14 @@
 - `labels` 不允许覆盖 `job`/`instance`/`instance_name`/`mw_type`；
 - 集成产物同时是一个纳管实例，`prom_job` 自动写为服务发现抓取任务名（默认 `middleware-integration`），
   `prom_instance` 恒为空。
+- **网络接入（两个方向，默认前者）**：
+  - 默认：平台把自己的 Exporter 接进**目标容器所在网络**（用 `address` 里的主机名反查容器，
+    见 `internal/docker.ResolveTarget`），被管项目零改动、无需勾选任何开关；
+  - 可选：`join_platform_network=true` 时改为把**目标容器**接入平台网络
+    （等价 `docker network connect <平台网络> <目标容器>`）。这会修改被管容器的网络配置，
+    若它原本只在 `internal` 网络里会因此获得出网路径，故默认关闭、需显式勾选；
+  - 抓取目标恒为平台自己的 Exporter 容器（`mwops-exporter-<名称>:<模板端口>`），
+    不会去抓 MySQL/Redis 自身的端口。
 
 `GET /api/sd/integrations` 是 Prometheus `http_sd_configs` 的服务发现文档，形如：
 
