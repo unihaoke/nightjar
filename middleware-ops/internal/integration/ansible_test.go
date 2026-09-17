@@ -240,6 +240,69 @@ func TestRemoteDockerHostModeFlags(t *testing.T) {
 	}
 }
 
+// TestRemoteAccountSQLPlaybook 锁定「在目标机执行账号 SQL」的产物要点。
+//
+// 这条路径的意义：远程集成不需要平台侧 docker.sock 也能代建只读账号。
+// 因此必须固化：口令不进 playbook、不进命令行；客户端探测 + docker 回退 + 明确失败三态齐全。
+func TestRemoteAccountSQLPlaybook(t *testing.T) {
+	statements := []string{
+		"CREATE USER IF NOT EXISTS 'mwops_exporter'@'%' IDENTIFIED WITH mysql_native_password BY 'pw'",
+		"GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'mwops_exporter'@'%'",
+	}
+	art, err := RenderAccountSQL(AccountSQLRequest{
+		Name: "order-mysql", MWType: TypeMySQL, DBHost: "127.0.0.1", DBPort: 3306,
+		ExecUser: "root", ExecPassword: "adm1n-pass", Statements: statements,
+	})
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	for _, want := range []string{
+		"command -v mysql",         // 先探测目标机自带客户端
+		"command -v docker",        // 缺失时探测 docker 作为回退
+		"docker run --rm --network host",
+		"MYSQL_PWD",                // 口令走环境变量
+		"ansible.builtin.fail",     // 两者都没有时明确失败（不擅自装包）
+		"127.0.0.1",
+	} {
+		if !strings.Contains(art.Playbook, want) {
+			t.Fatalf("账号 SQL playbook 应包含 %q：\n%s", want, art.Playbook)
+		}
+	}
+	// 口令绝不出现：playbook 与展示用 vars 都是占位
+	if strings.Contains(art.Playbook, "adm1n-pass") {
+		t.Fatalf("playbook 不得包含管理员口令：\n%s", art.Playbook)
+	}
+	if strings.Contains(art.MaskedVarsFile, "adm1n-pass") {
+		t.Fatalf("展示用 vars 不得包含口令：%s", art.MaskedVarsFile)
+	}
+	if !strings.Contains(art.VarsFile, "adm1n-pass") {
+		t.Fatalf("真实 vars 文件应含口令（0600、用完即删）：%s", art.VarsFile)
+	}
+	if strings.Contains(strings.Join(strings.Split(art.Playbook, "\n"), " "), "-p adm1n-pass") {
+		t.Fatal("口令不得出现在命令行参数里")
+	}
+	// PostgreSQL 走 psql + PGPASSWORD，且不能再出现 mysql 专属开关
+	pgArt, err := RenderAccountSQL(AccountSQLRequest{
+		Name: "order-pg", MWType: TypePG, DBHost: "10.0.0.9", DBPort: 5432,
+		ExecUser: "postgres", ExecPassword: "pg-pass", Statements: []string{"SELECT 1"},
+	})
+	if err != nil {
+		t.Fatalf("PG 渲染失败：%v", err)
+	}
+	if !strings.Contains(pgArt.Playbook, "psql") || !strings.Contains(pgArt.Playbook, "PGPASSWORD") {
+		t.Fatalf("PG 应使用 psql + PGPASSWORD：\n%s", pgArt.Playbook)
+	}
+	if strings.Contains(pgArt.Playbook, "--protocol=TCP") {
+		t.Fatalf("psql 不应带 mysql 的 --protocol：\n%s", pgArt.Playbook)
+	}
+	// 不支持的组件类型必须明确报错
+	if _, err := RenderAccountSQL(AccountSQLRequest{
+		Name: "r", MWType: TypeRedis, DBHost: "127.0.0.1", Statements: []string{"SELECT 1"},
+	}); err == nil {
+		t.Fatal("Redis 不需要账号，调用远程账号 SQL 应报错")
+	}
+}
+
 func TestRemoteBridgeModeAddsPortMapping(t *testing.T) {
 	tpl, _ := TemplateOf(TypeMySQL)
 	address, _ := ParseAddress("10.0.0.12:3306", tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)

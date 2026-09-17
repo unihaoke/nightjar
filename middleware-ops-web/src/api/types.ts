@@ -282,6 +282,14 @@ export interface IntegrationView {
   has_password: boolean
 }
 
+/** 远程集成的账号操作所需 SSH 凭据（仅本次请求使用，平台不落库、不回显）。 */
+export interface AccountSecurePayload {
+  ssh_user?: string
+  ssh_password?: string
+  ssh_port?: number
+  ssh_key?: string
+}
+
 /** 集成中心：平台代管的只读监控账号现状。 */
 export interface IntegrationAccount {
   integration_id: number
@@ -299,6 +307,9 @@ export interface IntegrationAccount {
   /** 该组件是否支持平台代管账号（Redis 等不需要）。 */
   supports_management: boolean
   last_error: string
+  /** 部署位置：remote 时账号操作在目标机上执行，需要 SSH 凭据。 */
+  deploy_target: string
+  target_host: string
 }
 
 /** 集成中心：重试建号/连接的结果。 */

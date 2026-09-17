@@ -201,6 +201,100 @@ func (s *IntegrationService) writeSecret(name, content string) (string, error) {
 	return path, nil
 }
 
+// accountSQLRemote 在**目标主机**上执行账号 SQL（建号 / 轮换 / 删除）。
+//
+// 与"平台侧起一次性容器"的区别：这条路径只用到 ansible-playbook + SSH，
+// 因此远程集成可以在平台完全没有 docker.sock 的情况下完成建号。
+// SQL 语句仍来自平台内置模板（不接受使用者传入任意语句）。
+func (s *IntegrationService) accountSQLRemote(
+	ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template,
+	instance integration.Instance, meta IntegrationMeta, execUser, execPassword string,
+	statements []string, creds RemoteCreds,
+) (string, error) {
+	if err := s.remoteReady(); err != nil {
+		return "", err
+	}
+	if !creds.provided() {
+		return "", fmt.Errorf("远程建号/改号需要在目标机上执行 SQL，但本次没有 SSH 凭据：" +
+			"请在集成表单里填写 SSH 用户名与口令后重新保存（凭据不落库，因此「重新应用」无法复用）")
+	}
+	host := strings.TrimSpace(creds.Host)
+	if host == "" {
+		host = strings.TrimSpace(meta.TargetHost)
+	}
+	if host == "" {
+		return "", fmt.Errorf("远程建号/改号需要目标服务器地址")
+	}
+
+	art, err := integration.RenderAccountSQL(integration.AccountSQLRequest{
+		Name: item.Name, MWType: tpl.Type,
+		DBHost: instance.Address.Host, DBPort: instance.Address.Port,
+		ExecUser: execUser, ExecPassword: execPassword,
+		Statements: statements,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// 产物落盘：playbook 供审计（不含密）；inventory 与 vars 含凭据 → 0600 且用完即删。
+	artifactDir := filepath.Join(s.cfg.Integration.OutputDir, "ansible")
+	if mkErr := os.MkdirAll(artifactDir, 0o750); mkErr != nil {
+		return "", fmt.Errorf("创建产物目录失败：%w", mkErr)
+	}
+	playbookPath := filepath.Join(artifactDir, item.Name+"-account.yml")
+	if writeErr := os.WriteFile(playbookPath, []byte(art.Playbook), 0o644); writeErr != nil {
+		return "", fmt.Errorf("写入 playbook 失败：%w", writeErr)
+	}
+	// 复用安装流程的 inventory 渲染（同一套 SSH 凭据与主机密钥策略）。
+	installOpts := integration.RemoteOptions{
+		Host: host, SSHUser: creds.User, SSHPort: creds.Port,
+		SSHPassword: creds.Password, Become: true,
+	}
+	if creds.Password == "" && strings.TrimSpace(creds.Key) != "" {
+		path, writeErr := s.writeSecret(item.Name+"-account.key", creds.Key)
+		if writeErr != nil {
+			return "", fmt.Errorf("写入临时私钥失败：%w", writeErr)
+		}
+		defer func() { _ = os.Remove(path) }()
+		installOpts.SSHKeyFile = path
+	}
+	// inventory 文本由安装渲染器生成（含凭据），这里只需要它，不需要 playbook。
+	installArt, err := integration.RenderRemoteInstall(tpl, instance, installOpts)
+	if err != nil {
+		// 安装渲染失败不影响账号 SQL：退化为只用 inventory 段落。
+		installArt.Inventory = ""
+	}
+	if strings.TrimSpace(installArt.Inventory) == "" {
+		return "", fmt.Errorf("生成临时 inventory 失败")
+	}
+	inventoryPath, err := s.writeSecret(item.Name+"-account.ini", installArt.Inventory)
+	if err != nil {
+		return "", fmt.Errorf("写入临时 inventory 失败：%w", err)
+	}
+	defer func() { _ = os.Remove(inventoryPath) }()
+	varsPath, err := s.writeSecret(item.Name+"-account.vars.yml", art.VarsFile)
+	if err != nil {
+		return "", fmt.Errorf("写入临时变量文件失败：%w", err)
+	}
+	defer func() { _ = os.Remove(varsPath) }()
+
+	timeout := s.cfg.Integration.Ansible.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, s.cfg.Integration.Ansible.Binary,
+		"-i", inventoryPath, playbookPath, "-e", "@"+varsPath, "--become")
+	cmd.Env = append(os.Environ(), "ANSIBLE_HOST_KEY_CHECKING=False", "ANSIBLE_NOCOLOR=1")
+	output, runErr := cmd.CombinedOutput()
+	safe := redactSecrets(string(output), creds.Password, creds.Key, execPassword)
+	if runErr != nil {
+		return safe, fmt.Errorf("在目标机上执行账号 SQL 失败：%w（输出：%s）", runErr, truncateText(safe, 600))
+	}
+	return safe, nil
+}
+
 // installMode 归一化安装方式（systemd → docker-systemd；空值取配置，再回落 docker）。
 func (s *IntegrationService) installMode(creds RemoteCreds) string {
 	mode := strings.TrimSpace(creds.InstallMode)

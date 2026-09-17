@@ -18,6 +18,7 @@ import type {
   AccountProbeResult,
   AccountRetryResult,
   AccountRotateResult,
+  AccountSecurePayload,
   IntegrationArtifacts,
   IntegrationInput,
   IntegrationOverview,
@@ -122,14 +123,20 @@ export const integrationApi = {
   apply: (id: number) => post<IntegrationView>(`/api/integrations/${id}/apply`),
   /** 监控账号管理：查看平台代管的只读账号；轮换口令（账号改自己口令，无需管理员凭据）。 */
   accounts: () => get<{ items: IntegrationAccount[] }>('/api/integrations/accounts'),
-  rotateAccount: (id: number) => postSlow<AccountRotateResult>(`/api/integrations/${id}/account/rotate`),
+  /**
+   * 远程集成的账号操作在**目标主机**上执行（只经 SSH + Ansible），
+   * 因此这些接口都可带一份可选的 SSH 凭据（仅本次请求使用，平台不落库）。
+   */
+  rotateAccount: (id: number, payload: AccountSecurePayload = {}) =>
+    postSlow<AccountRotateResult>(`/api/integrations/${id}/account/rotate`, payload),
   /** 重试建号/连接：带管理凭据=幂等重建账号；不带=只测连接并重建 Exporter。 */
-  retryAccount: (id: number, payload: { admin_username?: string; admin_password?: string }) =>
+  retryAccount: (id: number, payload: AccountSecurePayload & { admin_username?: string; admin_password?: string }) =>
     postSlow<AccountRetryResult>(`/api/integrations/${id}/account/retry`, payload),
   /** 只做连接测试（不建号、不改配置）。 */
-  probeAccount: (id: number) => postSlow<AccountProbeResult>(`/api/integrations/${id}/account/probe`),
-  /** 删除监控账号（L2：需被管实例的管理员凭据）。 */
-  dropAccount: (id: number, payload: { admin_username: string; admin_password: string }) =>
+  probeAccount: (id: number, payload: AccountSecurePayload = {}) =>
+    postSlow<AccountProbeResult>(`/api/integrations/${id}/account/probe`, payload),
+  /** 删除监控账号（L2：需被管实例的管理员凭据；远程集成还需 SSH 凭据）。 */
+  dropAccount: (id: number, payload: AccountSecurePayload & { admin_username: string; admin_password: string }) =>
     postSlow<IntegrationView>(`/api/integrations/${id}/account/drop`, payload),
   remove: (id: number) => del<{ message: string }>(`/api/integrations/${id}`),
   /** 日志接入：读取被管容器的 docker 配置反查日志位置（读不到会报错，不猜路径）。 */

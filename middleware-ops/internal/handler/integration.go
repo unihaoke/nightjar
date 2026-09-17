@@ -185,7 +185,11 @@ func (h *Handler) RotateIntegrationAccount(c *gin.Context) {
 	if !ok {
 		return
 	}
-	item, err := h.deps.Integration.RotateAccountPassword(c.Request.Context(), id, h.operator(c))
+	var in service.RotateAccountInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	item, err := h.deps.Integration.RotateAccountPassword(c.Request.Context(), id, in, h.operator(c))
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -220,7 +224,11 @@ func (h *Handler) ProbeIntegrationAccount(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.deps.Integration.ProbeAccount(c.Request.Context(), id)
+	var in service.AccountProbeInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	result, err := h.deps.Integration.ProbeAccount(c.Request.Context(), id, in)
 	if err != nil {
 		response.Fail(c, err)
 		return

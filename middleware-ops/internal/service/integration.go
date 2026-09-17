@@ -943,6 +943,24 @@ func (s *IntegrationService) bootstrapAccount(
 		return "生产环境需审批：已创建工单 " + ticket.TicketID +
 			"（工单内含将执行的 SQL）；审批通过后请点「重新应用」由平台建号", nil, false
 	}
+	// 远程集成：SQL 在**目标主机**上执行 —— 这条路径只用 ansible-playbook + SSH，
+	// 因此平台即使完全没有 docker.sock，也能为远程实例代建只读账号。
+	if meta, ok := IntegrationMetaOf(*item); ok && meta.DeployTarget == DeployTargetRemote {
+		statements, sqlErr := monitoringAccountSQL(tpl.Type, instance.Username, instance.Password)
+		if sqlErr != nil {
+			return "", sqlErr, false
+		}
+		if _, runErr := s.accountSQLRemote(ctx, item, tpl, instance, meta,
+			strings.TrimSpace(in.AdminUsername), in.AdminPassword, statements,
+			remoteCredsFromInput(in)); runErr != nil {
+			s.log.Warn("集成：在目标机上创建只读监控账号失败",
+				zap.String("integration", item.Name), zap.Error(runErr))
+			return "", runErr, false
+		}
+		s.writeMeta(ctx, item, func(m *IntegrationMeta) { m.AccountManaged = true })
+		return fmt.Sprintf("平台已在目标机上创建/更新只读监控账号 %s（权限：%s）",
+			instance.Username, grantSummary(tpl.Type)), nil, true
+	}
 	note, err = s.ensureMonitoringAccount(ctx, instance, tpl, in.AdminUsername, in.AdminPassword)
 	if err != nil {
 		s.log.Warn("集成：创建只读监控账号失败",
@@ -952,6 +970,36 @@ func (s *IntegrationService) bootstrapAccount(
 	// 记下"该账号由平台代管"，供账号管理页展示与后续轮换/删除使用。
 	s.writeMeta(ctx, item, func(meta *IntegrationMeta) { meta.AccountManaged = true })
 	return note, nil, true
+}
+
+// AccountSecureInput 是账号类操作（轮换/删除/重试）可选携带的 SSH 凭据。
+//
+// 为什么需要：远程集成的账号操作改为在**目标主机**上执行 SQL（只经 SSH + Ansible），
+// 这样平台即使没有 docker.sock 也能改号/删号；而 SSH 凭据与安装时一样**不落库**，
+// 因此每次操作都需要使用者重新填写。
+type AccountSecureInput struct {
+	SSHUser     string `json:"ssh_user"`
+	SSHPassword string `json:"ssh_password"`
+	SSHPort     int    `json:"ssh_port"`
+	SSHKey      string `json:"ssh_key"`
+}
+
+// remoteCreds 把可选 SSH 凭据转换成安装通道使用的凭据结构。
+func (in AccountSecureInput) remoteCreds(host string) RemoteCreds {
+	return RemoteCreds{
+		Host: host, User: in.SSHUser, Port: in.SSHPort,
+		Password: in.SSHPassword, Key: in.SSHKey,
+	}
+}
+
+// useRemoteAccountChannel 判断账号操作是否应走「在目标机执行 SQL」通道。
+func useRemoteAccountChannel(meta IntegrationMeta) bool {
+	return meta.DeployTarget == DeployTargetRemote
+}
+
+// accountStatusDeployTarget 返回该集成的部署位置（供前端决定是否需要询问 SSH 凭据）。
+func accountStatusDeployTarget(meta IntegrationMeta) string {
+	return normalizeDeployTarget(meta.DeployTarget)
 }
 
 // AccountStatus 描述一个集成的监控账号现状（供「监控账号」管理界面）。
@@ -969,6 +1017,10 @@ type AccountStatus struct {
 	RotatedAt     string `json:"rotated_at"`
 	Grants        string `json:"grants"`
 	SupportsMngmt bool   `json:"supports_management"`
+	// DeployTarget / TargetHost 让界面知道该集成是远程部署，
+	// 从而在轮换/删除/重试时询问一次 SSH 凭据（远程账号操作在目标机上执行）。
+	DeployTarget string `json:"deploy_target"`
+	TargetHost   string `json:"target_host"`
 	// LastError 取自集成核验结论（Exporter up / 认证失败等）。
 	LastError string `json:"last_error"`
 }
@@ -993,6 +1045,7 @@ func (s *IntegrationService) ListAccounts(ctx context.Context, scope Scope) ([]A
 			Managed: meta.AccountManaged, HasPassword: view.HasPassword,
 			RotatedAt: meta.AccountRotatedAt, Grants: grantSummary(tpl.Type),
 			SupportsMngmt: tpl.MonitorUser != "",
+			DeployTarget:  accountStatusDeployTarget(meta), TargetHost: meta.TargetHost,
 			LastError:     view.LastError,
 		})
 	}
@@ -1014,7 +1067,12 @@ type AccountRotateResult struct {
 // 为什么不需要管理凭据：MySQL / PostgreSQL 都允许**账号修改自己的口令**，
 // 而平台加密保存着该账号的口令，因此可以自助完成轮换——
 // 轮换后立即重建 Exporter，使它用新口令抓取。
-func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64, operator Operator) (*AccountRotateResult, error) {
+// RotateAccountInput 是轮换口令的入参（远程集成需带 SSH 凭据；不落库）。
+type RotateAccountInput struct {
+	AccountSecureInput
+}
+
+func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64, in RotateAccountInput, operator Operator) (*AccountRotateResult, error) {
 	item, err := s.integrationInstance(ctx, id)
 	if err != nil {
 		return nil, err
@@ -1026,10 +1084,6 @@ func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64
 	tpl, ok := integration.TemplateOf(meta.Template)
 	if !ok || tpl.MonitorUser == "" {
 		return nil, apperr.Newf(apperr.CodeInvalidParam, "%s 不支持平台代管账号", item.MWType)
-	}
-	if s.docker == nil {
-		return nil, apperr.New(apperr.CodeForbidden,
-			"轮换口令需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）")
 	}
 	oldPassword, err := s.decrypt(item.PasswordEncrypted)
 	if err != nil {
@@ -1051,9 +1105,23 @@ func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64
 		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
 	}
 	// 关键：用**账号自己**的旧口令登录后执行 ALTER，因此不需要管理员凭据。
-	if _, err := s.runClientSQL(ctx, instance, tpl, item.Username, oldPassword, statements); err != nil {
-		return nil, apperr.Wrap(apperr.CodeUpstream,
-			fmt.Errorf("轮换口令失败（可能账号已被删除，请重新保存并勾选自动建号）：%w", err))
+	// 远程集成在目标机上执行（只经 SSH），因此平台无需 docker.sock。
+	if useRemoteAccountChannel(meta) {
+		if _, err := s.accountSQLRemote(ctx, item, tpl, instance, meta,
+			item.Username, oldPassword, statements, in.remoteCreds(meta.TargetHost)); err != nil {
+			return nil, apperr.Wrap(apperr.CodeUpstream,
+				fmt.Errorf("在目标机上轮换口令失败（可能账号已被删除，请重新保存并勾选自动建号）：%w", err))
+		}
+	} else {
+		if s.docker == nil {
+			return nil, apperr.New(apperr.CodeForbidden,
+				"轮换口令需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）；"+
+					"若被管实例在远程服务器上，请改用「远程服务器」部署位置，并携带 SSH 凭据重试")
+		}
+		if _, err := s.runClientSQL(ctx, instance, tpl, item.Username, oldPassword, statements); err != nil {
+			return nil, apperr.Wrap(apperr.CodeUpstream,
+				fmt.Errorf("轮换口令失败（可能账号已被删除，请重新保存并勾选自动建号）：%w", err))
+		}
 	}
 	encrypted, err := s.cipher.Encrypt(newPassword)
 	if err != nil {
@@ -1079,10 +1147,11 @@ func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64
 	return &AccountRotateResult{View: s.viewOf(ctx, *item), NewPassword: newPassword}, nil
 }
 
-// DropAccountInput 是删除监控账号的入参（需要管理凭据）。
+// DropAccountInput 是删除监控账号的入参（需要管理凭据；远程集成还需 SSH 凭据）。
 type DropAccountInput struct {
 	AdminUsername string `json:"admin_username"`
 	AdminPassword string `json:"admin_password"`
+	AccountSecureInput
 }
 
 // DropAccount 删除由平台创建的只读监控账号。
@@ -1104,9 +1173,10 @@ func (s *IntegrationService) DropAccount(
 	if !ok || tpl.MonitorUser == "" {
 		return nil, apperr.Newf(apperr.CodeInvalidParam, "%s 不支持平台代管账号", item.MWType)
 	}
-	if s.docker == nil {
+	if !useRemoteAccountChannel(meta) && s.docker == nil {
 		return nil, apperr.New(apperr.CodeForbidden,
-			"删除账号需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）")
+			"删除账号需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）；"+
+				"若被管实例在远程服务器上，请改用「远程服务器」部署位置，并携带 SSH 凭据重试")
 	}
 	if strings.TrimSpace(in.AdminUsername) == "" || strings.TrimSpace(in.AdminPassword) == "" {
 		return nil, apperr.New(apperr.CodeInvalidParam, "删除账号需要提供被管实例的管理账号与口令")
@@ -1141,7 +1211,14 @@ func (s *IntegrationService) DropAccount(
 		view.DeployNote = "生产环境需审批：已创建工单 " + ticket.TicketID + "（删除账号 " + item.Username + "）"
 		return &view, nil
 	}
-	if _, err := s.runClientSQL(ctx, instance, tpl, in.AdminUsername, in.AdminPassword, statements); err != nil {
+	if useRemoteAccountChannel(meta) {
+		if _, err := s.accountSQLRemote(ctx, item, tpl, instance, meta,
+			strings.TrimSpace(in.AdminUsername), in.AdminPassword, statements,
+			in.remoteCreds(meta.TargetHost)); err != nil {
+			return nil, apperr.Wrap(apperr.CodeUpstream,
+				fmt.Errorf("在目标机上删除监控账号失败：%w", err))
+		}
+	} else if _, err := s.runClientSQL(ctx, instance, tpl, in.AdminUsername, in.AdminPassword, statements); err != nil {
 		return nil, apperr.Wrap(apperr.CodeUpstream, fmt.Errorf("删除监控账号失败：%w", err))
 	}
 	s.writeMeta(ctx, item, func(m *IntegrationMeta) {
@@ -1184,9 +1261,17 @@ func (s *IntegrationService) requireDocker(action string) error {
 //   - 带了凭据 → 幂等重跑建号 SQL（账号不存在就建、存在就重置口令并授权）+ 测试连接；
 //   - 没带凭据 → 只测试已有监控账号能否连上，并重建 Exporter（用于"账号其实已经建好、
 //     只是 Exporter 用了旧口令"这类场景）。
+// RetryAccountInput 是「重试建号/连接」的入参。
+//
+// 管理凭据是**可选**的：
+//   - 带了凭据 → 幂等重跑建号 SQL（账号不存在就建、存在就重置口令并授权）+ 测试连接；
+//   - 没带凭据 → 只测试已有监控账号能否连上，并重建 Exporter（用于"账号其实已经建好、
+//     只是 Exporter 用了旧口令"这类场景）。
+// 远程集成还需要 SSH 凭据（账号 SQL 在目标机上执行，凭据不落库）。
 type RetryAccountInput struct {
 	AdminUsername string `json:"admin_username"`
 	AdminPassword string `json:"admin_password"`
+	AccountSecureInput
 }
 
 // AccountRetryResult 是重试结果：既要能显示"做了什么"，也要能显示"还差什么"。
@@ -1227,9 +1312,10 @@ func (s *IntegrationService) RetryAccount(
 		return nil, apperr.Newf(apperr.CodeInvalidParam,
 			"%s 不需要平台托管账号（口令由目标自身鉴权配置决定）", item.MWType)
 	}
-	if s.docker == nil {
+	if !useRemoteAccountChannel(meta) && s.docker == nil {
 		return nil, apperr.New(apperr.CodeForbidden,
-			"重试建号需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）")
+			"重试建号需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）；"+
+				"若被管实例在远程服务器上，请改用「远程服务器」部署位置，并携带 SSH 凭据重试")
 	}
 	password, err := s.decrypt(item.PasswordEncrypted)
 	if err != nil {
@@ -1247,14 +1333,19 @@ func (s *IntegrationService) RetryAccount(
 	}
 
 	result := &AccountRetryResult{}
-	if err := s.requireDocker("重试建号"); err != nil {
-		return nil, err
+	if !useRemoteAccountChannel(meta) {
+		if err := s.requireDocker("重试建号"); err != nil {
+			return nil, err
+		}
 	}
 	// 1) 建号（幂等）：口令沿用库内已存的那一个，保证与 Exporter 注入的一致。
+	//    远程集成带上本次填写的 SSH 凭据，走"在目标机执行 SQL"通道。
 	if hasAdminCreds(IntegrationInput{AdminUsername: in.AdminUsername, AdminPassword: in.AdminPassword}) {
-		note, bootErr, performed := s.bootstrapAccount(ctx, item, tpl, instance, IntegrationInput{
+		bootInput := IntegrationInput{
 			AdminUsername: in.AdminUsername, AdminPassword: in.AdminPassword,
-		}, operator)
+			SSHUser: in.SSHUser, SSHPassword: in.SSHPassword, SSHPort: in.SSHPort, SSHKey: in.SSHKey,
+		}
+		note, bootErr, performed := s.bootstrapAccount(ctx, item, tpl, instance, bootInput, operator)
 		result.Created = performed
 		if bootErr != nil {
 			result.Message = "建号失败：" + bootErr.Error()
@@ -1275,7 +1366,15 @@ func (s *IntegrationService) RetryAccount(
 	}
 
 	// 2) 连接测试：拿真实结果，而不是让使用者去猜。
-	probe, probeErr := s.runClientSQL(ctx, instance, tpl, item.Username, password, probeAccountSQL(tpl.Type))
+	// 连接测试：远程集成同样在目标机上执行（只读 SELECT，不产生副作用）。
+	var probe string
+	var probeErr error
+	if useRemoteAccountChannel(meta) {
+		probe, probeErr = s.accountSQLRemote(ctx, item, tpl, instance, meta,
+			item.Username, password, probeAccountSQL(tpl.Type), in.remoteCreds(meta.TargetHost))
+	} else {
+		probe, probeErr = s.runClientSQL(ctx, instance, tpl, item.Username, password, probeAccountSQL(tpl.Type))
+	}
 	if probeErr == nil {
 		result.Connected = true
 		result.Output = truncateText(probe, 200)
@@ -1323,8 +1422,13 @@ type AccountProbeResult struct {
 	Output  string `json:"output"`
 }
 
+// AccountProbeInput 是连接测试的入参（远程集成需带 SSH 凭据；不落库）。
+type AccountProbeInput struct {
+	AccountSecureInput
+}
+
 // ProbeAccount 只做连接测试（不建号、不改配置），供"账号到底能不能连"这个疑问。
-func (s *IntegrationService) ProbeAccount(ctx context.Context, id int64) (*AccountProbeResult, error) {
+func (s *IntegrationService) ProbeAccount(ctx context.Context, id int64, in AccountProbeInput) (*AccountProbeResult, error) {
 	item, err := s.integrationInstance(ctx, id)
 	if err != nil {
 		return nil, err
@@ -1352,9 +1456,16 @@ func (s *IntegrationService) ProbeAccount(ctx context.Context, id int64) (*Accou
 		Labels: meta.Labels, Options: meta.Options,
 		Environment: item.Environment, GroupName: item.GroupName,
 	}
-	output, err := s.runClientSQL(ctx, instance, tpl, item.Username, password, probeAccountSQL(tpl.Type))
-	if err != nil {
-		return &AccountProbeResult{OK: false, Message: err.Error(), Output: truncateText(output, 300)}, nil
+	var output string
+	var runErr error
+	if useRemoteAccountChannel(meta) {
+		output, runErr = s.accountSQLRemote(ctx, item, tpl, instance, meta,
+			item.Username, password, probeAccountSQL(tpl.Type), in.remoteCreds(meta.TargetHost))
+	} else {
+		output, runErr = s.runClientSQL(ctx, instance, tpl, item.Username, password, probeAccountSQL(tpl.Type))
+	}
+	if runErr != nil {
+		return &AccountProbeResult{OK: false, Message: runErr.Error(), Output: truncateText(output, 300)}, nil
 	}
 	return &AccountProbeResult{
 		OK: true, Message: fmt.Sprintf("监控账号 %s 连接正常", item.Username),

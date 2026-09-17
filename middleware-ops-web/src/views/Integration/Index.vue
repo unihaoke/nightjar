@@ -12,7 +12,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { integrationApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
+import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
 import { envLabels, formatTime } from '@/utils/format'
 
 const router = useRouter()
@@ -90,6 +90,42 @@ const rules: FormRules = {
   address: [{ required: true, message: '请输入连接地址', trigger: 'blur' }],
 }
 
+/**
+ * 预览某个 Exporter 参数**最终会以什么形式**传给 Exporter。
+ *
+ * 规则与后端 internal/integration/template.go 的 RenderEnv/RenderArgs 保持一致：
+ *   - 环境变量：KEY=value（空值不传递）；
+ *   - 命令行字符串：--key=value；
+ *   - 命令行开关：显式为真 → --key；显式为假但上游默认开 → --no-key（关掉默认采集项的唯一写法）；
+ *     显式为假且上游默认关 → 什么都不传。
+ * 这样"标了命令行却是开关控件、没法输入文本"就不会再让人困惑。
+ */
+function optionPreview(option: IntegrationTemplate['options'][number]): string {
+  const raw = String(form.options[option.key] ?? option.default ?? '').trim()
+  const defaultOn = isTruthyValue(option.default || '')
+  if (option.target === 'env') {
+    if (option.kind === 'bool') {
+      if (!raw) {
+        return '（不传递该环境变量）'
+      }
+      return `${option.key}=${isTruthyValue(raw) ? 'true' : 'false'}`
+    }
+    return raw ? `${option.key}=${raw}` : '（不传递该环境变量）'
+  }
+  if (option.kind === 'bool') {
+    if (isTruthyValue(raw)) {
+      return `--${option.key}`
+    }
+    return defaultOn ? `--no-${option.key}（关掉上游默认开启的采集项）` : '（不传递该开关）'
+  }
+  return raw ? `--${option.key}=${raw}` : '（不传递该开关）'
+}
+
+/** 与后端 isTruthy 一致的真值判断。 */
+function isTruthyValue(value: string): boolean {
+  return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase())
+}
+
 /** 是否处于编辑态。 */
 const isEdit = computed(() => Boolean(editing.value?.instance_id))
 
@@ -110,6 +146,38 @@ const retryingId = ref<number | null>(null)
 const probingId = ref<number | null>(null)
 /** 最近一次重试/探测的结论（就地展示失败原因，而不是只弹一条 toast）。 */
 const accountResult = ref<{ ok: boolean; title: string; detail: string } | null>(null)
+/**
+ * 远程集成的账号操作在**目标主机**上执行（只经 SSH + Ansible，不依赖平台 Docker），
+ * 因此需要在弹窗里填一次 SSH 凭据；凭据仅本次使用、平台不落库。
+ */
+const accountSsh = reactive({ user: '', password: '', port: 22 })
+
+/** 账号清单里是否存在远程部署的集成（决定是否显示 SSH 凭据输入）。 */
+const hasRemoteAccount = computed(() => accounts.value.some((row) => row.deploy_target === 'remote'))
+
+/** 组装 SSH 凭据载荷（本机集成返回空对象）。 */
+function sshPayload(row: IntegrationAccount): AccountSecurePayload {
+  if (row.deploy_target !== 'remote') {
+    return {}
+  }
+  return { ssh_user: accountSsh.user.trim(), ssh_password: accountSsh.password, ssh_port: accountSsh.port }
+}
+
+/** 远程集成必须先填 SSH 凭据，否则明确提示（而不是等服务端报错）。 */
+function ensureSshCreds(row: IntegrationAccount): boolean {
+  if (row.deploy_target !== 'remote') {
+    return true
+  }
+  if (!accountSsh.user.trim() || !accountSsh.password) {
+    ElMessage({
+      type: 'warning',
+      message: `「${row.name}」是远程部署：请先在弹窗顶部填写 SSH 用户名与口令（账号操作在目标机上执行）`,
+      grouping: true,
+    })
+    return false
+  }
+  return true
+}
 
 /** 载入账号清单。 */
 async function loadAccounts(): Promise<void> {
@@ -136,7 +204,10 @@ async function handleProbeAccount(row: IntegrationAccount): Promise<void> {
   probingId.value = row.integration_id
   accountResult.value = null
   try {
-    const result = await integrationApi.probeAccount(row.integration_id)
+    if (!ensureSshCreds(row)) {
+      return
+    }
+    const result = await integrationApi.probeAccount(row.integration_id, sshPayload(row))
     accountResult.value = {
       ok: result.ok,
       title: result.ok ? `${row.name}：连接正常` : `${row.name}：连接失败`,
@@ -188,10 +259,14 @@ async function handleRetryAccount(row: IntegrationAccount): Promise<void> {
 
   retryingId.value = row.integration_id
   accountResult.value = null
+  if (!ensureSshCreds(row)) {
+    return
+  }
   try {
     const result = await integrationApi.retryAccount(row.integration_id, {
       admin_username: adminUser,
       admin_password: adminPassword,
+      ...sshPayload(row),
     })
     accountResult.value = {
       ok: result.ok,
@@ -218,7 +293,10 @@ async function handleRotateAccount(row: IntegrationAccount): Promise<void> {
     return
   }
   try {
-    const result = await integrationApi.rotateAccount(row.integration_id)
+    if (!ensureSshCreds(row)) {
+      return
+    }
+    const result = await integrationApi.rotateAccount(row.integration_id, sshPayload(row))
     accountResult.value = {
       ok: true,
       title: `${row.name}：口令已轮换`,
@@ -250,10 +328,14 @@ async function handleDropAccount(row: IntegrationAccount): Promise<void> {
   if (!adminPassword) {
     return
   }
+  if (!ensureSshCreds(row)) {
+    return
+  }
   try {
     await integrationApi.dropAccount(row.integration_id, {
       admin_username: adminUser,
       admin_password: adminPassword,
+      ...sshPayload(row),
     })
     ElMessage.success('已删除监控账号')
     await Promise.all([loadAccounts(), load()])
@@ -784,9 +866,14 @@ onMounted(load)
               </span>
             </template>
             <p class="field-hint">
-              默认值已按官方镜像适配，直接保存即可。只有这几类场景才需要调整：
-              云数据库的集群架构（Redis 的 SLOWLOG / LATENCY 命令不支持）、
-              主机监控的挂载排除正则、以及需要额外采集项时。
+              默认值已按官方镜像适配，直接保存即可。参数分两类，<b>控制项不同</b>：
+              <b>开关型</b>（如 <span class="mono">--collect.global_status</span>）用开关控制，
+              <b>不能输入文本</b>；<b>字符串型</b>（如 <span class="mono">--path.rootfs</span>）才提供输入框。
+              每行下方的「将传递」显示了它最终传给 Exporter 的形式。
+            </p>
+            <p class="field-hint">
+              平台只透传模板声明的参数，<b>不接受任意自定义 flag</b>（避免把平台变成任意命令入口）；
+              确实需要某个未暴露的开关时，请把它加进组件模板。
             </p>
             <div v-for="option in activeTemplate?.options || []" :key="option.key" class="option-row">
               <div class="option-main">
@@ -795,6 +882,7 @@ onMounted(load)
                   {{ option.target === 'env' ? '环境变量' : '命令行' }}
                 </el-tag>
                 <p class="field-hint">{{ option.help }}</p>
+                <p class="field-hint mono">将传递：{{ optionPreview(option) }}</p>
               </div>
               <el-switch
                 v-if="option.kind === 'bool'"
@@ -1015,6 +1103,34 @@ onMounted(load)
         class="mb"
         title="这些只读账号由平台创建并托管（口令加密存储）。建号/连接失败时可直接在这里重试；轮换口令不需要管理员凭据；删除账号是破坏性操作，需要管理员凭据（生产环境会转成审批工单）。"
       />
+      <!-- 远程集成的账号操作在目标主机上执行：需要一次 SSH 凭据（仅本次使用） -->
+      <div v-if="hasRemoteAccount" class="remote-creds">
+        <el-alert type="warning" :closable="false" show-icon
+          title="有远程部署的集成：账号操作在目标主机上执行，需要 SSH 凭据">
+          <p class="field-hint">
+            远程集成的建号 / 轮换 / 删除 / 连接测试都由平台 SSH 到目标机执行
+            （只经 SSH + Ansible，<b>不依赖平台 Docker</b>）。凭据仅本次使用、不落库、不回显。
+          </p>
+        </el-alert>
+        <el-row :gutter="12" class="mt">
+          <el-col :xs="24" :sm="8">
+            <el-form-item label="SSH 用户">
+              <el-input v-model="accountSsh.user" placeholder="如 ops" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="4">
+            <el-form-item label="SSH 端口">
+              <el-input-number v-model="accountSsh.port" :min="1" :max="65535" class="mobile-block" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="SSH 口令（仅本次使用）">
+              <el-input v-model="accountSsh.password" type="password" show-password
+                placeholder="不落库、不写审计、不回显" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </div>
       <el-alert
         v-if="accountResult"
         :type="accountResult.ok ? 'success' : 'error'"
@@ -1058,27 +1174,27 @@ onMounted(load)
               text
               size="small"
               :loading="retryingId === row.integration_id"
-              :disabled="!row.supports_management || !dockerReady"
+              :disabled="!row.supports_management || (!dockerReady && row.deploy_target !== 'remote')"
               @click="handleRetryAccount(row)"
             >重试建号</el-button>
             <el-button
               text
               size="small"
               :loading="probingId === row.integration_id"
-              :disabled="!row.supports_management || !dockerReady"
+              :disabled="!row.supports_management || (!dockerReady && row.deploy_target !== 'remote')"
               @click="handleProbeAccount(row)"
             >测试连接</el-button>
             <el-button
               text
               size="small"
-              :disabled="!row.has_password || !row.supports_management || !dockerReady"
+              :disabled="!row.has_password || !row.supports_management || (!dockerReady && row.deploy_target !== 'remote')"
               @click="handleRotateAccount(row)"
             >轮换口令</el-button>
             <el-button
               text
               size="small"
               type="danger"
-              :disabled="!row.supports_management || !dockerReady"
+              :disabled="!row.supports_management || (!dockerReady && row.deploy_target !== 'remote')"
               @click="handleDropAccount(row)"
             >删除</el-button>
           </template>
