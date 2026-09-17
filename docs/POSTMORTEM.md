@@ -53,7 +53,7 @@ Cannot read properties of undefined (reading 'series')
 **附注：内存使用率为什么是一条直线**
 
 与该缺陷无关，属于展示问题：`redis_memory_used_bytes / redis_memory_max_bytes * 100`
-在 jd 这类低流量 Redis 上长期在 1%~3% 之间微动，而 ECharts 的 value 轴默认
+在 低流量 Redis 上长期在 1%~3% 之间微动，而 ECharts 的 value 轴默认
 `scale:false`（从 0 起），微小波动被压缩成一条贴底直线。
 已改为 `scale: true`（量程按数据自适应），并把时间轴与 tooltip 的时间格式统一为
 `yyyy-MM-dd HH:mm:ss`。

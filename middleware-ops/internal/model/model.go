@@ -22,6 +22,8 @@ const (
 	MWTypeES    = "es"
 	MWTypeNginx = "nginx"
 	MWTypeRMQ   = "rabbitmq"
+	// MWTypeNode 为主机监控（node_exporter）：采集对象是服务器本身，不是中间件实例。
+	MWTypeNode = "node"
 )
 
 // 环境分级（数据权限的隔离维度）。

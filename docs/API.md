@@ -92,9 +92,9 @@
 
 ```json
 {
-  "name": "jd-redis",
+  "name": "legacy-redis",
   "mw_type": "redis",
-  "address": "jd-redis:6379",
+  "address": "legacy-redis:6379",
   "username": "monitor",
   "password": "******",
   "environment": "dev",
@@ -128,8 +128,8 @@
 ```json
 [
   {
-    "targets": ["mwops-exporter-jd-redis:9121"],
-    "labels": { "instance_name": "jd-redis", "mw_type": "redis", "env": "dev", "team": "interview" }
+    "targets": ["mwops-exporter-app-redis:9121"],
+    "labels": { "instance_name": "legacy-redis", "mw_type": "redis", "env": "dev", "team": "interview" }
   }
 ]
 ```
@@ -163,7 +163,7 @@
 
 ```json
 {
-  "selector": "job=\"middleware-exporter-redis\",instance_name=\"jd-redis\"",
+  "selector": "job=\"middleware-exporter-redis\",instance_name=\"legacy-redis\"",
   "job_up": 1,
   "matched": 0,
   "total": 8,

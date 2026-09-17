@@ -12,12 +12,12 @@ import (
 // 本文件负责把「查不到指标」翻译成「你该填什么」。
 //
 // 背景（真实故障）：纳管实例时最容易把**容器名**当成 **Prometheus job 名**填进
-// prom_job（例如把 jd-redis-exporter 填进去），而容器名、job 名、instance_name
+// prom_job（例如把 redis-exporter 填进去），而容器名、job 名、instance_name
 // 是三个完全不同的东西：
 //
-//	容器名          jd-redis-exporter          docker ps 里看到的
+//	容器名          redis-exporter          docker ps 里看到的
 //	job 名          middleware-exporter-redis prometheus.yml 的 job_name
-//	instance_name   jd-redis                  relabel 写入的标签值，= 平台实例名
+//	instance_name   legacy-redis                  relabel 写入的标签值，= 平台实例名
 //
 // 报错只说"未匹配到任何时序"，使用者无从下手。这里把 Prometheus 里**实际存在**的
 // job 名与实例标签值拉出来，做相似度排序后直接给建议。

@@ -36,7 +36,7 @@ docker compose up -d --build
 
 包含组件：PostgreSQL 15 + pgvector、Redis 7、Prometheus、**Grafana（统一监控大盘）**、后端（Go）、Nginx + 前端静态资源。
 
-> **监控栈统一在本平台**：被管项目（如 jd）不再需要自带 Prometheus / Grafana / Exporter——
+> **监控栈统一在本平台**：被管项目（如某业务系统）不再需要自带 Prometheus / Grafana / Exporter——
 > 平台按「集成中心」的配置创建只读监控账号、拉起 Exporter、自动接入对方网络并抓取；
 > 数据源已由 provisioning 自动注入 Grafana，大盘按集成卡片给出的编号导入即可。
 
@@ -131,8 +131,8 @@ npm run dev                                          # 监听 :5173
 │   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
-├── scripts/setup-jd-link.sh        # 一键接入/修复：只维护 .env，其余全自动
-├── scripts/doctor-jd-link.sh       # 跨栈体检：平台/网络/别名/Exporter/采集/抓取
+├── scripts/onboard.sh        # 一键接入/修复：只维护 .env，其余全自动
+├── scripts/doctor.sh       # 跨栈体检：平台/网络/别名/Exporter/采集/抓取
 └── Makefile                        # 常用开发/部署命令
 ```
 
@@ -179,7 +179,7 @@ AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管
 - 上报 Hook：`POST /api/hooks/logs`、`POST /api/hooks/alerts`，使用 `X-Hook-Token` 与服务令牌，与用户 JWT 分离。
 
 完整接口清单见 [`docs/API.md`](docs/API.md)，接入与运维说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)，
-**「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-JD-ONBOARD.md`](docs/GUIDE-JD-ONBOARD.md)（以 jd 为例）**，
+**「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-ONBOARD.md`](docs/GUIDE-ONBOARD.md)（以某业务系统为例）**，
 **「集成中心」的字段对照与落地方式见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)**，
 **「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**。
 

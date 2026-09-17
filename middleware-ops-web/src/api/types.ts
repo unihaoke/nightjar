@@ -270,6 +270,12 @@ export interface IntegrationView {
   deploy_note: string
   /** 该集成是否勾选了「把目标容器接入平台网络」。 */
   join_platform_network: boolean
+  /** 部署位置：local（本机 Docker）| remote（远程 Ansible）。 */
+  deploy_target: string
+  target_host: string
+  exporter_host_port: number
+  install_mode: string
+  remote_installed_at: string
   selector: string
   applied_at: string
   last_error: string
@@ -349,6 +355,17 @@ export interface IntegrationInput {
   tags?: string[]
   deploy?: boolean
   auto_rules?: boolean
+  /** 部署位置与远程安装参数（SSH 凭据不落库）。 */
+  deploy_target?: 'local' | 'remote'
+  target_host?: string
+  exporter_port?: number
+  /** 远程安装方式：docker（默认）| docker-systemd（容器交 systemd）| binary（二进制 + 原生 systemd）。 */
+  install_mode?: 'docker' | 'docker-systemd' | 'binary'
+  ssh_user?: string
+  ssh_port?: number
+  ssh_password?: string
+  ssh_key?: string
+  ssh_become?: boolean
   /** 由平台创建/更新只读监控账号（写操作，默认关闭）。 */
   bootstrap_account?: boolean
   /**

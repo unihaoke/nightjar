@@ -17,13 +17,13 @@ import (
 //   - 生成的配置里绝不出现明文口令。
 
 func TestValidateNameFollowsConsoleConvention(t *testing.T) {
-	valid := []string{"jd-redis", "redis", "a1", "mysql.prod-01", "redis-dev-01"}
+	valid := []string{"legacy-redis", "redis", "a1", "mysql.prod-01", "redis-dev-01"}
 	for _, name := range valid {
 		if err := ValidateName(name); err != nil {
 			t.Fatalf("名称 %q 应合法，实际被拒：%v", name, err)
 		}
 	}
-	invalid := []string{"", "JD-Redis", "jd_redis", "-redis", "redis-", "redis..prod", "redis prod"}
+	invalid := []string{"", "Prod-Redis", "prod_redis", "-redis", "redis-", "redis..prod", "redis prod"}
 	for _, name := range invalid {
 		if err := ValidateName(name); err == nil {
 			t.Fatalf("名称 %q 应被拒绝", name)
@@ -42,7 +42,7 @@ func TestParseAddressForms(t *testing.T) {
 	}{
 		{"10.0.0.11:6379", 6379, "10.0.0.11", 6379, "", ""},
 		{"redis.internal", 6379, "redis.internal", 6379, "", ""},
-		{"redis://jd-redis:6380", 6379, "jd-redis", 6380, "redis", ""},
+		{"redis://legacy-redis:6380", 6379, "legacy-redis", 6380, "redis", ""},
 		{"http://10.0.0.15:9200/", 9200, "10.0.0.15", 9200, "http", ""},
 		{"10.0.0.16:80", 80, "10.0.0.16", 80, "", ""},
 	}
@@ -77,12 +77,12 @@ func TestRenderRedisIntegration(t *testing.T) {
 	if !ok {
 		t.Fatal("redis 模板缺失")
 	}
-	address, err := ParseAddress("redis://jd-redis:6379", tpl.DefaultPort, "", "")
+	address, err := ParseAddress("redis://legacy-redis:6379", tpl.DefaultPort, "", "")
 	if err != nil {
 		t.Fatalf("地址解析失败：%v", err)
 	}
 	instance := Instance{
-		Name: "jd-redis", MWType: TypeRedis, Address: address,
+		Name: "legacy-redis", MWType: TypeRedis, Address: address,
 		Username: "monitor", Password: "p@ss w0rd", // 故意带 @ 与空格，验证脱敏与转义
 		Labels:      map[string]string{"team": "interview"},
 		Options:     map[string]string{"REDIS_EXPORTER_EXCLUDE_SLOWLOG_METRICS": "true"},
@@ -94,7 +94,7 @@ func TestRenderRedisIntegration(t *testing.T) {
 	}
 
 	// 选择器必须与平台的 buildSelector 约定一致（job + instance_name）。
-	if artifacts.Selector != `job="middleware-integration",instance_name="jd-redis"` {
+	if artifacts.Selector != `job="middleware-integration",instance_name="legacy-redis"` {
 		t.Fatalf("选择器不符：%s", artifacts.Selector)
 	}
 
@@ -103,10 +103,10 @@ func TestRenderRedisIntegration(t *testing.T) {
 	if err := json.Unmarshal([]byte(artifacts.FileSD), &entries); err != nil {
 		t.Fatalf("file_sd 不是合法 JSON：%v\n%s", err, artifacts.FileSD)
 	}
-	if len(entries) != 1 || entries[0].Labels["instance_name"] != "jd-redis" {
+	if len(entries) != 1 || entries[0].Labels["instance_name"] != "legacy-redis" {
 		t.Fatalf("file_sd 缺少 instance_name：%s", artifacts.FileSD)
 	}
-	if entries[0].Targets[0] != "jd-redis:6379" {
+	if entries[0].Targets[0] != "legacy-redis:6379" {
 		t.Fatalf("file_sd 目标不符：%v", entries[0].Targets)
 	}
 	if entries[0].Labels["team"] != "interview" || entries[0].Labels["mw_type"] != "redis" {
@@ -122,7 +122,7 @@ func TestRenderRedisIntegration(t *testing.T) {
 	}
 
 	// Redis 的参数走环境变量，且 REDIS_ADDR 使用 redis:// 前缀。
-	if !strings.Contains(artifacts.Compose, "REDIS_ADDR: redis://jd-redis:6379") {
+	if !strings.Contains(artifacts.Compose, "REDIS_ADDR: redis://legacy-redis:6379") {
 		t.Fatalf("compose 片段缺少 REDIS_ADDR：\n%s", artifacts.Compose)
 	}
 	if !strings.Contains(artifacts.Compose, "REDIS_EXPORTER_EXCLUDE_SLOWLOG_METRICS: true") {
@@ -138,7 +138,7 @@ func TestRenderRedisIntegration(t *testing.T) {
 	}
 
 	// 显式 job 片段（file_sd 的替代方案）也要带 instance_name。
-	if !strings.Contains(artifacts.ScrapeJob, "instance_name: jd-redis") {
+	if !strings.Contains(artifacts.ScrapeJob, "instance_name: legacy-redis") {
 		t.Fatalf("显式 job 片段缺少 instance_name：\n%s", artifacts.ScrapeJob)
 	}
 }
@@ -152,7 +152,7 @@ func TestRenderMySQLIntegrationUsesCollectFlags(t *testing.T) {
 		t.Fatalf("地址解析失败：%v", err)
 	}
 	instance := Instance{
-		Name: "jd-mysql", MWType: TypeMySQL, Address: address,
+		Name: "legacy-mysql", MWType: TypeMySQL, Address: address,
 		Username: "exporter", Password: "secret",
 		Options: map[string]string{
 			"collect.global_status":          "true",
@@ -201,7 +201,7 @@ func TestRenderRejectsReservedLabelsAndUnknownOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("地址解析失败：%v", err)
 	}
-	base := Instance{Name: "jd-redis", MWType: TypeRedis, Address: address, Username: "monitor"}
+	base := Instance{Name: "legacy-redis", MWType: TypeRedis, Address: address, Username: "monitor"}
 
 	reserved := base
 	reserved.Labels = map[string]string{"instance_name": "hijack"}

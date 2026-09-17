@@ -312,7 +312,7 @@ sed -i 's/^DB_PASSWORD=.*/DB_PASSWORD=mwo_change_me/' .env && docker compose up 
 docker compose down -v && docker compose up -d --build
 ```
 
-`scripts/setup-jd-link.sh` 第 5 步已经内建了 ①：检测到数据卷已存在时**不会轮换** `DB_PASSWORD`，
+`scripts/onboard.sh` 第 5 步已经内建了 ①：检测到数据卷已存在时**不会轮换** `DB_PASSWORD`，
 并在启动前用 `pg_isready` + TCP `scram` 认证核对口径，不一致就自动 `ALTER USER` 对齐。
 
 > 同理，`DB_USER` / `DB_NAME` 也是**卷初始化时定死的**：改了 `DB_USER` 会报

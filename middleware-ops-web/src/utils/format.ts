@@ -95,6 +95,8 @@ export const mwTypeLabels: Record<string, string> = {
   es: 'Elasticsearch',
   nginx: 'Nginx',
   rabbitmq: 'RabbitMQ',
+  // 主机监控（node_exporter）：采集对象是服务器本身
+  node: '主机 / Node',
 }
 
 /** 中间件类型标签色（仅语义区分，不使用装饰性配色）。 */

@@ -80,8 +80,8 @@ docker compose up -d --build
 
    | 字段 | 示例 |
    |---|---|
-   | 集成名称 | `jd-redis` |
-   | 连接地址 | `jd-redis:6379`（容器名或 `10.0.0.11:6379`） |
+   | 集成名称 | `legacy-redis` |
+   | 连接地址 | `legacy-redis:6379`（容器名或 `10.0.0.11:6379`） |
    | 用户名 / 密码 | 留空 / `$REDIS_PASSWORD`（只做 TCP 探测与 Exporter 认证） |
    | 自定义标签 | `team=interview` |
    | Exporter 参数 | 云数据库 Redis 集群架构请打开「跳过 SLOWLOG / LATENCY HISTOGRAM 指标」 |
@@ -116,7 +116,7 @@ INTEGRATION_DOCKER_ENABLED=true
 | 方式 | 适用 | 操作 |
 |---|---|---|
 | **http_sd（推荐，平台内置）** | 平台自带 Prometheus（`deploy/prometheus/prometheus.yml` 已内置 `middleware-integration` job） | 无：保存后 30 秒内自动生效 |
-| **http_sd（外部 Prometheus）** | 复用 jd 自带的 interview-prometheus 等外部 Prometheus | 在其 `scrape_configs` 加一个 job，`http_sd_configs.url: http://mwops-backend:8080/api/sd/integrations`（该 Prometheus 需能访问 `mwops-backend`，例如与平台同网络） |
+| **http_sd（外部 Prometheus）** | 复用 被管项目自带的 app-prometheus 等外部 Prometheus | 在其 `scrape_configs` 加一个 job，`http_sd_configs.url: http://mwops-backend:8080/api/sd/integrations`（该 Prometheus 需能访问 `mwops-backend`，例如与平台同网络） |
 | **显式 scrape job** | 外部 Prometheus 无法访问平台接口（例如跨主机且未放通 8000） | 抽屉 →「Prometheus(显式 job)」→ 复制片段并入 `scrape_configs` → reload/重启 |
 | **人工 compose** | 平台未启用 Docker 一键部署 | 抽屉 →「Exporter(compose)」→ 合并进 compose → `docker compose up -d` |
 
@@ -160,12 +160,12 @@ job="middleware-integration",instance_name="<集成名称>"
 
 ---
 
-## 6. 与 jd（跨栈被管系统）的组合
+## 6. 与被管项目（跨主机 / 跨 compose）的组合
 
-jd 的 MySQL / Redis 在 `jd-data`（internal）网络里，不发布宿主端口，也不为监控做任何改动。
-平台创建 Exporter 时会**自己发现**目标容器所在的网络（`jd_jd-data`），然后把 Exporter
+被管项目的 MySQL / Redis 在 `app-data`（internal）网络里，不发布宿主端口，也不为监控做任何改动。
+平台创建 Exporter 时会**自己发现**目标容器所在的网络（`app_data`），然后把 Exporter
 接成两张网：「平台网络（Prometheus 抓它）」+「目标网络（它连被管实例）」。
-因此 jd 侧不需要建互联网络、不需要加别名，`deploy/compose.jd-link.yml` 已经删除。
+因此 被管项目侧不需要建互联网络、不需要加别名，`deploy/旧的跨栈 overlay` 已经删除。
 
 ```bash
 # .env —— 只需平台网络；目标网络由集成时自动发现，不必手写
@@ -175,8 +175,8 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops
 发现过程（`internal/docker.ResolveTarget`）：
 
 1. 列容器 → 逐个 inspect，按 **容器名 → compose 服务名 → 网络别名** 顺序匹配用户填的地址；
-2. 取命中容器的真实网络名（如 `jd_jd-data`），与 `INTEGRATION_EXPORTER_NETWORK` 求并集；
-3. 把用户填的地址**换成容器名**（`interview-redis`）——容器名在目标网络上一定能被内嵌 DNS 解析，
+2. 取命中容器的真实网络名（如 `app_data`），与 `INTEGRATION_EXPORTER_NETWORK` 求并集；
+3. 把用户填的地址**换成容器名**（`app-redis`）——容器名在目标网络上一定能被内嵌 DNS 解析，
    而别名可能只存在于用户以为的那张网上；
 4. 容器第一个网络在创建时指定，其余通过 `POST /networks/{id}/connect` 追加；
 5. 同时把平台自身（`MWOPS_SELF_CONTAINER`，默认 `mwops-backend`）也接进目标网络，
@@ -195,13 +195,13 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops
 **「改为把目标容器接入平台网络」**（`join_platform_network=true`），平台会执行等价的：
 
 ```bash
-docker network connect <平台网络> <目标容器>      # 例如 middleware-ops_mwops interview-mysql
+docker network connect <平台网络> <目标容器>      # 例如 middleware-ops_mwops app-mysql
 ```
 
 代价与注意事项：
 
 - 这**修改了被管容器的网络配置**（默认方向不改被管容器）；
-- 若目标容器原本只在 `internal` 网络里（jd 的 `jd-data` 就是刻意做成无出网的），
+- 若目标容器原本只在 `internal` 网络里（被管项目的 `app-data` 就是刻意做成无出网的），
   接入非 internal 的平台网络后它会**多一条出网路径**，数据面隔离随之失效；
 - 地址填的是外部地址（非容器名）时不需要、也不应该勾选——平台连容器都找不到；
 - 勾选状态持久化在集成元信息里，「重新应用」会复现同样行为（取消勾选后保存即停止）。
@@ -274,7 +274,7 @@ dial unix /var/run/docker.sock: connect: permission denied
 
 | 方式 | 做法 | 代价 |
 |---|---|---|
-| **① 附加 docker 组 GID（默认）** | `stat -c '%g' /var/run/docker.sock` 取 GID → 平台 `.env` 写 `DOCKER_GID=<GID>`（`docker-compose.yml` 已配 `group_add`）→ `up -d --force-recreate backend` | 保持非 root；GID 随宿主不同需正确填写（`scripts/setup-jd-link.sh` 会自动探测写入） |
+| **① 附加 docker 组 GID（默认）** | `stat -c '%g' /var/run/docker.sock` 取 GID → 平台 `.env` 写 `DOCKER_GID=<GID>`（`docker-compose.yml` 已配 `group_add`）→ `up -d --force-recreate backend` | 保持非 root；GID 随宿主不同需正确填写（`scripts/onboard.sh` 会自动探测写入） |
 | ② 容器内以 root 运行 | 给 backend 加 `user: "0:0"` | 容器内进程获得 root；鉴于 socket 本身已等价宿主机 root，属"放弃纵深防御" |
 | ③ docker-socket-proxy | 用 `tecnativa/docker-socket-proxy`，只放行 `containers`/`networks`/`volumes` 的 GET/POST 与 `exec`，平台连代理而非真实 socket | 多一个容器；最符合最小权限，生产强烈建议 |
 
@@ -305,9 +305,9 @@ dial unix /var/run/docker.sock: connect: permission denied
 | 环节 | 今天的状态 | 能否全自动 | 前置条件 / 风险 |
 |---|---|---|---|
 | ① Exporter 容器拉起 | ✅ 平台调 Docker Engine API 创建（默认关闭，可开） | 能 | 需挂载 `docker.sock`（等价宿主机 root 权限） |
-| ② 网络接入（监控面 + 数据面） | ✅ 按 `integration.exporter_network` 多网络接入；`setup-jd-link.sh` 会自动写进 `.env` | 能 | 需 `docker.sock`；也可像 jd 脚本那样把网络名写进 `.env` |
+| ② 网络接入（监控面 + 数据面） | ✅ 按 `integration.exporter_network` 多网络接入；`onboard.sh` 会自动写进 `.env` | 能 | 需 `docker.sock`；也可手工把网络名写进 `.env` |
 | ③ 抓取目标注册（`instance_name` 标签） | ✅ http_sd，保存后 30s 内生效，无需重启 | 能 | 无 |
-| ④ 实例纳管 / 命名一致 / 告警规则 | ✅ 自动（集成即纳管；relabel 由 `JD_*_INSTANCE_NAME` 同步） | 能 | 无 |
+| ④ 实例纳管 / 命名一致 / 告警规则 | ✅ 自动（集成即纳管；relabel 由 `实例名相关环境变量` 同步） | 能 | 无 |
 | ⑤ 凭据注入（口令含特殊字符） | ✅ 改为官方 flag + 环境变量（`--mysqld.username` / `MYSQLD_EXPORTER_PASSWORD`），不拼 DSN | 能 | 无（本轮修复） |
 | ⑥ 「到底跑没跑起来」的核验 | ✅ 保存后**异步核验**：抓取目标 up 则标记已应用，失败则把 Prometheus 的 `lastError` 翻译后写回集成 | 能 | 无（本轮新增） |
 | **⑦ 只读监控账号的创建** | ✅ **平台可代劳**：集成表单勾选「由平台创建/更新只读监控账号」并填一次管理凭据 | 能 | 属写操作 → 需显式授权；平台只执行内置模板 SQL（幂等 + 最小权限 + `MAX_USER_CONNECTIONS`），口令由平台生成，审计不含口令 |
@@ -317,17 +317,17 @@ dial unix /var/run/docker.sock: connect: permission denied
 
 - 账号：平台用一次性 client 容器执行固定模板 SQL 建号，不需要登录被管库手工建；
 - 网络：平台按**别名自动发现**目标所在的 docker 网络（跨 compose 项目也行），
-  使用者只需填 `jd-mysql` 这样的名字，不必知道它属于哪个项目、哪张网；
+  使用者只需填 `legacy-mysql` 这样的名字，不必知道它属于哪个项目、哪张网；
 - Exporter：平台拉起（同时接入监控面与数据面）；
 - 抓取与大盘：平台自带的 Prometheus + Grafana，被管项目**不再需要自带监控栈**。
 
 > 唯一仍需被管项目配合的是**日志链路**：日志文件在被管容器里，
-> 平台侧的采集需要共享日志卷（jd 的 `docker-compose.yml` 里那一行 `backend-logs` 挂载）。
+> 平台侧的采集需要共享日志卷（被管项目的 `docker-compose.yml` 里那一行 `backend-logs` 挂载）。
 > 这是"读对方文件"的物理前提，与监控栈无关。
 
 **结论**：①②③④⑤⑥ 已经做到"配置即接入"；**唯一的硬缺口是 ⑦**——
 没有只读账号，mysqld_exporter 必然 `up=0`（表现为 `Access denied`）。
-这正是 `docs/GUIDE-JD-ONBOARD.md` §8.4 里最常见的那一类。
+这正是 `docs/GUIDE-ONBOARD.md` §8.4 里最常见的那一类。
 
 给使用者的两条路（**现已默认走平台托管**）：
 
@@ -335,7 +335,7 @@ dial unix /var/run/docker.sock: connect: permission denied
   填一次管理凭据 → 平台执行固定模板 SQL 建号（详见上表 ⑦），
   口令留空则由平台生成十六进制随机串。**被管项目零配置**。
 - **路径 B（自行预置）**：不勾选该选项，账号由被管系统侧预置
-  （模板 SQL 见组件说明；jd 的 `setup-jd-link.sh` 也会执行 initdb）。
+  （模板 SQL 见组件说明；被管项目的 `onboard.sh` 也会执行 initdb）。
   适合不便提供管理凭据的环境（如生产库由 DBA 管控）。
 
 ---
@@ -346,7 +346,7 @@ dial unix /var/run/docker.sock: connect: permission denied
 **它不止配置，还会真的去读对方的 docker 配置**：
 
 ```
-① 你填「目标容器名」（如 interview-backend）
+① 你填「目标容器名」（如 app-backend）
         ↓
 ② 平台 docker inspect 该容器，读 env 与 Mounts
         ↓

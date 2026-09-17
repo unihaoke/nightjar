@@ -71,9 +71,9 @@ func newStubClient(t *testing.T, mode stubMode) (Client, func()) {
 	return New(cfg, nil, zap.NewNop()), server.Close
 }
 
-// jdRedisTarget 是测试用的实例（对应 jd 场景）。
-func jdRedisTarget() Target {
-	return Target{InstanceID: 1, Name: "jd-redis", MWType: "redis"}
+// sampleRedisTarget 是测试用的实例（对应 跨项目场景）。
+func sampleRedisTarget() Target {
+	return Target{InstanceID: 1, Name: "legacy-redis", MWType: "redis"}
 }
 
 // TestSnapshotExposesSelectorWhenNothingMatches 锁定：
@@ -82,7 +82,7 @@ func TestSnapshotExposesSelectorWhenNothingMatches(t *testing.T) {
 	client, closeFn := newStubClient(t, stubEmpty)
 	defer closeFn()
 
-	snapshot, err := client.Snapshot(context.Background(), jdRedisTarget())
+	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
 	if err != nil {
 		t.Fatalf("空结果不应返回错误（否则会掩盖真实原因）：%v", err)
 	}
@@ -95,7 +95,7 @@ func TestSnapshotExposesSelectorWhenNothingMatches(t *testing.T) {
 	if snapshot.Total == 0 {
 		t.Fatal("必须回传画像指标总数，否则前端无法判断「一条都没命中」")
 	}
-	wantSelector := `job="middleware-exporter-redis",instance_name="jd-redis"`
+	wantSelector := `job="middleware-exporter-redis",instance_name="legacy-redis"`
 	if snapshot.Selector != wantSelector {
 		t.Fatalf("选择器不符：want %s, got %s", wantSelector, snapshot.Selector)
 	}
@@ -113,7 +113,7 @@ func TestHistoryDoesNotFabricateDataOnEmptyResult(t *testing.T) {
 	client, closeFn := newStubClient(t, stubEmpty)
 	defer closeFn()
 
-	samples, err := client.History(context.Background(), jdRedisTarget(), "memory_usage_percent", TimeRange{})
+	samples, err := client.History(context.Background(), sampleRedisTarget(), "memory_usage_percent", TimeRange{})
 	if err != nil {
 		t.Fatalf("空结果不应报错：%v", err)
 	}
@@ -128,7 +128,7 @@ func TestSnapshotDegradesToSimulatorWhenPrometheusDown(t *testing.T) {
 	client, closeFn := newStubClient(t, stubDown)
 	defer closeFn()
 
-	snapshot, err := client.Snapshot(context.Background(), jdRedisTarget())
+	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
 	if err != nil {
 		t.Fatalf("降级链应兜住上游故障：%v", err)
 	}
@@ -138,7 +138,7 @@ func TestSnapshotDegradesToSimulatorWhenPrometheusDown(t *testing.T) {
 	if !strings.Contains(snapshot.Note, "已回退") {
 		t.Fatalf("降级必须显式提示，实际 note=%q", snapshot.Note)
 	}
-	if snapshot.Selector != `job="middleware-exporter-redis",instance_name="jd-redis"` {
+	if snapshot.Selector != `job="middleware-exporter-redis",instance_name="legacy-redis"` {
 		t.Fatalf("降级后仍应回传真实选择器，实际 %q", snapshot.Selector)
 	}
 }
@@ -149,7 +149,7 @@ func TestSnapshotMatchesWhenJobAndLabelsAgree(t *testing.T) {
 	client, closeFn := newStubClient(t, stubValue)
 	defer closeFn()
 
-	snapshot, err := client.Snapshot(context.Background(), jdRedisTarget())
+	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
 	if err != nil {
 		t.Fatalf("正常路径不应报错：%v", err)
 	}
@@ -164,7 +164,7 @@ func TestSnapshotMatchesWhenJobAndLabelsAgree(t *testing.T) {
 	}
 
 	// 历史查询走真实数据源，不应被模拟器接管。
-	samples, err := client.History(context.Background(), jdRedisTarget(), "memory_usage_percent", TimeRange{})
+	samples, err := client.History(context.Background(), sampleRedisTarget(), "memory_usage_percent", TimeRange{})
 	if err != nil {
 		t.Fatalf("历史查询不应报错：%v", err)
 	}
@@ -176,7 +176,7 @@ func TestSnapshotMatchesWhenJobAndLabelsAgree(t *testing.T) {
 // TestDiagnoseSelectorIgnoresInstanceNameWhenInstanceFilled 锁定 buildSelector 的二选一语义：
 // 填了 prom_instance 就用 instance 标签，实例名不再参与匹配（接入说明必须与此一致）。
 func TestDiagnoseSelectorIgnoresInstanceNameWhenInstanceFilled(t *testing.T) {
-	selector := SelectorFor(Target{Name: "jd-redis", MWType: "redis", Instance: "10.0.0.11:6379"}, "middleware-exporter")
+	selector := SelectorFor(Target{Name: "legacy-redis", MWType: "redis", Instance: "10.0.0.11:6379"}, "middleware-exporter")
 	if selector != `job="middleware-exporter-redis",instance="10.0.0.11:6379"` {
 		t.Fatalf("填了 prom_instance 时应改用 instance 标签，实际 %s", selector)
 	}

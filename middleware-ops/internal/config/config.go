@@ -210,6 +210,44 @@ type IntegrationConfig struct {
 	ExporterNetwork string `mapstructure:"exporter_network"`
 	// DefaultEnvironment 为集成的默认环境（数据权限按环境隔离）。
 	DefaultEnvironment string `mapstructure:"default_environment"`
+	// AllowRemoteInstall 表示允许「远程服务器」模式：平台通过 Ansible Playbook
+	// 把官方 Exporter 安装到目标机器上。默认关闭——它会在**别的机器**上执行命令，
+	// 属于比本地起容器更高的权限动作，必须由管理员显式开启。
+	AllowRemoteInstall bool `mapstructure:"allow_remote_install"`
+	// Ansible 为远程安装的执行配置。
+	Ansible AnsibleConfig `mapstructure:"ansible"`
+}
+
+// AnsibleConfig 是「远程一键安装 Exporter」的执行参数。
+//
+// 设计约定：
+//   - 平台只渲染**内置模板**的 playbook（不接受使用者上传任意 playbook），
+//     渲染结果落盘到 OutputDir 供审计与人工复核；
+//   - SSH 凭据（口令/私钥）只在本次请求内存中使用，写进 0600 的临时 inventory，
+//     执行完立即删除；绝不落库、绝不写审计、绝不出现在命令行参数里（避免 ps 泄漏）。
+type AnsibleConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Binary 为 ansible-playbook 可执行文件（容器内已安装）。
+	Binary string `mapstructure:"binary"`
+	// InventoryDir 为临时 inventory 的存放目录（建议挂在容器内的 tmpfs/数据卷）。
+	InventoryDir string `mapstructure:"inventory_dir"`
+	// Timeout 为单次安装的总超时。
+	Timeout time.Duration `mapstructure:"timeout"`
+	// DefaultSSHPort 为默认 SSH 端口。
+	DefaultSSHPort int `mapstructure:"default_ssh_port"`
+	// Become 表示是否用 sudo 执行（安装到 /opt、写 systemd 单元时需要）。
+	Become bool `mapstructure:"become"`
+	// InstallMode 为远程安装方式：docker（默认，复用官方镜像）或 systemd（二进制 + 单元文件）。
+	InstallMode string `mapstructure:"install_mode"`
+	// InstallDir 为 systemd 模式的安装根目录。
+	InstallDir string `mapstructure:"install_dir"`
+	// DockerNetwork 为 docker 模式下 Exporter 容器使用的网络；host 表示跟随宿主网络。
+	// 默认 host：Exporter 要与被管实例（常在宿主上）通信，host 网络最简单也最通用。
+	DockerNetwork string `mapstructure:"docker_network"`
+	// CheckMode 表示执行前先跑 --check 做语法/连通性预演。
+	CheckMode bool `mapstructure:"check_mode"`
+	// ExtraArgs 为附加的 ansible-playbook 参数（如 -vvv、--private-key 等运维选项）。
+	ExtraArgs []string `mapstructure:"extra_args"`
 }
 
 // NotifyConfig 通知渠道（4.4：飞书/企微必选，钉钉/邮件备选）。

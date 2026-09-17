@@ -32,7 +32,31 @@ const (
 	TypeKafka = "kafka"
 	TypeES    = "es"
 	TypeNginx = "nginx"
+	// TypeNode 是**主机监控**（node_exporter）：采集对象是服务器本身，
+	// 不是某个中间件实例。它是"跨机一键部署"里最常用的一类。
+	TypeNode = "node"
 )
+
+// ReleaseSpec 描述「二进制安装模式」所需的 GitHub Release 资产信息。
+//
+// 用途：目标机没有 Docker（或不允许跑容器）时，远程安装改为
+// 下载官方 release 的 tar.gz → 解压 → 写 systemd 单元 → 开机自启。
+// 与文档《Exporter 一键部署方案》2.3 的做法一致。
+type ReleaseSpec struct {
+	// Repo 为 GitHub 仓库（owner/name），用于拼默认下载地址。
+	Repo string `json:"repo"`
+	// Version 为版本号（不带 v 前缀）。
+	Version string `json:"version"`
+	// Binary 为压缩包内可执行文件名（通常也是顶层目录名的前缀）。
+	Binary string `json:"binary"`
+	// URLTemplate 可选：覆盖默认下载地址，支持 {repo} {version} {binary} {arch} 占位。
+	//
+	// 为什么需要：各仓库的资产命名并不统一（例如 nginx-prometheus-exporter
+	// 用下划线 nginx-prometheus-exporter_1.3.0_linux_amd64.tar.gz）。
+	URLTemplate string `json:"url_template,omitempty"`
+	// TopDir 可选：解压后的顶层目录名，默认 {binary}-{version}.linux-{arch}。
+	TopDir string `json:"top_dir,omitempty"`
+}
 
 // OptionTarget 描述 Exporter 参数的落地形式。
 type OptionTarget string
@@ -97,6 +121,21 @@ type Template struct {
 	// MonitorUser 表示该组件支持**由平台代建只读监控账号**，并给出默认账号名。
 	// 为空表示不需要账号（如 Redis：口令由目标自身鉴权决定），或不支持代建。
 	MonitorUser string `json:"monitor_user"`
+	// ---------------------------------------------------------------
+	// 宿主模式（典型：node_exporter / cadvisor）
+	//
+	// 这类 Exporter 采集的是**宿主机本身**，因此本机 Docker 模式下必须共享宿主
+	// 网络/PID 命名空间并只读挂载宿主根目录；Prometheus 的抓取目标也必须写成
+	// 主机地址而不是容器名。
+	// ---------------------------------------------------------------
+	// HostNetwork 表示容器需共享宿主网络（NetworkMode=host）。
+	HostNetwork bool `json:"host_network"`
+	// HostPID 表示容器需共享宿主 PID 命名空间（采集宿主进程指标）。
+	HostPID bool `json:"host_pid"`
+	// HostMounts 为必须挂载的宿主路径（docker 语法），如 "  /:/host:ro,rslave"。
+	HostMounts []string `json:"host_mounts"`
+	// Release 为二进制安装模式所需的官方发布信息；为空表示该组件只支持 docker 模式。
+	Release *ReleaseSpec `json:"release,omitempty"`
 	// AddressLabel / AddressHint 用于前端表单文案。
 	AddressLabel string `json:"address_label"`
 	AddressHint  string `json:"address_hint"`
@@ -128,6 +167,7 @@ var templates = map[string]Template{
 		Description:  "开源 Redis / Valkey 内存数据库指标暴露（内存、连接、命中率、淘汰、慢查询）",
 		Phase:        1,
 		Image:        "oliver006/redis_exporter:v1.66.0",
+		Release:      &ReleaseSpec{Repo: "oliver006/redis_exporter", Version: "1.66.0", Binary: "redis_exporter"},
 		ExporterPort: 9121, DefaultPort: 6379, MetricsPath: "/metrics",
 		NeedsAuth:    true,
 		AddressLabel: "连接地址", AddressHint: "如 10.0.0.11:6379；也可写完整 redis:// 前缀",
@@ -142,9 +182,11 @@ var templates = map[string]Template{
 				Help: "为指标附加 instance_role 标签，便于区分主从（会增加序列基数）"},
 		},
 		Notes: []string{
-			"REDIS_ADDR 形如 redis://<host>:<port>；账号密码分别用 REDIS_USER / REDIS_PASSWORD 注入，不要写进 URL。",
-			"redis_exporter 没有 SERVICE_NAME 之类的实例名开关，instance_name 由平台写入 Prometheus 抓取标签（file_sd）。",
-			"开启 requirepass 的实例务必填写密码，否则 Exporter 侧 redis_up=0。",
+			"REDIS_ADDR 形如 redis://<host>:<port>；口令用 REDIS_PASSWORD 注入，不要写进 URL。",
+			"**用户名只在 Redis 6+ 的 ACL 场景才需要**（如云厂商 Redis 的账号）。自建 Redis 通常只配了 requirepass：此时用户名必须**留空**，" +
+				"否则 Exporter 会发 AUTH <用户名> <口令>，得到 WRONGPASS、redis_up=0（在 prometheus.yml 里看起来一切正常，最容易被忽略）。",
+			"redis_exporter 没有 SERVICE_NAME 之类的实例名开关，instance_name 由平台写入 Prometheus 抓取标签（服务发现）。",
+			"开启 requirepass 的实例务必填写口令，否则 Exporter 侧 redis_up=0。",
 		},
 		Docs: []string{
 			"https://cloud.tencent.com/document/product/1416/111839",
@@ -165,6 +207,7 @@ var templates = map[string]Template{
 		Description:  "MySQL / MariaDB 指标暴露（连接、QPS、慢查询、缓冲池、主从延迟）",
 		Phase:        1,
 		Image:        "prom/mysqld-exporter:v0.15.1",
+		Release:      &ReleaseSpec{Repo: "prometheus/mysqld_exporter", Version: "0.15.1", Binary: "mysqld_exporter"},
 		ExporterPort: 9104, DefaultPort: 3306, MetricsPath: "/metrics",
 		NeedsAuth:    true,
 		MonitorUser:  "mwops_exporter",
@@ -212,6 +255,7 @@ var templates = map[string]Template{
 		Description:  "PostgreSQL 指标暴露（连接、事务、缓存命中、锁等待、复制延迟）",
 		Phase:        1,
 		Image:        "prometheuscommunity/postgres-exporter:v0.16.0",
+		Release:      &ReleaseSpec{Repo: "prometheus-community/postgres_exporter", Version: "0.16.0", Binary: "postgres_exporter"},
 		ExporterPort: 9187, DefaultPort: 5432, MetricsPath: "/metrics",
 		NeedsAuth:    true,
 		MonitorUser:  "mwops_exporter",
@@ -242,6 +286,7 @@ var templates = map[string]Template{
 		Description:  "Kafka 指标暴露（Broker、Topic 分区、消费者组 Lag）",
 		Phase:        1,
 		Image:        "danielqsj/kafka-exporter:v1.7.0",
+		Release:      &ReleaseSpec{Repo: "danielqsj/kafka_exporter", Version: "1.7.0", Binary: "kafka_exporter"},
 		ExporterPort: 9308, DefaultPort: 9092, MetricsPath: "/metrics",
 		NeedsAuth:    false,
 		AddressLabel: "Broker 地址", AddressHint: "如 10.0.0.14:9092；多 Broker 用逗号分隔",
@@ -271,6 +316,7 @@ var templates = map[string]Template{
 		Description:  "Elasticsearch 指标暴露（集群健康、分片、JVM 堆、检索与索引速率）",
 		Phase:        1,
 		Image:        "prometheuscommunity/elasticsearch-exporter:v1.7.0",
+		Release:      &ReleaseSpec{Repo: "prometheus-community/elasticsearch_exporter", Version: "1.7.0", Binary: "elasticsearch_exporter"},
 		ExporterPort: 9114, DefaultPort: 9200, MetricsPath: "/metrics",
 		NeedsAuth:    true,
 		AddressLabel: "集群地址", AddressHint: "如 http://10.0.0.15:9200",
@@ -303,6 +349,12 @@ var templates = map[string]Template{
 		Description:  "Nginx 指标暴露（连接数、请求速率、5xx 错误率、upstream 响应时间）",
 		Phase:        1,
 		Image:        "nginx/nginx-prometheus-exporter:1.3.0",
+		// 该仓库的 release 资产用下划线命名，与默认规则不同，必须显式给出模板。
+		Release: &ReleaseSpec{
+			Repo: "nginx/nginx-prometheus-exporter", Version: "1.3.0", Binary: "nginx-prometheus-exporter",
+			URLTemplate: "https://github.com/nginx/nginx-prometheus-exporter/releases/download/v{version}/nginx-prometheus-exporter_{version}_linux_{arch}.tar.gz",
+			TopDir:      "nginx-prometheus-exporter_{version}_linux_{arch}",
+		},
 		ExporterPort: 9113, DefaultPort: 80, MetricsPath: "/metrics",
 		NeedsAuth:    false,
 		AddressLabel: "stub_status 地址", AddressHint: "如 http://10.0.0.16:80/stub_status",
@@ -321,6 +373,63 @@ var templates = map[string]Template{
 				Level: "critical", TimeWindow: 3, Cooldown: 10, Description: "上游异常，检查 upstream 健康状态"},
 		},
 		Dashboard: Dashboard{Title: "NGINX Prometheus Exporter", ID: "9614"},
+	},
+	// ---------------------------------------------------------------------------
+	// 主机监控（node_exporter）
+	//
+	// 与中间件不同，它监控的是**服务器本身**：CPU / 内存 / 磁盘 / 负载 / 网络 / 文件系统。
+	// 因此：
+	//   - 地址填主机（本机可填 127.0.0.1，跨机填目标 IP）；
+	//   - 本机 Docker 模式必须共享宿主网络/PID 并只读挂载 /（见 Host* 字段）；
+	//   - 抓取目标是"主机地址:9100"，不是容器名（在 scrapeTarget 里按 HostNetwork 判定）。
+	// ---------------------------------------------------------------------------
+	TypeNode: {
+		Type: TypeNode, Name: "主机 / Node", Component: "node_exporter",
+		Description:  "服务器主机指标（CPU、内存、磁盘、负载、文件系统、网络）——跨机一键部署最常用的一类",
+		Phase:        1,
+		Image:        "quay.io/prometheus/node-exporter:v1.8.2",
+		ExporterPort: 9100, DefaultPort: 9100, MetricsPath: "/metrics",
+		NeedsAuth:    false,
+		HostNetwork:  true,
+		HostPID:      true,
+		// 宿主根目录只读挂载：node_exporter 依赖 /proc、/sys 才能读到宿主机真实指标。
+		HostMounts:   []string{"/:/host:ro,rslave"},
+		AddressLabel: "目标主机", AddressHint: "本机填 127.0.0.1，跨机填目标机 IP；端口默认 9100",
+		Options: []Option{
+			{Key: "path.rootfs", Label: "宿主根目录", Target: TargetArg, Kind: "string", Default: "/host",
+				Help: "Docker 模式下宿主根挂载在 /host；二进制安装模式下平台会自动改为 /"},
+			{Key: "collector.systemd", Label: "采集 systemd 服务状态", Target: TargetArg, Kind: "bool",
+				Help: "暴露 systemd 单元状态与启动耗时（需目标机有 dbus）"},
+			{Key: "collector.processes", Label: "采集进程数", Target: TargetArg, Kind: "bool",
+				Help: "按状态统计进程数"},
+			{Key: "collector.filesystem.mount-points-exclude", Label: "文件系统排除正则",
+				Target: TargetArg, Kind: "string", Default: "^/(dev|proc|sys|run|var/lib/docker/.+)($|/)",
+				Help: "排除伪文件系统与容器层，避免磁盘使用率被重复计算"},
+		},
+		Notes: []string{
+			"主机监控的「地址」是**被监控的那台机器**：本机填 127.0.0.1（Docker 模式会共享宿主网络），跨机填目标机 IP。",
+			"本机 Docker 模式会自动以 --net=host --pid=host 并只读挂载宿主 / 到 /host（--path.rootfs=/host），否则读到的是容器自身指标。",
+			"跨机场景建议用「远程服务器」部署位置：平台会把 node_exporter 装到目标机并让 Prometheus 抓「目标IP:9100」。",
+			"防火墙需放通 9100；节点时间不同步会导致样本被丢弃，请确保各机 NTP/chrony 正常。",
+		},
+		Docs: []string{
+			"https://github.com/prometheus/node_exporter",
+			"https://grafana.com/grafana/dashboards/1860",
+		},
+		Release: &ReleaseSpec{Repo: "prometheus/node_exporter", Version: "1.8.2", Binary: "node_exporter"},
+		Alerts: []AlertTemplate{
+			{Name: "主机不可达", MetricName: "host_up", Operator: "<", Threshold: 1,
+				Level: "critical", TimeWindow: 2, Cooldown: 10, Description: "Exporter 抓取失败：目标机宕机或网络/防火墙不通"},
+			{Name: "CPU 使用率过高", MetricName: "cpu_usage_percent", Operator: ">", Threshold: 85,
+				Level: "warning", TimeWindow: 5, Cooldown: 15, Description: "持续高 CPU：排查热点进程或容量不足"},
+			{Name: "内存使用率过高", MetricName: "memory_usage_percent", Operator: ">", Threshold: 90,
+				Level: "critical", TimeWindow: 5, Cooldown: 15, Description: "内存紧张，存在 OOM 风险"},
+			{Name: "磁盘使用率过高", MetricName: "disk_usage_percent", Operator: ">", Threshold: 85,
+				Level: "warning", TimeWindow: 10, Cooldown: 30, Description: "磁盘即将写满，日志/数据目录需清理或扩容"},
+			{Name: "系统负载过高", MetricName: "load1", Operator: ">", Threshold: 8,
+				Level: "warning", TimeWindow: 10, Cooldown: 20, Description: "1 分钟负载持续偏高"},
+		},
+		Dashboard: Dashboard{Title: "Node Exporter Full", ID: "1860"},
 	},
 }
 
@@ -472,7 +581,7 @@ func ValidateName(name string) error {
 		return fmt.Errorf("集成名称不能超过 63 个字符")
 	}
 	if !namePattern.MatchString(trimmed) {
-		return fmt.Errorf("集成名称 %q 不合法：只能包含小写字母、数字、中划线与点，且以字母或数字开头结尾（如 jd-redis、redis.prod-01）", trimmed)
+		return fmt.Errorf("集成名称 %q 不合法：只能包含小写字母、数字、中划线与点，且以字母或数字开头结尾（如 legacy-redis、redis.prod-01）", trimmed)
 	}
 	return nil
 }
@@ -509,9 +618,18 @@ func (t Template) Validate(in Instance) error {
 	if in.Address.Port <= 0 || in.Address.Port > 65535 {
 		return fmt.Errorf("连接地址的端口必须在 1-65535 之间")
 	}
-	if t.NeedsAuth && strings.TrimSpace(in.Username) == "" && t.Type != TypeES {
-		// ES 允许匿名/仅口令；其余组件给出明确提示，避免误配成匿名访问。
-		return fmt.Errorf("%s 集成需要填写监控账号（只读账号）", t.Name)
+	// 只有"平台确实要代建只读账号"的组件（MySQL / PostgreSQL）才强制填账号名。
+	//
+	// 为什么不能对所有 NeedsAuth 的组件都强制：Redis / Kafka 这类实例的鉴权常常只有口令
+	// （自建 Redis 就是 requirepass，只有 default 用户）。旧逻辑强制填账号名，表单逼着使用者
+	// 编一个（如 exporter），渲染出 REDIS_USER 后 Exporter 会发 AUTH exporter <pw>，
+	// 必然 WRONGPASS、redis_up=0 —— 而网络与标签看起来全都正常，极难排查。
+	if t.MonitorUser != "" && strings.TrimSpace(in.Username) == "" {
+		return fmt.Errorf("%s 集成需要填写监控账号（平台将按该账号名代建只读账号）", t.Name)
+	}
+	if t.NeedsAuth && strings.TrimSpace(in.Username) == "" && strings.TrimSpace(in.Password) == "" && t.Type != TypeES {
+		// 两者都空且该组件通常需要认证：给出明确提示，避免误配成匿名访问。
+		return fmt.Errorf("%s 集成需要填写口令（若确实匿名访问，请显式填写账号或口令以确认）", t.Name)
 	}
 	if err := ValidateLabels(in.Labels); err != nil {
 		return err

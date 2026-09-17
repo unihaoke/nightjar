@@ -12,16 +12,16 @@ import (
 
 // 本文件锁定「填错了该提示什么」的排序逻辑。
 //
-// 真实故障：纳管实例时把**容器名** jd-redis-exporter 当成 **job 名** 填进 prom_job，
+// 真实故障：纳管实例时把**容器名** redis-exporter 当成 **job 名** 填进 prom_job，
 // 平台只回一句"未匹配到任何时序"，使用者无从下手。修正方式是让平台把 Prometheus 里
 // 实际存在的 job 拉出来并按相似度排序，所以这个排序必须真的把正确答案排在最前面。
 
 func TestSuggestLabelsRanksContainerNameToJobName(t *testing.T) {
 	jobs := []string{
-		"interview-backend", "prometheus", "middleware-exporter-mysql", "middleware-exporter-redis",
+		"app-backend", "prometheus", "middleware-exporter-mysql", "middleware-exporter-redis",
 	}
-	// 用户把容器名 jd-redis-exporter 填进了 job 字段。
-	got := suggestLabels("jd-redis-exporter", jobs, 3)
+	// 用户把容器名 redis-exporter 填进了 job 字段。
+	got := suggestLabels("redis-exporter", jobs, 3)
 	if len(got) == 0 {
 		t.Fatal("应给出候选 job，实际为空")
 	}
@@ -35,10 +35,10 @@ func TestSuggestLabelsRanksContainerNameToJobName(t *testing.T) {
 }
 
 func TestSuggestLabelsRanksInstanceName(t *testing.T) {
-	// 实例名用了容器名 interview-redis，实际标签是 jd-redis。
-	got := suggestLabels("interview-redis", []string{"jd-redis", "jd-mysql"}, 2)
-	if len(got) == 0 || got[0] != "jd-redis" {
-		t.Fatalf("应优先推荐 jd-redis，实际 %v", got)
+	// 实例名用了容器名 app-redis，实际标签是 legacy-redis。
+	got := suggestLabels("app-redis", []string{"legacy-redis", "legacy-mysql"}, 2)
+	if len(got) == 0 || got[0] != "legacy-redis" {
+		t.Fatalf("应优先推荐 legacy-redis，实际 %v", got)
 	}
 }
 
@@ -62,7 +62,7 @@ func TestSuggestLabelsRespectsLimitAndExactMatch(t *testing.T) {
 }
 
 func TestSharedTokenCountAndPrefix(t *testing.T) {
-	if got := sharedTokenCount("jd-redis-exporter", "middleware-exporter-redis"); got != 2 {
+	if got := sharedTokenCount("redis-exporter", "middleware-exporter-redis"); got != 2 {
 		t.Fatalf("共同 token 应为 exporter/redis 两个，实际 %d", got)
 	}
 	if got := commonPrefixLen("middleware-exporter", "middleware-integration"); got != len("middleware-") {
@@ -114,14 +114,14 @@ func upValue(v float64) *float64 { return &v }
 func TestLabelHintsListsActualInstanceName(t *testing.T) {
 	reporter := fakeLabelReporter{values: map[string][]string{
 		"job":           {"middleware-exporter-redis", "prometheus"},
-		"instance_name": {"jd-redis"},
+		"instance_name": {"legacy-redis"},
 		"instance":      {"redis-exporter:9121"},
 	}}
-	item := &model.MiddlewareInstance{Name: "interview-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
+	item := &model.MiddlewareInstance{Name: "app-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
 	result := &DiagnoseResult{Matched: 0, Total: 8, JobUp: upValue(1)}
 
 	hints := strings.Join(labelHints(context.Background(), reporter, item, result), "\n")
-	if !strings.Contains(hints, "instance_name 实际是：jd-redis") {
+	if !strings.Contains(hints, "instance_name 实际是：legacy-redis") {
 		t.Fatalf("应列出实际的 instance_name 取值，实际：\n%s", hints)
 	}
 	if !strings.Contains(hints, "redis-exporter:9121") {
@@ -136,7 +136,7 @@ func TestLabelHintsDetectMissingInstanceName(t *testing.T) {
 		"job":      {"middleware-exporter-redis"},
 		"instance": {"redis-exporter:9121"},
 	}}
-	item := &model.MiddlewareInstance{Name: "jd-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
+	item := &model.MiddlewareInstance{Name: "legacy-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
 	result := &DiagnoseResult{Matched: 0, Total: 8, JobUp: upValue(1)}
 
 	hints := strings.Join(labelHints(context.Background(), reporter, item, result), "\n")
@@ -152,7 +152,7 @@ func TestLabelHintsDetectMissingInstanceName(t *testing.T) {
 // 不输出标签候选，避免与「job 未配置」的提示互相干扰。
 func TestLabelHintsSilentWhenJobNotScraped(t *testing.T) {
 	reporter := fakeLabelReporter{values: map[string][]string{"job": {"middleware-exporter-redis"}}}
-	item := &model.MiddlewareInstance{Name: "jd-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
+	item := &model.MiddlewareInstance{Name: "legacy-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
 	result := &DiagnoseResult{Matched: 0, JobUp: upValue(0)}
 	hints := strings.Join(labelHints(context.Background(), reporter, item, result), "\n")
 	if strings.Contains(hints, "instance_name") {
@@ -165,7 +165,7 @@ func TestLabelHintsDegradesWhenLabelQueryFails(t *testing.T) {
 	reporter := fakeLabelReporter{values: map[string][]string{}, fail: map[string]bool{
 		"job": true, "instance_name": true, "instance": true,
 	}}
-	item := &model.MiddlewareInstance{Name: "jd-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
+	item := &model.MiddlewareInstance{Name: "legacy-redis", MWType: "redis", PromJob: "middleware-exporter-redis"}
 	result := &DiagnoseResult{Matched: 0, JobUp: upValue(1)}
 	hints := labelHints(context.Background(), reporter, item, result)
 	if len(hints) == 0 {

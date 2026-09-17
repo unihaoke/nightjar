@@ -13,17 +13,17 @@ import (
 func TestDiscoverLogSourcePrefersLogPathEnv(t *testing.T) {
 	env := []string{"TZ=Asia/Shanghai", "LOG_PATH=/app/data/logs", "AI_PROVIDER=mock"}
 	mounts := []MountInfo{
-		{Type: "volume", Name: "jd_backend-logs", Destination: "/app/data/logs"},
-		{Type: "volume", Name: "jd_mysql-data", Destination: "/var/lib/mysql"},
+		{Type: "volume", Name: "app_backend-logs", Destination: "/app/data/logs"},
+		{Type: "volume", Name: "app_mysql-data", Destination: "/var/lib/mysql"},
 	}
-	source, ok := DiscoverLogSource("interview-backend", env, mounts, []string{"jd_jd-data"})
+	source, ok := DiscoverLogSource("app-backend", env, mounts, []string{"app_data"})
 	if !ok {
 		t.Fatal("环境变量指明了日志目录且被卷覆盖，应判定为可采集")
 	}
-	if source.MountKind != "volume" || source.MountSource != "jd_backend-logs" {
-		t.Fatalf("应挂载命名卷 jd_backend-logs，实际 %s/%s", source.MountKind, source.MountSource)
+	if source.MountKind != "volume" || source.MountSource != "app_backend-logs" {
+		t.Fatalf("应挂载命名卷 app_backend-logs，实际 %s/%s", source.MountKind, source.MountSource)
 	}
-	if source.MountSpec != "jd_backend-logs:/logs:ro" {
+	if source.MountSpec != "app_backend-logs:/logs:ro" {
 		t.Fatalf("挂载串不符：%s", source.MountSpec)
 	}
 	if source.Glob != "/logs/*.log" {
@@ -37,12 +37,12 @@ func TestDiscoverLogSourcePrefersLogPathEnv(t *testing.T) {
 func TestDiscoverLogSourceMatchesParentMount(t *testing.T) {
 	// 日志写在挂载点的子目录里（挂 /app/data、日志在 /app/data/logs）
 	env := []string{"LOG_PATH=/app/data/logs"}
-	mounts := []MountInfo{{Type: "volume", Name: "jd_backend-data", Destination: "/app/data"}}
-	source, ok := DiscoverLogSource("interview-backend", env, mounts, nil)
+	mounts := []MountInfo{{Type: "volume", Name: "app_backend-data", Destination: "/app/data"}}
+	source, ok := DiscoverLogSource("app-backend", env, mounts, nil)
 	if !ok {
 		t.Fatal("父目录被挂载时也应能采集（整卷挂进去即可）")
 	}
-	if source.MountSource != "jd_backend-data" {
+	if source.MountSource != "app_backend-data" {
 		t.Fatalf("应挂载父卷，实际 %s", source.MountSource)
 	}
 	if source.Dir != "/app/data/logs" {
@@ -53,14 +53,14 @@ func TestDiscoverLogSourceMatchesParentMount(t *testing.T) {
 func TestDiscoverLogSourceFallsBackToLogNamedMount(t *testing.T) {
 	// 没有 LOG_PATH，但卷名/路径里有 log
 	mounts := []MountInfo{
-		{Type: "bind", Source: "/srv/jd/logs", Destination: "/var/log/app"},
-		{Type: "volume", Name: "jd_redis-data", Destination: "/data"},
+		{Type: "bind", Source: "/srv/app/logs", Destination: "/var/log/app"},
+		{Type: "volume", Name: "app_redis-data", Destination: "/data"},
 	}
-	source, ok := DiscoverLogSource("interview-backend", nil, mounts, nil)
+	source, ok := DiscoverLogSource("app-backend", nil, mounts, nil)
 	if !ok {
 		t.Fatal("挂载路径含 log 时应判定为可采集")
 	}
-	if source.MountKind != "bind" || source.MountSource != "/srv/jd/logs" {
+	if source.MountKind != "bind" || source.MountSource != "/srv/app/logs" {
 		t.Fatalf("应识别为宿主目录挂载，实际 %s/%s", source.MountKind, source.MountSource)
 	}
 }
@@ -68,10 +68,10 @@ func TestDiscoverLogSourceFallsBackToLogNamedMount(t *testing.T) {
 func TestDiscoverLogSourceRefusesWhenNothingFound(t *testing.T) {
 	// 关键用例：既没有日志环境变量，也没有像日志的挂载 —— 必须拒绝。
 	mounts := []MountInfo{
-		{Type: "volume", Name: "jd_mysql-data", Destination: "/var/lib/mysql"},
-		{Type: "volume", Name: "jd_redis-data", Destination: "/data"},
+		{Type: "volume", Name: "app_mysql-data", Destination: "/var/lib/mysql"},
+		{Type: "volume", Name: "app_redis-data", Destination: "/data"},
 	}
-	if _, ok := DiscoverLogSource("interview-mysql", []string{"MYSQL_ROOT_PASSWORD=x"}, mounts, nil); ok {
+	if _, ok := DiscoverLogSource("app-mysql", []string{"MYSQL_ROOT_PASSWORD=x"}, mounts, nil); ok {
 		t.Fatal("读不到日志位置时必须拒绝配置，而不是猜一个路径")
 	}
 }
@@ -79,8 +79,8 @@ func TestDiscoverLogSourceRefusesWhenNothingFound(t *testing.T) {
 func TestDiscoverLogSourceRefusesWhenEnvDirNotMounted(t *testing.T) {
 	// 环境变量指向的目录没有被任何卷覆盖：采集容器挂不到它 → 也必须拒绝。
 	env := []string{"LOG_PATH=/app/data/logs"}
-	mounts := []MountInfo{{Type: "volume", Name: "jd_mysql-data", Destination: "/var/lib/mysql"}}
-	source, ok := DiscoverLogSource("interview-backend", env, mounts, nil)
+	mounts := []MountInfo{{Type: "volume", Name: "app_mysql-data", Destination: "/var/lib/mysql"}}
+	source, ok := DiscoverLogSource("app-backend", env, mounts, nil)
 	if ok {
 		t.Fatalf("日志目录未被挂载时不应判定为可采集，实际 %+v", source)
 	}

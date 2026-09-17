@@ -36,9 +36,11 @@ type ContainerSpec struct {
 	//
 	// 为什么需要多网络：Exporter 既要被 Prometheus 抓到（监控面，平台网络），
 	// 又要能连上被管实例（目标容器所在网络）。后者由平台在集成时自动发现，
-	// 例如：mwops（监控面）+ jd_jd-data（目标容器所在网络）。
+	// 例如：mwops（监控面）+ app_data（目标容器所在网络）。
 	Networks []string
-	Restart  string
+	// Restart 为重启策略；留空时 create() 用 unless-stopped（适合常驻的 Exporter/采集容器）。
+	// **一次性容器不要依赖这个默认值**：RunOnce 会强制设为 "no"。
+	Restart string
 	Labels   map[string]string
 	// Binds 为容器挂载，docker 语法："<命名卷或宿主路径>:<容器内路径>[:ro]"。
 	//
@@ -47,6 +49,9 @@ type ContainerSpec struct {
 	Binds []string
 	// Entrypoint 用于复用平台镜像里附带的其它二进制（如日志 Agent）。
 	Entrypoint []string
+	// PidMode 为 PID 命名空间模式："host" 表示共享宿主 PID
+	//（node_exporter 采集宿主进程指标时需要）。
+	PidMode string
 }
 
 // ContainerDetail 是被管容器的详细配置（日志位置发现的依据）。
@@ -258,6 +263,9 @@ func (c *Client) create(ctx context.Context, spec ContainerSpec) (string, error)
 	if len(spec.Binds) > 0 {
 		hostConfig["Binds"] = spec.Binds
 	}
+	if spec.PidMode != "" {
+		hostConfig["PidMode"] = spec.PidMode
+	}
 	body := map[string]any{
 		"Image":      spec.Image,
 		"Env":        spec.Env,
@@ -388,6 +396,11 @@ func (c *Client) RunOnce(ctx context.Context, spec ContainerSpec, timeout time.D
 	if strings.TrimSpace(spec.Name) == "" || strings.TrimSpace(spec.Image) == "" {
 		return "", fmt.Errorf("容器名与镜像不能为空")
 	}
+	// 一次性容器**必须**显式关掉重启策略。
+	// 否则会继承 create() 的默认值 unless-stopped：命令执行完退出后 Docker 立刻重启它，
+	// 于是 ①下面的"等退出"永远等不到 exited（白等到超时），
+	// ②容器永远停在 Restarting 状态、删不干净（真实现象：mwops-exporter-*-bootstrap）。
+	spec.Restart = "no"
 	// 同名残留先清掉，保证可重复执行
 	if existing, err := c.Inspect(ctx, spec.Name); err == nil && existing != nil {
 		_ = c.Remove(ctx, spec.Name)
@@ -483,7 +496,7 @@ func stripDockerLogFrames(raw []byte) string {
 
 // TargetResolution 是「集成目标」的解析结果。
 //
-// 使用者在平台里只填一个地址（如 `interview-redis:6379`、`jd-mysql:3306`），
+// 使用者在平台里只填一个地址（如 `app-redis:6379`、`legacy-mysql:3306`），
 // 平台自己去 docker 里查这个名字对应哪个容器、容器在哪张网络上——
 // 被管项目因此**不需要**为监控改任何配置：不用建互联网络、不用加别名、
 // 不用把自己的 compose 文件交给平台。
@@ -495,10 +508,13 @@ type TargetResolution struct {
 	ContainerID string
 	// Container 是匹配到的容器名；为空表示没找到。
 	Container string
-	// Networks 是该容器所在的真实 docker 网络名（如 `jd_jd-data`）。
+	// Networks 是该容器所在的真实 docker 网络名（如 `app_data`）。
 	Networks []string
-	// MatchedBy 说明匹配依据：container_name / compose_service / alias。
+	// MatchedBy 说明匹配依据：container_name / compose_service / alias / loose_service。
 	MatchedBy string
+	// AutoCorrected 表示这次是"宽松匹配"（按服务名猜到了唯一容器），
+	// 平台会把地址自动换成容器名——调用方应当把这件事告诉使用者。
+	AutoCorrected bool
 	// Running 表示目标容器是否在运行。
 	Running bool
 	// Candidates 在没匹配到时给出已知的容器名（便于报错时提示正确写法）。
@@ -518,8 +534,8 @@ type targetInfo struct {
 // ResolveTarget 把「用户填的名字」解析成「容器 + 容器所在的网络」。
 //
 // 匹配顺序：容器名 → compose 服务名 → 网络别名（并集所有命中者）。
-// 这样无论用户填 `interview-redis`（容器名）、`redis`（服务名）
-// 还是 `jd-redis`（别名），平台都能自己找到目标，并把 Exporter 接到
+// 这样无论用户填 `app-redis`（容器名）、`redis`（服务名）
+// 还是 `legacy-redis`（别名），平台都能自己找到目标，并把 Exporter 接到
 // 目标真正所在的网络上。
 func (c *Client) ResolveTarget(ctx context.Context, nameOrAlias string) (*TargetResolution, error) {
 	target := strings.TrimSpace(nameOrAlias)
@@ -546,12 +562,17 @@ func (c *Client) ResolveTarget(ctx context.Context, nameOrAlias string) (*Target
 		list = list[:200]
 	}
 	seenNet := map[string]bool{}
+	infos := make([]*targetInfo, 0, len(list))
 	for _, item := range list {
 		info, err := c.inspectTarget(ctx, item.ID)
 		if err != nil || info == nil {
 			continue
 		}
+		infos = append(infos, info)
 		res.Candidates = append(res.Candidates, info.name)
+	}
+	// 第一轮：精确匹配（容器名 → compose 服务名 → 网络别名）。
+	for _, info := range infos {
 		matched := ""
 		switch {
 		case info.name == target:
@@ -576,6 +597,45 @@ func (c *Client) ResolveTarget(ctx context.Context, nameOrAlias string) (*Target
 			}
 			seenNet[network] = true
 			res.Networks = append(res.Networks, network)
+		}
+	}
+
+	// 第二轮：宽松匹配（仅在精确匹配失败时）。
+	//
+	// 为什么需要：旧架构让人工别名长这样——`legacy-redis`、`legacy-mysql`（项目名 + 服务名）。
+	// 这些名字在 docker 里**不存在**，于是精确匹配失败 → Exporter 只挂了平台网络 →
+	// 解析不了被管容器（真实现象：redis_exporter 一直报 Couldn't connect to redis，
+	// 而 Prometheus 那边 up=1、标签全对）。
+	// 这里用"最后一段"（redis / mysql）去匹配 compose 服务名与网络别名，
+	// 并且**要求唯一命中**；一旦命中就把地址自动换成容器名，同时把 Exporter
+	// 接进目标容器所在的网络。
+	if res.Container == "" {
+		tail := target
+		if idx := strings.LastIndex(target, "-"); idx >= 0 && idx < len(target)-1 {
+			tail = target[idx+1:]
+		}
+		if tail != "" {
+			matchedNames := make([]string, 0, 2)
+			var hit *targetInfo
+			for _, info := range infos {
+				if info.service == tail || containsString(info.aliases, tail) {
+					matchedNames = append(matchedNames, info.name)
+					hit = info
+				}
+			}
+			if len(matchedNames) == 1 && hit != nil {
+				res.Container, res.ContainerID, res.Running = hit.name, hit.id, hit.running
+				res.MatchedBy = "loose_service"
+				res.AutoCorrected = true
+				res.Host = hit.name
+				for _, network := range hit.nets {
+					if network == "" || seenNet[network] {
+						continue
+					}
+					seenNet[network] = true
+					res.Networks = append(res.Networks, network)
+				}
+			}
 		}
 	}
 	sort.Strings(res.Networks)

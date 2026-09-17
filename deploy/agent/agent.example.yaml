@@ -13,8 +13,8 @@
 # 也可以用纯环境变量配置（不挂配置文件）：
 #   MWOPS_AGENT_PLATFORM_URL=http://mwops-backend:8080
 #   MWOPS_AGENT_HOOK_TOKEN=<与平台 HOOK_TOKEN 一致>
-#   MWOPS_AGENT_SERVICE=interview-review-backend
-#   MWOPS_AGENT_SERVER_NAME=interview-backend
+#   MWOPS_AGENT_SERVICE=app-review-api
+#   MWOPS_AGENT_SERVER_NAME=app-backend
 #   MWOPS_AGENT_FILES="/logs/*.log:error:ERROR"     # 支持通配，分号分隔多条
 #   MWOPS_AGENT_POSITION_FILE=/data/agent-position.json
 
@@ -25,10 +25,10 @@ platform_url: http://mwops-backend:8080
 hook_token: ""
 
 # 默认服务名（各文件未单独指定时使用）
-service: interview-review-backend
+service: app-review-api
 
 environment: dev
-server_name: interview-backend
+server_name: app-backend
 
 # 偏移量文件：记录每个日志文件的读取位置，避免重复上报（可放在数据盘）
 position_file: /data/agent-position.json
@@ -43,12 +43,12 @@ files:
   # 应用错误日志（logback 的 ERROR_FILE）。路径支持通配，轮转出的新文件也会被采到。
   - path: /logs/*.log
     alert_type: error
-    service: interview-review-backend
+    service: app-review-api
     # 仅采集 ERROR 及以上；gc.log 这类无级别日志需要 INFO
     level_filter: ERROR
 
   # 需要 GC 诊断时再打开下面这条（建议先把 JVM 参数收敛为 -Xlog:gc，控制日志量）
   # - path: /logs/gc.log
   #   alert_type: gc
-  #   service: interview-review-backend
+  #   service: app-review-api
   #   level_filter: INFO

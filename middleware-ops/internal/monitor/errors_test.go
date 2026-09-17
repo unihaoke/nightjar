@@ -10,19 +10,19 @@ import (
 // 本文件锁定「错误翻译」的映射：跨栈接入时最常见的失败是容器网络挂错，
 // 平台必须把它翻译成使用者的语言，而不是抛出 Go 的原始错误。
 //
-// 原始错误形态（真实案例）：dial tcp: lookup jd-prometheus on 127.0.0.11:53: server misbehaving
+// 原始错误形态（真实案例）：dial tcp: lookup legacy-prometheus on 127.0.0.11:53: server misbehaving
 // 注意：修复方向必须是"平台侧自动接入网络"，而不是让被管项目去建互联网络/加别名。
 
 func TestDescribeErrorMapsDockerDNSFailure(t *testing.T) {
-	raw := errors.New(`Get "http://jd-prometheus:9090/api/v1/query?query=up": dial tcp: lookup jd-prometheus on 127.0.0.11:53: server misbehaving`)
-	got := DescribeError(raw, "http://jd-prometheus:9090")
-	if !strings.Contains(got, "解析不了 jd-prometheus") {
+	raw := errors.New(`Get "http://legacy-prometheus:9090/api/v1/query?query=up": dial tcp: lookup legacy-prometheus on 127.0.0.11:53: server misbehaving`)
+	got := DescribeError(raw, "http://legacy-prometheus:9090")
+	if !strings.Contains(got, "解析不了 legacy-prometheus") {
 		t.Fatalf("应指出解析失败的主机名，实际：%s", got)
 	}
 	if !strings.Contains(got, "自动") || !strings.Contains(got, "docker.sock") {
 		t.Fatalf("应把修复方向指向平台侧自动接入网络（docker.sock），实际：%s", got)
 	}
-	if strings.Contains(got, "jd-nightjar") || strings.Contains(got, "compose.jd-link.yml") {
+	if strings.Contains(got, "legacy-link") || strings.Contains(got, "旧的跨栈 overlay") {
 		t.Fatalf("不应再要求被管项目建互联网络/加别名，实际：%s", got)
 	}
 }
@@ -53,7 +53,7 @@ func TestDescribeErrorFallsBackToRaw(t *testing.T) {
 
 func TestHostOfParsesBaseURL(t *testing.T) {
 	cases := map[string]string{
-		"http://jd-prometheus:9090": "jd-prometheus",
+		"http://legacy-prometheus:9090": "legacy-prometheus",
 		"https://prom.example.com":  "prom.example.com",
 		"10.0.0.9:9090":             "10.0.0.9",
 		"":                          "",

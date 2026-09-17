@@ -354,7 +354,7 @@ func (s *MetricsService) augmentTargetHints(ctx context.Context, item *model.Mid
 
 // augmentEndpointHints 在自检里做一次容器内 DNS 实测。
 //
-// 为什么值得单独做：跨栈接入时最常见的故障是平台没接到 jd 的容器网络，
+// 为什么值得单独做：跨栈接入时最常见的故障是平台没接到 被管项目的容器网络，
 // 表现为 Docker 内置 DNS（127.0.0.11）报 server misbehaving。与其让使用者
 // 去猜，不如在平台容器里直接解析一次 prometheus.base_url 的主机名——
 // 解析失败即可确定结论为"容器网络问题"，解析成功则把方向指向 Prometheus 本身。
@@ -378,7 +378,7 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 			"平台容器内解析不了 %s（%v）：这是**容器网络**问题，不是 Prometheus 的问题。"+
 				"集成中心创建 Exporter 时会自动把容器接进目标网络；若仍解析不了，"+
 				"请核对名字是否与 `docker ps` 的容器名一致，并确认平台已挂载 docker.sock。"+
-				"可执行 scripts/doctor-jd-link.sh 体检。当前查询地址：%s",
+				"可执行 scripts/doctor.sh 体检。当前查询地址：%s",
 			host, err, endpoint)}
 	}
 	// 解析成功：把方向指向 Prometheus 自身/端口，避免用户继续在网络层打转。
@@ -414,7 +414,7 @@ func diagnoseHints(item *model.MiddlewareInstance, result *DiagnoseResult) []str
 		hints = append(hints, "抓取正常但标签对不上：把平台「实例名称」改成与 Prometheus 标签 instance_name 完全一致的值，或填写「Prometheus instance」精确指定。")
 	}
 	if item.PromInstance != "" {
-		hints = append(hints, "已填写「Prometheus instance」：实例名称不再参与匹配（两者二选一）。jd 这类自建 Exporter 只上报 instance_name，此时应清空该字段。")
+		hints = append(hints, "已填写「Prometheus instance」：实例名称不再参与匹配（两者二选一）。自建 Exporter 只上报 instance_name，此时应清空该字段。")
 	}
 	if result.Selector != "" {
 		hints = append(hints, "可以直接在 Prometheus 里验证："+result.Selector)
@@ -448,7 +448,7 @@ func (s *MetricsService) MonitorKind() string {
 // PrometheusJobs 返回 Prometheus 中已存在的 job 名，供纳管表单直接选择。
 //
 // 目的：把「job 名靠猜」变成「从列表里选」。纳管时最容易踩的坑就是把容器名
-// （jd-redis-exporter）当成 job 名（middleware-exporter-redis）填进去。
+// （redis-exporter）当成 job 名（middleware-exporter-redis）填进去。
 // 查询失败或超时不阻塞表单，返回空列表即可（前端退化为手工输入）。
 func (s *MetricsService) PrometheusJobs(ctx context.Context) []string {
 	reporter, ok := s.monitor.(monitor.LabelReporter)
@@ -469,7 +469,7 @@ func (s *MetricsService) PrometheusJobs(ctx context.Context) []string {
 // PrometheusInstanceNames 返回 Prometheus 里已存在的 instance_name 取值。
 //
 // 这就是「实例名称」应该填的东西——**平台集成写入的服务发现标签**，
-// 取值等于「集成中心」里的集成名称（如 jd-redis / jd-mysql）。
+// 取值等于「集成中心」里的集成名称（如 legacy-redis / legacy-mysql）。
 // 界面把它做成下拉候选，使用者不必再去 Prometheus 页面翻标签。
 func (s *MetricsService) PrometheusInstanceNames(ctx context.Context) []string {
 	reporter, ok := s.monitor.(monitor.LabelReporter)

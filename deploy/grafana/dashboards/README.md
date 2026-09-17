@@ -24,7 +24,7 @@
 3. 等 30 秒或重启 Grafana 容器即可在 Grafana 的 Dashboards 里看到。
 
 > 大盘里的数据源变量选 `mwops-prometheus`；实例筛选变量选 `instance_name`
-> （平台写入的标签，值就是「集成名称」，如 `jd-redis`）。
+> （平台写入的标签，值就是「集成名称」，如 `legacy-redis`）。
 
 ## 为什么不预置一堆 JSON
 

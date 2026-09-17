@@ -14,7 +14,7 @@ import (
 
 func TestSnapshotNoteJobUpIsNotInstanceUp(t *testing.T) {
 	jobUp := 1.0
-	note := buildSnapshotNote(`job="middleware-integration",instance_name="jd-redis"`,
+	note := buildSnapshotNote(`job="middleware-integration",instance_name="legacy-redis"`,
 		"middleware-integration", &jobUp, 0, 0, 0)
 
 	if !strings.Contains(note, "job 级 up=1") {

@@ -219,8 +219,40 @@ var profiles = map[string]Profile{
 				WarningThreshold: 70, CriticalThreshold: 85, Generator: SeriesSpec{Base: 45, Amplitude: 6, Noise: 3, Trend: 0.2}},
 		},
 	},
+	// 主机监控（node_exporter）：采集对象是服务器本身，不是中间件实例。
+	// 指标名与告警模板（internal/integration/template.go 的 node 模板）一一对应。
+	"node": {
+		MWType: "node",
+		Metrics: []MetricSpec{
+			{Name: "host_up", DisplayName: "主机可达", Unit: "", Category: "reliability", Mode: ThresholdBoolDown,
+				Expr:             `up{selector}`,
+				WarningThreshold: 0, CriticalThreshold: 0, Generator: SeriesSpec{Base: 1, Amplitude: 0, Noise: 0}},
+			{Name: "cpu_usage_percent", DisplayName: "CPU 使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
+				Expr: `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance_name) * 100)`,
+				WarningThreshold: 80, CriticalThreshold: 92, Generator: SeriesSpec{Base: 32, Amplitude: 9, Noise: 5, Trend: 0.3}},
+			{Name: "memory_usage_percent", DisplayName: "内存使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
+				Expr: `(1 - node_memory_MemAvailable_bytes{selector} / node_memory_MemTotal_bytes{selector}) * 100`,
+				WarningThreshold: 85, CriticalThreshold: 93, Generator: SeriesSpec{Base: 58, Amplitude: 7, Noise: 3, Trend: 0.25}},
+			{Name: "disk_usage_percent", DisplayName: "磁盘使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
+				Expr: `max(100 - (node_filesystem_avail_bytes{selector, fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{selector, fstype!~"tmpfs|overlay"} * 100))`,
+				WarningThreshold: 85, CriticalThreshold: 93, Generator: SeriesSpec{Base: 61, Amplitude: 2, Noise: 0.6, Trend: 0.6}},
+			{Name: "load1", DisplayName: "1 分钟负载", Unit: "", Category: "performance", Mode: ThresholdHigherWorse,
+				Expr:             `node_load1{selector}`,
+				WarningThreshold: 8, CriticalThreshold: 16, Generator: SeriesSpec{Base: 2.4, Amplitude: 1.2, Noise: 0.6, Trend: 0.05}},
+			{Name: "filesystem_inodes_used_percent", DisplayName: "inode 使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
+				Expr: `max(100 - (node_filesystem_files_free{selector, fstype!~"tmpfs|overlay"} / node_filesystem_files{selector, fstype!~"tmpfs|overlay"} * 100))`,
+				WarningThreshold: 85, CriticalThreshold: 95, Generator: SeriesSpec{Base: 12, Amplitude: 1, Noise: 0.4, Trend: 0.1}},
+			{Name: "network_receive_bytes_rate", DisplayName: "入向流量", Unit: "B/s", Category: "performance", Mode: ThresholdNone,
+				Expr:             `sum(rate(node_network_receive_bytes_total{selector, device!="lo"}[5m]))`,
+				WarningThreshold: 80 * 1024 * 1024, CriticalThreshold: 200 * 1024 * 1024,
+				Generator: SeriesSpec{Base: 3 * 1024 * 1024, Amplitude: 1024 * 1024, Noise: 512 * 1024, Trend: 20 * 1024}},
+			{Name: "network_transmit_bytes_rate", DisplayName: "出向流量", Unit: "B/s", Category: "performance", Mode: ThresholdNone,
+				Expr:             `sum(rate(node_network_transmit_bytes_total{selector, device!="lo"}[5m]))`,
+				WarningThreshold: 80 * 1024 * 1024, CriticalThreshold: 200 * 1024 * 1024,
+				Generator: SeriesSpec{Base: 2 * 1024 * 1024, Amplitude: 900 * 1024, Noise: 400 * 1024, Trend: 15 * 1024}},
+		},
+	},
 }
-
 // ProfileOf 返回中间件类型的指标画像，未知类型返回空画像。
 func ProfileOf(mwType string) Profile {
 	if p, ok := profiles[strings.ToLower(mwType)]; ok {
@@ -280,7 +312,7 @@ func jobOf(t Target, jobPrefix string) string {
 //  2. 实例：prom_instance 非空 → instance="..."；否则 → instance_name="<实例名>"。
 //
 // 注意 2 是「二选一」而不是「都要满足」：一旦填了 prom_instance，实例名就不再参与
-// 匹配。这是接入时最容易踩的坑（jd 这类自建 Exporter 场景只上报 instance_name，
+// 匹配。这是接入时最容易踩的坑（自建 Exporter 场景只上报 instance_name，
 // 把 instance 填成 IP:端口 就永远查不到数据），因此自检接口会显式提示。
 func buildSelector(t Target, jobPrefix string) string {
 	parts := make([]string, 0, 3)

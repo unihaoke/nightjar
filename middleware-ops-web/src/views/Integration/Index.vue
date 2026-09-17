@@ -48,6 +48,15 @@ const form = reactive({
   admin_password: '',
   // 反向接网：把**目标容器**接入平台网络。默认关闭（正常方向是平台自己接进目标网络）
   join_platform_network: false,
+  // Exporter 部署位置：local（本机 Docker）/ remote（远程服务器，Ansible 一键安装）
+  deploy_target: 'local' as 'local' | 'remote',
+  target_host: '',
+  exporter_port: undefined as number | undefined,
+  install_mode: 'docker' as 'docker' | 'docker-systemd' | 'binary',
+  ssh_user: '',
+  ssh_port: 22,
+  ssh_password: '',
+  ssh_become: true,
   labels: [] as { key: string; value: string }[],
   options: {} as Record<string, string>,
 })
@@ -283,6 +292,15 @@ function openInstall(template: IntegrationTemplate, item?: IntegrationView): voi
   form.admin_username = ''
   form.admin_password = ''
   form.join_platform_network = item?.join_platform_network ?? false
+  // 部署位置可从已有集成回填；SSH 凭据绝不回填（平台不保存）
+  form.deploy_target = (item?.deploy_target as 'local' | 'remote') || 'local'
+  form.target_host = item?.target_host || ''
+  form.exporter_port = item?.exporter_host_port || undefined
+  form.install_mode = (item?.install_mode as 'docker' | 'docker-systemd' | 'binary') || 'docker'
+  form.ssh_user = ''
+  form.ssh_port = 22
+  form.ssh_password = ''
+  form.ssh_become = true
   form.labels = Object.entries(item?.labels || {}).map(([key, value]) => ({ key, value }))
   const options: Record<string, string> = {}
   for (const option of template.options) {
@@ -320,6 +338,19 @@ function buildPayload(): IntegrationInput {
     auto_rules: form.auto_rules,
     // 始终显式提交，避免"取消勾选后编辑保存仍生效"
     join_platform_network: form.join_platform_network,
+    deploy_target: form.deploy_target,
+  }
+  // 远程安装：只在选中 remote 时提交目标与 SSH 凭据（凭据仅本次请求使用，平台不落库）
+  if (form.deploy_target === 'remote') {
+    payload.target_host = form.target_host.trim()
+    payload.install_mode = form.install_mode
+    payload.ssh_user = form.ssh_user.trim()
+    payload.ssh_port = form.ssh_port
+    payload.ssh_password = form.ssh_password
+    payload.ssh_become = form.ssh_become
+    if (form.exporter_port) {
+      payload.exporter_port = form.exporter_port
+    }
   }
   // 代建账号：只有勾选时才提交管理凭据（否则一个字节也不上传）
   if (form.bootstrap_account) {
@@ -679,7 +710,7 @@ onMounted(load)
         <el-row :gutter="12">
           <el-col :xs="24" :sm="12">
             <el-form-item label="集成名称" prop="name">
-              <el-input v-model="form.name" placeholder="如 jd-redis" />
+              <el-input v-model="form.name" placeholder="如 legacy-redis" />
             </el-form-item>
             <p class="field-hint">
               唯一，且必须与 Prometheus 的 <span class="mono">instance_name</span> 一致（平台按它定位指标）。
@@ -747,6 +778,73 @@ onMounted(load)
           </div>
         </template>
 
+        <el-divider content-position="left">Exporter 部署位置</el-divider>
+        <el-form-item label="部署到">
+          <el-select v-model="form.deploy_target" class="mobile-block">
+            <el-option label="本机（平台用 Docker API 创建容器，需要 docker.sock）" value="local" />
+            <el-option label="远程服务器（平台用内置 Ansible playbook 一键安装）" value="remote" />
+          </el-select>
+        </el-form-item>
+        <template v-if="form.deploy_target === 'remote'">
+          <el-row :gutter="12">
+            <el-col :xs="24" :sm="10">
+              <el-form-item label="目标服务器">
+                <el-input v-model="form.target_host" placeholder="如 10.0.0.31（被管实例所在机器）" />
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="7">
+              <el-form-item label="Exporter 端口">
+                <el-input-number v-model="form.exporter_port" :min="1" :max="65535" class="mobile-block"
+                  :placeholder="`模板默认 ${activeTemplate?.exporter_port || ''}`" />
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="7">
+              <el-form-item label="安装方式">
+                <el-select v-model="form.install_mode" class="mobile-block">
+                  <el-option label="docker（官方镜像跑容器，需目标机有 Docker）" value="docker" />
+                  <el-option label="docker-systemd（容器交给 systemd 托管）" value="docker-systemd" />
+                  <el-option label="binary（下载官方二进制 + 原生 systemd，无需 Docker）" value="binary" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <el-row :gutter="12">
+            <el-col :xs="24" :sm="8">
+              <el-form-item label="SSH 用户">
+                <el-input v-model="form.ssh_user" placeholder="如 ops" />
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="4">
+              <el-form-item label="SSH 端口">
+                <el-input-number v-model="form.ssh_port" :min="1" :max="65535" class="mobile-block" />
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="SSH 口令（仅本次使用）">
+                <el-input v-model="form.ssh_password" type="password" show-password
+                  placeholder="不落库、不写审计、不回显" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <div class="switch-row">
+            <el-switch v-model="form.ssh_become" />
+            <span>远程安装使用 sudo（装到 /opt、写 systemd 单元时需要）</span>
+          </div>
+          <el-alert type="warning" :closable="false" show-icon class="mb"
+            title="远程安装会在目标服务器上执行命令">
+            <p class="field-hint">
+              平台只渲染「内置」playbook（不接受自定义脚本），SSH 凭据只在本次请求内存中使用、
+              写入 0600 临时文件并在执行后立即删除，因此「重新应用」需要重新填写凭据；
+              生产环境会先创建审批工单，审批通过后才执行。
+            </p>
+            <p class="field-hint">
+              目标机需有 sudo 权限；选 docker/docker-systemd 时还需已安装 Docker（选 binary 则不需要）；
+              安装完成后平台会主动探测一次「目标IP:端口」，探不通会把原因写进集成备注。
+              该能力还需平台镜像带 ansible-playbook 且已开启 INTEGRATION_ALLOW_REMOTE_INSTALL。
+            </p>
+          </el-alert>
+        </template>
+
         <el-divider content-position="left">落地方式</el-divider>
         <div class="switch-row">
           <el-switch v-model="form.deploy" :disabled="!dockerReady" />
@@ -769,7 +867,7 @@ onMounted(load)
             默认方向本来就是「平台自动接进目标网络」，正常情况下不需要勾选它。
           </p>
           <p class="field-hint">
-            务必注意：若目标容器原本只在 internal 网络里（例如 jd 的 jd-data，刻意做成无出网），
+            务必注意：若目标容器原本只在 internal 网络里（例如 被管项目的 internal 网络，刻意做成无出网），
             接入平台网络后它会多一条出网路径，数据面隔离随之失效。
             地址填的是外部地址（非容器名）时无需勾选。
           </p>
@@ -964,12 +1062,12 @@ onMounted(load)
         <el-row :gutter="12">
           <el-col :xs="24" :sm="12">
             <el-form-item label="接入名称">
-              <el-input v-model="logForm.name" placeholder="如 jd-backend-logs" />
+              <el-input v-model="logForm.name" placeholder="如 app-backend-logs" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
             <el-form-item label="目标容器名">
-              <el-input v-model="logForm.target_container" placeholder="docker ps 里的 NAMES，如 interview-backend" />
+              <el-input v-model="logForm.target_container" placeholder="docker ps 里的 NAMES，如 app-backend" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">

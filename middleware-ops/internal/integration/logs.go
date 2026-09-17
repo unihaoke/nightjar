@@ -28,7 +28,7 @@ type MountInfo struct {
 
 // logPathEnvs 是各语言/框架常见的日志目录环境变量名。
 //
-// jd（Spring Boot + logback）用的是 LOG_PATH；其余为通用兜底。
+// Spring Boot + logback 项目常用 LOG_PATH；其余为通用兜底。
 var logPathEnvs = []string{
 	"LOG_PATH", "LOG_DIR", "LOG_HOME", "LOGS_DIR", "LOG_FOLDER", "LOGGING_FILE_PATH",
 }

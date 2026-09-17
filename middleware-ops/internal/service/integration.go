@@ -150,6 +150,26 @@ type IntegrationInput struct {
 	Tags        []string          `json:"tags"`
 	// Deploy 表示本次保存是否尝试一键拉起 Exporter 容器。
 	Deploy *bool `json:"deploy"`
+	// ---------------------------------------------------------------------
+	// Exporter 部署位置：本机（Docker API）或远程服务器（Ansible 一键安装）
+	//
+	// 空值按 local 处理（向后兼容）。远程模式的 SSH 凭据只在本次请求内存中使用：
+	// 不落库、不写审计、不回显，"重新应用"需要重新填写。
+	// ---------------------------------------------------------------------
+	DeployTarget string `json:"deploy_target"`
+	// TargetHost 为远程服务器地址（deploy_target=remote 时必填）。
+	TargetHost string `json:"target_host"`
+	// ExporterPort 为远程服务器上 Exporter 的监听端口（留空用模板默认端口）。
+	ExporterPort int `json:"exporter_port"`
+	// InstallMode 为远程安装方式：docker（默认）| systemd。
+	InstallMode string `json:"install_mode"`
+	SSHUser     string `json:"ssh_user"`
+	SSHPort     int    `json:"ssh_port"`
+	// SSHPassword / SSHKey 二选一；只在本次请求使用。
+	SSHPassword string `json:"ssh_password"`
+	SSHKey      string `json:"ssh_key"`
+	// SSHBecome 表示远程安装时是否使用 sudo（默认取配置）。
+	SSHBecome *bool `json:"ssh_become"`
 	// AutoRules 表示是否自动创建推荐告警规则（缺省取配置 integration.auto_rules）。
 	AutoRules *bool `json:"auto_rules"`
 	// BootstrapAccount 表示由平台创建/更新只读监控账号（需要管理凭据）。
@@ -193,6 +213,13 @@ type IntegrationView struct {
 	DeployNote string `json:"deploy_note"`
 	// JoinPlatformNetwork 表示该集成是否勾选了「把目标容器接入平台网络」。
 	JoinPlatformNetwork bool   `json:"join_platform_network"`
+	// DeployTarget 为部署位置：local（本机 Docker）| remote（远程 Ansible）。
+	DeployTarget string `json:"deploy_target"`
+	// TargetHost / ExporterHostPort 为远程 Exporter 的位置（Prometheus 抓 host:port）。
+	TargetHost       string `json:"target_host"`
+	ExporterHostPort int    `json:"exporter_host_port"`
+	InstallMode      string `json:"install_mode"`
+	RemoteInstalledAt string `json:"remote_installed_at"`
 	Selector            string `json:"selector"`
 	AppliedAt           string `json:"applied_at"`
 	LastError           string `json:"last_error"`
@@ -395,7 +422,12 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 		Options: instance.Options, Job: s.jobName(), Image: tpl.Image,
 		Container: integration.ContainerName(instance.Name), ExporterPort: tpl.ExporterPort,
 		JoinPlatformNetwork: s.shouldJoinPlatformNetwork(in),
-		CreatedBy:           operator.Username, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		// 部署位置与远程参数（SSH 凭据不入库，只记目标与端口）。
+		DeployTarget:     normalizeDeployTarget(in.DeployTarget),
+		TargetHost:       strings.TrimSpace(in.TargetHost),
+		ExporterHostPort: exporterPortOrDefault(in.ExporterPort, tpl.ExporterPort),
+		InstallMode:      s.installMode(remoteCredsFromInput(in)),
+		CreatedBy:        operator.Username, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	item.Config["integration"] = meta.toMap()
 	if err := s.instances.Create(ctx, item); err != nil {
@@ -414,7 +446,8 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 			if bootstrapNote != "" {
 				s.setDeployNote(context.Background(), item.ID, bootstrapNote)
 			}
-			deployErr := s.deploy(bgCtx, item, tpl, instance)
+			deployErr := s.deploy(bgCtx, item, tpl, instance,
+				deployParams{creds: remoteCredsFromInput(in), operator: operator})
 			if err := firstErr(bootstrapErr, deployErr); err != nil {
 				return err
 			}
@@ -497,6 +530,11 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 	meta.Image = tpl.Image
 	meta.Container = integration.ContainerName(instance.Name)
 	meta.ExporterPort = tpl.ExporterPort
+	// 部署位置（含远程目标）：与 Create 保持一致；远程参数变化会重写 meta。
+	meta.DeployTarget = normalizeDeployTarget(in.DeployTarget)
+	meta.TargetHost = strings.TrimSpace(in.TargetHost)
+	meta.ExporterHostPort = exporterPortOrDefault(in.ExporterPort, tpl.ExporterPort)
+	meta.InstallMode = s.installMode(remoteCredsFromInput(in))
 	// 编辑时若前端没带该字段（nil）则沿用原值，避免"编辑一次就把勾选丢掉"。
 	if in.JoinPlatformNetwork != nil {
 		meta.JoinPlatformNetwork = *in.JoinPlatformNetwork
@@ -523,7 +561,8 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 			if bootstrapNote != "" {
 				s.setDeployNote(context.Background(), item.ID, bootstrapNote)
 			}
-			deployErr := s.deploy(bgCtx, item, tpl, instance)
+			deployErr := s.deploy(bgCtx, item, tpl, instance,
+				deployParams{creds: remoteCredsFromInput(in), operator: operator})
 			if err := firstErr(bootstrapErr, deployErr); err != nil {
 				return err
 			}
@@ -586,7 +625,7 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 	}
 	// 重建 Exporter 同样要经过 Docker（可能还要拉镜像）→ 放后台，避免请求超时。
 	s.runAsync(item.ID, item.Name, "重建 Exporter", func(bgCtx context.Context) error {
-		if err := s.deploy(bgCtx, item, tpl, instance); err != nil {
+		if err := s.deploy(bgCtx, item, tpl, instance, deployParams{operator: operator}); err != nil {
 			return err
 		}
 		s.markApplied(context.Background(), item.ID)
@@ -1025,7 +1064,7 @@ func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
 	instance.Password = newPassword
-	deployErr := s.deploy(ctx, item, tpl, instance)
+	deployErr := s.deploy(ctx, item, tpl, instance, deployParams{operator: operator})
 	if deployErr != nil {
 		s.log.Warn("集成：轮换后重建 Exporter 失败", zap.String("integration", item.Name), zap.Error(deployErr))
 	}
@@ -1129,7 +1168,7 @@ func (s *IntegrationService) requireDocker(action string) error {
 		return apperr.Newf(apperr.CodeForbidden,
 			"%s 需要平台能访问 Docker：请确认 docker-compose.yml 里 backend 挂载了 "+
 				"/var/run/docker.sock 且 INTEGRATION_DOCKER_ENABLED=true，"+
-				"然后 docker compose up -d --force-recreate backend（或重跑 scripts/setup-jd-link.sh）", action)
+				"然后 docker compose up -d --force-recreate backend（或重跑 scripts/onboard.sh）", action)
 	}
 	// 启动期探活已经明确失败时，直接把那份"怎么修"的结论回传，
 	// 而不是让使用者再撞一次 permission denied。
@@ -1249,7 +1288,7 @@ func (s *IntegrationService) RetryAccount(
 	}
 
 	// 3) 重建 Exporter + 核验（即使连接没通过也重建：这样拿到的是最新配置）。
-	if deployErr := s.deploy(ctx, item, tpl, instance); deployErr != nil {
+	if deployErr := s.deploy(ctx, item, tpl, instance, deployParams{operator: operator}); deployErr != nil {
 		if result.Message != "" {
 			result.Message += "；"
 		}
@@ -1393,8 +1432,8 @@ func (s *IntegrationService) ensureMonitoringAccount(
 	if err != nil {
 		return "", err
 	}
-	// 网络自动发现：目标可能属于**另一个 compose 项目**（如 jd），
-	// 使用者只需要填 "jd-mysql" / "interview-mysql" 这样的名字，平台自己找出
+	// 网络自动发现：目标可能属于**另一个 compose 项目**（如某业务系统），
+	// 使用者只需要填 "legacy-mysql" / "app-mysql" 这样的名字，平台自己找出
 	// 该名字对应哪个容器、在哪张网络上，并把一次性容器接进去——
 	// 这就是"同服务器不同 docker/compose 也不用改对方配置"的关键一步。
 	networks, resolvedHost, note := s.targetNetworks(ctx, in.Address.Host)
@@ -1493,6 +1532,16 @@ type IntegrationMeta struct {
 	// JoinPlatformNetwork 记录用户是否显式要求「把目标容器接入平台网络」。
 	// 存起来是为了「重新应用」时行为可复现（平台每次都会重新接网）。
 	JoinPlatformNetwork bool `json:"join_platform_network"`
+	// DeployTarget 为部署位置：local（本机 Docker）| remote（远程 Ansible）。
+	DeployTarget string `json:"deploy_target"`
+	// TargetHost 为远程服务器地址（remote 模式）。
+	TargetHost string `json:"target_host"`
+	// ExporterHostPort 为远程 Exporter 的监听端口（Prometheus 抓 host:port）。
+	ExporterHostPort int `json:"exporter_host_port"`
+	// InstallMode 为远程安装方式（docker / systemd）。
+	InstallMode string `json:"install_mode"`
+	// RemoteInstalledAt 为最近一次远程安装成功的时间。
+	RemoteInstalledAt string `json:"remote_installed_at"`
 	// AccountManaged 表示只读监控账号由平台创建（供账号管理界面展示）。
 	AccountManaged bool `json:"account_managed"`
 	// AccountRotatedAt 为最近一次口令轮换时间（RFC3339）。
@@ -1507,6 +1556,9 @@ func (m IntegrationMeta) toMap() map[string]any {
 		"created_by": m.CreatedBy, "created_at": m.CreatedAt,
 		"updated_by": m.UpdatedBy, "updated_at": m.UpdatedAt, "deploy_note": m.DeployNote,
 		"join_platform_network": m.JoinPlatformNetwork,
+		"deploy_target":         m.DeployTarget, "target_host": m.TargetHost,
+		"exporter_host_port": m.ExporterHostPort, "install_mode": m.InstallMode,
+		"remote_installed_at": m.RemoteInstalledAt,
 		"account_managed":       m.AccountManaged, "account_rotated_at": m.AccountRotatedAt,
 	}
 }
@@ -1625,19 +1677,50 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 // 网络不需要任何人预先配置：平台先用 docker 反查目标容器在哪张网络上，
 // 再把 Exporter 接进「监控面（平台网络）+ 目标网络」。被管项目因此
 // 不需要建互联网络、不需要加别名，也不需要把 compose 文件交给平台。
-func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template, instance integration.Instance) error {
+func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template, instance integration.Instance, params deployParams) error {
+	// 远程模式：不在本机起容器，改由 Ansible 安装到目标服务器——因此**不需要** docker.sock。
+	if meta, ok := IntegrationMetaOf(*item); ok && meta.DeployTarget == DeployTargetRemote {
+		if err := s.deployRemote(ctx, item, tpl, instance, meta, params.creds, params.operator); err != nil {
+			s.setDeployNote(ctx, item.ID, "远程安装失败："+err.Error())
+			return err
+		}
+		s.writeMeta(ctx, item, func(m *IntegrationMeta) {
+			m.RemoteInstalledAt = time.Now().UTC().Format(time.RFC3339)
+		})
+		s.setDeployNote(ctx, item.ID, fmt.Sprintf("已在 %s 上安装 %s（监听 %d），Prometheus 抓取目标 %s",
+			meta.TargetHost, tpl.Component, meta.ExporterHostPort,
+			integration.JoinHostPort(meta.TargetHost, meta.ExporterHostPort)))
+		return nil
+	}
 	if s.docker == nil {
 		s.setDeployNote(ctx, item.ID, s.dockerNote)
 		return nil
 	}
 	networks, resolvedHost, note := s.targetNetworks(ctx, instance.Address.Host)
+	// 兜底提醒：地址看着像容器名，但 docker 里没有同名容器/服务/别名——
+	// 最常见的是仍在填旧架构的人工别名（如 legacy-redis），Exporter 必然连不上。
+	if note == "" && looksLikeContainerName(instance.Address.Host) {
+		note = fmt.Sprintf("⚠️ 平台没在 docker 里找到名为 %q 的容器（既非容器名、也非 compose 服务名或网络别名）："+
+			"Exporter 很可能解析不了该地址。请把「地址」改成 `docker ps` 里 NAMES 列的名字（如 app-redis:6379）。",
+			instance.Address.Host)
+		s.log.Warn("集成：目标容器未找到", zap.String("integration", instance.Name), zap.String("host", instance.Address.Host))
+	}
 	// 平台把用户填的名字换成"在目标网络上一定能解析"的名字（优先容器名）：
-	// 用户填 `jd-redis`（别名）也不会因为别名只存在于旧网络而连不上。
+	// 用户填 `legacy-redis`（别名）也不会因为别名只存在于旧网络而连不上。
 	if resolvedHost != "" && resolvedHost != instance.Address.Host {
 		instance.Address.Host = resolvedHost
 	}
 	env := tpl.RenderEnv(instance)
 	args := tpl.RenderArgs(instance)
+	// 宿主模式（node_exporter 等）：Exporter 采集的是**宿主机本身**，
+	// 因此必须以宿主网络/PID 运行并只读挂载宿主根目录；
+	// 此时"目标网络发现"没有意义（宿主网络里本来什么都能解析）。
+	hostMode := tpl.HostNetwork || tpl.HostPID || len(tpl.HostMounts) > 0
+	if hostMode {
+		networks = []string{"host"}
+		resolvedHost = instance.Address.Host
+		note = "该组件为主机监控：以宿主网络/PID 运行，只读挂载宿主根目录"
+	}
 	spec := docker.ContainerSpec{
 		Name:     integration.ContainerName(instance.Name),
 		Image:    tpl.Image,
@@ -1648,6 +1731,10 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 			"mwops.integration": instance.Name,
 			"mwops.mw_type":     tpl.Type,
 		},
+		Binds: append([]string{}, tpl.HostMounts...),
+	}
+	if tpl.HostPID {
+		spec.PidMode = "host"
 	}
 	action, id, err := s.docker.Ensure(ctx, spec)
 	if err != nil {
@@ -1656,12 +1743,15 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 	}
 	// 顺带把平台自己接进目标网络，纳管实例的 TCP 健康探测才能成功——
 	// 这一步同样是平台侧动作，被管项目无感。
-	s.attachSelf(ctx, instance.Address.Host)
+	// 宿主模式下被管对象是"那台机器"而不是容器，接网与反向接网都无意义。
 	joinNote := ""
-	// 反向接网（改被管容器）是用户显式勾选的可选项，值持久化在集成元信息里，
-	// 因此 Create / Update / 重新应用 三条路径行为一致。
-	if meta, ok := IntegrationMetaOf(*item); ok && meta.JoinPlatformNetwork {
-		joinNote = s.joinTargetToPlatformNetwork(ctx, instance.Address.Host)
+	if !hostMode {
+		s.attachSelf(ctx, instance.Address.Host)
+		// 反向接网（改被管容器）是用户显式勾选的可选项，值持久化在集成元信息里，
+		// 因此 Create / Update / 重新应用 三条路径行为一致。
+		if meta, ok := IntegrationMetaOf(*item); ok && meta.JoinPlatformNetwork {
+			joinNote = s.joinTargetToPlatformNetwork(ctx, instance.Address.Host)
+		}
 	}
 	if instance.Address.Host != item.Host && instance.Address.Host != "" {
 		// 纳管实例的连接地址也统一成可解析名，避免"平台能抓指标、但健康探测失败"。
@@ -1679,8 +1769,50 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 		done += "；" + joinNote
 	}
 	s.setDeployNote(ctx, item.ID, done)
+	// 起完容器再读一眼它的日志：Exporter 最常见的失败（名字解析不了、端口拒绝、
+	// 口令不对）只写在自己的日志里。平台既然创建了它，就把结论顺手带回来，
+	// 免得使用者去翻 docker logs（"redis 找不到"就是这类问题）。
+	//
+	// 注意这里要**返回 error**：调用方（后台任务/重试流程）据此把结论写进
+	// last_error 并停在"待处理"，否则随后的 markApplied 会把它覆盖掉。
+	if reason := s.inspectExporterLogs(ctx, spec.Name); reason != "" {
+		// Redis 特有的经典坑：填了「用户名」但目标只有 requirepass（default 用户），
+		// AUTH <user> <pass> 必然 WRONGPASS。这里把"清空用户名"直接说出来。
+		if tpl.Type == integration.TypeRedis && strings.TrimSpace(instance.Username) != "" &&
+			strings.Contains(reason, "认证失败") {
+			reason += fmt.Sprintf("另外：该集成填了「用户名」(%s)。自建 Redis 通常只有 requirepass（default 用户），"+
+				"并没有这个 ACL 用户——把「用户名」清空、只填口令即可（无需在 Redis 上建用户）。", instance.Username)
+		}
+		s.setDeployNote(ctx, item.ID, done+"；⚠️ "+reason)
+		s.log.Warn("集成：Exporter 日志显示连接问题",
+			zap.String("integration", instance.Name), zap.String("container", spec.Name), zap.String("reason", reason))
+		return fmt.Errorf("Exporter 已创建，但连不上目标——%s", reason)
+	}
 	return nil
 }
+
+// inspectExporterLogs 读取 Exporter 容器日志并翻译失败原因。
+//
+// 给容器几秒钟去连目标（redis_exporter 启动即连；mysqld_exporter 首次抓取时连）。
+func (s *IntegrationService) inspectExporterLogs(ctx context.Context, container string) string {
+	if s.docker == nil || strings.TrimSpace(container) == "" {
+		return ""
+	}
+	select {
+	case <-ctx.Done():
+		return ""
+	case <-time.After(exporterLogWait):
+	}
+	logs, _, err := s.docker.Logs(ctx, container)
+	if err != nil {
+		s.log.Debug("集成：读取 Exporter 日志失败", zap.String("container", container), zap.Error(err))
+		return ""
+	}
+	return DescribeExporterLog(logs)
+}
+
+// exporterLogWait 是"等 Exporter 尝试连接目标"的时长。
+const exporterLogWait = 4 * time.Second
 
 // joinTargetToPlatformNetwork 把目标容器接入平台网络（用户显式勾选时才调用）。
 //
@@ -1726,7 +1858,7 @@ func dockerHint(err error) string {
 		return "。原因：平台容器内找不到 docker.sock，因此无法创建任何容器。" +
 			"处理：在 docker-compose.yml 里取消 backend.volumes 的 " +
 			"`/var/run/docker.sock:/var/run/docker.sock` 注释，然后 " +
-			"`docker compose up -d --force-recreate backend`（或重跑 scripts/setup-jd-link.sh）。" +
+			"`docker compose up -d --force-recreate backend`（或重跑 scripts/onboard.sh）。" +
 			"若使用 rootless Docker，socket 通常在 /run/user/<uid>/docker.sock，请把 " +
 			"INTEGRATION_DOCKER_HOST 指向它并挂载该路径"
 	case strings.Contains(msg, "permission denied") && strings.Contains(msg, "docker.sock"):
@@ -1763,6 +1895,11 @@ func (s *IntegrationService) resolveTarget(ctx context.Context, host string) (re
 	}
 	note = fmt.Sprintf("平台自动发现目标容器 %s（依据 %s），所在网络：%s",
 		res.Container, res.MatchedBy, strings.Join(res.Networks, "、"))
+	if res.AutoCorrected {
+		note = fmt.Sprintf("地址「%s」在 docker 里没有精确匹配，已按服务名解析为目标容器 %s，并接入其所在网络：%s"+
+			"（建议把「地址」直接改成 %s:端口，避免以后依赖这个推断）",
+			host, res.Container, strings.Join(res.Networks, "、"), res.Container)
+	}
 	if !res.Running {
 		note += "（注意：该容器当前未运行）"
 	}
@@ -1803,15 +1940,76 @@ func (s *IntegrationService) targetHint(ctx context.Context, host string) string
 
 // scrapeTarget 返回 Prometheus 应当抓取的目标。
 //
-// 关键点：集成由平台拉起 Exporter 时，抓取目标必须是 **Exporter 容器**
+// 关键点：集成由平台拉起 Exporter 时，抓取目标必须是 **Exporter 本身**
 // （mwops-exporter-<集成名>:<模板端口>），而不是被管实例本身——
 // MySQL / Redis 自己不暴露 /metrics，抓实例地址必然是 up=0。
-// 只有平台拿不到 Exporter 信息时才回落到实例地址。
+// 远程模式下 Exporter 在别的机器上，没有容器名可解析，因此用 目标IP:端口。
 func (s *IntegrationService) scrapeTarget(meta IntegrationMeta, address integration.Address) string {
+	if meta.DeployTarget == DeployTargetRemote && strings.TrimSpace(meta.TargetHost) != "" {
+		port := meta.ExporterHostPort
+		if port <= 0 {
+			port = meta.ExporterPort
+		}
+		return integration.JoinHostPort(meta.TargetHost, port)
+	}
+	// 宿主模式（node_exporter 等）：Exporter 共享宿主网络，容器名对 Prometheus 没有意义，
+	// 抓取目标必须是"主机地址:端口"。地址填回环地址时改写成 host.docker.internal ——
+	// Prometheus 跑在容器里，127.0.0.1 会指向它自己（compose 已配 host-gateway 映射）。
+	if tpl, ok := integration.TemplateOf(meta.Template); ok && tpl.HostNetwork {
+		port := meta.ExporterPort
+		if port <= 0 {
+			port = tpl.ExporterPort
+		}
+		host := strings.TrimSpace(address.Host)
+		switch host {
+		case "127.0.0.1", "localhost", "::1":
+			host = "host.docker.internal"
+		}
+		return integration.JoinHostPort(host, port)
+	}
 	if strings.TrimSpace(meta.Container) != "" && meta.ExporterPort > 0 {
 		return net.JoinHostPort(meta.Container, strconv.Itoa(meta.ExporterPort))
 	}
 	return address.HostPort()
+}
+
+// Exporter 部署位置。
+const (
+	// DeployTargetLocal 表示平台在自己的宿主上创建 Exporter 容器（Docker API）。
+	DeployTargetLocal = "local"
+	// DeployTargetRemote 表示在目标服务器上用 Ansible 安装并启动 Exporter。
+	DeployTargetRemote = "remote"
+)
+
+// normalizeDeployTarget 归一化部署位置（空值按 local 处理，保持向后兼容）。
+func normalizeDeployTarget(value string) string {
+	if strings.TrimSpace(value) == DeployTargetRemote {
+		return DeployTargetRemote
+	}
+	return DeployTargetLocal
+}
+
+// deployParams 汇总一次部署所需的请求级信息（SSH 凭据与操作者只在内存中流转）。
+type deployParams struct {
+	creds    RemoteCreds
+	operator Operator
+}
+
+// exporterPortOrDefault 归一化远程 Exporter 端口（留空用模板默认端口）。
+func exporterPortOrDefault(value, fallback int) int {
+	if value > 0 && value <= 65535 {
+		return value
+	}
+	return fallback
+}
+
+// remoteCredsFromInput 把表单入参里的 SSH 凭据抽出来（仅内存使用）。
+func remoteCredsFromInput(in IntegrationInput) RemoteCreds {
+	return RemoteCreds{
+		Host: in.TargetHost, User: in.SSHUser, Port: in.SSHPort,
+		Password: in.SSHPassword, Key: in.SSHKey, Become: in.SSHBecome,
+		InstallMode: in.InstallMode, ExporterPort: in.ExporterPort,
+	}
 }
 
 // attachSelf 把平台自身（backend 容器）接入目标容器所在网络。
@@ -1854,6 +2052,16 @@ func (s *IntegrationService) attachSelf(ctx context.Context, host string) {
 		s.log.Info("集成：平台已自动接入目标网络",
 			zap.String("container", self), zap.String("network", network))
 	}
+}
+
+// looksLikeContainerName 判断主机名是否是"本该能在 docker 里找到"的名字：
+// 既不是 IP，也不是含点的域名（容器名按规定不含点）。
+func looksLikeContainerName(host string) bool {
+	trimmed := strings.TrimSpace(host)
+	if trimmed == "" || net.ParseIP(trimmed) != nil {
+		return false
+	}
+	return !strings.Contains(trimmed, ".")
 }
 
 // defaultSelfContainer 是平台自身（backend）的默认容器名。
@@ -1912,9 +2120,14 @@ func (s *IntegrationService) shouldCreateRules(in IntegrationInput) bool {
 }
 
 // deployEnabled 判断本次是否请求一键部署。
+//
+// 远程模式不依赖本机 docker.sock（由 Ansible 在目标机上安装），因此远程集成默认就"要部署"。
 func (s *IntegrationService) deployEnabled(in IntegrationInput) bool {
 	if in.Deploy != nil {
 		return *in.Deploy
+	}
+	if normalizeDeployTarget(in.DeployTarget) == DeployTargetRemote {
+		return true
 	}
 	return s.docker != nil
 }
@@ -1995,6 +2208,9 @@ func (s *IntegrationService) toView(ctx context.Context, item model.MiddlewareIn
 		Labels: meta.Labels, Options: meta.Options, JobName: meta.Job,
 		Container: meta.Container, Image: meta.Image, DeployNote: meta.DeployNote,
 		JoinPlatformNetwork: meta.JoinPlatformNetwork,
+		DeployTarget:        meta.DeployTarget, TargetHost: meta.TargetHost,
+		ExporterHostPort: meta.ExporterHostPort, InstallMode: meta.InstallMode,
+		RemoteInstalledAt: meta.RemoteInstalledAt,
 		Selector:  integration.SelectorFor(integration.Instance{Name: item.Name, MWType: item.MWType}, meta.Job),
 		AppliedAt: meta.AppliedAt, LastError: meta.LastError,
 		HasPassword: item.PasswordEncrypted != "",
@@ -2086,7 +2302,7 @@ func (s *IntegrationService) exporterNetwork() string { return s.cfg.Integration
 // exporterNetworks 解析逗号分隔的网络列表。
 //
 // 第一个网络是「监控面」（Prometheus 能抓到 Exporter），其余是「数据面」
-// （Exporter 能连上被管实例）。jd 场景下两者不同：
+// （Exporter 能连上被管实例）。跨项目场景下两者不同：
 // exporter_network: "middleware-ops_mwops,my-project_default"。
 func (s *IntegrationService) exporterNetworks() []string {
 	raw := s.cfg.Integration.ExporterNetwork

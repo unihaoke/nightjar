@@ -306,7 +306,7 @@ watch(
           <p class="field-hint">
             这里填的是 <span class="mono">prometheus.yml</span> 里的 job_name（如
             <span class="mono">middleware-exporter-redis</span>），<b>不是容器名</b>（如
-            <span class="mono">jd-redis-exporter</span>）。留空则按前缀自动匹配。
+            <span class="mono">redis-exporter</span>）。留空则按前缀自动匹配。
           </p>
         </el-col>
         <el-col :xs="24" :sm="12">
@@ -315,7 +315,7 @@ watch(
           </el-form-item>
           <p class="field-hint">
             填了它就用 <span class="mono">instance</span> 标签匹配，<b>实例名称不再参与</b>。
-            jd 这类自建 Exporter 只上报 <span class="mono">instance_name</span>，请留空。
+            自建 Exporter 只上报 <span class="mono">instance_name</span>，请留空。
           </p>
         </el-col>
         <el-col :span="24">

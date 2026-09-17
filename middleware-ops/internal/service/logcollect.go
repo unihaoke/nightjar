@@ -26,7 +26,7 @@ import (
 type LogCollectInput struct {
 	// Name 为接入名称（唯一，用于采集容器命名与服务器记录）。
 	Name string `json:"name" binding:"required,min=1,max=63"`
-	// TargetContainer 为被管容器名（如 interview-backend）。
+	// TargetContainer 为被管容器名（如 app-backend）。
 	TargetContainer string `json:"target_container" binding:"required"`
 	// Service 为日志事件归属的服务名（缺省取 Name）。
 	Service string `json:"service"`

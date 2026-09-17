@@ -13,8 +13,8 @@ import (
 //
 // 背景（真实故障）：平台查询失败时只把 Go 的原始错误抛给使用者，例如
 //
-//	Get "http://jd-prometheus:9090/api/v1/query?...": dial tcp:
-//	lookup jd-prometheus on 127.0.0.11:53: server misbehaving
+//	Get "http://legacy-prometheus:9090/api/v1/query?...": dial tcp:
+//	lookup legacy-prometheus on 127.0.0.11:53: server misbehaving
 //
 // 这句话里 127.0.0.11 是 **Docker 内置 DNS**，"server misbehaving" 实际含义是
 // 「该容器所属的网络上没有这个名字」——也就是容器网络挂错了，而使用者很难看出来。
@@ -140,7 +140,7 @@ func DescribeTargetError(lastError string) string {
 	case strings.Contains(lower, "no such host"), strings.Contains(lower, "server misbehaving"),
 		strings.Contains(lower, "name resolution"):
 		return "原因：容器内解析不了被管实例的主机名——网络/别名问题。" +
-			"确认 Exporter 与目标在同一 docker 网络（jd 场景：jd_jd-data）。"
+			"确认 Exporter 与目标在同一 docker 网络（跨项目场景：app_data）。"
 
 	case strings.Contains(lower, "timeout"), strings.Contains(lower, "deadline exceeded"):
 		return "原因：抓取超时。实例负载过高、网络隔离，或 scrape_timeout 小于实际采集耗时（可调大 scrape_timeout）。"
@@ -152,7 +152,7 @@ func DescribeTargetError(lastError string) string {
 		return "原因：TLS 证书校验失败（自签证书场景）。在 Exporter 侧信任该 CA 或改用非 TLS 连接。"
 
 	default:
-		return "原因见上面的 lastError 原文；对照 docs/GUIDE-JD-ONBOARD.md 的「up=0 排查」表逐条排除。"
+		return "原因见上面的 lastError 原文；对照 docs/GUIDE-ONBOARD.md 的「up=0 排查」表逐条排除。"
 	}
 }
 

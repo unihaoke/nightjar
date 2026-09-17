@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 本文件用 HTTP 桩验证 Engine API 客户端的请求构造与幂等语义。
@@ -25,6 +26,8 @@ type engineStub struct {
 	// imagePresent 表示本地已有镜像；pulled 记录被拉取的镜像引用。
 	imagePresent bool
 	pulled       []string
+	// exitOnStart 模拟"一次性容器启动即结束"（RunOnce 的等待循环据此立即退出）。
+	exitOnStart bool
 }
 
 func (s *engineStub) handler() http.HandlerFunc {
@@ -54,7 +57,7 @@ func (s *engineStub) handler() http.HandlerFunc {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"Id": "existing", "Name": "/mwops-exporter-jd-redis",
+				"Id": "existing", "Name": "/mwops-exporter-app-redis",
 				"State":  map[string]any{"Status": "running", "Running": true},
 				"Config": map[string]any{"Image": "oliver006/redis_exporter:v1.66.0"},
 			})
@@ -70,6 +73,9 @@ func (s *engineStub) handler() http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "new-container-id"})
 			return
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			if s.exitOnStart {
+				s.exists = false // 跑完即退出并被清理
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/connect"):
@@ -98,8 +104,8 @@ func TestEnsureCreatesContainerWithNetworkAndEnv(t *testing.T) {
 	client := newStubClient(t, stub)
 
 	action, id, err := client.Ensure(context.Background(), ContainerSpec{
-		Name: "mwops-exporter-jd-redis", Image: "oliver006/redis_exporter:v1.66.0",
-		Env:      []string{"REDIS_ADDR=redis://jd-redis:6379", "REDIS_PASSWORD=secret"},
+		Name: "mwops-exporter-app-redis", Image: "oliver006/redis_exporter:v1.66.0",
+		Env:      []string{"REDIS_ADDR=redis://legacy-redis:6379", "REDIS_PASSWORD=secret"},
 		Cmd:      []string{"--check-keys=db0=session:*"},
 		Networks: []string{"mwops", "target_default"},
 	})
@@ -135,6 +141,29 @@ func TestEnsureCreatesContainerWithNetworkAndEnv(t *testing.T) {
 	}
 }
 
+// TestRunOnceDisablesRestartPolicy 锁定一次性容器不得带重启策略。
+//
+// 真实现象：bootstrap/建号容器执行完退出后被 Docker 无限重启，
+// 停在 `Restarting (1)` 状态、RunOnce 白等到超时，账号永远建不出来。
+func TestRunOnceDisablesRestartPolicy(t *testing.T) {
+	// exitOnStart 让桩模拟"命令跑完就退出并被清理"，从而立刻结束等待循环。
+	stub := &engineStub{exitOnStart: true}
+	client := newStubClient(t, stub)
+	_, _ = client.RunOnce(context.Background(), ContainerSpec{
+		Name: "mwops-exporter-app-mysql-bootstrap", Image: "mysql:8.0",
+		Cmd: []string{"mysql", "-e", "SELECT 1"}, Networks: []string{"mwops"},
+	}, 5*time.Second)
+
+	hostConfig, ok := stub.createdBody["HostConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("创建请求缺少 HostConfig：%v", stub.createdBody)
+	}
+	policy, _ := hostConfig["RestartPolicy"].(map[string]any)
+	if policy["Name"] != "no" {
+		t.Fatalf("一次性容器必须以 no 创建（否则会无限重启），实际 %v", policy)
+	}
+}
+
 // TestEnsureImagePulledOnlyWhenMissing 锁定：镜像已存在时不重复拉取（避免每次保存都打网络）。
 func TestEnsureImagePulledOnlyWhenMissing(t *testing.T) {
 	stub := &engineStub{imagePresent: true}
@@ -156,7 +185,7 @@ func TestEnsureRecreatesExistingContainer(t *testing.T) {
 	client := newStubClient(t, stub)
 
 	action, _, err := client.Ensure(context.Background(), ContainerSpec{
-		Name: "mwops-exporter-jd-redis", Image: "oliver006/redis_exporter:v1.66.0",
+		Name: "mwops-exporter-app-redis", Image: "oliver006/redis_exporter:v1.66.0",
 		Networks: []string{"mwops"},
 	})
 	if err != nil {
@@ -166,7 +195,7 @@ func TestEnsureRecreatesExistingContainer(t *testing.T) {
 		t.Fatalf("容器已存在时应重建，实际动作 %s", action)
 	}
 	joined := strings.Join(stub.calls, " | ")
-	if !strings.Contains(joined, "DELETE /containers/mwops-exporter-jd-redis") {
+	if !strings.Contains(joined, "DELETE /containers/mwops-exporter-app-redis") {
 		t.Fatalf("重建前应先删除旧容器，实际调用：%s", joined)
 	}
 	if strings.Contains(joined, "/connect") {
@@ -193,8 +222,8 @@ func TestListManagedFiltersByLabel(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rawQuery = r.URL.RawQuery
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"Id": "1", "Names": []string{"/mwops-exporter-jd-redis"}, "Image": "img", "State": "running", "Status": "Up 2 minutes"},
-			{"Id": "2", "Names": []string{"/mwops-exporter-jd-mysql"}, "Image": "img", "State": "exited", "Status": "Exited (0) 1 minute ago"},
+			{"Id": "1", "Names": []string{"/mwops-exporter-app-redis"}, "Image": "img", "State": "running", "Status": "Up 2 minutes"},
+			{"Id": "2", "Names": []string{"/mwops-exporter-app-mysql"}, "Image": "img", "State": "exited", "Status": "Exited (0) 1 minute ago"},
 		})
 	}))
 	defer server.Close()
@@ -214,10 +243,10 @@ func TestListManagedFiltersByLabel(t *testing.T) {
 	for _, item := range items {
 		byName[item.Name] = item.Running
 	}
-	if running, ok := byName["mwops-exporter-jd-redis"]; !ok || !running {
+	if running, ok := byName["mwops-exporter-app-redis"]; !ok || !running {
 		t.Fatalf("redis exporter 应为 running：%+v", items)
 	}
-	if running, ok := byName["mwops-exporter-jd-mysql"]; !ok || running {
+	if running, ok := byName["mwops-exporter-app-mysql"]; !ok || running {
 		t.Fatalf("mysql exporter 应为 exited：%+v", items)
 	}
 	if !strings.Contains(rawQuery, "mwops.managed%3Dtrue") {
