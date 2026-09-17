@@ -18,8 +18,12 @@ BIN="/usr/local/bin/middleware-ops"
 ARTIFACT="/app/data/integrations/ansible/${INTEGRATION}.yml"
 # 与 Go 侧 integration.PlaybookRendererVersion 对应；版本升级时同步改这里。
 EXPECTED_RENDERER="mwops-playbook v4"
+# 与 Go 侧 service.CodeRevision 对应：平台自身行为（错误呈现/诊断）的修订号。
+EXPECTED_REVISION="r1"
 # 该变量名是 v3 才引入的：二进制里搜到它，说明镜像至少是 v3。
 RENDERER_MARKER="exporter_docker_bin"
+# 该函数名是 r1 才引入的（失败摘要）：二进制里搜到它，说明代码里有这份诊断修复。
+REVISION_MARKER="ansibleFailureExcerpt"
 
 pass=0
 fail=0
@@ -51,6 +55,12 @@ if [ "${marker:-0}" -gt 0 ] 2>/dev/null; then
 else
   no "二进制里没有 $RENDERER_MARKER → **镜像至少落后一个版本，请重建**"
 fi
+rev_marker=$(docker exec "$CONTAINER" grep -c "$REVISION_MARKER" "$BIN" 2>/dev/null | tr -d '[:space:]')
+if [ "${rev_marker:-0}" -gt 0 ] 2>/dev/null; then
+  ok "二进制含 $EXPECTED_REVISION 标记（$REVISION_MARKER）"
+else
+  no "二进制里没有 $REVISION_MARKER → 平台缺少 $EXPECTED_REVISION 的失败摘要修复（界面只会显示被截断的输出），请重建"
+fi
 
 echo
 echo "== 3. 启动日志里的渲染器版本 =="
@@ -71,6 +81,11 @@ else
     ok "healthz 报告 $EXPECTED_RENDERER"
   else
     no "healthz 没有报告 $EXPECTED_RENDERER：$(echo "$health" | cut -c1-200)"
+  fi
+  if echo "$health" | grep -q "\"code_revision\":\"$EXPECTED_REVISION\""; then
+    ok "healthz 报告 code_revision=$EXPECTED_REVISION"
+  else
+    no "healthz 没有报告 code_revision=$EXPECTED_REVISION（字段缺失=镜像更旧）"
   fi
   if echo "$health" | grep -q '"sshpass":true'; then
     ok "healthz 报告 sshpass 可用"

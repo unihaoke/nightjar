@@ -81,6 +81,8 @@ func (h *Handler) Health(c *gin.Context) {
 		"uptime":            nowUnix() - h.deps.StartedAt,
 		"engine":            service.WatchEngineStatus(h.deps.Engine),
 		"playbook_renderer": integration.PlaybookRendererVersion,
+		// 平台代码修订号：远程安装/诊断类问题先比这个值，判断镜像里有没有对应修复。
+		"code_revision": service.CodeRevision,
 		// 口令方式远程安装依赖平台侧的 sshpass：这里直接暴露探测结果，
 		// 排障时一眼看出是"镜像旧"还是"镜像没装 sshpass"（见 INC-007）。
 		"sshpass": service.SSHPassAvailable(),

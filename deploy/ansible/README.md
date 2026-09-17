@@ -308,13 +308,32 @@ docker logs <容器名>                 # Exporter 自身日志
 
 ### 6.5 重建后仍未生效的常见原因
 
+先跑一次只读自检（会逐项告诉你差在哪）：
+
+```bash
+bash deploy/ansible/tools/check-backend-freshness.sh [容器名] [集成名]
+```
+
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `docker compose up -d` 后行为没变 | 该命令不重建镜像 | 用 `docker compose build backend` 或 `up -d --build backend` |
 | 构建很快但代码没变 | 构建上下文不是当前工作区（换了目录/机器） | `docker compose build --progress=plain backend` 看 `COPY` 的源；确认 `docker compose config \| grep context` |
 | 改了 `.env` 没生效 | 环境变量在容器创建时注入 | `docker compose up -d --force-recreate backend` |
+| 不确定镜像里有没有某修复 | 无 | `curl -s /healthz` 看 `code_revision`（当前 `r1`）与 `playbook_renderer`（当前 v4） |
 
-### 6.6 怀疑产物本身有问题时
+### 6.6 界面上的报错只有任务名，看不到原因
+
+v4 起界面上给的是**失败摘要**（失败任务名 + `fatal`/`msg` 原文，并注明省略了多少行），
+完整（已脱敏）输出在平台日志里：
+
+```bash
+docker logs mwops-backend 2>&1 | grep -A40 '集成：远程安装失败' | tail -60
+```
+
+若摘要里出现 `censored`，说明失败任务带 `no_log`（含口令，必须遮蔽），
+按 §6.4 到目标机上手工确认。
+
+### 6.7 怀疑产物本身有问题时
 
 平台内部的渲染后自校验用的是 Go 的 YAML 解析器，而 ansible 用的是 PyYAML（同族、不同实现），
 所以怀疑产物时可以**用下游的解析器复核**。仓库里带了工具，不需要连任何主机：

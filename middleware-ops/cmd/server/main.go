@@ -75,9 +75,10 @@ func run(configPath string) error {
 		zap.String("version", version),
 		zap.String("mode", cfg.App.Mode),
 		zap.String("config", configPath),
-		// 渲染器版本写进启动日志：远程安装报 YAML/Jinja 类错误时，
-		// 先看这一行就能判断「平台模板有缺陷」还是「镜像没重建、仍在跑旧代码」（INC-005/006）。
-		zap.String("playbook_renderer", integration.PlaybookRendererVersion))
+		// 渲染器版本与平台代码修订号写进启动日志：远程安装报错时，
+		// 先看这一行就能判断「平台模板有缺陷」还是「镜像没重建、仍在跑旧代码」（INC-005~009）。
+		zap.String("playbook_renderer", integration.PlaybookRendererVersion),
+		zap.String("code_revision", service.CodeRevision))
 
 	// 数据库
 	gdb, err := db.New(cfg, &db.Logger{SQLVerbose: cfg.App.Mode == "debug"})

@@ -212,7 +212,11 @@ func (s *IntegrationService) deployRemote(
 	output, runErr := cmd.CombinedOutput()
 	safe := redactSecrets(string(output), creds.Password, creds.Key)
 	if runErr != nil {
-		return fmt.Errorf("Ansible 执行失败：%w（输出：%s）%s", runErr, truncateText(safe, 600), censoredHint(safe))
+		// 完整（已脱敏）输出进平台日志：界面里的摘要只够定位，深挖要看原始输出。
+		s.log.Error("集成：远程安装失败",
+			zap.String("integration", item.Name), zap.String("host", host),
+			zap.String("output", truncateText(safe, 8000)))
+		return fmt.Errorf("Ansible 执行失败：%w\n%s%s", runErr, ansibleFailureExcerpt(safe, 900), censoredHint(safe))
 	}
 
 	// 安装完不等于可用：从平台侧探一次端口，把结论写回来。
@@ -240,6 +244,80 @@ func censoredHint(output string) string {
 		"ls -ld /opt/mwops-exporter && df -h /opt && journalctl -u 'mwops-exporter-*' -n 50 --no-pager，" +
 		"或用 docker logs <容器名> 看 Exporter 自身日志）"
 }
+
+// ansibleFailureExcerpt 从 ansible 输出里挑出**失败相关**的部分。
+//
+// 为什么不能只截前 N 个字符（真实故障 INC-009）：ansible 是"从前往后"打印的，
+// 失败一定在**尾部**；按 head 截断恰好把唯一有用的那段砍掉——使用者看到的是一串
+// 成功任务的 ok/changed，真正的原因一个字都没有。
+//
+// 这里的做法：定位第一条失败标记（fatal/unreachable/FAILED!/ERROR!），
+// 回溯它所属的 TASK 行，再连同紧跟其后的若干行（msg 常是多行）一起摘出来；
+// 找不到失败标记时退回"头 + 尾"摘要，保证任何情况下都有信息量。
+func ansibleFailureExcerpt(output string, limit int) string {
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	markers := []string{"fatal:", "unreachable:", "FAILED!", "ERROR!", "failed="}
+	failAt := -1
+	for i, line := range lines {
+		for _, marker := range markers {
+			if strings.Contains(line, marker) {
+				failAt = i
+				break
+			}
+		}
+		if failAt >= 0 {
+			break
+		}
+	}
+	if failAt < 0 {
+		// 没有失败标记（例如平台侧超时被杀）：头尾都给，避免只看开头。
+		head := truncateText(output, limit/2)
+		if len(strings.TrimSpace(output)) <= limit {
+			return strings.TrimSpace(output)
+		}
+		tail := strings.TrimSpace(output)
+		if len(tail) > limit/2 {
+			tail = "…" + tail[len(tail)-limit/2:]
+		}
+		return head + "\n…（中略）…\n" + tail
+	}
+
+	// 回溯最近的 TASK 行（含 RETRYING 行，便于看出重试了几次）。
+	from := failAt
+	for i := failAt; i >= 0 && failAt-i < 40; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "TASK [") || strings.HasPrefix(trimmed, "PLAY [") {
+			from = i
+			break
+		}
+	}
+	// 失败行之后继续收：msg 可能是多行，但遇到下一个 TASK / PLAY RECAP 就停。
+	to := failAt + 1
+	for to < len(lines) && to-failAt < 12 {
+		trimmed := strings.TrimSpace(lines[to])
+		if strings.HasPrefix(trimmed, "TASK [") || strings.HasPrefix(trimmed, "PLAY RECAP") {
+			break
+		}
+		to++
+	}
+	excerpt := strings.Join(lines[from:to], "\n")
+	if from > 0 {
+		excerpt = "…（前面 " + strconv.Itoa(from) + " 行成功的任务已省略）\n" + excerpt
+	}
+	return truncateText(excerpt, limit)
+}
+
+// CodeRevision 是**平台代码**的运行期修订号：只增不减。
+//
+// 与 PlaybookRendererVersion 的分工：后者只跟踪 playbook 模板（写进产物第 3 行），
+// 前者跟踪平台自身行为（远程执行、错误呈现、诊断等）。任何"修好了、但需要确认
+// 镜像里到底有没有这一版"的改动都要在此 +1，并在注释里留一行说明。
+//
+// 排查首问：`curl -s http://<平台>:8080/healthz` 里的 code_revision 是否等于代码里的常量。
+// 历史：
+//
+//	r1：远程安装失败摘要（不再只截前 600 字符，改为摘出失败任务与原因）+ 完整输出进平台日志。
+const CodeRevision = "r1"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {
@@ -349,7 +427,10 @@ func (s *IntegrationService) accountSQLRemote(
 	output, runErr := cmd.CombinedOutput()
 	safe := redactSecrets(string(output), creds.Password, creds.Key, execPassword)
 	if runErr != nil {
-		return safe, fmt.Errorf("在目标机上执行账号 SQL 失败：%w（输出：%s）", runErr, truncateText(safe, 600))
+		s.log.Error("集成：目标机账号 SQL 失败",
+			zap.String("integration", item.Name), zap.String("host", host),
+			zap.String("output", truncateText(safe, 8000)))
+		return safe, fmt.Errorf("在目标机上执行账号 SQL 失败：%w\n%s", runErr, ansibleFailureExcerpt(safe, 900))
 	}
 	return safe, nil
 }
