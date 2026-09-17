@@ -723,6 +723,145 @@ func taskName(task string) string {
 	return task
 }
 
+// TestExporterFlagsComeAfterImage 锁定：Exporter 自己的参数必须排在**镜像之后**。
+//
+// 真实故障 INC-010：`--web.listen-address=:6379` 被放在镜像前，docker 把它当成
+// 自己的选项 → `unknown flag: --web.listen-address`、rc=125，容器根本没起来。
+func TestExporterFlagsComeAfterImage(t *testing.T) {
+	tpl, _ := TemplateOf(TypeRedis)
+	opts := remoteTestOptions()
+	opts.ExporterPort = 7777 // 与模板端口 9121 不同 → 需要 --web.listen-address
+	art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, TypeRedis), opts)
+	if err != nil {
+		t.Fatalf("渲染失败：%v", err)
+	}
+	want := "--env-file {{ exporter_env_file }} {{ exporter_image }} --web.listen-address=:7777"
+	if !strings.Contains(art.Playbook, want) {
+		t.Fatalf("Exporter 参数应紧跟镜像：\n%s", art.Playbook)
+	}
+	// 镜像之前不得出现 Exporter 自己的参数。
+	for i, line := range strings.Split(art.Playbook, "\n") {
+		imageAt := strings.Index(line, "{{ exporter_image }}")
+		if imageAt < 0 || !strings.Contains(line, "run ") {
+			continue
+		}
+		if strings.Contains(line[:imageAt], "--web.listen-address") {
+			t.Fatalf("第 %d 行把 Exporter 参数放到了镜像之前（docker 会报 unknown flag）：%s", i+1, line)
+		}
+	}
+}
+
+// TestDockerRunFlagsAreWhitelisted 结构性地锁定 docker run 的参数顺序。
+//
+// 只允许"已知的 docker 选项"出现在镜像之前，其余一律视为误放（Exporter 的参数、镜像命令等）。
+// 这比逐条断言更耐改：将来给模板加参数时，放错位置会立刻失败。
+func TestDockerRunFlagsAreWhitelisted(t *testing.T) {
+	valueFlags := map[string]bool{
+		"--name": true, "--restart": true, "--network": true,
+		"-v": true, "-p": true, "--env-file": true,
+	}
+	allowed := map[string]bool{"-d": true, "--pid=host": true}
+	for flag := range valueFlags {
+		allowed[flag] = true
+	}
+
+	cases := []struct {
+		typ, mode string
+		port      int
+	}{
+		{TypeRedis, InstallModeDocker, 7777}, // host 网络 + 端口不一致
+		{TypeMySQL, InstallModeDocker, 9104}, // bridge 网络（-p 映射）
+		{TypeNode, InstallModeDocker, 9100},  // 宿主模式（--pid=host / -v）
+		{TypeRedis, InstallModeDockerSystemd, 9121},
+	}
+	for _, c := range cases {
+		tpl, _ := TemplateOf(c.typ)
+		opts := remoteTestOptions()
+		opts.InstallMode = c.mode
+		opts.ExporterPort = c.port
+		if c.typ == TypeMySQL {
+			opts.DockerNetwork = "bridge"
+		}
+		art, err := RenderRemoteInstall(tpl, remoteInstanceFor(t, c.typ), opts)
+		if err != nil {
+			t.Fatalf("%s/%s 渲染失败：%v", c.typ, c.mode, err)
+		}
+		checked := 0
+		for _, line := range strings.Split(art.Playbook, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "ExecStart=") {
+				trimmed = strings.TrimPrefix(trimmed, "ExecStart=")
+				trimmed = strings.Replace(trimmed, "{{ exporter_docker_bin.stdout | trim }}", "docker", 1)
+			}
+			if !strings.Contains(trimmed, "docker run -d") && !strings.Contains(trimmed, " run -d --name") {
+				continue
+			}
+			checked++
+			verifyRunTokens(t, c.typ+"/"+c.mode, trimmed, valueFlags, allowed)
+		}
+		if checked == 0 {
+			t.Fatalf("%s/%s 没找到 docker run 行，测试失效", c.typ, c.mode)
+		}
+	}
+}
+
+// verifyRunTokens 校验 `docker run … 镜像 …` 中镜像之前的 token 全是已知 docker 选项/其取值。
+func verifyRunTokens(t *testing.T, label, line string, valueFlags, allowed map[string]bool) {
+	t.Helper()
+	tokens := splitRunTokens(line)
+	imageAt := -1
+	for i, tok := range tokens {
+		if strings.Contains(tok, "{{ exporter_image }}") || strings.Contains(tok, "quay.io/") || strings.Contains(tok, "prom/") || strings.Contains(tok, "oliver006/") {
+			imageAt = i
+			break
+		}
+	}
+	if imageAt < 0 {
+		t.Fatalf("%s 找不到镜像 token：%s", label, line)
+	}
+	for i := 2; i < imageAt; i++ {
+		tok := tokens[i]
+		if strings.HasPrefix(tok, "-") {
+			if !allowed[tok] {
+				t.Fatalf("%s 镜像前出现非 docker 选项 %q（Exporter 的参数必须排在镜像之后）：%s", label, tok, line)
+			}
+			continue
+		}
+		if i < 2 || !valueFlags[tokens[i-1]] {
+			t.Fatalf("%s 镜像前出现游离 token %q：%s", label, tok, line)
+		}
+	}
+}
+
+// splitRunTokens 按空格切分命令，但把 `{{ … }}` 当成一个整体（内部含空格）。
+func splitRunTokens(line string) []string {
+	var tokens []string
+	i := 0
+	for i < len(line) {
+		for i < len(line) && line[i] == ' ' {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		start := i
+		for i < len(line) && line[i] != ' ' {
+			if strings.HasPrefix(line[i:], "{{") {
+				end := strings.Index(line[i:], "}}")
+				if end < 0 {
+					i = len(line)
+					break
+				}
+				i += end + 2
+				continue
+			}
+			i++
+		}
+		tokens = append(tokens, line[start:i])
+	}
+	return tokens
+}
+
 // TestValidatePlaybookYAML 锁定运行时自校验（INC-005 的第二道防线）。
 //
 // 回归测试只能守住"当前模板"；渲染器还要在执行前自己解析一遍，

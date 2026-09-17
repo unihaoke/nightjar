@@ -5,6 +5,58 @@
 
 ---
 
+## INC-010 · `docker run` 参数顺序错误：Exporter 的开关被 docker 当成自己的选项
+
+**首次暴露**：2026-09-18，远程安装首次跑到"起容器"这一步（上一轮的失败摘要直接把原文摆了出来）：
+
+```
+TASK [重建并启动 Exporter 容器] ***
+fatal: [203.195.191.75]: FAILED! => {"rc": 125, "cmd": "docker run -d --name mwops-exporter-jd-redis
+  --restart unless-stopped --network host --web.listen-address=:6379 --env-file … oliver006/redis_exporter:v1.66.0",
+  "stderr": "unknown flag: --web.listen-address\n\nUsage: docker run [OPTIONS] IMAGE [COMMAND] [ARG...]"}
+```
+
+**定位过程**
+
+1. 摘要里 `cmd` 一栏把整条命令摆出来了，一眼可见 `--web.listen-address=:6379` **排在镜像之前**；
+2. `docker run` 的解析规则：镜像**之前**的参数是 docker 自己的选项，镜像**之后**的才是容器内进程的参数。
+   于是 docker 试图解析 `--web.listen-address` 这个它不认识的选项 → `unknown flag`、`rc=125`，
+   容器根本没创建；
+3. 模板里 `--web.listen-address` 由 `webListenArg` 单独拼接（"host 网络 + 宿主端口≠默认端口"
+   才需要），而模板参数（`in.Args`，如 `--mysqld.address=…`）本来就拼在镜像之后——
+   两者走了**两条不同的拼接路径**，只有前者放错了位置，所以此前从未暴露；
+4. 顺带发现"为什么会走到这条分支"：集成的 Exporter 端口被填成了 **6379（实例自己的端口）**，
+   `webListenArg` 才被触发。host 网络下 Exporter 监听宿主端口，与实例同端口**必然冲突**
+   （bind 失败或把实例遮住）——即使参数顺序修好，这个配置也起不来。
+
+**根因**
+
+1. 拼接命令时按"代码书写顺序"而非"docker 的语义位置"组织参数，缺少结构性约束；
+2. 端口字段允许填成与实例相同，平台既不校验也不提示——而这是一个必然失败的配置。
+
+**修复**
+
+1. `dockerRunLineWith` 只负责拼 docker 自己的选项（`-d/--name/--restart/--network/-p/-v/--pid=host/--env-file`），
+   镜像之后统一追加 `exporterArgs(in)`（`--web.listen-address` + 模板参数），
+   两类参数从此只有一个出口；
+2. 新增 `exporterPortConflictFix`：Exporter 端口与实例端口相同**且同机**（地址是回环，或地址主机就是目标机）
+   时，自动改用模板默认端口并**写回 meta**（保证渲染端口、`/healthz` 抓取目标、Prometheus SD 三处一致），
+   在部署说明里明确写出"已自动改用端口 X，原因是……"；实例在别的机器上则不干预（同端口本来无妨）。
+
+**防复发**
+
+1. `TestExporterFlagsComeAfterImage`：端口不一致时断言 `--env-file … <镜像> --web.listen-address=:7777`
+   这一顺序，并断言镜像之前不出现该参数；
+2. `TestDockerRunFlagsAreWhitelisted`：**结构性**守卫——把 `docker run` 行切成 token，
+   镜像之前的每个 token 必须是已知 docker 选项或其取值，否则失败；
+   同时覆盖 host/bridge/宿主模式与 systemd 单元里的 `ExecStart=`（tokenizer 会把 `{{ … }}` 当整体）；
+   已用"把参数挪回镜像前"注入验证两条守卫都会红；
+3. `TestExporterPortConflictFix` / `TestSameMachine`：表格化覆盖同机冲突、异机同端口、未配置、
+   模板端口恰好也冲突等分支；
+4. 渲染器升到 v5，平台代码修订号升到 r2；自检脚本按"每修订一个独有标记"逐个核对。
+
+---
+
 ## INC-009 · 平台把 ansible 输出"截头"呈现，恰好砍掉失败原因
 
 **首次暴露**：2026-09-18，远程安装跑到第 5 个任务时失败，界面上给出的却是：
@@ -490,3 +542,10 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
     （失败标记 + 所属任务 + 多行 msg），要么头尾都给；界面给摘要、日志留全文。
     另外每解决一个"跑的是不是新代码"的问题，都该问一次：**下次怎么在 1 条命令内确认**——
     `/healthz` 的 `playbook_renderer` / `code_revision` 就是这么来的。
+11. **拼命令行要按"消费者怎么解析"分区，而不是按代码顺序**：`docker run` 以镜像为界，
+    前后参数属于两个不同的解析器（docker 自己 vs 容器内进程），放错位置就是 `unknown flag`
+    （INC-010）。凡是拼接多段参数的命令（docker、ssh、systemd `ExecStart`），
+    都该把"每一段归谁"写成函数并用**结构性守卫**（token 白名单）锁住，而不是逐条断言字符串。
+12. **必然失败的配置要在执行前变成自愈或明确拒绝**：Exporter 端口填成实例端口，在 host 网络下
+    100% 起不来（INC-010）。平台既然知道实例端口与拓扑，就不该把这个错误留给目标机去报——
+    能安全自愈的自愈（并把原因写进部署说明），不能自愈的就在提交前拒绝。

@@ -333,7 +333,25 @@ docker logs mwops-backend 2>&1 | grep -A40 '集成：远程安装失败' | tail 
 若摘要里出现 `censored`，说明失败任务带 `no_log`（含口令，必须遮蔽），
 按 §6.4 到目标机上手工确认。
 
-### 6.7 怀疑产物本身有问题时
+### 6.7 `unknown flag: --web.listen-address`（或其它 Exporter 开关）
+
+```
+fatal: [203.195.191.75]: FAILED! => {"rc": 125,
+  "stderr": "unknown flag: --web.listen-address\n\nUsage: docker run [OPTIONS] IMAGE [COMMAND] [ARG...]"}
+```
+
+`docker run` 以**镜像为界**：镜像之前是 docker 自己的选项，镜像之后才是容器内进程的参数。
+Exporter 的开关（`--web.listen-address`、`--mysqld.address` 等）一旦排在镜像之前，
+docker 就会报 `unknown flag`，`rc=125`，容器根本没创建。
+
+- v5 渲染器起已把 Exporter 参数统一排到镜像之后，**这个报错只可能出现在 v5 之前的产物上**：
+  `curl -s /healthz` 看 `playbook_renderer`，重建后端并「重新应用」即可；
+- 同时注意触发它的原因：只有"宿主端口 ≠ 组件默认端口"才会加 `--web.listen-address`。
+  如果是因为把 **Exporter 端口填成了实例端口**（如 Redis 6379），host 网络下两者会抢同一个端口——
+  v5 起平台会**自动改用模板默认端口**并把原因写进部署说明；
+  建议仍按模板默认端口（Redis 9121 / MySQL 9104 / PG 9187 / node 9100）配置。
+
+### 6.8 怀疑产物本身有问题时
 
 平台内部的渲染后自校验用的是 Go 的 YAML 解析器，而 ansible 用的是 PyYAML（同族、不同实现），
 所以怀疑产物时可以**用下游的解析器复核**。仓库里带了工具，不需要连任何主机：

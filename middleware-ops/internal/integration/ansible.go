@@ -361,15 +361,27 @@ func dockerRunLineWith(bin string, in remotePlaybookInput) string {
 	line += hostModeDockerFlags(in)
 	if networkOrDefault(in.Network) != "host" {
 		line += " -p {{ exporter_port }}:" + strconv.Itoa(in.ContainerPort)
-	} else if listenArg := webListenArg(in); listenArg != "" {
-		// host 网络下没有端口映射，端口不一致时只能让 Exporter 自己改监听地址。
-		line += " " + listenArg
 	}
 	line += " --env-file {{ exporter_env_file }} {{ exporter_image }}"
-	for _, arg := range in.Args {
+	// ⚠️ 镜像**之后**的参数才是 Exporter 进程自己的参数。
+	// docker run 把镜像之前的未知参数当成自己的选项：曾经把 --web.listen-address 放在镜像前，
+	// 结果 `docker run` 直接 rc=125 "unknown flag: --web.listen-address"（真实故障 INC-010）。
+	for _, arg := range exporterArgs(in) {
 		line += " " + shellArg(arg)
 	}
 	return line
+}
+
+// exporterArgs 返回要传给 **Exporter 进程**的参数（必须排在镜像之后）。
+func exporterArgs(in remotePlaybookInput) []string {
+	args := make([]string, 0, len(in.Args)+1)
+	// host 网络下没有端口映射，端口不一致时只能让 Exporter 自己改监听地址。
+	if networkOrDefault(in.Network) == "host" {
+		if listen := webListenArg(in); listen != "" {
+			args = append(args, listen)
+		}
+	}
+	return append(args, in.Args...)
 }
 
 // hostModeDockerFlags 生成宿主模式组件在 docker 模式下必需的参数。

@@ -1797,6 +1797,7 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template, instance integration.Instance, params deployParams) error {
 	// 远程模式：不在本机起容器，改由 Ansible 安装到目标服务器——因此**不需要** docker.sock。
 	if meta, ok := IntegrationMetaOf(*item); ok && meta.DeployTarget == DeployTargetRemote {
+		portNote := s.fixRemoteExporterPortConflict(ctx, item, &meta, tpl, instance, params.creds.Host)
 		if err := s.deployRemote(ctx, item, tpl, instance, meta, params.creds, params.operator); err != nil {
 			s.setDeployNote(ctx, item.ID, "远程安装失败："+err.Error())
 			return err
@@ -1804,9 +1805,13 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 		s.writeMeta(ctx, item, func(m *IntegrationMeta) {
 			m.RemoteInstalledAt = time.Now().UTC().Format(time.RFC3339)
 		})
-		s.setDeployNote(ctx, item.ID, fmt.Sprintf("已在 %s 上安装 %s（监听 %d），Prometheus 抓取目标 %s",
+		done := fmt.Sprintf("已在 %s 上安装 %s（监听 %d），Prometheus 抓取目标 %s",
 			meta.TargetHost, tpl.Component, meta.ExporterHostPort,
-			integration.JoinHostPort(meta.TargetHost, meta.ExporterHostPort)))
+			integration.JoinHostPort(meta.TargetHost, meta.ExporterHostPort))
+		if portNote != "" {
+			done += "；" + portNote
+		}
+		s.setDeployNote(ctx, item.ID, done)
 		return nil
 	}
 	if s.docker == nil {
@@ -2053,6 +2058,65 @@ func (s *IntegrationService) targetHint(ctx context.Context, host string) string
 		limit = limit[:8]
 	}
 	return "（docker 里现有的容器：" + strings.Join(limit, "、") + "）"
+}
+
+// fixRemoteExporterPortConflict 在「Exporter 与实例同机且端口相同」时把 Exporter 端口改回模板默认值。
+//
+// 为什么必须处理（真实故障 INC-010）：host 网络下 Exporter 直接监听宿主端口，
+// 与实例端口相同必然 bind 失败（即使侥幸绑上也会把实例遮住）。改动同时**写回 meta**，
+// 否则渲染端口与 Prometheus 抓取目标会不一致——抓取会打到实例自己身上。
+//
+// 返回给使用者看的说明（空串表示无需改动）。
+func (s *IntegrationService) fixRemoteExporterPortConflict(
+	ctx context.Context, item *model.MiddlewareInstance, meta *IntegrationMeta,
+	tpl integration.Template, instance integration.Instance, targetHost string,
+) string {
+	port := meta.ExporterHostPort
+	if port <= 0 {
+		port = meta.ExporterPort
+	}
+	fixed := exporterPortConflictFix(port, instance.Address.Port, instance.Address.Host, targetHost, tpl.ExporterPort)
+	if fixed <= 0 {
+		return ""
+	}
+	meta.ExporterHostPort = fixed
+	s.writeMeta(ctx, item, func(m *IntegrationMeta) { m.ExporterHostPort = fixed })
+	s.log.Warn("集成：Exporter 端口与实例端口冲突，已自动改用模板默认端口",
+		zap.String("integration", item.Name), zap.Int("conflict_port", port), zap.Int("used_port", fixed))
+	return fmt.Sprintf("⚠️ Exporter 端口 %d 与实例端口相同且两者同机（host 网络下会被实例占用），已自动改用模板默认端口 %d；"+
+		"如需固定端口，请在集成表单里把「Exporter 端口」改成空闲端口（如 %d）", port, fixed, fixed)
+}
+
+// exporterPortConflictFix 判断是否需要纠正端口，需要时返回应改用的端口（0 表示不动）。
+//
+// 只有"同一个网络命名空间"才会冲突：地址是回环地址，或地址主机就是目标机本身。
+// 实例在别的机器上时，同端口毫无问题（各自监听自己的机器）。
+func exporterPortConflictFix(port, instancePort int, addrHost, targetHost string, tplPort int) int {
+	if port <= 0 || instancePort <= 0 || port != instancePort {
+		return 0
+	}
+	if tplPort <= 0 || tplPort == port {
+		return 0
+	}
+	if !sameMachine(addrHost, targetHost) {
+		return 0
+	}
+	return tplPort
+}
+
+// sameMachine 判断实例地址与 Exporter 目标机是否同一台机器。
+func sameMachine(addrHost, targetHost string) bool {
+	addrHost = strings.ToLower(strings.TrimSpace(addrHost))
+	targetHost = strings.ToLower(strings.TrimSpace(targetHost))
+	if addrHost == "" {
+		return false
+	}
+	// 回环地址永远指向"跑 Exporter 的那台机器"。
+	switch addrHost {
+	case "127.0.0.1", "localhost", "::1", "[::1]":
+		return true
+	}
+	return addrHost == targetHost
 }
 
 // scrapeTarget 返回 Prometheus 应当抓取的目标。

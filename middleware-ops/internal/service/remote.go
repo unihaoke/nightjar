@@ -317,7 +317,8 @@ func ansibleFailureExcerpt(output string, limit int) string {
 // 历史：
 //
 //	r1：远程安装失败摘要（不再只截前 600 字符，改为摘出失败任务与原因）+ 完整输出进平台日志。
-const CodeRevision = "r1"
+//	r2：Exporter 端口与实例端口同机冲突时自动改用模板默认端口（INC-010）。
+const CodeRevision = "r2"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

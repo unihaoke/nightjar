@@ -17,13 +17,13 @@ INTEGRATION="${2:-jd-redis}"
 BIN="/usr/local/bin/middleware-ops"
 ARTIFACT="/app/data/integrations/ansible/${INTEGRATION}.yml"
 # 与 Go 侧 integration.PlaybookRendererVersion 对应；版本升级时同步改这里。
-EXPECTED_RENDERER="mwops-playbook v4"
+EXPECTED_RENDERER="mwops-playbook v5"
 # 与 Go 侧 service.CodeRevision 对应：平台自身行为（错误呈现/诊断）的修订号。
-EXPECTED_REVISION="r1"
+EXPECTED_REVISION="r2"
 # 该变量名是 v3 才引入的：二进制里搜到它，说明镜像至少是 v3。
 RENDERER_MARKER="exporter_docker_bin"
-# 该函数名是 r1 才引入的（失败摘要）：二进制里搜到它，说明代码里有这份诊断修复。
-REVISION_MARKER="ansibleFailureExcerpt"
+# 各修订号的"独有标记"：用来判断镜像里到底有没有这一版修复（只增不改写）。
+REVISION_MARKERS="r1:ansibleFailureExcerpt r2:exporterPortConflictFix"
 
 pass=0
 fail=0
@@ -55,12 +55,17 @@ if [ "${marker:-0}" -gt 0 ] 2>/dev/null; then
 else
   no "二进制里没有 $RENDERER_MARKER → **镜像至少落后一个版本，请重建**"
 fi
-rev_marker=$(docker exec "$CONTAINER" grep -c "$REVISION_MARKER" "$BIN" 2>/dev/null | tr -d '[:space:]')
-if [ "${rev_marker:-0}" -gt 0 ] 2>/dev/null; then
-  ok "二进制含 $EXPECTED_REVISION 标记（$REVISION_MARKER）"
-else
-  no "二进制里没有 $REVISION_MARKER → 平台缺少 $EXPECTED_REVISION 的失败摘要修复（界面只会显示被截断的输出），请重建"
-fi
+# 逐个修订号检查"独有标记"：缺哪个就说明镜像落后于该修订。
+for pair in $REVISION_MARKERS; do
+  rev="${pair%%:*}"
+  mk="${pair##*:}"
+  count=$(docker exec "$CONTAINER" grep -c "$mk" "$BIN" 2>/dev/null | tr -d '[:space:]')
+  if [ "${count:-0}" -gt 0 ] 2>/dev/null; then
+    ok "含 $rev 的标记（$mk）"
+  else
+    no "缺少 $rev（$mk）→ 镜像落后于该修订，请重建"
+  fi
+done
 
 echo
 echo "== 3. 启动日志里的渲染器版本 =="
