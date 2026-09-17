@@ -295,6 +295,27 @@ export interface IntegrationAccount {
   last_error: string
 }
 
+/** 集成中心：重试建号/连接的结果。 */
+export interface AccountRetryResult {
+  /** 本次是否真的执行了建号 SQL。 */
+  created: boolean
+  /** 用监控账号是否连上了被管实例。 */
+  connected: boolean
+  /** 总体是否就绪。 */
+  ok: boolean
+  /** 可读结论（含失败原因与下一步）。 */
+  message: string
+  output: string
+  view: IntegrationView
+}
+
+/** 集成中心：单次连接测试结果。 */
+export interface AccountProbeResult {
+  ok: boolean
+  message: string
+  output: string
+}
+
 /** 集成中心：生成的采集配置。 */
 export interface IntegrationArtifacts {
   job_name: string

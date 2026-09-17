@@ -96,6 +96,11 @@ const total = computed(() => items.value.length)
 const accountsVisible = ref(false)
 const accountsLoading = ref(false)
 const accounts = ref<IntegrationAccount[]>([])
+/** 正在重试/探测的集成 ID（用于按钮 loading）。 */
+const retryingId = ref<number | null>(null)
+const probingId = ref<number | null>(null)
+/** 最近一次重试/探测的结论（就地展示失败原因，而不是只弹一条 toast）。 */
+const accountResult = ref<{ ok: boolean; title: string; detail: string } | null>(null)
 
 /** 载入账号清单。 */
 async function loadAccounts(): Promise<void> {
@@ -113,7 +118,83 @@ async function loadAccounts(): Promise<void> {
 /** 打开账号管理弹窗。 */
 function openAccounts(): void {
   accountsVisible.value = true
+  accountResult.value = null
   void loadAccounts()
+}
+
+/** 测试连接：只探测，不改配置。 */
+async function handleProbeAccount(row: IntegrationAccount): Promise<void> {
+  probingId.value = row.integration_id
+  accountResult.value = null
+  try {
+    const result = await integrationApi.probeAccount(row.integration_id)
+    accountResult.value = {
+      ok: result.ok,
+      title: result.ok ? `${row.name}：连接正常` : `${row.name}：连接失败`,
+      detail: result.ok ? result.output || result.message : result.message,
+    }
+  } catch (error) {
+    toastError(error)
+  } finally {
+    probingId.value = null
+  }
+}
+
+/**
+ * 重试建号/连接：失败后不必重填整个表单。
+ *
+ * 带管理凭据 → 平台幂等重跑建号 SQL（不存在则建、存在则重置口令并授权）；
+ * 不带 → 只测试连接并重建 Exporter。
+ */
+async function handleRetryAccount(row: IntegrationAccount): Promise<void> {
+  const retryWithCreds = await ElMessageBox.confirm(
+    `重试 ${row.name} 的监控账号 ${row.username}。\n\n` +
+      `选「由平台重建」会幂等重跑建号 SQL（需要一次管理员凭据，口令不落库）；\n` +
+      `选「只测连接」则只测试现有账号并重建 Exporter。`,
+    '重试建号 / 连接',
+    { confirmButtonText: '由平台重建', cancelButtonText: '只测连接', distinguishCancelAndClose: true },
+  ).then(() => true).catch((action) => (action === 'cancel' ? false : null))
+  if (retryWithCreds === null) {
+    return
+  }
+
+  let adminUser = ''
+  let adminPassword = ''
+  if (retryWithCreds) {
+    const user = await ElMessageBox.prompt('管理员账号（仅本次使用）：', '重试建号', {
+      inputPlaceholder: '如 root', inputValue: 'root', confirmButtonText: '下一步', cancelButtonText: '取消',
+    }).catch(() => ({ value: '' }))
+    if (!user.value) {
+      return
+    }
+    const pass = await ElMessageBox.prompt('管理员口令（仅本次使用，不落库、不写审计）：', '重试建号', {
+      inputType: 'password', confirmButtonText: '开始重试', cancelButtonText: '取消',
+    }).catch(() => ({ value: '' }))
+    if (!pass.value) {
+      return
+    }
+    adminUser = user.value
+    adminPassword = pass.value
+  }
+
+  retryingId.value = row.integration_id
+  accountResult.value = null
+  try {
+    const result = await integrationApi.retryAccount(row.integration_id, {
+      admin_username: adminUser,
+      admin_password: adminPassword,
+    })
+    accountResult.value = {
+      ok: result.ok,
+      title: result.ok ? `${row.name}：账号已就绪` : `${row.name}：仍未就绪`,
+      detail: result.message,
+    }
+    await Promise.all([loadAccounts(), load()])
+  } catch (error) {
+    toastError(error)
+  } finally {
+    retryingId.value = null
+  }
 }
 
 /** 轮换口令：账号改自己的口令，不需要管理员凭据。 */
@@ -572,9 +653,10 @@ onMounted(load)
           </el-table-column>
         </el-table>
       </div>
-      <p v-if="items.some((item) => item.last_error)" class="muted note">
-        待处理项：{{ items.find((item) => item.last_error)?.last_error }}
-      </p>
+      <div v-if="items.some((item) => item.last_error)" class="pending-row">
+        <span class="muted">待处理项：{{ items.find((item) => item.last_error)?.last_error }}</span>
+        <el-button text size="small" type="primary" @click="openAccounts">去重试 / 测试连接</el-button>
+      </div>
       <p v-if="items.some((item) => item.deploy_note)" class="muted note">
         平台自动完成：{{ items.find((item) => item.deploy_note)?.deploy_note }}
       </p>
@@ -783,31 +865,61 @@ onMounted(load)
         :closable="false"
         show-icon
         class="mb"
-        title="这些只读账号由平台创建并托管（口令加密存储）。轮换口令不需要管理员凭据——账号可以修改自己的口令；删除账号是破坏性操作，需要填写管理员凭据（生产环境会转成审批工单）。"
+        title="这些只读账号由平台创建并托管（口令加密存储）。建号/连接失败时可直接在这里重试；轮换口令不需要管理员凭据；删除账号是破坏性操作，需要管理员凭据（生产环境会转成审批工单）。"
       />
+      <el-alert
+        v-if="accountResult"
+        :type="accountResult.ok ? 'success' : 'error'"
+        :closable="true"
+        show-icon
+        class="mb"
+        :title="accountResult.title"
+        @close="accountResult = null"
+      >
+        <p class="field-hint" style="white-space: pre-wrap">{{ accountResult.detail }}</p>
+      </el-alert>
       <el-table v-loading="accountsLoading" :data="accounts" size="small">
-        <el-table-column prop="name" label="集成" min-width="130" show-overflow-tooltip />
-        <el-table-column label="组件" width="100">
+        <el-table-column prop="name" label="集成" min-width="120" show-overflow-tooltip />
+        <el-table-column label="组件" width="95">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.component || row.mw_type }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="username" label="监控账号" width="140" />
-        <el-table-column label="来源" width="110">
+        <el-table-column prop="username" label="监控账号" width="130" />
+        <el-table-column label="来源" width="105">
           <template #default="{ row }">
             <el-tag v-if="row.managed" size="small" type="success" effect="light">平台创建</el-tag>
             <el-tag v-else-if="row.supports_management" size="small" effect="plain">外部账号</el-tag>
             <span v-else class="muted">不需要</span>
           </template>
         </el-table-column>
-        <el-table-column prop="grants" label="权限" width="200" show-overflow-tooltip />
-        <el-table-column label="最近轮换" width="150">
+        <el-table-column label="状态" width="120">
+          <template #default="{ row }">
+            <el-tag v-if="row.last_error" size="small" type="danger" effect="light">待处理</el-tag>
+            <el-tag v-else size="small" type="success" effect="light">正常</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="最近轮换" width="140">
           <template #default="{ row }">
             <span class="muted">{{ row.rotated_at ? formatTime(row.rotated_at) : '-' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="250" fixed="right">
           <template #default="{ row }">
+            <el-button
+              text
+              size="small"
+              :loading="retryingId === row.integration_id"
+              :disabled="!row.supports_management || !dockerReady"
+              @click="handleRetryAccount(row)"
+            >重试建号</el-button>
+            <el-button
+              text
+              size="small"
+              :loading="probingId === row.integration_id"
+              :disabled="!row.supports_management || !dockerReady"
+              @click="handleProbeAccount(row)"
+            >测试连接</el-button>
             <el-button
               text
               size="small"
@@ -820,13 +932,17 @@ onMounted(load)
               type="danger"
               :disabled="!row.supports_management || !dockerReady"
               @click="handleDropAccount(row)"
-            >删除账号</el-button>
+            >删除</el-button>
           </template>
         </el-table-column>
       </el-table>
+      <p v-if="accounts.some((row) => row.last_error)" class="muted note">
+        失败原因：{{ accounts.find((row) => row.last_error)?.last_error }}
+        —— 修好外部原因（凭据/网络/权限）后点「重试建号」即可，不需要重填整个集成表单。
+      </p>
       <p v-if="!dockerReady" class="muted note">
         当前「一键部署」不可用（未挂载 docker.sock 或 integration.docker_enabled=false），
-        无法由平台执行建号/轮换/删除；请在平台 .env 打开后重建 backend 容器。
+        无法由平台执行建号/重试/轮换/删除；请在平台 .env 打开后重建 backend 容器。
       </p>
     </el-dialog>
     <!-- 日志接入：从被管容器的 docker 配置反查日志位置（读不到不允许配置） -->
@@ -968,6 +1084,16 @@ onMounted(load)
 
 .note {
   margin: 8px 0 0;
+  font-size: 11.5px;
+}
+
+/* 待处理提示 + 直达重试入口 */
+.pending-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
   font-size: 11.5px;
 }
 

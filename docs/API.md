@@ -81,6 +81,8 @@
 | POST | `/api/integrations` | `middleware:write` | L1 | 新建集成：纳管实例 + 服务发现更新 + 可选拉起容器 + 可选推荐告警规则；**需要账号的组件默认由平台代建只读账号**（传 `bootstrap_account=false` 可关闭） |
 | GET | `/api/integrations/accounts` | `middleware:read` | L0 | 监控账号清单：账号名、是否平台创建、权限摘要、最近轮换时间、能否自助轮换 |
 | POST | `/api/integrations/:id/account/rotate` | `middleware:write` | L1 | **轮换监控账号口令**：用账号自己的旧口令执行 `ALTER USER USER()` / `ALTER ROLE CURRENT_USER`（不需要管理员凭据），随后重建 Exporter |
+| POST | `/api/integrations/:id/account/retry` | `middleware:write` | L1 | **失败重试**：带 `admin_username`/`admin_password` 则幂等重跑建号 SQL（不存在则建、存在则重置口令并授权），不带则只测连接；随后重建 Exporter 并核验。返回 `created`/`connected`/`ok`/`message` |
+| POST | `/api/integrations/:id/account/probe` | `middleware:read` | L0 | 只做连接测试：用监控账号执行 `SELECT 1`（+ MySQL 的 `SHOW GRANTS`），不改任何配置 |
 | POST | `/api/integrations/:id/account/drop` | `middleware:write` | L2 | **删除监控账号**：需 `admin_username` / `admin_password`（不落库）；生产环境只创建审批工单 |
 | PUT | `/api/integrations/:id` | `middleware:write` | L1 | 更新集成（改名会同步 instance_name 标签） |
 | POST | `/api/integrations/:id/apply` | `middleware:write` | L1 | 重新应用：重写产物 + 重建 Exporter 容器 |

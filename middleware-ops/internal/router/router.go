@@ -107,6 +107,9 @@ func New(opt Options) *gin.Engine {
 		integrations.PUT("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.UpdateIntegration)
 		integrations.POST("/:id/apply", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.ApplyIntegration)
 		integrations.POST("/:id/account/rotate", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.RotateIntegrationAccount)
+		// 失败重试：带管理凭据=幂等重建账号；不带=只测连接 + 重建 Exporter
+		integrations.POST("/:id/account/retry", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.RetryIntegrationAccount)
+		integrations.POST("/:id/account/probe", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.ProbeIntegrationAccount)
 		integrations.POST("/:id/account/drop", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.DropIntegrationAccount)
 		integrations.DELETE("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.DeleteIntegration)
 	}

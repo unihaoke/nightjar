@@ -82,6 +82,37 @@ func TestRandomHexPasswordHasNoEscapeRisk(t *testing.T) {
 	}
 }
 
+// TestProbeSQLIsReadOnly 锁定连接测试语句只读（重试流程会让它反复执行）。
+func TestProbeSQLIsReadOnly(t *testing.T) {
+	for _, mwType := range []string{integration.TypeMySQL, integration.TypePG, integration.TypeRedis} {
+		joined := strings.ToUpper(strings.Join(probeAccountSQL(mwType), ";"))
+		for _, forbidden := range []string{"DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "GRANT ", "CREATE "} {
+			if strings.Contains(joined, forbidden) {
+				t.Fatalf("%s 的连接测试语句必须是只读的，出现 %q：%s", mwType, forbidden, joined)
+			}
+		}
+	}
+	if !strings.Contains(strings.Join(probeAccountSQL(integration.TypeMySQL), ";"), "SHOW GRANTS") {
+		t.Fatal("MySQL 连接测试应顺带回显权限，便于确认最小权限是否生效")
+	}
+}
+
+// TestAccountOpsRequireDocker 锁定：没有 docker 通道时，建号/重试/探测等操作必须**明确拒绝**，
+// 而不是静默成功（否则使用者会以为账号已经建好了）。
+func TestAccountOpsRequireDocker(t *testing.T) {
+	svc := &IntegrationService{}
+	err := svc.requireDocker("重试建号")
+	if err == nil {
+		t.Fatal("未启用 docker 时必须报错")
+	}
+	// 报错要能让使用者直接照做：点明 docker.sock 与开关。
+	for _, want := range []string{"docker.sock", "INTEGRATION_DOCKER_ENABLED", "重试建号"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误信息应包含 %q，实际：%v", want, err)
+		}
+	}
+}
+
 // TestBootstrapDefaultsByComponent 锁定「自动建号」的默认策略。
 //
 // 产品口径（用户明确要求）：**需要账号的组件默认由平台代建**，

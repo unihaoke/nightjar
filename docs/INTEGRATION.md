@@ -227,8 +227,21 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 | 能力 | 实现 | 是否需要管理员凭据 |
 |---|---|---|
 | 查看账号现状 | `GET /api/integrations/accounts`：账号名、来源（平台创建/外部账号）、权限摘要、最近轮换时间、集成当前错误 | 否 |
+| **失败重试** | `POST /api/integrations/:id/account/retry`：带凭据 → 幂等重跑建号 SQL；不带 → 只测连接；两种情况都会重建 Exporter 并核验。返回 `created` / `connected` / `message`，前端就地显示"还差什么" | 可选 |
+| 连接测试 | `POST /api/integrations/:id/account/probe`：用监控账号执行 `SELECT 1`（MySQL 另附 `SHOW GRANTS`），只读、不改配置 | 否 |
 | 轮换口令 | `POST /api/integrations/:id/account/rotate`：账号**改自己的**口令（MySQL `ALTER USER USER()` / PG `ALTER ROLE CURRENT_USER`），随后自动重建 Exporter | **不需要**（平台持有该账号口令） |
 | 删除账号 | `POST /api/integrations/:id/account/drop`：`DROP USER IF EXISTS` / `DROP ROLE IF EXISTS` | 需要；prod 转审批工单 |
+
+**失败可重试的设计要点**（为什么不需要重填整个集成表单）：
+
+- 建号语句天然幂等：`CREATE USER IF NOT EXISTS` + `ALTER USER`（口令重置）+ 补 `GRANT`，
+  因此"重试"永远是安全操作，不会产生半成品状态；
+- 重试用的是**库里已存的那个口令**（加密存储），所以重建出的账号口令与 Exporter 注入的口令
+  天然一致，不会出现"账号建好了但 Exporter 还在用旧口令"；
+- 集成列表里的「待处理」提示旁直接给「去重试 / 测试连接」入口，
+  打开后即可看到每条集成的账号来源、状态与失败原因；
+- 「重新应用」只重建 Exporter（没有管理凭据、建不了号），因此当账号尚未由平台创建时，
+  它会把备注写成"到「监控账号」点「重试建号」"，避免使用者反复点重新应用。
 
 > 轮换为什么不需要管理员凭据：SQL 标准与两个数据库都允许账号修改自己的口令，
 > 因此"平台托管的账号"可以自助轮换，避免了每次轮换都要向用户再要一次 root 口令。
@@ -242,10 +255,32 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
   统一替换为 `${MONITOR_PASSWORD}` 占位；一键部署时才解密并按容器环境变量注入。
 - **参数白名单**：只允许模板声明的 Exporter 参数，拒绝透传任意 env/flag；
   镜像与端口来自内置模板，不接受用户自定义。
-- **审计**：`integration_create` / `integration_update` / `integration_apply` / `integration_delete`
-  四条动作全部落审计（含地址、标签、是否部署，不含口令）。
+- **审计**：`integration_create` / `integration_update` / `integration_apply` / `integration_delete` /
+  `integration_account_rotate` / `integration_account_retry` / `integration_account_drop`
+  全部落审计（含地址、标签、是否部署、账号名，**不含口令**）。
 - **操作级别**：L1（低危，直接执行并留痕）。生产环境若要更严的管控，
   可把 `deploy` 关掉，只允许平台渲染配置、由人工执行。
+
+### 7.1 docker.sock：权限与收敛（部署必读）
+
+平台容器以**非 root 用户**（镜像里的 `mwops`）运行，而宿主 socket 通常是 `root:docker 0660`，
+因此只把 socket 挂进容器还不够，会报：
+
+```
+dial unix /var/run/docker.sock: connect: permission denied
+```
+
+三种处理方式，按推荐度：
+
+| 方式 | 做法 | 代价 |
+|---|---|---|
+| **① 附加 docker 组 GID（默认）** | `stat -c '%g' /var/run/docker.sock` 取 GID → 平台 `.env` 写 `DOCKER_GID=<GID>`（`docker-compose.yml` 已配 `group_add`）→ `up -d --force-recreate backend` | 保持非 root；GID 随宿主不同需正确填写（`scripts/setup-jd-link.sh` 会自动探测写入） |
+| ② 容器内以 root 运行 | 给 backend 加 `user: "0:0"` | 容器内进程获得 root；鉴于 socket 本身已等价宿主机 root，属"放弃纵深防御" |
+| ③ docker-socket-proxy | 用 `tecnativa/docker-socket-proxy`，只放行 `containers`/`networks`/`volumes` 的 GET/POST 与 `exec`，平台连代理而非真实 socket | 多一个容器；最符合最小权限，生产强烈建议 |
+
+> 平台在**启动时**就会探活 socket（`/_ping`）：一旦权限不对，集成中心页面顶部的
+> `docker_note` 会直接显示上面这份修复步骤，`docker_ok` 为 false 时相关按钮会禁用，
+> 不会等到你点保存才报一句 permission denied。
 
 ---
 

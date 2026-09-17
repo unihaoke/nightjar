@@ -48,6 +48,9 @@ type IntegrationService struct {
 	log        *zap.Logger
 	docker     *docker.Client
 	dockerNote string
+	// dockerOK 为启动期探活结果：socket 挂上了但没权限时，这里为 false，
+	// 前端据此禁用按钮并展示 dockerNote 里的修复步骤。
+	dockerOK bool
 	// selfImageName 缓存平台自身镜像名（采集容器复用它）。
 	selfImageName string
 }
@@ -82,11 +85,46 @@ func NewIntegrationService(
 			log.Warn("集成中心：Docker 客户端初始化失败，一键部署不可用", zap.Error(err))
 		} else {
 			svc.docker = client
+			// 启动时真探一次：socket 挂上了但"没权限"是最常见的形态
+			// （平台以非 root 用户运行，宿主 socket 是 root:docker 0660）。
+			// 这里把结论直接写进 docker_note —— 集成中心页面顶部会显示它，
+			// 不至于等使用者点保存才看到一句 permission denied。
+			pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			pingErr := client.Ping(pingCtx)
+			cancel()
+			if pingErr == nil {
+				svc.dockerOK = true
+			} else {
+				svc.dockerNote = describeDockerChannel(pingErr)
+				log.Warn("集成中心：Docker 通道不可用，一键集成将不可用",
+					zap.String("host", cfg.Integration.DockerHost), zap.Error(pingErr))
+			}
 		}
 	} else {
 		svc.dockerNote = "未启用一键部署（integration.docker_enabled=false）：平台只渲染配置，容器需人工启动"
 	}
 	return svc
+}
+
+// describeDockerChannel 把"启动期探活失败"翻译成可直接照做的修复步骤。
+func describeDockerChannel(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "permission denied"):
+		return "Docker 通道不可用：平台能读到 /var/run/docker.sock，但容器内用户没有权限。" +
+			"修复：取宿主 docker 组的 GID（`stat -c '%g' /var/run/docker.sock` 或 `getent group docker | cut -d: -f3`），" +
+			"在平台 .env 里设 DOCKER_GID=<该 GID>，然后 `docker compose up -d --force-recreate backend`。" +
+			"（更严格的做法是用 docker-socket-proxy 只放行必要接口，见 docs/INTEGRATION.md 的安全边界）"
+	case strings.Contains(msg, "no such file"):
+		return "Docker 通道不可用：平台容器内没有 /var/run/docker.sock。" +
+			"修复：确认 docker-compose.yml 里 backend 挂载了该 socket，然后 `docker compose up -d --force-recreate backend`；" +
+			"rootless Docker 请把 INTEGRATION_DOCKER_HOST 指向 /run/user/<uid>/docker.sock 并挂载同一路径"
+	case strings.Contains(msg, "connection refused"):
+		return "Docker 通道不可用：socket 路径不对或 daemon 未运行（connection refused）。" +
+			"核对 INTEGRATION_DOCKER_HOST 与宿主上实际路径"
+	default:
+		return "Docker 通道不可用：" + msg
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +250,7 @@ func (s *IntegrationService) Overview(ctx context.Context) (*IntegrationOverview
 	return &IntegrationOverview{
 		Total: len(items), ByType: byType, Templates: views,
 		FileSDPath: s.fileSDPath(),
-		DockerNote: s.dockerNote, DockerOK: s.docker != nil,
+		DockerNote: s.dockerNote, DockerOK: s.dockerOK,
 	}, nil
 }
 
@@ -471,6 +509,12 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 	}
 	syncErr := s.SyncFileSD(ctx)
 	deployErr := s.deploy(ctx, item, tpl, instance)
+	// 「重新应用」没有管理凭据，建不了号；这里把"还差什么"直接写进备注，
+	// 让使用者知道该去「监控账号」点「重试建号」，而不是反复点重新应用。
+	if !meta.AccountManaged && tpl.MonitorUser != "" {
+		s.setDeployNote(ctx, item.ID,
+			"该实例的只读监控账号尚未由平台创建：到「监控账号」点「重试建号」并填一次管理员凭据即可")
+	}
 	s.record(ctx, operator, item.ID, "integration_apply", map[string]any{"name": item.Name})
 	if err := firstErr(syncErr, deployErr); err != nil {
 		s.markError(ctx, item.ID, err.Error())
@@ -987,6 +1031,233 @@ func (s *IntegrationService) DropAccount(
 	return &view, nil
 }
 
+// requireDocker 是集成中心里所有"需要 Docker 通道"的操作的统一前置校验。
+//
+// 抽出来是为了让"平台没有 docker 权限"这件事始终给出一致的、可执行的提示，
+// 并且可以被单元测试直接锁定（否则每条路径都要靠真实容器才能验证）。
+func (s *IntegrationService) requireDocker(action string) error {
+	if s.docker == nil {
+		if s.dockerNote != "" {
+			return apperr.Newf(apperr.CodeForbidden, "%s 不可用：%s", action, s.dockerNote)
+		}
+		return apperr.Newf(apperr.CodeForbidden,
+			"%s 需要平台能访问 Docker：请确认 docker-compose.yml 里 backend 挂载了 "+
+				"/var/run/docker.sock 且 INTEGRATION_DOCKER_ENABLED=true，"+
+				"然后 docker compose up -d --force-recreate backend（或重跑 scripts/setup-jd-link.sh）", action)
+	}
+	// 启动期探活已经明确失败时，直接把那份"怎么修"的结论回传，
+	// 而不是让使用者再撞一次 permission denied。
+	if !s.dockerOK && s.dockerNote != "" {
+		return apperr.Newf(apperr.CodeForbidden, "%s 不可用：%s", action, s.dockerNote)
+	}
+	return nil
+}
+
+// RetryAccountInput 是「重试建号/连接」的入参。
+//
+// 管理凭据是**可选**的：
+//   - 带了凭据 → 幂等重跑建号 SQL（账号不存在就建、存在就重置口令并授权）+ 测试连接；
+//   - 没带凭据 → 只测试已有监控账号能否连上，并重建 Exporter（用于"账号其实已经建好、
+//     只是 Exporter 用了旧口令"这类场景）。
+type RetryAccountInput struct {
+	AdminUsername string `json:"admin_username"`
+	AdminPassword string `json:"admin_password"`
+}
+
+// AccountRetryResult 是重试结果：既要能显示"做了什么"，也要能显示"还差什么"。
+type AccountRetryResult struct {
+	// Created 表示本次真的执行了建号 SQL。
+	Created bool `json:"created"`
+	// Connected 表示用监控账号成功连上了被管实例。
+	Connected bool `json:"connected"`
+	// OK 为总体是否就绪（账号可用）。
+	OK bool `json:"ok"`
+	// Message 为可读结论（成功说明或失败原因，已翻译成可执行的下一步）。
+	Message string `json:"message"`
+	// Output 为客户端容器输出的摘要（不含口令）。
+	Output string `json:"output"`
+	// View 为更新后的集成视图（前端直接刷新即可）。
+	View *IntegrationView `json:"view"`
+}
+
+// RetryAccount 重试「建号 + 连接」：失败后不必重新编辑整个表单，在页面上点一下就能再来一次。
+//
+// 步骤：
+//  1. （带凭据时）幂等重跑内置建号 SQL —— 账号不存在则创建，存在则重置口令并补齐授权；
+//  2. 用监控账号做一次真实连接测试（SELECT 1），拿到"能连/不能连 + 为什么"；
+//  3. 重建 Exporter（让它用当前口令抓取）并触发核验。
+func (s *IntegrationService) RetryAccount(
+	ctx context.Context, id int64, in RetryAccountInput, operator Operator,
+) (*AccountRetryResult, error) {
+	item, err := s.integrationInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	meta, ok := IntegrationMetaOf(*item)
+	if !ok {
+		return nil, apperr.New(apperr.CodeInvalidParam, "该实例不是通过集成中心创建的")
+	}
+	tpl, ok := integration.TemplateOf(meta.Template)
+	if !ok || tpl.MonitorUser == "" {
+		return nil, apperr.Newf(apperr.CodeInvalidParam,
+			"%s 不需要平台托管账号（口令由目标自身鉴权配置决定）", item.MWType)
+	}
+	if s.docker == nil {
+		return nil, apperr.New(apperr.CodeForbidden,
+			"重试建号需要平台能访问 Docker（integration.docker_enabled=true 且挂载 docker.sock）")
+	}
+	password, err := s.decrypt(item.PasswordEncrypted)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, err)
+	}
+	address, err := integration.ParseAddress(meta.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+	if err != nil {
+		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+	instance := integration.Instance{
+		Name: item.Name, MWType: tpl.Type, Address: address,
+		Username: item.Username, Password: password,
+		Labels: meta.Labels, Options: meta.Options,
+		Environment: item.Environment, GroupName: item.GroupName,
+	}
+
+	result := &AccountRetryResult{}
+	if err := s.requireDocker("重试建号"); err != nil {
+		return nil, err
+	}
+	// 1) 建号（幂等）：口令沿用库内已存的那一个，保证与 Exporter 注入的一致。
+	if hasAdminCreds(IntegrationInput{AdminUsername: in.AdminUsername, AdminPassword: in.AdminPassword}) {
+		note, bootErr, performed := s.bootstrapAccount(ctx, item, tpl, instance, IntegrationInput{
+			AdminUsername: in.AdminUsername, AdminPassword: in.AdminPassword,
+		}, operator)
+		result.Created = performed
+		if bootErr != nil {
+			result.Message = "建号失败：" + bootErr.Error()
+			s.setDeployNote(ctx, item.ID, result.Message)
+			s.markError(ctx, item.ID, result.Message)
+			result.View = s.viewOf(ctx, *item)
+			s.record(ctx, operator, id, "integration_account_retry", map[string]any{
+				"name": item.Name, "created": performed, "connected": false, "ok": false,
+			})
+			return result, nil
+		}
+		if note != "" {
+			result.Message = note
+		}
+	} else if !meta.AccountManaged {
+		result.Message = "未提供管理凭据，且该账号不是平台创建的：只会测试连接与重建 Exporter。" +
+			"要由平台建号，请填写一次管理员凭据后重试。"
+	}
+
+	// 2) 连接测试：拿真实结果，而不是让使用者去猜。
+	probe, probeErr := s.runClientSQL(ctx, instance, tpl, item.Username, password, probeAccountSQL(tpl.Type))
+	if probeErr == nil {
+		result.Connected = true
+		result.Output = truncateText(probe, 200)
+	} else {
+		result.Connected = false
+		if result.Message != "" {
+			result.Message += "；"
+		}
+		result.Message += "连接测试未通过：" + probeErr.Error()
+	}
+
+	// 3) 重建 Exporter + 核验（即使连接没通过也重建：这样拿到的是最新配置）。
+	if deployErr := s.deploy(ctx, item, tpl, instance); deployErr != nil {
+		if result.Message != "" {
+			result.Message += "；"
+		}
+		result.Message += "重建 Exporter 失败：" + deployErr.Error()
+	}
+	result.OK = result.Connected
+	if result.OK {
+		if result.Message == "" {
+			result.Message = "监控账号可用，Exporter 已按当前口令重建"
+		} else if !result.Created {
+			result.Message += "；连接测试通过，Exporter 已重建"
+		}
+		s.markApplied(ctx, item.ID)
+	} else {
+		s.markError(ctx, item.ID, result.Message)
+	}
+	s.setDeployNote(ctx, item.ID, result.Message)
+	s.record(ctx, operator, id, "integration_account_retry", map[string]any{
+		"name": item.Name, "created": result.Created, "connected": result.Connected, "ok": result.OK,
+	})
+	if result.OK {
+		s.scheduleVerify(item.ID, item.Name, s.jobName())
+	}
+	result.View = s.viewOf(ctx, *item)
+	return result, nil
+}
+
+// AccountProbeResult 是单独的"测试连接"结果。
+type AccountProbeResult struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+	Output  string `json:"output"`
+}
+
+// ProbeAccount 只做连接测试（不建号、不改配置），供"账号到底能不能连"这个疑问。
+func (s *IntegrationService) ProbeAccount(ctx context.Context, id int64) (*AccountProbeResult, error) {
+	item, err := s.integrationInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	meta, ok := IntegrationMetaOf(*item)
+	if !ok {
+		return nil, apperr.New(apperr.CodeInvalidParam, "该实例不是通过集成中心创建的")
+	}
+	tpl, ok := integration.TemplateOf(meta.Template)
+	if !ok || tpl.MonitorUser == "" {
+		return nil, apperr.Newf(apperr.CodeInvalidParam,
+			"%s 不需要平台托管账号（请直接看「统一监控」里的指标是否正常）", item.MWType)
+	}
+	password, err := s.decrypt(item.PasswordEncrypted)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, err)
+	}
+	address, err := integration.ParseAddress(meta.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+	if err != nil {
+		return nil, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+	instance := integration.Instance{
+		Name: item.Name, MWType: tpl.Type, Address: address,
+		Username: item.Username, Password: password,
+		Labels: meta.Labels, Options: meta.Options,
+		Environment: item.Environment, GroupName: item.GroupName,
+	}
+	output, err := s.runClientSQL(ctx, instance, tpl, item.Username, password, probeAccountSQL(tpl.Type))
+	if err != nil {
+		return &AccountProbeResult{OK: false, Message: err.Error(), Output: truncateText(output, 300)}, nil
+	}
+	return &AccountProbeResult{
+		OK: true, Message: fmt.Sprintf("监控账号 %s 连接正常", item.Username),
+		Output: truncateText(output, 300),
+	}, nil
+}
+
+// probeAccountSQL 是"用监控账号自证可用"的探测语句（只读，不产生副作用）。
+func probeAccountSQL(mwType string) []string {
+	switch mwType {
+	case integration.TypeMySQL:
+		return []string{"SELECT CURRENT_USER()", "SHOW GRANTS FOR CURRENT_USER()"}
+	case integration.TypePG:
+		return []string{"SELECT current_user"}
+	default:
+		return []string{"SELECT 1"}
+	}
+}
+
+// viewOf 组装视图并在失败时带上 last_error（供重试结果回传）。
+func (s *IntegrationService) viewOf(ctx context.Context, item model.MiddlewareInstance) *IntegrationView {
+	view := s.toView(ctx, item)
+	if meta, ok := IntegrationMetaOf(item); ok && meta.LastError != "" {
+		view.LastError = meta.LastError
+	}
+	return &view
+}
+
 // runClientSQL 用一次性客户端容器执行 SQL（口令走环境变量，不出现在命令行）。
 func (s *IntegrationService) runClientSQL(
 	ctx context.Context, instance integration.Instance, tpl integration.Template,
@@ -1373,9 +1644,11 @@ func dockerHint(err error) string {
 			"若使用 rootless Docker，socket 通常在 /run/user/<uid>/docker.sock，请把 " +
 			"INTEGRATION_DOCKER_HOST 指向它并挂载该路径"
 	case strings.Contains(msg, "permission denied") && strings.Contains(msg, "docker.sock"):
-		return "。原因：容器能读到 docker.sock 但无权访问。" +
-			"处理：确认 socket 属主（Linux 上通常 root:docker）并让平台容器以相应权限运行，" +
-			"或改用 socket 代理（见 docs/INTEGRATION.md 的安全边界）"
+		return "。原因：平台容器能读到 docker.sock 但无权访问（容器内用户不在宿主 docker 组）。" +
+			"处理：取宿主 docker 组的 GID（`stat -c '%g' /var/run/docker.sock` 或 " +
+			"`getent group docker | cut -d: -f3`），在平台 .env 里设 DOCKER_GID=<该 GID>，" +
+			"然后 `docker compose up -d --force-recreate backend`；" +
+			"也可以用 docker-socket-proxy 只放行必要接口（见 docs/INTEGRATION.md 的安全边界）"
 	case strings.Contains(msg, "connection refused"):
 		return "。原因：docker 守护进程不可达（socket 路径不对或 daemon 未运行）。" +
 			"处理：核对 INTEGRATION_DOCKER_HOST 与宿主上实际路径"

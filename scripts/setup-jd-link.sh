@@ -236,6 +236,35 @@ set_env_reported "$NJ" INTEGRATION_DOCKER_ENABLED 'true'
 set_env_reported "$NJ" MWOPS_PROMETHEUS_BASE_URL 'http://prometheus:9090'
 enable_docker_sock
 
+# docker.sock 的权限：平台容器以非 root 用户运行，必须把宿主 docker 组的 GID
+# 作为附加组加进容器，否则会报 "connect: permission denied"。
+detect_docker_gid() {
+  local gid=""
+  if [ -S /var/run/docker.sock ]; then
+    gid=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)
+  fi
+  if [ -z "$gid" ] && command -v getent >/dev/null 2>&1; then
+    gid=$(getent group docker 2>/dev/null | cut -d: -f3 || true)
+  fi
+  printf '%s' "$gid"
+}
+if [ "$DRY_RUN" = "1" ]; then
+  dryskip "跳过 docker.sock 权限探测（正式运行会写入 DOCKER_GID）"
+else
+  DOCKER_SOCK_GID=$(detect_docker_gid)
+  if [ -n "$DOCKER_SOCK_GID" ]; then
+    set_env_reported "$NJ" DOCKER_GID "$DOCKER_SOCK_GID"
+    if [ -S /var/run/docker.sock ] && [ "$(stat -c '%a' /var/run/docker.sock 2>/dev/null)" = "666" ]; then
+      ok 'socket 权限为 666（任何用户可读写），DOCKER_GID 实际不影响使用'
+    else
+      ok "已按宿主 socket 写入 DOCKER_GID=$DOCKER_SOCK_GID（平台容器以非 root 用户运行，靠它才有权限）"
+    fi
+  else
+    warn '未能探测 docker 组 GID（宿主上找不到 /var/run/docker.sock 或 docker 组）'
+    hint 'Docker Desktop（macOS/Windows）通常无需设置；Linux 上手工填：stat -c %g /var/run/docker.sock'
+  fi
+fi
+
 # 旧版本写过跨栈网络名：留着会让后来者以为还要建互联网络，这里主动清掉。
 if grep -qE '^[[:space:]]*JD_NIGHTJAR_NETWORK[[:space:]]*=' "$NJ" 2>/dev/null; then
   if [ "$DRY_RUN" = "1" ]; then drytag '删除 JD_NIGHTJAR_NETWORK（新架构不再需要互联网络）'

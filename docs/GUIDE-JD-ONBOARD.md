@@ -122,12 +122,13 @@ cd <nightjar>
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 集成报 `dial unix /var/run/docker.sock: connect: no such file or directory` | 平台容器里**没有** docker.sock：compose 里的挂载还是注释状态，或平台容器早于该改动启动 | ① `docker inspect mwops-backend --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' \| grep docker.sock` 确认；② 重跑 `./scripts/setup-jd-link.sh`（它会自动放开注释）；③ `docker compose up -d --force-recreate backend`。rootless Docker 请把 `INTEGRATION_DOCKER_HOST` 指向 `/run/user/<uid>/docker.sock` 并挂载该路径 |
-| 集成报 `permission denied` 且提到 docker.sock | socket 已挂载但无权限 | 确认 socket 属主（通常 `root:docker`）与平台容器的用户/组，或改用 socket 代理 |
+| 集成报 `dial unix /var/run/docker.sock: connect: permission denied` | socket 已挂载，但平台以非 root 用户（`mwops`）运行，不在宿主 docker 组里 | `stat -c '%g' /var/run/docker.sock` 取 GID → 写进平台 `.env` 的 `DOCKER_GID=<GID>` → `docker compose up -d --force-recreate backend`。校验：`docker exec mwops-backend curl -s --unix-socket /var/run/docker.sock http://localhost/_ping` 应输出 `OK`（setup 脚本会自动探测并写入 DOCKER_GID） |
 | 集成报「Prometheus 已配置 job 但 target 抓取失败（up=0）」 | Exporter 容器根本没被创建（上一条 docker.sock 报错的连锁结果） | 先解决 docker.sock，再点该集的「重新应用」 |
 | 后端启动失败：`password authentication failed for user "mwo" (SQLSTATE 28P01)` | **Postgres 只在数据卷为空时应用 `POSTGRES_PASSWORD`**；卷早就初始化过，`setup` 脚本又轮换了 `.env` 的 `DB_PASSWORD`（旧版脚本的行为） | 重跑 `./scripts/setup-jd-link.sh`：第 5 步会用容器内 trust socket 把库内口令对齐到 `.env`（零数据损失）。详见 `OPERATIONS.md` §5.8 |
 | 集成报「无法确定目标所在网络」 | 地址里的名字与 docker 里的容器名/服务名/别名都不匹配，或平台没挂 docker.sock | 报错里会列出候选容器名；`./scripts/setup-jd-link.sh` 会自动放开 docker.sock |
 | 集成报「解析不了 jd-mysql / server misbehaving」 | 用的是**旧架构的人工别名**（jd 侧已不再提供） | 把地址改成容器名 `interview-mysql:3306` / `interview-redis:6379`，重新保存即可（平台会自动接入 `jd_jd-data`） |
-| 集成保存成功但指标为空（`job_up=0`） | Exporter 连不上目标：账号没建 / 口令不一致 / 目标容器没运行 | 列表里的「待处理」已写明 lastError；勾选代建账号可自动解决认证类问题 |
+| 集成保存成功但指标为空（`job_up=0`） | Exporter 连不上目标：账号没建 / 口令不一致 / 目标容器没运行 | 集成列表下方「待处理项」旁的 **「去重试 / 测试连接」**：带 root 凭据点「重试建号」（幂等重跑建号 SQL），或先点「测试连接」看账号到底能不能连 |
+| 建号失败（权限不足、实例只读、凭据不对） | 建号 SQL 需要 CREATE USER / GRANT 权限 | 修好外部原因后**不必重填集成表单**：集成中心右上角「监控账号」→「重试建号」，失败原因就地显示；建号语句幂等，可反复重试 |
 | 报 `Access denied for user 'exporter'` | 只读账号不存在或口令不一致 | 重新保存并勾选「由平台创建只读监控账号」（等效手工：见 `INTEGRATION.md` 的模板 SQL） |
 | 报 `invalid DSN` | 旧版 Exporter 配置在拼 `DATA_SOURCE_NAME` | 已被官方方式取代（`--mysqld.username` + `MYSQLD_EXPORTER_PASSWORD`）；重建 Exporter 即可 |
 | Exporter 起来了但 up=0，且 lastError 是 `connection refused` | Exporter 不在目标网络上（例如平台没有 docker.sock，无法自动接网） | 挂上 docker.sock 后点该集的「重新应用」；或按 `INTEGRATION.md` §6 手工把网络写进 `INTEGRATION_EXPORTER_NETWORK` |

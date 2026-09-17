@@ -193,6 +193,41 @@ func (h *Handler) RotateIntegrationAccount(c *gin.Context) {
 	response.OK(c, item)
 }
 
+// RetryIntegrationAccount 重试「建号 + 连接」：失败后不必重填整个表单。
+//
+// 带管理凭据 → 幂等重跑建号 SQL；不带 → 只测连接并重建 Exporter。
+// 结果里同时给出 created / connected / message，便于前端直接展示"还差什么"。
+func (h *Handler) RetryIntegrationAccount(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	var in service.RetryAccountInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	result, err := h.deps.Integration.RetryAccount(c.Request.Context(), id, in, h.operator(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
+// ProbeIntegrationAccount 只做连接测试（不建号、不改配置）。
+func (h *Handler) ProbeIntegrationAccount(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	result, err := h.deps.Integration.ProbeAccount(c.Request.Context(), id)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
 // DropIntegrationAccount 删除平台创建的监控账号（L2：破坏性写操作，需管理凭据）。
 func (h *Handler) DropIntegrationAccount(c *gin.Context) {
 	id, ok := idParam(c, "id")

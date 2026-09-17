@@ -15,6 +15,8 @@ import type {
   FixPreview,
   FixRecord,
   IntegrationAccount,
+  AccountProbeResult,
+  AccountRetryResult,
   IntegrationArtifacts,
   IntegrationInput,
   IntegrationOverview,
@@ -117,6 +119,11 @@ export const integrationApi = {
   /** 监控账号管理：查看平台代管的只读账号；轮换口令（账号改自己口令，无需管理员凭据）。 */
   accounts: () => get<{ items: IntegrationAccount[] }>('/api/integrations/accounts'),
   rotateAccount: (id: number) => post<IntegrationView>(`/api/integrations/${id}/account/rotate`),
+  /** 重试建号/连接：带管理凭据=幂等重建账号；不带=只测连接并重建 Exporter。 */
+  retryAccount: (id: number, payload: { admin_username?: string; admin_password?: string }) =>
+    post<AccountRetryResult>(`/api/integrations/${id}/account/retry`, payload),
+  /** 只做连接测试（不建号、不改配置）。 */
+  probeAccount: (id: number) => post<AccountProbeResult>(`/api/integrations/${id}/account/probe`),
   /** 删除监控账号（L2：需被管实例的管理员凭据）。 */
   dropAccount: (id: number, payload: { admin_username: string; admin_password: string }) =>
     post<IntegrationView>(`/api/integrations/${id}/account/drop`, payload),
