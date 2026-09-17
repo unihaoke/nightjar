@@ -40,7 +40,8 @@ const form = reactive({
   password: '',
   environment: 'dev',
   group_name: '',
-  deploy: false,
+  // 默认"由平台负责部署"：这是平台的卖点，关掉它等于退化成手工模式
+  deploy: true,
   auto_rules: true,
   // 自动建号：需要账号的组件**默认由平台创建**（使用者不必提前建号）
   bootstrap_account: true,
@@ -49,7 +50,9 @@ const form = reactive({
   // 反向接网：把**目标容器**接入平台网络。默认关闭（正常方向是平台自己接进目标网络）
   join_platform_network: false,
   // Exporter 部署位置：local（本机 Docker）/ remote（远程服务器，Ansible 一键安装）
-  deploy_target: 'local' as 'local' | 'remote',
+  // 默认部署到**远程服务器**：被管实例通常不在平台这台机器上。
+  // 本机模式留给"平台与被管实例同机"的场景，可随时切换。
+  deploy_target: 'remote' as 'local' | 'remote',
   target_host: '',
   exporter_port: undefined as number | undefined,
   install_mode: 'docker' as 'docker' | 'docker-systemd' | 'binary',
@@ -384,14 +387,15 @@ function openInstall(template: IntegrationTemplate, item?: IntegrationView): voi
   form.password = ''
   form.environment = item?.environment || template.default_environment || 'dev'
   form.group_name = item?.group_name || ''
-  form.deploy = dockerReady.value
+  // 默认由平台部署（新建时）；编辑已有集成时沿用它的部署位置语义
+  form.deploy = true
   form.auto_rules = true
   form.bootstrap_account = bootstrapSupported.value
   form.admin_username = ''
   form.admin_password = ''
   form.join_platform_network = item?.join_platform_network ?? false
   // 部署位置可从已有集成回填；SSH 凭据绝不回填（平台不保存）
-  form.deploy_target = (item?.deploy_target as 'local' | 'remote') || 'local'
+  form.deploy_target = (item?.deploy_target as 'local' | 'remote') || 'remote'
   form.target_host = item?.target_host || ''
   form.exporter_port = item?.exporter_host_port || undefined
   form.install_mode = (item?.install_mode as 'docker' | 'docker-systemd' | 'binary') || 'docker'
@@ -906,8 +910,8 @@ onMounted(load)
         <el-divider content-position="left">Exporter 部署位置</el-divider>
         <el-form-item label="部署到">
           <el-select v-model="form.deploy_target" class="mobile-block">
+            <el-option label="远程服务器（平台用内置 Ansible playbook 一键安装）— 默认" value="remote" />
             <el-option label="本机（平台用 Docker API 创建容器，需要 docker.sock）" value="local" />
-            <el-option label="远程服务器（平台用内置 Ansible playbook 一键安装）" value="remote" />
           </el-select>
         </el-form-item>
         <!-- Docker 通道提示只在「本机」时出现：选远程时它不相关，不该打扰使用者 -->
@@ -996,7 +1000,11 @@ onMounted(load)
 
         <el-divider content-position="left">落地方式</el-divider>
         <div class="switch-row">
-          <el-switch v-model="form.deploy" :disabled="form.deploy_target === 'remote' ? !remoteReady : !dockerReady" />
+          <!-- 开关本身永远可选：
+               能力没就绪时只做提示，不阻止使用者勾选——
+               因为"平台不部署"本身也是合法选择（手工模式），
+               而灰掉开关只会让人不知道发生了什么（本次反馈的问题）。 -->
+          <el-switch v-model="form.deploy" />
           <span v-if="form.deploy_target === 'remote'">
             由平台远程安装 Exporter（{{ remoteReady ? 'Ansible 通道可用' : '需平台镜像带 ansible-playbook' }}）
           </span>

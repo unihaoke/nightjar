@@ -32,14 +32,15 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # 运行阶段：仅保留二进制与必要证书
 FROM alpine:3.20
 
-# 远程安装 Exporter（Ansible）默认**不装**：它会给所有使用者增加约 200MB 镜像体积，
-# 而「本机 Docker」路径完全不需要它。需要远程安装时用 --build-arg WITH_ANSIBLE=true，
-# 详见 deploy/ansible/README.md。
-ARG WITH_ANSIBLE=false
+# 远程安装 Exporter（Ansible）**默认安装**：远程部署是集成中心的默认路径，
+# 缺 ansible-playbook 会让"一键远程安装"开箱即不可用（代价是镜像约 +200MB）。
+# 只做本机 Docker 部署、想瘦身时用 --build-arg WITH_ANSIBLE=false（见 deploy/ansible/README.md）。
+ARG WITH_ANSIBLE=true
 
 RUN apk add --no-cache ca-certificates tzdata curl && \
     if [ "$WITH_ANSIBLE" = "true" ]; then \
-      apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/v3.20/community ansible; \
+      apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/v3.20/community ansible && \
+      ansible-playbook --version >/dev/null; \
     fi && \
     addgroup -S mwops && adduser -S -G mwops mwops && \
     mkdir -p /app/data/logs /app/data/audit-snapshots /app/data/integrations /app/data/ansible /app/configs && \

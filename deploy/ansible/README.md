@@ -35,48 +35,66 @@
 - 跨机建议直接用「远程服务器 + binary」组合：目标机无需 Docker；
 - 防火墙放通 9100；各节点需 NTP/chrony 时间同步，偏差过大样本会被丢弃。
 
-## 1. 让平台镜像带上 Ansible
+## 1. 平台镜像已默认带 Ansible
 
-默认镜像**不含** Ansible（避免给所有使用者增加约 200MB）。需要远程安装时用这个开关构建：
+远程部署是集成中心的**默认路径**，所以镜像默认就把 `ansible-playbook` 装进去
+（`WITH_ANSIBLE` 构建参数默认 `true`，镜像约 +200MB）：
 
 ```bash
-# docker-compose.yml 的 backend.build.args 里加（或 .env 里设 WITH_ANSIBLE=true）
-WITH_ANSIBLE=true docker compose up -d --build backend
+# 正常构建即可，什么都不用加
+docker compose up -d --build backend
+docker exec mwops-backend ansible-playbook --version   # 应输出版本号
 ```
 
-对应的 Dockerfile 片段（`middleware-ops/Dockerfile`）：
+只做「本机 Docker」部署、想给镜像瘦身时：
+
+```bash
+WITH_ANSIBLE=false docker compose up -d --build backend
+```
+
+对应的 Dockerfile 片段（`middleware-ops/Dockerfile`，构建期会做一次 `--version` 校验，
+装不上就直接让构建失败，而不是等到运行时才发现）：
 
 ```dockerfile
-ARG WITH_ANSIBLE=false
+ARG WITH_ANSIBLE=true
 RUN if [ "$WITH_ANSIBLE" = "true" ]; then \
-      apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/v3.20/community ansible; \
+      apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/v3.20/community ansible && \
+      ansible-playbook --version >/dev/null; \
     fi
 ```
 
-验证：
+> 只用到 `ansible.builtin.*` 模块，因此不需要 `community.*` 集合；
+> 若你的构建环境无法访问 Alpine community 源，可改用 `pip install ansible-core`（约 20MB）。
 
-```bash
-docker exec mwops-backend ansible-playbook --version
-```
+## 2. 平台开关（默认已开）
 
-## 2. 打开平台开关
-
-`nightjar/.env`：
+`.env` 里两项**默认就是 true**，通常不用改：
 
 ```bash
 INTEGRATION_ALLOW_REMOTE_INSTALL=true
 INTEGRATION_ANSIBLE_ENABLED=true
-# 可选：安装方式（docker|systemd）、网络、超时、安装目录
-INTEGRATION_ANSIBLE_INSTALL_MODE=docker
+```
+
+安全说明：远程安装会在**别的机器**上执行命令。默认开启是因为它是主功能；
+合规要求更严时可设为 `false` 并用 `WITH_ANSIBLE=false` 构建
+（生产环境 `env=prod` 的集成本就会先创建审批工单，审批通过后才执行）。
+
+## 2.1 其它可调项
+
+```bash
+INTEGRATION_ANSIBLE_INSTALL_MODE=docker      # docker | docker-systemd | binary
 INTEGRATION_ANSIBLE_DOCKER_NETWORK=host
-INTEGRATION_ANSIBLE_TIMEOUT=15m
 INTEGRATION_ANSIBLE_INSTALL_DIR=/opt/mwops-exporter
+INTEGRATION_ANSIBLE_TIMEOUT=15m
+INTEGRATION_ANSIBLE_BECOME=true
 ```
 
 ## 3. 目标机要求
 
 - 可通过 SSH 登录（口令或私钥），有 sudo 权限（`--become`，默认开）；
-- 已安装 Docker（`docker version` 可用）——远程安装默认用**官方 Exporter 镜像**跑容器，不需要在目标机上装 Python 之外的任何东西；
+- `docker` / `docker-systemd` 安装方式：目标机需已安装 Docker（`docker version` 可用）；
+  **`binary` 方式不需要目标机有 Docker**（下载官方 release 二进制 + 原生 systemd 服务）；
+- 建号/改号时：目标机需有 `mysql` / `psql` 客户端，或退回到它自己的 docker；
 - 平台能访问目标机的 Exporter 端口（安装后平台会主动探一次，探不通会在集成备注里写明）。
 
 ## 4. 安全约定（重要）

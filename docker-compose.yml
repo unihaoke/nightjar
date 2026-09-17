@@ -123,8 +123,9 @@ services:
       args:
         # 需要 pgvector 原生类型与 HNSW 索引时改为 pgvector
         GO_BUILD_TAGS: ${GO_BUILD_TAGS:-}
-        # 需要「远程服务器安装 Exporter（Ansible）」时设为 true（镜像约 +200MB）
-        WITH_ANSIBLE: ${WITH_ANSIBLE:-false}
+        # 远程安装 Exporter（Ansible）：默认构建进镜像（远程是默认部署路径）。
+        # 只做本机 Docker 部署时设 WITH_ANSIBLE=false 可让镜像小约 200MB。
+        WITH_ANSIBLE: ${WITH_ANSIBLE:-true}
     container_name: mwops-backend
     restart: unless-stopped
     depends_on:
@@ -182,9 +183,10 @@ services:
       # 平台自身容器名：集成后平台会把自己也接进目标网络，以便做 TCP 健康探测
       MWOPS_SELF_CONTAINER: mwops-backend
       # ---------- 远程安装 Exporter（Ansible，见 deploy/ansible/README.md）----------
-      # 默认关闭：它会在**别的机器**上执行命令，属高权限动作，需管理员显式开启。
-      MWOPS_INTEGRATION_ALLOW_REMOTE_INSTALL: ${INTEGRATION_ALLOW_REMOTE_INSTALL:-false}
-      MWOPS_INTEGRATION_ANSIBLE_ENABLED: ${INTEGRATION_ANSIBLE_ENABLED:-false}
+      # 默认开启（远程是默认部署路径）。它会在**别的机器**上执行命令：
+      # 生产若要求更严，设为 false 并把 WITH_ANSIBLE 构建参数关掉即可（prod 环境本就走审批工单）。
+      MWOPS_INTEGRATION_ALLOW_REMOTE_INSTALL: ${INTEGRATION_ALLOW_REMOTE_INSTALL:-true}
+      MWOPS_INTEGRATION_ANSIBLE_ENABLED: ${INTEGRATION_ANSIBLE_ENABLED:-true}
       MWOPS_INTEGRATION_ANSIBLE_BINARY: ${INTEGRATION_ANSIBLE_BINARY:-ansible-playbook}
       # 临时 inventory / vars（含 SSH 凭据）的目录：用完即删
       MWOPS_INTEGRATION_ANSIBLE_INVENTORY_DIR: /app/data/ansible

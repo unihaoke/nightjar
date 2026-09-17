@@ -108,9 +108,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("integration.docker_host", "unix:///var/run/docker.sock")
 	v.SetDefault("integration.exporter_network", "mwops")
 	v.SetDefault("integration.default_environment", "dev")
-	// 远程安装（Ansible）：默认关闭；开启后平台才会在目标机器上执行安装。
-	v.SetDefault("integration.allow_remote_install", false)
-	v.SetDefault("integration.ansible.enabled", false)
+	// 远程安装（Ansible）：默认开启——远程是集成中心的默认部署路径，
+	// 关掉它等于让主功能不可用。生产若要求更严可显式设为 false（prod 环境本就走审批工单）。
+	v.SetDefault("integration.allow_remote_install", true)
+	v.SetDefault("integration.ansible.enabled", true)
 	v.SetDefault("integration.ansible.binary", "ansible-playbook")
 	v.SetDefault("integration.ansible.inventory_dir", "./data/ansible")
 	v.SetDefault("integration.ansible.timeout", 15*time.Minute)
