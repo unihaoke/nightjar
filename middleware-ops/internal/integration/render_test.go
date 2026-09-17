@@ -121,9 +121,14 @@ func TestRenderRedisIntegration(t *testing.T) {
 		t.Fatal("生成的口令应替换为变量占位")
 	}
 
-	// Redis 的参数走环境变量，且 REDIS_ADDR 使用 redis:// 前缀。
-	if !strings.Contains(artifacts.Compose, "REDIS_ADDR: redis://legacy-redis:6379") {
-		t.Fatalf("compose 片段缺少 REDIS_ADDR：\n%s", artifacts.Compose)
+	// Redis 的参数走环境变量。地址用**不带 scheme** 的 host:port：
+	// 带 `redis://` 时 redis_exporter v1.66 会把它当成网络类型，报
+	// `dial redis: unknown network redis`、redis_up=0（真实故障 INC-012）。
+	if !strings.Contains(artifacts.Compose, "REDIS_ADDR: legacy-redis:6379") {
+		t.Fatalf("compose 片段缺少 REDIS_ADDR（应为不带 scheme 的 host:port）：\n%s", artifacts.Compose)
+	}
+	if strings.Contains(artifacts.Compose, "REDIS_ADDR: redis://") {
+		t.Fatalf("REDIS_ADDR 不得带 scheme：\n%s", artifacts.Compose)
 	}
 	if !strings.Contains(artifacts.Compose, "REDIS_EXPORTER_EXCLUDE_SLOWLOG_METRICS: true") {
 		t.Fatalf("compose 片段缺少集群架构的排除开关：\n%s", artifacts.Compose)

@@ -212,18 +212,22 @@ type IntegrationView struct {
 	// DeployNote 记录平台"为你做了什么"：一键部署结果，以及在哪个网络上发现了目标容器。
 	DeployNote string `json:"deploy_note"`
 	// JoinPlatformNetwork 表示该集成是否勾选了「把目标容器接入平台网络」。
-	JoinPlatformNetwork bool   `json:"join_platform_network"`
+	JoinPlatformNetwork bool `json:"join_platform_network"`
 	// DeployTarget 为部署位置：local（本机 Docker）| remote（远程 Ansible）。
 	DeployTarget string `json:"deploy_target"`
 	// TargetHost / ExporterHostPort 为远程 Exporter 的位置（Prometheus 抓 host:port）。
-	TargetHost       string `json:"target_host"`
-	ExporterHostPort int    `json:"exporter_host_port"`
-	InstallMode      string `json:"install_mode"`
+	TargetHost        string `json:"target_host"`
+	ExporterHostPort  int    `json:"exporter_host_port"`
+	InstallMode       string `json:"install_mode"`
 	RemoteInstalledAt string `json:"remote_installed_at"`
-	Selector            string `json:"selector"`
-	AppliedAt           string `json:"applied_at"`
-	LastError           string `json:"last_error"`
-	HasPassword         bool   `json:"has_password"`
+	Selector          string `json:"selector"`
+	AppliedAt         string `json:"applied_at"`
+	LastError         string `json:"last_error"`
+	// NextAction / NextActionLabel 告诉界面"下一步该点哪个按钮"：部署类失败→重新应用，
+	// 账号类失败→重试建号。由后端判定，避免两个入口互相推诿（见 integration_attempt.go）。
+	NextAction      string `json:"next_action"`
+	NextActionLabel string `json:"next_action_label"`
+	HasPassword     bool   `json:"has_password"`
 }
 
 // IntegrationOverview 是集成中心的概览（用于卡片上的角标）。
@@ -325,7 +329,7 @@ func (s *IntegrationService) Get(ctx context.Context, id int64, scope Scope) (*I
 // asyncBudget 是后台"重活"的时间预算。
 //
 // 为什么需要后台：创建 Exporter / 建号都要经过 Docker，**首次还要拉镜像**
-//（mysqld-exporter、mysql 客户端镜像动辄上百 MB）。这些同步做完会超过
+// （mysqld-exporter、mysql 客户端镜像动辄上百 MB）。这些同步做完会超过
 // 前端 60s 的请求超时，表现为"点击集成→请求超时，然后 target up=0"。
 // 因此写库与产物落盘照旧同步完成，重活交给后台，接口立刻返回并给出进度说明。
 const asyncBudget = 10 * time.Minute
@@ -446,7 +450,10 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 	// 重活（建号 → 拉 Exporter）放后台：见 asyncBudget 的说明。
 	// 顺序很重要：先建只读账号，再拉起 Exporter；反过来的话 Exporter 会因认证失败反复重启。
 	if s.deployEnabled(in) || s.shouldBootstrapAccount(in, tpl.Type) {
-		s.setDeployNote(ctx, item.ID, pendingNote("创建只读账号并拉起 Exporter"))
+		// 用清理后的实例组装响应：否则返回的 last_error 还是上一次的旧失败。
+		if fresh := s.beginAttempt(ctx, item.ID, "创建只读账号并拉起 Exporter"); fresh != nil {
+			item = fresh
+		}
 		s.runAsync(item.ID, item.Name, "创建只读账号并拉起 Exporter", func(bgCtx context.Context) error {
 			bootstrapNote, bootstrapErr, _ := s.bootstrapAccount(bgCtx, item, tpl, instance, in, operator)
 			if bootstrapNote != "" {
@@ -561,7 +568,10 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 	syncErr := s.SyncFileSD(ctx)
 	// 重活放后台（与 Create 一致）：编辑保存同样会重建 Exporter/建号。
 	if s.deployEnabled(in) || s.shouldBootstrapAccount(in, tpl.Type) {
-		s.setDeployNote(ctx, item.ID, pendingNote("重建账号与 Exporter"))
+		// 用清理后的实例组装响应：否则返回的 last_error 还是上一次的旧失败。
+		if fresh := s.beginAttempt(ctx, item.ID, "重建账号与 Exporter"); fresh != nil {
+			item = fresh
+		}
 		s.runAsync(item.ID, item.Name, "重建账号与 Exporter", func(bgCtx context.Context) error {
 			bootstrapNote, bootstrapErr, _ := s.bootstrapAccount(bgCtx, item, tpl, instance, in, operator)
 			if bootstrapNote != "" {
@@ -592,8 +602,12 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 
 // Apply 重新应用：重渲染 file_sd 并按需重建 Exporter 容器。
 //
-// 用于「改了地址/口令后指标不生效」「容器被误删」等场景的一键修复。
-func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Operator) (*IntegrationView, error) {
+// 用于「改了地址/口令后指标不生效」「容器被误删」「上次安装失败修好了外部原因」等场景的一键重做。
+//
+// in 携带可选的 SSH 凭据：远程部署必须经由目标机安装 Exporter，凭据不落库，
+// 因此**必须允许在重新应用时就地填写**——否则这个按钮在远程集成上必然失败，
+// 使用者只能绕到「监控账号」弹窗去重试，两个入口互相推诿（真实反馈）。
+func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Operator, in SSHCredsInput) (*IntegrationView, error) {
 	item, err := s.integrationInstance(ctx, id)
 	if err != nil {
 		return nil, err
@@ -605,6 +619,12 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 	tpl, ok := integration.TemplateOf(meta.Template)
 	if !ok {
 		return nil, apperr.Newf(apperr.CodeInvalidParam, "组件模板 %q 不存在", meta.Template)
+	}
+	// 远程部署缺凭据时**立刻**给出可操作提示（而不是排一个必然失败的后台任务，
+	// 再让界面显示一条需要编辑表单才能消掉的错误）。
+	if normalizeDeployTarget(meta.DeployTarget) == DeployTargetRemote && !in.provided() {
+		return nil, apperr.New(apperr.CodeInvalidParam,
+			"远程部署需要 SSH 凭据：请在「重新应用」弹窗里填写 SSH 用户名与口令或私钥（凭据仅本次使用、不落库）")
 	}
 	password, err := s.decrypt(item.PasswordEncrypted)
 	if err != nil {
@@ -626,12 +646,13 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 	if !meta.AccountManaged && tpl.MonitorUser != "" {
 		s.setDeployNote(ctx, item.ID,
 			"该实例的只读监控账号尚未由平台创建：到「监控账号」点「重试建号」并填一次管理员凭据即可")
-	} else {
-		s.setDeployNote(ctx, item.ID, pendingNote("重建 Exporter"))
+	} else if fresh := s.beginAttempt(ctx, item.ID, "重建 Exporter"); fresh != nil {
+		// 用清理后的实例组装响应，避免把上一次的失败原因当成这次的结果返回。
+		item = fresh
 	}
 	// 重建 Exporter 同样要经过 Docker（可能还要拉镜像）→ 放后台，避免请求超时。
 	s.runAsync(item.ID, item.Name, "重建 Exporter", func(bgCtx context.Context) error {
-		if err := s.deploy(bgCtx, item, tpl, instance, deployParams{operator: operator}); err != nil {
+		if err := s.deploy(bgCtx, item, tpl, instance, deployParams{creds: in.remoteCreds(meta.TargetHost), operator: operator}); err != nil {
 			return err
 		}
 		s.markApplied(context.Background(), item.ID)
@@ -978,24 +999,35 @@ func (s *IntegrationService) bootstrapAccount(
 	return note, nil, true
 }
 
-// AccountSecureInput 是账号类操作（轮换/删除/重试）可选携带的 SSH 凭据。
+// SSHCredsInput 是远程操作可选携带的 SSH 凭据（不落库，每次操作都要重填）。
 //
-// 为什么需要：远程集成的账号操作改为在**目标主机**上执行 SQL（只经 SSH + Ansible），
-// 这样平台即使没有 docker.sock 也能改号/删号；而 SSH 凭据与安装时一样**不落库**，
-// 因此每次操作都需要使用者重新填写。
-type AccountSecureInput struct {
+// 为什么统一成一个类型：安装 Exporter、建号/改号、删号、以及「重新应用」都走同一条
+// SSH + Ansible 通道，凭据字段与语义完全一致，不该各写一份。
+type SSHCredsInput struct {
 	SSHUser     string `json:"ssh_user"`
 	SSHPassword string `json:"ssh_password"`
 	SSHPort     int    `json:"ssh_port"`
 	SSHKey      string `json:"ssh_key"`
 }
 
+// AccountSecureInput 是账号类操作（轮换/删除/重试）可选携带的 SSH 凭据。
+//
+// 为什么需要：远程集成的账号操作改为在**目标主机**上执行 SQL（只经 SSH + Ansible），
+// 这样平台即使没有 docker.sock 也能改号/删号；而 SSH 凭据与安装时一样**不落库**，
+// 因此每次操作都需要使用者重新填写。
+type AccountSecureInput = SSHCredsInput
+
 // remoteCreds 把可选 SSH 凭据转换成安装通道使用的凭据结构。
-func (in AccountSecureInput) remoteCreds(host string) RemoteCreds {
+func (in SSHCredsInput) remoteCreds(host string) RemoteCreds {
 	return RemoteCreds{
 		Host: host, User: in.SSHUser, Port: in.SSHPort,
 		Password: in.SSHPassword, Key: in.SSHKey,
 	}
+}
+
+// provided 判断本次是否带了 SSH 凭据（界面上"口令/私钥二选一"）。
+func (in SSHCredsInput) provided() bool {
+	return strings.TrimSpace(in.SSHUser) != "" && (in.SSHPassword != "" || strings.TrimSpace(in.SSHKey) != "")
 }
 
 // useRemoteAccountChannel 判断账号操作是否应走「在目标机执行 SQL」通道。
@@ -1052,7 +1084,7 @@ func (s *IntegrationService) ListAccounts(ctx context.Context, scope Scope) ([]A
 			RotatedAt: meta.AccountRotatedAt, Grants: grantSummary(tpl.Type),
 			SupportsMngmt: tpl.MonitorUser != "",
 			DeployTarget:  accountStatusDeployTarget(meta), TargetHost: meta.TargetHost,
-			LastError:     view.LastError,
+			LastError: view.LastError,
 		})
 	}
 	return out, nil
@@ -1267,12 +1299,14 @@ func (s *IntegrationService) requireDocker(action string) error {
 //   - 带了凭据 → 幂等重跑建号 SQL（账号不存在就建、存在就重置口令并授权）+ 测试连接；
 //   - 没带凭据 → 只测试已有监控账号能否连上，并重建 Exporter（用于"账号其实已经建好、
 //     只是 Exporter 用了旧口令"这类场景）。
+//
 // RetryAccountInput 是「重试建号/连接」的入参。
 //
 // 管理凭据是**可选**的：
 //   - 带了凭据 → 幂等重跑建号 SQL（账号不存在就建、存在就重置口令并授权）+ 测试连接；
 //   - 没带凭据 → 只测试已有监控账号能否连上，并重建 Exporter（用于"账号其实已经建好、
 //     只是 Exporter 用了旧口令"这类场景）。
+//
 // 远程集成还需要 SSH 凭据（账号 SQL 在目标机上执行，凭据不落库）。
 type RetryAccountInput struct {
 	AdminUsername string `json:"admin_username"`
@@ -1393,13 +1427,21 @@ func (s *IntegrationService) RetryAccount(
 	}
 
 	// 3) 重建 Exporter + 核验（即使连接没通过也重建：这样拿到的是最新配置）。
-	if deployErr := s.deploy(ctx, item, tpl, instance, deployParams{operator: operator}); deployErr != nil {
+	//
+	// 远程集成**必须带上本次填写的 SSH 凭据**：这条 deploy 走同一条 SSH + Ansible 通道，
+	// 不带凭据就必然以"远程安装需要 SSH 凭据"失败——而使用者明明刚刚在弹窗里填过
+	//（真实反馈：填了凭据仍报缺凭据，就是这里漏传）。
+	deployErr := s.deploy(ctx, item, tpl, instance,
+		deployParams{creds: in.remoteCreds(meta.TargetHost), operator: operator})
+	if deployErr != nil {
 		if result.Message != "" {
 			result.Message += "；"
 		}
 		result.Message += "重建 Exporter 失败：" + deployErr.Error()
 	}
-	result.OK = result.Connected
+	// OK 表示"这个集成能出指标"：账号通、且 Exporter 装好。
+	// 账号通但 Exporter 装不上时也必须停在待处理，否则界面显示成功、指标却没有。
+	result.OK = result.Connected && deployErr == nil
 	if result.OK {
 		if result.Message == "" {
 			result.Message = "监控账号可用，Exporter 已按当前口令重建"
@@ -1497,7 +1539,17 @@ func (s *IntegrationService) viewOf(ctx context.Context, item model.MiddlewareIn
 	if meta, ok := IntegrationMetaOf(item); ok && meta.LastError != "" {
 		view.LastError = meta.LastError
 	}
+	view.NextAction, view.NextActionLabel = nextActionOf(view.LastError)
 	return &view
+}
+
+// nextActionOf 把失败原因翻译成"下一步动作 + 按钮文案"（空错误返回空）。
+func nextActionOf(lastError string) (string, string) {
+	action := classifyNextAction(lastError)
+	if action == "" {
+		return "", ""
+	}
+	return string(action), nextActionLabel(action)
 }
 
 // runClientSQL 用一次性客户端容器执行 SQL（口令走环境变量，不出现在命令行）。
@@ -1530,7 +1582,6 @@ func (s *IntegrationService) runClientSQL(
 	}
 	return output, nil
 }
-
 
 // ensureMonitoringAccount 由平台创建/更新只读监控账号。
 //
@@ -1676,7 +1727,7 @@ func (m IntegrationMeta) toMap() map[string]any {
 		"deploy_target":         m.DeployTarget, "target_host": m.TargetHost,
 		"exporter_host_port": m.ExporterHostPort, "install_mode": m.InstallMode,
 		"remote_installed_at": m.RemoteInstalledAt,
-		"account_managed":       m.AccountManaged, "account_rotated_at": m.AccountRotatedAt,
+		"account_managed":     m.AccountManaged, "account_rotated_at": m.AccountRotatedAt,
 	}
 }
 
@@ -1811,6 +1862,12 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 		if portNote != "" {
 			done += "；" + portNote
 		}
+		// 主动解释一个必然被问到的现象：host 网络下 `docker ps` 的 PORTS 列是空的。
+		// docker 只在做端口映射（-p/NAT）时才在那一列显示端口；host 网络下容器直接用宿主
+		// 网络命名空间，Exporter 绑的就是宿主端口，因此"没 port"不代表没监听。
+		done += fmt.Sprintf("；host 网络下 Exporter 直接监听宿主端口 %d（`docker ps` 的 PORTS 列为空属正常，"+
+			"可用 `ss -ltnp | grep %d` 与 `curl -s http://127.0.0.1:%d/metrics` 复核）",
+			meta.ExporterHostPort, meta.ExporterHostPort, meta.ExporterHostPort)
 		s.setDeployNote(ctx, item.ID, done)
 		return nil
 	}
@@ -1841,7 +1898,8 @@ func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareI
 	if hostMode {
 		networks = []string{"host"}
 		resolvedHost = instance.Address.Host
-		note = "该组件为主机监控：以宿主网络/PID 运行，只读挂载宿主根目录"
+		note = "该组件为主机监控：以宿主网络/PID 运行，只读挂载宿主根目录" +
+			"（host 网络不做端口映射，`docker ps` 的 PORTS 列为空属正常）"
 	}
 	spec := docker.ContainerSpec{
 		Name:     integration.ContainerName(instance.Name),
@@ -1968,7 +2026,9 @@ func (s *IntegrationService) joinTargetToPlatformNetwork(ctx context.Context, ho
 //
 // 最常见的真实故障：平台容器里没有 /var/run/docker.sock（compose 里的挂载被注释着，
 // 或 rootless Docker 的 socket 在别的路径），表现为
-//   dial unix /var/run/docker.sock: connect: no such file or directory
+//
+//	dial unix /var/run/docker.sock: connect: no such file or directory
+//
 // 原始信息看不出"该怎么修"，因此在这里补上。
 func dockerHint(err error) string {
 	if err == nil {
@@ -2392,10 +2452,11 @@ func (s *IntegrationService) toView(ctx context.Context, item model.MiddlewareIn
 		DeployTarget:        meta.DeployTarget, TargetHost: meta.TargetHost,
 		ExporterHostPort: meta.ExporterHostPort, InstallMode: meta.InstallMode,
 		RemoteInstalledAt: meta.RemoteInstalledAt,
-		Selector:  integration.SelectorFor(integration.Instance{Name: item.Name, MWType: item.MWType}, meta.Job),
-		AppliedAt: meta.AppliedAt, LastError: meta.LastError,
+		Selector:          integration.SelectorFor(integration.Instance{Name: item.Name, MWType: item.MWType}, meta.Job),
+		AppliedAt:         meta.AppliedAt, LastError: meta.LastError,
 		HasPassword: item.PasswordEncrypted != "",
 	}
+	view.NextAction, view.NextActionLabel = nextActionOf(meta.LastError)
 	if s.docker != nil && meta.Container != "" {
 		if state, err := s.docker.Inspect(ctx, meta.Container); err == nil && state != nil {
 			view.ContainerStatus = state.Status

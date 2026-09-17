@@ -153,12 +153,22 @@ func (h *Handler) UpdateIntegration(c *gin.Context) {
 }
 
 // ApplyIntegration 重新应用集成（重写 file_sd + 重建 Exporter 容器）。
+//
+// 请求体可选：远程部署需要 SSH 凭据（ssh_user/ssh_password 或 ssh_key），凭据不落库。
 func (h *Handler) ApplyIntegration(c *gin.Context) {
 	id, ok := idParam(c, "id")
 	if !ok {
 		return
 	}
-	item, err := h.deps.Integration.Apply(c.Request.Context(), id, h.operator(c))
+	var in service.SSHCredsInput
+	// 允许空体（本机部署的老前端仍可无体调用）。
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&in); err != nil {
+			response.Fail(c, apperr.New(apperr.CodeInvalidParam, "请求体不是合法的 JSON"))
+			return
+		}
+	}
+	item, err := h.deps.Integration.Apply(c.Request.Context(), id, h.operator(c), in)
 	if err != nil {
 		response.Fail(c, err)
 		return

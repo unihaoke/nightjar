@@ -318,7 +318,9 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //
 //	r1：远程安装失败摘要（不再只截前 600 字符，改为摘出失败任务与原因）+ 完整输出进平台日志。
 //	r2：Exporter 端口与实例端口同机冲突时自动改用模板默认端口（INC-010）。
-const CodeRevision = "r2"
+//	r3：重新应用接受 SSH 凭据（口令/私钥）、发起新尝试时清掉上次失败、待处理项只推荐一个动作（INC-011）。
+//	r4：Redis 的 REDIS_ADDR 改为不带 scheme 的 host:port（INC-012）。
+const CodeRevision = "r4"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

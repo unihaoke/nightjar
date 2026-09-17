@@ -154,6 +154,9 @@ const logCollectReady = computed(() => dockerReady.value)
 /** 已集成总数。 */
 const total = computed(() => items.value.length)
 
+/** 当前待处理的集成（有 last_error 的第一条），横幅与按钮都基于它。 */
+const pendingItem = computed(() => items.value.find((item) => item.last_error) || null)
+
 // ---------------------------------------------------------------------------
 // 监控账号管理（平台代管的只读账号：查看 / 轮换口令 / 删除）
 // ---------------------------------------------------------------------------
@@ -162,14 +165,25 @@ const accountsLoading = ref(false)
 const accounts = ref<IntegrationAccount[]>([])
 /** 正在重试/探测的集成 ID（用于按钮 loading）。 */
 const retryingId = ref<number | null>(null)
+/**
+ * 「重新应用」的 SSH 凭据弹窗状态。
+ *
+ * 为什么单独放一份而不是复用表单里的字段：表单保存会落库（表单里的 SSH 字段只在提交时用），
+ * 而重新应用是"就地重做一次部署"，需要当场收集凭据又不写回表单。
+ */
+const applyVisible = ref(false)
+const applying = ref(false)
+const applyTarget = ref<IntegrationView | null>(null)
+const applySsh = reactive({ user: '', method: 'password' as 'password' | 'key', password: '', key: '', port: 22 })
 const probingId = ref<number | null>(null)
 /** 最近一次重试/探测的结论（就地展示失败原因，而不是只弹一条 toast）。 */
 const accountResult = ref<{ ok: boolean; title: string; detail: string } | null>(null)
 /**
  * 远程集成的账号操作在**目标主机**上执行（只经 SSH + Ansible，不依赖平台 Docker），
  * 因此需要在弹窗里填一次 SSH 凭据；凭据仅本次使用、平台不落库。
+ * 口令与私钥二选一——很多人只用私钥登录，界面必须支持（否则只能去改整个集成表单）。
  */
-const accountSsh = reactive({ user: '', password: '', port: 22 })
+const accountSsh = reactive({ user: '', method: 'password' as 'password' | 'key', password: '', key: '', port: 22 })
 
 /** 账号清单里是否存在远程部署的集成（决定是否显示 SSH 凭据输入）。 */
 const hasRemoteAccount = computed(() => accounts.value.some((row) => row.deploy_target === 'remote'))
@@ -179,7 +193,30 @@ function sshPayload(row: IntegrationAccount): AccountSecurePayload {
   if (row.deploy_target !== 'remote') {
     return {}
   }
-  return { ssh_user: accountSsh.user.trim(), ssh_password: accountSsh.password, ssh_port: accountSsh.port }
+  return buildSshPayload(accountSsh)
+}
+
+/**
+ * 把界面上的 SSH 输入组装成后端载荷。
+ *
+ * 只提交选中的那种认证方式：另一种留空，避免把用户没填的字段当成"空口令"传过去，
+ * 也避免口令与私钥两个字段里混进上一次留下的内容。
+ */
+function buildSshPayload(src: { user: string; method: 'password' | 'key'; password: string; key: string; port: number }): AccountSecurePayload {
+  return {
+    ssh_user: src.user.trim(),
+    ssh_port: src.port,
+    ssh_password: src.method === 'password' ? src.password : '',
+    ssh_key: src.method === 'key' ? src.key : '',
+  }
+}
+
+/** 判断一组 SSH 输入是否可用（用户 + 口令或私钥）。 */
+function sshCredsReady(src: { user: string; method: 'password' | 'key'; password: string; key: string }): boolean {
+  if (!src.user.trim()) {
+    return false
+  }
+  return src.method === 'key' ? src.key.trim().length > 0 : src.password.length > 0
 }
 
 /** 远程集成必须先填 SSH 凭据，否则明确提示（而不是等服务端报错）。 */
@@ -187,10 +224,10 @@ function ensureSshCreds(row: IntegrationAccount): boolean {
   if (row.deploy_target !== 'remote') {
     return true
   }
-  if (!accountSsh.user.trim() || !accountSsh.password) {
+  if (!sshCredsReady(accountSsh)) {
     ElMessage({
       type: 'warning',
-      message: `「${row.name}」是远程部署：请先在弹窗顶部填写 SSH 用户名与口令（账号操作在目标机上执行）`,
+      message: `「${row.name}」是远程部署：请先在弹窗顶部填写 SSH 用户名与口令或私钥（账号操作在目标机上执行）`,
       grouping: true,
     })
     return false
@@ -516,19 +553,56 @@ async function handleSubmit(): Promise<void> {
   }
 }
 
-/** 重新应用（重写 file_sd + 重建 Exporter 容器）。 */
+/**
+ * 重新应用（重写 file_sd + 重建/重装 Exporter）。
+ *
+ * 远程集成必须先收集 SSH 凭据：安装动作发生在目标机上，凭据不落库，
+ * 因此**不能**在按钮里直接发请求——否则必然留下一条"远程安装需要 SSH 凭据"的待处理项，
+ * 使用者还得到处找地方补凭据（真实反馈）。
+ */
 async function handleApply(item: IntegrationView): Promise<void> {
+  if (item.deploy_target === 'remote') {
+    applyTarget.value = item
+    applySsh.user = ''
+    applySsh.method = 'password'
+    applySsh.password = ''
+    applySsh.key = ''
+    applySsh.port = 22
+    applyVisible.value = true
+    return
+  }
+  await runApply(item, {})
+}
+
+/** 提交重新应用（带可选的 SSH 凭据）。 */
+async function runApply(item: IntegrationView, payload: AccountSecurePayload): Promise<void> {
+  applying.value = true
   try {
-    const saved = await integrationApi.apply(item.instance_id)
+    const saved = await integrationApi.apply(item.instance_id, payload)
     if (saved.last_error) {
       ElMessage({ type: 'warning', message: saved.last_error })
     } else {
-      ElMessage({ type: 'success', message: '已重新应用：抓取目标与 Exporter 容器均已刷新' })
+      ElMessage({ type: 'success', message: '已开始重新应用：后台重建/重装 Exporter，完成后此处显示结果（可点刷新）' })
     }
+    applyVisible.value = false
     await load()
   } catch (error) {
     toastError(error)
+  } finally {
+    applying.value = false
   }
+}
+
+/** 弹窗内的"开始重新应用"。 */
+async function submitApply(): Promise<void> {
+  if (!applyTarget.value) {
+    return
+  }
+  if (!sshCredsReady(applySsh)) {
+    ElMessage({ type: 'warning', message: '请填写 SSH 用户名，并选择口令或私钥其中一种认证方式' })
+    return
+  }
+  await runApply(applyTarget.value, buildSshPayload(applySsh))
 }
 
 /** 按类型取模板。 */
@@ -784,9 +858,25 @@ onMounted(load)
           </el-table-column>
         </el-table>
       </div>
-      <div v-if="items.some((item) => item.last_error)" class="pending-row">
-        <span class="muted">待处理项：{{ items.find((item) => item.last_error)?.last_error }}</span>
-        <el-button text size="small" type="primary" @click="openAccounts">去重试 / 测试连接</el-button>
+      <div v-if="pendingItem" class="pending-row">
+        <span class="muted">待处理项：{{ pendingItem.last_error }}</span>
+        <!-- 按钮由后端的 next_action 决定：部署类失败→重新应用（远程会先问 SSH 凭据），
+             账号类失败→去重试建号。避免两个入口互相推诿、让人以为功能重复。 -->
+        <el-button
+          v-if="pendingItem.next_action === 'retry_account'"
+          text
+          size="small"
+          type="primary"
+          @click="openAccounts"
+        >{{ pendingItem.next_action_label || '去重试建号' }}</el-button>
+        <el-button
+          v-else-if="pendingItem.next_action === 'reapply'"
+          text
+          size="small"
+          type="primary"
+          @click="handleApply(pendingItem)"
+        >{{ pendingItem.next_action_label || '重新应用' }}</el-button>
+        <el-button v-else text size="small" type="primary" @click="openAccounts">去重试 / 测试连接</el-button>
       </div>
       <p v-if="items.some((item) => item.deploy_note)" class="muted note">
         平台自动完成：{{ items.find((item) => item.deploy_note)?.deploy_note }}
@@ -1176,9 +1266,25 @@ onMounted(load)
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
+            <el-form-item label="认证方式">
+              <el-radio-group v-model="accountSsh.method">
+                <el-radio value="password">口令</el-radio>
+                <el-radio value="key">私钥</el-radio>
+              </el-radio-group>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row :gutter="12">
+          <el-col v-if="accountSsh.method === 'password'" :span="24">
             <el-form-item label="SSH 口令（仅本次使用）">
               <el-input v-model="accountSsh.password" type="password" show-password
-                placeholder="不落库、不写审计、不回显" />
+                placeholder="不落库、不写审计、不回显；平台镜像需含 sshpass" />
+            </el-form-item>
+          </el-col>
+          <el-col v-else :span="24">
+            <el-form-item label="SSH 私钥（仅本次使用）">
+              <el-input v-model="accountSsh.key" type="textarea" :rows="3"
+                placeholder="粘贴私钥全文（-----BEGIN OPENSSH PRIVATE KEY----- …）；不需要 sshpass" />
             </el-form-item>
           </el-col>
         </el-row>
@@ -1331,6 +1437,57 @@ onMounted(load)
           <el-button type="primary" :disabled="!logPlan" :loading="logLoading" @click="handleLogSubmit">
             创建采集容器
           </el-button>
+        </div>
+      </template>
+    </el-dialog>
+
+    <!-- 重新应用：远程部署需要 SSH 凭据（仅本次使用，不落库） -->
+    <el-dialog
+      v-model="applyVisible"
+      :title="`重新应用 ${applyTarget?.name || ''}`"
+      width="620px"
+      :close-on-click-modal="false"
+    >
+      <el-alert type="info" :closable="false" show-icon
+        title="将重写抓取配置并在目标机上重建/重装 Exporter">
+        <p class="field-hint">
+          平台会重写 Prometheus 抓取目标并重新安装 Exporter。
+          SSH 凭据仅本次使用、不落库、不回显；用<b>私钥</b>认证时不需要平台安装 sshpass。
+        </p>
+      </el-alert>
+      <el-row :gutter="12" class="mt">
+        <el-col :xs="24" :sm="10">
+          <el-form-item label="SSH 用户">
+            <el-input v-model="applySsh.user" placeholder="如 root" />
+          </el-form-item>
+        </el-col>
+        <el-col :xs="24" :sm="6">
+          <el-form-item label="SSH 端口">
+            <el-input-number v-model="applySsh.port" :min="1" :max="65535" class="mobile-block" />
+          </el-form-item>
+        </el-col>
+        <el-col :xs="24" :sm="8">
+          <el-form-item label="认证方式">
+            <el-radio-group v-model="applySsh.method">
+              <el-radio value="password">口令</el-radio>
+              <el-radio value="key">私钥</el-radio>
+            </el-radio-group>
+          </el-form-item>
+        </el-col>
+      </el-row>
+      <el-form-item v-if="applySsh.method === 'password'" label="SSH 口令（仅本次使用）">
+        <el-input v-model="applySsh.password" type="password" show-password
+          placeholder="不落库、不写审计、不回显" />
+      </el-form-item>
+      <el-form-item v-else label="SSH 私钥（仅本次使用）">
+        <el-input v-model="applySsh.key" type="textarea" :rows="4"
+          placeholder="粘贴私钥全文（-----BEGIN OPENSSH PRIVATE KEY----- …）" />
+      </el-form-item>
+      <template #footer>
+        <div class="dialog-footer">
+          <div class="spacer" />
+          <el-button @click="applyVisible = false">取消</el-button>
+          <el-button type="primary" :loading="applying" @click="submitApply">开始重新应用</el-button>
         </div>
       </template>
     </el-dialog>

@@ -282,6 +282,9 @@ export interface IntegrationView {
   selector: string
   applied_at: string
   last_error: string
+  /** 下一步该点哪个按钮（后端判定）：reapply=重新应用，retry_account=去重试建号，investigate=看诊断。 */
+  next_action?: string
+  next_action_label?: string
   has_password: boolean
 }
 

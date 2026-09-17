@@ -182,7 +182,9 @@ var templates = map[string]Template{
 				Help: "为指标附加 instance_role 标签，便于区分主从（会增加序列基数）"},
 		},
 		Notes: []string{
-			"REDIS_ADDR 形如 redis://<host>:<port>；口令用 REDIS_PASSWORD 注入，不要写进 URL。",
+			"REDIS_ADDR 平台按 `<host>:<port>` 注入（不带 scheme）；口令用 REDIS_PASSWORD 注入，不要写进地址。",
+			"**不要手工改成 `redis://…`**：redis_exporter v1.66 在单实例路径上会把 scheme 当成网络类型，报 " +
+				"`dial redis: unknown network redis`、redis_up=0，看起来像「Redis 连不上」，实际是地址写法问题。",
 			"**用户名只在 Redis 6+ 的 ACL 场景才需要**（如云厂商 Redis 的账号）。自建 Redis 通常只配了 requirepass：此时用户名必须**留空**，" +
 				"否则 Exporter 会发 AUTH <用户名> <口令>，得到 WRONGPASS、redis_up=0（在 prometheus.yml 里看起来一切正常，最容易被忽略）。",
 			"**无认证的 Redis（未开 requirepass）账号口令都留空即可**，保存不会被拦；若目标其实要求认证，" +
@@ -653,12 +655,30 @@ func (t Template) Validate(in Instance) error {
 // 渲染：Exporter 的 env 与命令行参数
 // ---------------------------------------------------------------------------
 
+// redisAddr 渲染 redis_exporter 的 REDIS_ADDR。
+//
+// 用**不带 scheme** 的 `host:port`（官方 README 明确这种 tcp 地址同样合法），
+// 因为带 scheme 的写法在 redis_exporter v1.66 的单实例路径上会被解析成
+// 「网络类型 = redis」→ Exporter 自己报
+//
+//	redis_exporter_last_scrape_error{err="dial redis: unknown network redis"} 1
+//	redis_up 0
+//
+// 平台侧只能看到 up=0，极易被当成"Redis 没起来/地址填错"（真实故障 INC-012）。
+// 只有用户显式带路径（如指定 db）时才保留 URL 形态，避免丢掉那部分语义。
+func redisAddr(in Instance) string {
+	if in.Address.Path == "" {
+		return in.Address.HostPort()
+	}
+	return in.Address.URL("redis")
+}
+
 // RenderEnv 渲染 Exporter 容器需要的环境变量（不含密钥掩码，调用方决定是否脱敏）。
 func (t Template) RenderEnv(in Instance) map[string]string {
 	env := map[string]string{}
 	switch t.Type {
 	case TypeRedis:
-		env["REDIS_ADDR"] = in.Address.URL("redis")
+		env["REDIS_ADDR"] = redisAddr(in)
 		if in.Username != "" {
 			env["REDIS_USER"] = in.Username
 		}

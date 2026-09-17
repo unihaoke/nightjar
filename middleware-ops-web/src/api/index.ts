@@ -120,7 +120,9 @@ export const integrationApi = {
   preview: (payload: IntegrationInput) => post<IntegrationArtifacts>('/api/integrations/preview', payload),
   create: (payload: IntegrationInput) => post<IntegrationView>('/api/integrations', payload),
   update: (id: number, payload: IntegrationInput) => put<IntegrationView>(`/api/integrations/${id}`, payload),
-  apply: (id: number) => post<IntegrationView>(`/api/integrations/${id}/apply`),
+  // 重新应用：远程部署需要 SSH 凭据（凭据仅本次使用，平台不落库）。
+  apply: (id: number, payload: AccountSecurePayload = {}) =>
+    post<IntegrationView>(`/api/integrations/${id}/apply`, payload),
   /** 监控账号管理：查看平台代管的只读账号；轮换口令（账号改自己口令，无需管理员凭据）。 */
   accounts: () => get<{ items: IntegrationAccount[] }>('/api/integrations/accounts'),
   /**

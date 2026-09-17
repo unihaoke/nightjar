@@ -227,7 +227,7 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 | 能力 | 实现 | 是否需要管理员凭据 |
 |---|---|---|
 | 查看账号现状 | `GET /api/integrations/accounts`：账号名、来源（平台创建/外部账号）、权限摘要、最近轮换时间、集成当前错误 | 否 |
-| **失败重试** | `POST /api/integrations/:id/account/retry`：带凭据 → 幂等重跑建号 SQL；不带 → 只测连接；两种情况都会重建 Exporter 并核验。返回 `created` / `connected` / `message`，前端就地显示"还差什么" | 可选 |
+| **失败重试** | `POST /api/integrations/:id/account/retry`：带凭据 → 幂等重跑建号 SQL；不带 → 只测连接；两种情况都会**带上本次的 SSH 凭据**重建 Exporter 并核验。返回 `created` / `connected` / `message`，前端就地显示"还差什么" | 可选 |
 | 连接测试 | `POST /api/integrations/:id/account/probe`：用监控账号执行 `SELECT 1`（MySQL 另附 `SHOW GRANTS`），只读、不改配置 | 否 |
 | 轮换口令 | `POST /api/integrations/:id/account/rotate`：账号**改自己的**口令（MySQL `ALTER USER USER()` / PG `ALTER ROLE CURRENT_USER`），随后自动重建 Exporter | **不需要**（平台持有该账号口令） |
 | 删除账号 | `POST /api/integrations/:id/account/drop`：`DROP USER IF EXISTS` / `DROP ROLE IF EXISTS` | 需要；prod 转审批工单 |
@@ -238,10 +238,27 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
   因此"重试"永远是安全操作，不会产生半成品状态；
 - 重试用的是**库里已存的那个口令**（加密存储），所以重建出的账号口令与 Exporter 注入的口令
   天然一致，不会出现"账号建好了但 Exporter 还在用旧口令"；
-- 集成列表里的「待处理」提示旁直接给「去重试 / 测试连接」入口，
-  打开后即可看到每条集成的账号来源、状态与失败原因；
-- 「重新应用」只重建 Exporter（没有管理凭据、建不了号），因此当账号尚未由平台创建时，
-  它会把备注写成"到「监控账号」点「重试建号」"，避免使用者反复点重新应用。
+- 集成列表里的「待处理」提示旁**只给一个**推荐入口：按钮由后端的 `next_action` 决定
+  （`reapply` = 重新应用；`retry_account` = 去重试建号），不再一律甩到账号弹窗；
+- 「重新应用」只重建 Exporter（没有管理凭据、建不了号）。**远程集成会在弹窗里当场收一次
+  SSH 凭据**（口令或私钥二选一，仅本次使用、不落库）——否则这个按钮在远程部署上必然失败，
+  使用者只能绕到账号弹窗去重试，两个入口互相推诿；
+- 保存/重新应用都是**异步**的：发起时会立刻清掉上一次的失败原因（只剩"⏳ 已开始…"），
+  新的失败在后台任务结束时才写入。所以"刚填完凭据保存却先弹旧错误"这种情况不会再出现。
+
+### 两个入口的分工（不是重复）
+
+| | 「重新应用」 | 「重试建号 / 连接」 |
+|---|---|---|
+| 做什么 | 重写抓取配置 + 在目标机重装/重建 Exporter | **建号/重置口令** + 连接测试 + 重建 Exporter |
+| 凭据 | 远程：SSH（口令或私钥） | 建号：管理员账号口令；远程另需 SSH |
+| 适用 | 部署面问题：装了起不来、端口不通、容器被删、改了地址/端口、上次安装失败修好了外部原因 | 账号面问题：还没有账号、口令不一致（NOAUTH/WRONGPASS）、权限不足 |
+| 是否写被管库 | 否 | 是（仅幂等的建号/授权语句） |
+
+「重试建号」是「重新应用」的**超集**（多做了账号 SQL，代价是要管理员凭据）。
+两个都必须保留：去掉「重新应用」就得为了重装 Exporter 而索要 root 口令；
+去掉「重试建号」则没有任何入口能创建账号。真正要修的是**入口的完整性**（各自都能就地补齐凭据）
+与**指路唯一性**（待处理项只推荐一个动作）。
 
 > 轮换为什么不需要管理员凭据：SQL 标准与两个数据库都允许账号修改自己的口令，
 > 因此"平台托管的账号"可以自助轮换，避免了每次轮换都要向用户再要一次 root 口令。
@@ -285,12 +302,14 @@ dial unix /var/run/docker.sock: connect: permission denied
 ---
 
 ## 8. 排查
-
 | 现象 | 排查 |
 |---|---|
 | 集成保存成功但监控页没有数据 | 实例详情 → **接入自检**：`job_up=null` 说明没有该 job（检查 Prometheus 配置里是否有 `middleware-integration`）；`job_up=1` 且 `matched=0` 说明标签对不上（检查集成名称是否被改过） |
 | 服务发现不生效 | 后端容器内 `curl -s http://127.0.0.1:8080/api/sd/integrations`；Prometheus 容器内 `wget -qO- http://backend:8080/api/sd/integrations`；Prometheus 的 /targets 页看 `middleware-integration` 下的 target（`refresh_interval` 默认 30s） |
 | Exporter 容器起来了但 up=0 | Exporter 连不上被管实例：核对地址/账号口令、网络是否两张都挂上（`docker inspect <容器> | grep -A5 Networks`） |
+| **Redis：`redis_up 0` 且 `last_scrape_error` 形如 `dial redis: unknown network redis`** | 地址带了 scheme。`REDIS_ADDR` 按官方文档 `redis://host:port` 也算合法，但 redis_exporter v1.66 在单实例路径上把 scheme 当成了**网络类型**。平台从 r4 起按 **`host:port`（不带 scheme）** 注入；已有集成点一次「重新应用」刷新 env 文件即可。核对：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' <容器>` 里 `REDIS_ADDR` 不应含 `://` |
+| **容器在跑，但 `docker ps` 的 PORTS 列是空的** | **正常现象，不是故障**：只有做端口映射（`-p`/NAT）的容器才在这一列显示端口。远程安装与主机监控都用 `--network host`，容器直接使用宿主网络命名空间、Exporter 绑的就是宿主端口，因此没有映射可显示。按下面三条确认它真的在听：<br>`docker inspect -f '{{.HostConfig.NetworkMode}}' <容器>` → `host`<br>`ss -ltnp \| grep <Exporter端口>` → 看到 `redis_exporter`/`mysqld_exporter` 在听<br>`curl -s http://127.0.0.1:<Exporter端口>/metrics \| grep -E '^redis_up\|^mysql_up'` → `1` 才算真的通 |
+| 远程安装 Ansible 成功但平台报"探测失败" | 平台从**平台侧**探目标机的 Exporter 端口：云主机要在安全组/防火墙对平台出口 IP 放通该端口（9121/9104/9187/9100） |
 | 一键部署报错 | 集成列表里该行会显示「待处理」与失败原因；`INTEGRATION_DOCKER_ENABLED` 与 socket 挂载是否都就绪 |
 | MySQL 某个采集项"关了没关掉" | 开关是否渲染成 `--no-collect.xxx`（抽屉里看 compose 片段） |
 | 想彻底重来 | 列表行 →「重新应用」（重写服务发现 + 重建容器），或删除后重新集成 |
