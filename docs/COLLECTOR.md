@@ -155,7 +155,7 @@ docker run -d --name redis-exporter --restart unless-stopped \
 | 只填 job | `job="你的job",instance_name="<实例名>"` | 依赖实例名一致 |
 | 都没填 | `job="<前缀>-<类型>",instance_name="<实例名>"` | 依赖 Exporter 上报 `SERVICE_NAME` |
 
-**排查口诀**：监控页面显示「内置模拟器」= 没连上 Prometheus；
+**排查口诀**：监控页面显示「无数据源」或指标显示「无数据」= 没连上 Prometheus；
 显示指标但全是 `unknown`/`0` = 连上了 Prometheus 但**标签没匹配到序列**，去 Prometheus 里用同样的标签查一次。
 
 ### 配置平台的 Prometheus 地址
@@ -471,7 +471,7 @@ curl -s -H "Authorization: Bearer $TOKEN" 'http://<平台>/api/metrics/1' | jq '
 
 | 现象 | 定位 | 处理 |
 |------|------|------|
-| 监控页显示「内置模拟器」 | `prometheus.base_url` 为空或连不通 | 配置平台 Prometheus 地址；确认平台容器能访问 `:9090` |
+| 监控页显示「无数据源」/指标显示「无数据」 | `prometheus.base_url` 为空或连不通 | 配置平台 Prometheus 地址；确认平台容器能访问 `:9090` |
 | 有指标但值为 0 / `unknown` | PromQL 标签没匹配到序列 | 用第 2 步的查询核对 `job` / `instance` / `instance_name` 是否与纳管字段一致 |
 | 只有部分指标有值 | Exporter 未暴露该指标 | 核对第 4 节表格的指标名；`curl exporter/metrics` 搜索 |
 | Kafka 全部无数据 | kafka-exporter 无 `instance_name` 标签 | 在 Prometheus 抓取配置里用 `relabel_configs` 补标签 |

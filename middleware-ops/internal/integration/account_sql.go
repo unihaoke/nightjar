@@ -123,27 +123,55 @@ func RenderAccountSQL(req AccountSQLRequest) (AccountSQLArtifacts, error) {
 	b.WriteString("          ② 取消勾选「由平台创建只读监控账号」，手工建号后只把账号口令填进集成表单。" + "\n")
 	b.WriteString("      when: account_client.rc != 0 and (account_docker.rc | default(1)) != 0\n")
 
+	// 两个执行分支放进 block：任一失败时由 rescue 给出「不含口令」的诊断。
+	// 否则 no_log 会把真实报错（镜像拉取失败 / 库不可达 / 口令错误）一起藏成
+	// "censored"，使用者只看到 exit status 2，完全无从下手。
+	b.WriteString("    - name: 执行账号 SQL（" + req.Name + "）\n")
+	b.WriteString("      block:\n")
 	// 分支一：目标机自带客户端
-	b.WriteString("    - name: 使用目标机本地 " + client + " 客户端执行 SQL\n")
-	b.WriteString("      ansible.builtin.shell: |\n")
+	b.WriteString("        - name: 使用目标机本地 " + client + " 客户端执行 SQL\n")
+	b.WriteString("          ansible.builtin.shell: |\n")
 	for _, line := range accountSQLShellLines(client, passwordEnv, false, req.Statements) {
-		b.WriteString("        " + line + "\n")
+		b.WriteString("            " + line + "\n")
 	}
-	b.WriteString("      environment:\n")
-	b.WriteString("        " + passwordEnv + ": \"{{ db_password }}\"\n")
-	b.WriteString("      no_log: true\n")
-	b.WriteString("      when: account_client.rc == 0\n")
-
+	b.WriteString("          environment:\n")
+	b.WriteString("            " + passwordEnv + ": \"{{ db_password }}\"\n")
+	b.WriteString("          no_log: true\n")
+	b.WriteString("          when: account_client.rc == 0\n")
 	// 分支二：回退到目标机上的 docker（--network host 以便连到宿主上的库）
-	b.WriteString("    - name: 回退用 docker 一次性容器执行 SQL\n")
-	b.WriteString("      ansible.builtin.shell: |\n")
+	b.WriteString("        - name: 回退用 docker 一次性容器执行 SQL\n")
+	b.WriteString("          ansible.builtin.shell: |\n")
 	for _, line := range accountSQLShellLines(client, passwordEnv, true, req.Statements) {
-		b.WriteString("        " + line + "\n")
+		b.WriteString("            " + line + "\n")
 	}
-	b.WriteString("      environment:\n")
-	b.WriteString("        " + passwordEnv + ": \"{{ db_password }}\"\n")
-	b.WriteString("      no_log: true\n")
-	b.WriteString("      when: account_client.rc != 0 and (account_docker.rc | default(1)) == 0\n")
+	b.WriteString("          environment:\n")
+	b.WriteString("            " + passwordEnv + ": \"{{ db_password }}\"\n")
+	b.WriteString("          no_log: true\n")
+	b.WriteString("          when: account_client.rc != 0 and (account_docker.rc | default(1)) == 0\n")
+	// rescue：把失败原因摊开（不含口令），避免 no_log 把真实报错藏成「censored」。
+	b.WriteString("      rescue:\n")
+	b.WriteString("        - name: 账号 SQL 失败诊断（不含口令）\n")
+	b.WriteString("          ansible.builtin.fail:\n")
+	b.WriteString("            msg: >-\n")
+	b.WriteString("              账号 SQL 在目标机执行失败：可能是镜像拉取失败、数据库不可达或执行账号口令错误。\n")
+	b.WriteString("              ① 镜像：在目标机执行 `docker images " + image + "` 确认镜像存在；拉不到说明目标机无外网/私有仓库访问。\n")
+	b.WriteString("              ② 可达性：docker 回退使用 --network host，要求库在「宿主网络」可达；若库仅存在于未发布端口的容器内（如 compose 起库且未映射 3306），此路不通，请改用「本机」部署位置或手工建号后只填账号口令。\n")
+	b.WriteString("              ③ 认证：执行账号 " + yamlScalar(strings.TrimSpace(req.ExecUser)) + " 或口令不正确、或无建号权限。\n")
+	b.WriteString("              可在目标机手工复现（口令走环境变量，不进命令行）：\n")
+	userFlag, portFlag := "-u", "-P"
+	if client == "psql" {
+		userFlag, portFlag = "-U", "-p"
+	}
+	probeCmd := "docker run --rm --network host -e " + passwordEnv + " " + image + " " + client +
+		" -h " + yamlScalar(host) + " " + portFlag + " " + strconv.Itoa(port) +
+		" " + userFlag + " " + yamlScalar(strings.TrimSpace(req.ExecUser))
+	if client == "psql" {
+		probeCmd += " -d postgres -c \"SELECT 1\""
+	} else {
+		probeCmd += " --protocol=TCP -e \"SELECT 1\""
+	}
+	b.WriteString("              " + probeCmd + "\n")
+	b.WriteString("            no_log: false\n")
 
 	playbook := strings.Join(strings.Split(b.String(), "\r\n"), "\n")
 	if err := validatePlaybookYAML("账号 SQL", playbook); err != nil {

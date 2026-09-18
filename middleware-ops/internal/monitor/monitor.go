@@ -3,8 +3,8 @@
 // 设计依据（设计文档 4.2）：指标统一由 Prometheus + 官方 Exporter 采集，
 // 平台通过 PromQL 查询，**不建自有指标表**；历史趋势由 Prometheus 保留策略控制。
 //
-// 当 prometheus.base_url 为空时，是否使用内置指标模拟器取决于 prometheus.mock_enabled：
-// 开启则用模拟器（simulator.go，离线演示用），关闭则监控数据源禁用（disabled.go），
+// 当 prometheus.base_url 为空时，监控数据源禁用（disabled.go，页面显示"无数据"）：
+// 平台只使用真实数据，不提供任何模拟指标。
 // 明确表达「无数据源」而不是用假数据掩盖未接入的事实。
 package monitor
 
@@ -28,6 +28,10 @@ type Metric struct {
 	// Category 用于前端分组：resource / performance / reliability。
 	Category string `json:"category"`
 	// Latest 为最新值（当前快照）。
+	//
+	// **只使用真实数据**：Status == "unknown" 时表示"这次没查到数据"，
+	// 此时 Latest 无意义（JSON 里是 0，界面按 Status 显示「无数据」而不是 0）。
+	// 平台不会用任何模拟/默认值填充它。
 	Latest float64 `json:"latest"`
 	// Status 为语义化健康判定：ok / warning / critical / unknown。
 	Status string `json:"status"`
@@ -46,9 +50,9 @@ type Snapshot struct {
 	MWType     string    `json:"mw_type"`
 	Collected  time.Time `json:"collected_at"`
 	Metrics    []Metric  `json:"metrics"`
-	// Source 取值 prometheus / simulator。
+	// Source 取值 prometheus / disabled。
 	Source string `json:"source"`
-	// Degraded 为 true 表示 Prometheus 不可用，已降级为模拟数据。
+	// Degraded 为 true 表示 Prometheus 不可用（此时只有说明、没有数值；平台不使用模拟数据）。
 	Degraded bool   `json:"degraded"`
 	Note     string `json:"note"`
 	// Selector 为本次查询实际使用的 PromQL 标签匹配串（接入自检与排障用）。
@@ -169,7 +173,7 @@ type TargetReporter interface {
 //
 // 用途：自检要回答"组件自己是否可用"（redis_up / mysql_up / pg_up / 抓取目标的 up），
 // 这类指标不在 profile 里（profile 只放业务指标），必须按表达式直接查一次。
-// 内置模拟器不实现本接口，调用方据此跳过该环节。
+// 数据源未接入（disabled）时不实现本接口，调用方据此跳过该环节。
 type ValueReporter interface {
 	// QueryValue 执行 PromQL 并返回标量；无结果返回 (nil, nil)。
 	QueryValue(ctx context.Context, expr string) (*float64, error)
@@ -183,7 +187,7 @@ type Client interface {
 	History(ctx context.Context, target Target, metric string, r TimeRange) ([]Sample, error)
 	// Compare 多实例同指标对比。
 	Compare(ctx context.Context, targets []Target, metric string) (map[string]float64, error)
-	// Kind 返回实现类型（prometheus / simulator）。
+	// Kind 返回实现类型（prometheus / disabled）。
 	Kind() string
 	// Healthy 报告上游可用性。
 	Healthy(ctx context.Context) bool

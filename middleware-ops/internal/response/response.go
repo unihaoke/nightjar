@@ -77,8 +77,16 @@ func OKPage(c *gin.Context, list any, total int64, page, size int) {
 }
 
 // Fail 按业务错误返回失败响应，并终止后续处理。
+//
+// 同时把原始错误记入 gin 的 error 链（c.Error），让 Logger 中间件能把真实原因
+// （含 apperr.Wrap 保留的 Cause，例如「监控数据源未配置」「请求 prometheus 失败」）
+// 写进结构化访问日志的 errors 字段——否则 5xx 日志只剩状态码，难以排障。
+// 注意：只回给前端 appErr.Message（对外文案），Cause 仅用于日志，不上报客户端。
 func Fail(c *gin.Context, err error) {
 	appErr := apperr.From(err)
+	if err != nil {
+		c.Error(err)
+	}
 	c.AbortWithStatusJSON(appErr.HTTPStatus(), Body{
 		Code:    int(appErr.Code),
 		Message: appErr.Message,

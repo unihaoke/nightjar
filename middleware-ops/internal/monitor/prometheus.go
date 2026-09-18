@@ -31,6 +31,13 @@ import (
 // 静默替换成模拟曲线，把接入错误彻底藏了起来。
 var errEmptyResult = errors.New("查询结果为空")
 
+// ErrUnknownMetric 表示该指标不在指定中间件类型的指标画像中（SpecOf 查不到）。
+//
+// 与「上游不可用」严格区分：它是入参/配置问题（实例类型未纳管该指标或指标名写错），
+// 不应被包成 CodeUpstream(502)，否则会误导使用者以为是 Prometheus 挂了。
+// 服务层用 errors.Is 识别它，返回 4xx 并给出接入自检指引。
+var ErrUnknownMetric = errors.New("未知指标")
+
 // promClient 通过 Prometheus HTTP API 查询指标（4.2：不自建采集器）。
 type promClient struct {
 	baseURL   string
@@ -330,7 +337,7 @@ func buildSnapshotNote(selector, job string, jobUp *float64, matched, emptyCnt, 
 func (p *promClient) History(ctx context.Context, target Target, metric string, r TimeRange) ([]Sample, error) {
 	spec, ok := SpecOf(target.MWType, metric)
 	if !ok {
-		return nil, fmt.Errorf("未知指标: %s", metric)
+		return nil, fmt.Errorf("%w: 类型 %s 未纳管指标 %s", ErrUnknownMetric, target.MWType, metric)
 	}
 	selector := buildSelector(target, p.jobPrefix)
 	expr := strings.ReplaceAll(spec.Expr, "{selector}", "{"+selector+"}")

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,7 +18,7 @@ import (
 
 // MetricsService 提供统一监控查询能力（4.2）。
 //
-// 指标全部来自 Prometheus（或内置模拟器），平台不落自有指标表。
+// 指标全部来自 Prometheus（平台不使用模拟数据；无数据源时显示「无数据」），平台不落自有指标表。
 type MetricsService struct {
 	instances *repository.InstanceRepository
 	monitor   monitor.Client
@@ -62,6 +63,16 @@ func (s *MetricsService) History(ctx context.Context, instanceID int64, metric s
 	}
 	samples, err := s.monitor.History(ctx, ToTarget(*item), metric, r)
 	if err != nil {
+		// 「指标不在实例类型的画像中」是入参/配置问题，不是上游故障，
+		// 不应返回 502（否则会被误判为 Prometheus 挂了）。明确给 400 并指引接入自检。
+		// 注意：Prometheus 正常响应但「无时序」不会走到这里（monitor 层返回空序列、无错误），
+		// 那是合法结果，由 handler 以空 series + note 返回。
+		if errors.Is(err, monitor.ErrUnknownMetric) {
+			return nil, apperr.Newf(apperr.CodeInvalidParam,
+				"指标 %q 不在实例 %d（类型 %s）的指标画像中：该类型尚未纳管此指标或指标名不匹配。"+
+					"若 Prometheus 中确有该时序，请运行「接入自检」核对选择器标签与 Exporter 上报情况。",
+				metric, instanceID, item.MWType)
+		}
 		return nil, apperr.Wrap(apperr.CodeUpstream, err)
 	}
 	return samples, nil
@@ -365,7 +376,7 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 	}
 	endpoint := strings.TrimSpace(reporter.Endpoint())
 	if endpoint == "" {
-		return []string{"当前未配置 prometheus.base_url：监控页面展示的是内置模拟数据，不是真实指标。"}
+		return []string{"当前未配置 prometheus.base_url：监控页面显示「无数据」，平台不使用任何模拟数据。"}
 	}
 	host := monitor.HostOf(endpoint)
 	if host == "" {
@@ -394,11 +405,13 @@ func (s *MetricsService) augmentEndpointHints(ctx context.Context, result *Diagn
 // diagnoseHints 依据自检事实生成可执行的排查建议（按可能性从高到低）。
 func diagnoseHints(item *model.MiddlewareInstance, result *DiagnoseResult) []string {
 	hints := make([]string, 0, 6)
-	if result.MonitorKind == "simulator" {
-		hints = append(hints, "当前数据源是内置模拟器（prometheus.base_url 为空且 mock_enabled=true）：页面上的数值不是真实指标。请设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090（平台自带 Prometheus），并用 docker compose 启动平台监控服务。")
+	if result.MonitorKind != "prometheus" {
+		hints = append(hints, "当前没有监控数据源（prometheus.base_url 为空）：页面显示的是「无数据」，平台不使用任何模拟数据。"+
+			"请设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090（平台自带 Prometheus），并用 docker compose 启动平台监控服务。")
 	}
 	if result.MonitorKind == "disabled" {
-		hints = append(hints, "模拟数据已关闭且未配置 prometheus.base_url：当前没有监控数据源，页面不展示任何指标。如需离线演示可设 MWOPS_PROMETHEUS_MOCK_ENABLED=true；生产环境请接入平台自带 Prometheus（docker compose 启动 mwops-prometheus）。")
+		hints = append(hints, "未配置 prometheus.base_url：当前没有监控数据源，页面不展示任何指标。"+
+			"请设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090 并启动平台自带 Prometheus（docker compose 启动 mwops-prometheus）。")
 	}
 	if !result.Healthy {
 		hints = append(hints, "Prometheus 健康检查未通过：确认 mwops-prometheus 容器在运行、地址可达、网络别名正确（平台侧 getent hosts prometheus）。")

@@ -78,7 +78,7 @@ type Bundle struct {
 	ToolSteps []string `json:"tool_steps"`
 	// Truncated 为被预算截断的维度。
 	Truncated []string `json:"truncated"`
-	// DataSource 为指标来源（prometheus / simulator）。
+	// DataSource 为指标来源（prometheus / disabled；平台不使用模拟数据）。
 	DataSource string `json:"data_source"`
 }
 

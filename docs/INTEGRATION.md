@@ -164,16 +164,34 @@ job="middleware-integration",instance_name="<集成名称>"
 
 | 组件 | Exporter 镜像 | 端口 | 参数形态 | 推荐告警 | Grafana 大盘 |
 |---|---|---|---|---|---|
-| Redis | `oliver006/redis_exporter:v1.66.0` | 9121 | 环境变量 `REDIS_EXPORTER_*` | 内存率 > 85%、命中率 < 90%、淘汰 > 0 | 763 |
-| MySQL | `prom/mysqld-exporter:v0.15.1` | 9104 | 命令行 `--collect.*` + `DATA_SOURCE_NAME` | 连接数 > 400、慢查询 > 5 | 7362 |
+| Redis | `oliver006/redis_exporter:v1.66.0` | 9121 | 环境变量 `REDIS_EXPORTER_*` | 服务不可用、内存率 > 85%、命中率 < 90%、淘汰 > 0、主从链路断开 | 763 |
+| MySQL | `prom/mysqld-exporter:v0.15.1` | 9104 | 命令行 `--collect.*` + `DATA_SOURCE_NAME` | 服务不可用、连接数 > 400、连接使用率 > 85%、慢查询 > 5 | 7362 |
 | PostgreSQL | `prometheuscommunity/postgres-exporter:v0.16.0` | 9187 | `DATA_SOURCE_NAME` + `--auto-discover-databases` 等 | 连接数 > 150、主从延迟 > 30s | 9628 |
 | Kafka | `danielqsj/kafka-exporter:v1.7.0` | 9308 | 命令行 `--kafka.server` 等 | 消费 Lag > 1 万、ISR 不足 > 0 | 7589 |
 | Elasticsearch | `prometheuscommunity/elasticsearch-exporter:v1.7.0` | 9114 | 命令行 `--es.uri` / `--es.username` | 非 green、堆 > 85% | 2322 |
 | Nginx | `nginx/nginx-prometheus-exporter:1.3.0` | 9113 | 命令行 `--nginx.scrape-uri` | 5xx > 2% | 9614 |
 
+### 5.1 统一监控页可选指标（按画像顺序，**第一条是切换实例后的默认指标**）
+
+| 组件 | 指标（下拉顺序，共 N 项） |
+|---|---|
+| Redis（18） | **服务可用 `redis_up`** · 已用内存 · 客户端连接使用率 · 过期 key 速率 · 入向流量 · 出向流量 · 拒绝连接速率 · 主从链路 · RDB 持久化状态 · 运行时长 · 内存使用率 · 连接数 · QPS · 命中率 · key 数量 · 慢查询数 · 淘汰 key 数 · 阻塞客户端 |
+| MySQL（16） | **服务可用 `mysql_up`** · 运行中线程 · 连接使用率 · 缓冲池使用率 · 连接失败速率 · 行锁等待速率 · 磁盘临时表速率 · 复制 IO 线程 · 复制 SQL 线程 · 运行时长 · QPS · TPS · 连接数 · 慢查询数 · 缓冲池命中率 · 主从延迟 |
+| PostgreSQL（7） | QPS · TPS · 连接数 · 慢查询数 · 缓存命中率 · 锁等待 · 主从延迟（`pg_replication_lag`） |
+| 主机 Node（8） | 主机可达 · CPU · 内存 · 磁盘 · 负载 · inode · 入/出向流量 |
+| Kafka（6） / ES（7） / Nginx（4） | 见 `internal/monitor/profile.go`（顺序即下拉顺序） |
+
+> 指标名就是 PromQL 里那个指标（如 `redis_up`），因此怀疑数据不对时可以直接拿去 Prometheus 查。
+> 「服务可用」这类 0/1 指标只有**该时序存在**时才有值；非从库实例不会有主从相关指标，
+> 界面对缺失项显示「无数据」而不是 0，也不会误报。
+>
+> 补齐规则（改动指标时必须遵守）：**模板里推荐告警引用的指标必须存在于画像中**，
+> 由 `TestTemplateAlertMetricsExistInProfiles` 守卫——它已经在补齐过程中抓出过
+> 「PostgreSQL 主从延迟」这条永不触发的推荐规则。
+
 各组件的踩坑点（会显示在集成弹窗里）：
 
-- **Redis**：`REDIS_ADDR` 用 `redis://host:port`，账号口令分别用 `REDIS_USER`/`REDIS_PASSWORD`；
+- **Redis**：`REDIS_ADDR` 用 `<host>:<port>`（不带 scheme），账号口令分别用 `REDIS_USER`/`REDIS_PASSWORD`；
   云数据库集群架构必须打开两个 EXCLUDE 开关（不支持 `SLOWLOG`/`LATENCY HISTOGRAM`）；
   `redis_exporter` 没有 `SERVICE_NAME` 之类的实例名开关，`instance_name` 由平台写入。
 - **MySQL**：先建只读账号 `GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%';`；

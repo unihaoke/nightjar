@@ -6,7 +6,7 @@
 # 本文件即「单机零外部依赖可启动」的最小配置：
 #   - 仅需 PostgreSQL（平台元数据库）；
 #   - Redis 缺省为空 → 自动降级为进程内缓存与队列；
-#   - Prometheus 缺省为空、且 mock_enabled=false（默认）→ 监控数据源禁用，不提供模拟数据；
+#   - Prometheus 缺省为空 → 监控数据源禁用：页面显示「无数据」，平台只使用真实数据；
 #   - AI 引擎缺省 hybrid + mock → 规则引擎兜底，接入 LLM 只需填 base_url/api_key。
 
 app:
@@ -119,19 +119,12 @@ ai_engine:
     rules_engine_enabled: true
 
 prometheus:
-  # 留空 = 未接入 Prometheus。是否允许用内置模拟数据填充页面由 mock_enabled 决定。
+  # 留空 = 未接入 Prometheus（页面显示「无数据」）。平台**只使用真实数据**，不提供任何模拟指标。
   base_url: ""
   timeout: 8s
   cache_ttl: 15s
   retention: 360h
   exporter_job_prefix: middleware-exporter
-  # 模拟数据开关：默认 false（关闭）。
-  #   - false 且 base_url 为空 → 监控链路返回「无数据源」，页面不展示任何假指标；
-  #   - false 且 base_url 非空 → 查询失败直接报错，不回退模拟器；
-  #   - true 且 base_url 为空 → 使用内置模拟器（离线演示）；
-  #   - true 且 base_url 非空 → 查询失败时回退模拟器以保证页面可用。
-  # 需要离线演示可显式开启，环境变量：MWOPS_PROMETHEUS_MOCK_ENABLED=true。
-  mock_enabled: false
 
 # ---------------------------------------------------------------------------
 # 集成中心：在页面上选组件（Redis/MySQL/...）、填地址与账号，平台自动完成

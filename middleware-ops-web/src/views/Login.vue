@@ -28,7 +28,7 @@ const infraHint = computed(() => {
     return ''
   }
   const { infrastructure, ai_engine } = systemInfo.value
-  const source = infrastructure.prometheus.source === 'simulator' ? '内置指标模拟器' : 'Prometheus'
+  const source = infrastructure.prometheus.source === 'prometheus' ? 'Prometheus' : '无数据源'
   return `AI 引擎：${ai_engine.strategy} · 指标来源：${source} · 缓存：${infrastructure.redis.cache_kind}`
 })
 

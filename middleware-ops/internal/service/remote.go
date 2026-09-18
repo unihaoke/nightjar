@@ -323,7 +323,11 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	r5：Exporter 侧地址按「目标机视角」渲染（同机改用回环）；远程回环地址不再做平台侧探测（INC-013）。
 //	r6：新增「重新核验」接口与周期自愈；核验返回"是否已判定"，Prometheus 抖动不再误改状态（INC-015）。
 //	r7：新增「集成自检」：平台端口 → Exporter 在位 → Prometheus 抓取 → 业务指标，分环节给结论与动作。
-const CodeRevision = "r7"
+//	r8：彻底移除模拟数据（simulator / 回退客户端 / profile 生成器默认值 / mock_enabled），
+//	    无数据时界面显示「无数据」而不是 0。
+//	r9：补齐 redis/mysql 指标（含可用性指标，置于首位）；修正 PG 主从延迟告警引用了不存在的指标；
+//	    统一监控页切换实例时指标跟随切换（INC-017）。
+const CodeRevision = "r9"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

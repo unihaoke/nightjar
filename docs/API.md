@@ -154,7 +154,7 @@
 
 - 只有 Prometheus **不可达/协议错误**（全部指标查询失败）才降级为模拟器；
 - Prometheus 正常响应但选择器一条时序都没匹配到时，如实返回空快照，并在 `snapshot.note` 写明原因，
-  **绝不用模拟数据补齐**——否则前端会画出似是而非的曲线，把接入错误掩盖掉；
+  **绝不用模拟数据或默认值补齐**——平台只使用真实数据：查不到就是「无数据」（`status=unknown`，`latest` 不代表真实值），否则前端会画出似是而非的曲线，把接入错误掩盖掉；
 - 快照附带 `selector`、`matched` / `total`、`job_up` 三个诊断字段：
   `job_up = null` 表示该 job 未被 Prometheus 配置，`job_up = 0` 表示 target 抓取失败，
   `job_up = 1` 但 `matched = 0` 则是实例名与 `instance_name` 标签对不上。

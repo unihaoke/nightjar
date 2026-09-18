@@ -205,7 +205,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/audit/verify
 
 | 现象 | 排查方向 |
 |------|----------|
-| 监控页面显示「内置模拟器」 | 未配置或连不上 `prometheus.base_url`；检查 Prometheus 容器与 `/-/healthy` |
+| 监控页面显示「无数据源」/指标显示「无数据」 | 未配置或连不上 `prometheus.base_url`；检查 Prometheus 容器与 `/-/healthy` |
 | AI 诊断为「规则引擎」结论 | 第三方/本地引擎均不可用；检查 `ai_engine.*` 配置、API Key、出网连通性、熔断状态（`/api/system/info`） |
 | 诊断报 4033（需要审批） | 目标动作是 L2；到「审批管理」创建/审批工单后凭 `ticket_id` 执行 |
 | 代码分析提示「不在出网白名单」 | 需在「服务器与仓库」中为该服务开启 `allow_third_party`，并在 `security.outbound_whitelist` 中加入服务名 |

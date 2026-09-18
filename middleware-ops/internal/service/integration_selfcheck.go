@@ -195,7 +195,7 @@ func (s *IntegrationService) selfCheckScrape(
 	reporter, ok := s.monitor.(monitor.TargetReporter)
 	if !ok || s.monitor == nil {
 		stage.Status = stageWarn
-		stage.Detail = "当前监控数据源不支持查询抓取目标（如内置模拟器或数据源已禁用），无法判定"
+		stage.Detail = "当前监控数据源不支持查询抓取目标（数据源已禁用或实现不支持），无法判定"
 		return stage
 	}
 	job := meta.Job
@@ -246,14 +246,14 @@ func (s *IntegrationService) selfCheckMetrics(ctx context.Context, item *model.M
 	}
 	if snapshot.Source == "disabled" {
 		stage.Status = stageWarn
-		stage.Detail = "模拟数据已关闭且未配置 Prometheus，当前无监控数据源，无法判定真实指标"
-		stage.Advice = "如需离线演示可开启 mock_enabled；生产环境请接入平台自带 Prometheus"
+		stage.Detail = "未配置 Prometheus（当前无监控数据源），无法判定真实指标"
+		stage.Advice = "设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090 并启动平台自带 Prometheus"
 		return stage
 	}
 	if snapshot.Degraded || snapshot.Source != "prometheus" {
 		stage.Status = stageWarn
-		stage.Detail = "当前展示的是内置模拟数据（Prometheus 不可达），无法判定真实指标"
-		stage.Advice = "确认平台能访问 Prometheus"
+		stage.Detail = "当前读不到真实指标（Prometheus 不可达），无法判定"
+		stage.Advice = "确认平台能访问 Prometheus（prometheus.base_url / mwops-prometheus 容器）"
 		return stage
 	}
 	// 组件自身的 up（redis_up / mysql_up / pg_up / 抓取目标的 up）直接查一次：

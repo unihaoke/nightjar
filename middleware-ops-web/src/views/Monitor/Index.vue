@@ -2,11 +2,12 @@
 /**
  * 统一监控（4.2）。
  *
- * 指标全部来自 Prometheus（或内置模拟器），平台不落自有指标表；
+ * 指标全部来自 Prometheus（平台不使用模拟数据；无数据源时显示「无数据」），平台不落自有指标表；
  * 支持单实例多指标趋势与多实例同指标对比。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { metricsApi, middlewareApi } from '@/api'
 import { toastError } from '@/api/http'
 import type { MetricSnapshot, MiddlewareInstance } from '@/api/types'
@@ -64,9 +65,7 @@ async function loadSnapshot(): Promise<void> {
   loading.value = true
   try {
     snapshot.value = await metricsApi.snapshot(query.instance_id)
-    if (!query.metric && metricOptions.value.length > 0) {
-      query.metric = metricOptions.value[0].name
-    }
+    syncMetricWithInstance()
     await loadHistory()
   } catch (error) {
     toastError(error)
@@ -75,9 +74,35 @@ async function loadSnapshot(): Promise<void> {
   }
 }
 
+/**
+ * 让"当前指标"跟住"当前实例"。
+ *
+ * 为什么必须做（真实反馈）：切换实例（例如从 MySQL 切到 Redis）时，`query.metric` 还留着
+ * 上一个组件的指标名，而指标下拉是按**当前实例的画像**渲染的 —— 于是：
+ *   下拉里没有这个值（看起来是空的）→ 立刻拿它去查历史 → 后端「未知指标」
+ *   → 界面弹「上游依赖异常」。
+ * 正确行为：切换后若当前指标不属于新组件，就切到该组件的**第一个指标**。
+ */
+function syncMetricWithInstance(): void {
+  const options = metricOptions.value
+  if (options.length === 0) {
+    query.metric = ''
+    series.value = []
+    return
+  }
+  if (!options.some((item) => item.name === query.metric)) {
+    query.metric = options[0].name
+  }
+}
+
 /** 加载历史序列。 */
 async function loadHistory(): Promise<void> {
   if (!query.instance_id || !query.metric) {
+    return
+  }
+  // 防御：指标不属于当前实例时不要发请求（避免把"上游依赖异常"这种噪音弹给使用者）。
+  if (metricOptions.value.length > 0 && !metricOptions.value.some((item) => item.name === query.metric)) {
+    series.value = []
     return
   }
   historyLoading.value = true
@@ -95,6 +120,10 @@ async function loadHistory(): Promise<void> {
 /** 多实例对比。 */
 async function compare(): Promise<void> {
   if (!query.metric) {
+    return
+  }
+  if (metricOptions.value.length > 0 && !metricOptions.value.some((item) => item.name === query.metric)) {
+    ElMessage({ type: 'warning', message: '该指标不属于当前组件，请先重新选择指标' })
     return
   }
   compareLoading.value = true
@@ -128,7 +157,7 @@ onMounted(async () => {
       </div>
       <div class="row">
         <el-tag v-if="snapshot" size="small" effect="light" :type="snapshot.source === 'prometheus' ? 'success' : 'warning'">
-          {{ snapshot.source === 'prometheus' ? 'Prometheus' : '内置模拟器' }}
+          {{ snapshot.source === 'prometheus' ? 'Prometheus' : '无数据源' }}
         </el-tag>
         <el-button :icon="'Refresh'" size="small" @click="loadSnapshot">刷新</el-button>
       </div>
@@ -211,7 +240,7 @@ onMounted(async () => {
               {{ item.status }}
             </el-tag>
           </div>
-          <div class="metric-number">{{ formatNumber(item.latest, item.unit) }}</div>
+          <div class="metric-number">{{ item.status === 'unknown' ? '无数据' : formatNumber(item.latest, item.unit) }}</div>
           <p class="metric-threshold muted">{{ item.category }}</p>
         </div>
         <el-empty v-if="!(snapshot?.metrics || []).length" description="暂无指标数据" :image-size="72" />

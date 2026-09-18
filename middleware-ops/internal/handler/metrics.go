@@ -68,10 +68,17 @@ func (h *Handler) GetMetricsHistory(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
+	// 空序列（Prometheus 正常响应但无时序）是合法结果：不要返回 502，
+	// 用 note 解释"为什么没数据"，避免前端一片空白且被误读成故障。
+	note := ""
+	if len(samples) == 0 {
+		note = "该指标在当前时间范围内无采样数据：可能 Exporter 未上报此指标、或标签选择器（instance_name/job）与 Prometheus 实际标签不匹配。可运行「接入自检」核对。"
+	}
 	response.OK(c, gin.H{
 		"metric": c.Query("metric"),
 		"series": samples,
 		"source": h.deps.Metrics.MonitorKind(),
+		"note":   note,
 	})
 }
 

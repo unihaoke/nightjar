@@ -234,7 +234,7 @@ onMounted(load)
     <div class="card">
       <h3 class="card-title">
         当前指标
-        <el-tag size="small" effect="plain">来源：{{ snapshot?.source === 'prometheus' ? 'Prometheus' : '内置模拟器' }}</el-tag>
+        <el-tag size="small" effect="plain">来源：{{ snapshot?.source === 'prometheus' ? 'Prometheus' : '无数据源' }}</el-tag>
       </h3>
       <div class="metrics-grid">
         <div v-for="item in metrics" :key="item.name" class="metric-cell" :class="`is-${item.status}`">
@@ -245,7 +245,8 @@ onMounted(load)
             </el-tag>
           </div>
           <div class="metric-value-row">
-            <span class="metric-number">{{ formatNumber(item.latest, item.unit) }}</span>          </div>
+            <span class="metric-number">{{ item.status === 'unknown' ? '无数据' : formatNumber(item.latest, item.unit) }}</span>
+          </div>
           <p class="metric-threshold muted">
             警告 {{ item.warning_threshold || '-' }} · 严重 {{ item.critical_threshold || '-' }}
           </p>
@@ -331,7 +332,7 @@ onMounted(load)
           <el-descriptions-item label="连接地址">{{ diagnose.host }}:{{ diagnose.port }}</el-descriptions-item>
           <el-descriptions-item label="数据源">
             <el-tag size="small" :type="diagnose.monitor_kind === 'prometheus' ? 'success' : 'warning'">
-              {{ diagnose.monitor_kind === 'prometheus' ? 'Prometheus' : '内置模拟器' }}
+              {{ diagnose.monitor_kind === 'prometheus' ? 'Prometheus' : '无数据源' }}
             </el-tag>
             <el-tag class="ml" size="small" :type="diagnose.prometheus_healthy ? 'success' : 'danger'">
               {{ diagnose.prometheus_healthy ? '健康' : '不可达' }}

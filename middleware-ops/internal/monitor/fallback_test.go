@@ -122,36 +122,6 @@ func TestHistoryDoesNotFabricateDataOnEmptyResult(t *testing.T) {
 	}
 }
 
-// TestSnapshotDegradesToSimulatorWhenPrometheusDown 锁定：
-// 上游真的挂了才降级为模拟器，且降级后仍要回传真实选择器供排障。
-//
-// 注意：回退模拟器仅在 mock_enabled=true 时启用（默认关闭，避免用假数据掩盖未接入），
-// 因此本测试显式开启该开关。
-func TestSnapshotDegradesToSimulatorWhenPrometheusDown(t *testing.T) {
-	server := httptest.NewServer(stubHandler(stubDown))
-	defer server.Close()
-	cfg := &config.Config{}
-	cfg.Prometheus.BaseURL = server.URL
-	cfg.Prometheus.Timeout = 2 * time.Second
-	cfg.Prometheus.ExporterJobPrefix = "middleware-exporter"
-	cfg.Prometheus.MockEnabled = true
-	client := New(cfg, nil, zap.NewNop())
-
-	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
-	if err != nil {
-		t.Fatalf("降级链应兜住上游故障：%v", err)
-	}
-	if snapshot.Source != "simulator" || !snapshot.Degraded {
-		t.Fatalf("Prometheus 不可达时应降级为模拟器，实际 source=%s degraded=%v", snapshot.Source, snapshot.Degraded)
-	}
-	if !strings.Contains(snapshot.Note, "已回退") {
-		t.Fatalf("降级必须显式提示，实际 note=%q", snapshot.Note)
-	}
-	if snapshot.Selector != `job="middleware-exporter-redis",instance_name="legacy-redis"` {
-		t.Fatalf("降级后仍应回传真实选择器，实际 %q", snapshot.Selector)
-	}
-}
-
 // TestSnapshotMatchesWhenJobAndLabelsAgree 锁定：
 // 选择器命中时不得产生噪声提示，job_up 应为 1。
 func TestSnapshotMatchesWhenJobAndLabelsAgree(t *testing.T) {
@@ -182,36 +152,49 @@ func TestSnapshotMatchesWhenJobAndLabelsAgree(t *testing.T) {
 	}
 }
 
-// TestMockSwitchDefaultOff 锁定：mock_enabled 默认关闭时，base_url 为空不使用模拟器，
-// 而是返回 disabled 数据源，明确表达「无数据源」而非用假数据掩盖未接入。
-func TestMockSwitchDefaultOff(t *testing.T) {
-	cfg := &config.Config{} // base_url 为空，mock_enabled 默认 false
+// TestNoSimulatedDataEver 锁定产品约定：**只使用真实数据**。
+//
+// 平台曾经有一条"Prometheus 查询失败就回退内置模拟器"的通路，以及一个 mock_enabled 开关。
+// 它会把"实例其实没接入""后端不可达"伪装成一条看起来很正常的曲线，
+// 使用者无法分辨屏幕上的数字是不是真的。现在：
+//   - 未配置 base_url → 明确的无数据源（页面显示"无数据"），绝不生成数值；
+//   - 配置了 base_url → 只用 Prometheus，查询失败就报错。
+func TestNoSimulatedDataEver(t *testing.T) {
+	// 未配置 base_url：无数据源，且**一个数值都不能有**。
+	cfg := &config.Config{}
 	client := New(cfg, nil, zap.NewNop())
 	if client.Kind() != "disabled" {
-		t.Fatalf("mock 关闭且未配置 base_url 时应禁用数据源，实际 kind=%s", client.Kind())
+		t.Fatalf("未配置 base_url 时应为无数据源，实际 kind=%s", client.Kind())
 	}
 	snapshot, err := client.Snapshot(context.Background(), sampleRedisTarget())
 	if err != nil {
-		t.Fatalf("disabled 快照不应报错：%v", err)
+		t.Fatalf("无数据源的快照不应报错（页面要显示「无数据」）：%v", err)
 	}
-	if snapshot.Source != "disabled" || !snapshot.Degraded {
-		t.Fatalf("disabled 快照应标注 source=disabled，实际 source=%s degraded=%v", snapshot.Source, snapshot.Degraded)
+	if snapshot.Source != "disabled" {
+		t.Fatalf("应标注 source=disabled，实际 %s", snapshot.Source)
 	}
 	if len(snapshot.Metrics) != 0 {
-		t.Fatalf("disabled 不应有指标数据，实际 %d 项", len(snapshot.Metrics))
+		t.Fatalf("无数据源不得返回任何指标数值，实际 %d 项", len(snapshot.Metrics))
 	}
 	if _, err := client.History(context.Background(), sampleRedisTarget(), "memory_usage_percent", TimeRange{}); err == nil {
-		t.Fatal("disabled 的历史查询应报错")
+		t.Fatal("无数据源的历史查询应报错，而不是给出曲线")
 	}
-}
+	if _, err := client.Compare(context.Background(), []Target{sampleRedisTarget()}, "memory_usage_percent"); err == nil {
+		t.Fatal("无数据源的对比查询应报错")
+	}
 
-// TestMockSwitchOnWithEmptyBaseURL 锁定：开启 mock_enabled 且 base_url 为空时使用模拟器。
-func TestMockSwitchOnWithEmptyBaseURL(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Prometheus.MockEnabled = true
-	client := New(cfg, nil, zap.NewNop())
-	if client.Kind() != "simulator" {
-		t.Fatalf("开启 mock 且未配置 base_url 时应使用模拟器，实际 kind=%s", client.Kind())
+	// 配置了 base_url 但 Prometheus 不可达：如实报错，不编造数据。
+	server := httptest.NewServer(stubHandler(stubDown))
+	defer server.Close()
+	cfgErr := &config.Config{}
+	cfgErr.Prometheus.BaseURL = server.URL
+	cfgErr.Prometheus.Timeout = 2 * time.Second
+	live := New(cfgErr, nil, zap.NewNop())
+	if live.Kind() != "prometheus" {
+		t.Fatalf("配置了 base_url 时应使用 Prometheus，实际 kind=%s", live.Kind())
+	}
+	if _, err := live.Snapshot(context.Background(), sampleRedisTarget()); err == nil {
+		t.Fatal("Prometheus 不可达时应返回错误（由界面显示「无数据 + 原因」），而不是回退假数据")
 	}
 }
 

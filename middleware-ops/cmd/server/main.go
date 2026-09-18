@@ -149,13 +149,14 @@ func run(configPath string) error {
 		if mon.Healthy(ctx) {
 			log.Info("监控数据源连通性正常", zap.String("base_url", cfg.Prometheus.BaseURL))
 		} else {
-			log.Warn("监控数据源不可达，指标查询将回退内置模拟器",
+			log.Warn("监控数据源不可达：指标会显示「无数据」（平台不使用任何模拟数据）",
 				zap.String("base_url", cfg.Prometheus.BaseURL),
 				zap.String("hint", "确认 mwops-prometheus 容器在运行；跨栈集成**不需要**给平台准备任何互联网络——"+
 					"集成中心会按容器名自动发现并接入目标网络，核对 MWOPS_PROMETHEUS_BASE_URL 与 PROMETHEUS_PORT 即可"))
 		}
-	} else if mon.Kind() == "simulator" {
-		log.Warn("未配置 prometheus.base_url：监控页面展示的是内置模拟数据，不是真实指标")
+	} else {
+		log.Warn("未配置 prometheus.base_url：监控数据源已禁用，页面会显示「无数据」（平台不提供模拟数据）",
+			zap.String("hint", "设置 MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090 并启动平台自带 Prometheus"))
 	}
 
 	// 服务容器

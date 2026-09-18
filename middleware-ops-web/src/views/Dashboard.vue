@@ -258,7 +258,7 @@ onBeforeUnmount(() => {
             <div class="kv">
               <span>监控数据源</span>
               <el-tag size="small" :type="overview?.platform.monitor_source === 'prometheus' ? 'success' : 'warning'">
-                {{ overview?.platform.monitor_source === 'prometheus' ? 'Prometheus' : '内置模拟器' }}
+                {{ overview?.platform.monitor_source === 'prometheus' ? 'Prometheus' : '无数据源' }}
               </el-tag>
             </div>
             <div class="kv">
