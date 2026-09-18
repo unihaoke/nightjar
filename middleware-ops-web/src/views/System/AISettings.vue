@@ -128,14 +128,18 @@ const remainingStatus = computed<'neutral' | 'ok' | 'warning' | 'critical'>(() =
   return 'ok'
 })
 
-/** 趋势表只展示最近 14 天（接口默认返回 30 天，表格不引图表库）。 */
-const recentSeries = computed(() => (usage.value?.series || []).slice(-14))
+/** 趋势表只展示最近 7 天（接口默认返回 30 天，表格不引图表库）。 */
+const recentSeries = computed(() => (usage.value?.series || []).slice(-7))
 /**
  * 窗口内是否真的有消费：平台只展示真实数据，没有任何调用时（全是 0）不画一条「假」趋势，
  * 而是直接显示「暂无消费数据」，避免把补零的空序列误读成有消耗。
  */
 const hasRealUsage = computed(() => recentSeries.value.some((p) => p.tokens > 0 || p.calls > 0))
-const trendData = computed(() => (hasRealUsage.value ? recentSeries.value : []))
+/** 消费趋势倒排：日期从新到旧，一眼看到最近几天的消耗。 */
+const trendData = computed(() => {
+  const s = hasRealUsage.value ? recentSeries.value : []
+  return [...s].reverse()
+})
 
 /** 千分位展示。 */
 function thousand(value: number): string {
@@ -598,7 +602,7 @@ onMounted(async () => {
         </el-row>
       </el-form>
 
-      <h4 class="section">消费趋势（最近 14 天）</h4>
+      <h4 class="section">消费趋势（最近 7 天）</h4>
       <div class="table-scroll">
         <el-table :data="trendData" size="small" empty-text="暂无消费数据">
           <el-table-column prop="date" label="日期" width="130" />

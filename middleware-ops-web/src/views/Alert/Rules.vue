@@ -370,8 +370,10 @@ onMounted(() => {
           <el-col :span="24">
             <el-form-item label="通知渠道">
               <el-checkbox-group v-model="form.notify_channels">
-                <el-checkbox v-for="item in notifyChannels" :key="item.channel" :value="item.channel" :disabled="!item.enabled">
-                  {{ item.channel }}
+                <!-- 不再按 ChannelStatus 禁用：渠道「是否配置」与「在规则里分配」解耦，
+                     未配置的渠道运行时不会实际发出，顶部「（未配置）」标签已作提示。 -->
+                <el-checkbox v-for="item in notifyChannels" :key="item.channel" :value="item.channel">
+                  {{ item.channel }}{{ item.enabled ? '' : '（未配置）' }}
                 </el-checkbox>
               </el-checkbox-group>
             </el-form-item>
