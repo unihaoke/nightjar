@@ -329,7 +329,9 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	    统一监控页切换实例时指标跟随切换（INC-017）。
 //	r10：AI 设置与通知渠道改由平台管理（platform_settings 加密落库、保存即生效、密钥只回掩码），
 //	     新增 token 消费/剩余额度统计；通知配置改为原子快照（INC-018）。
-const CodeRevision = "r10"
+//	r11：表名不再手写字面量，改由 model.TableNameOf 推导（用量统计 + 启动期建索引/向量升级）；
+//	     参考 schema 的表名一并修正（INC-019）。
+const CodeRevision = "r11"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

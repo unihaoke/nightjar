@@ -98,7 +98,8 @@ prometheus:
   接口只回显掩码（`sk-****cdef`），日志与审计里不含密钥；输入框留空＝不修改，点「清除」才清空。
 - **额度**：日额度 / 每人日额度也在这一页配置，超限即触发平台的配额护栏（`CodeQuotaExceeded`）。
 - **消费与剩余额度**：同一页展示今日已用 tokens、剩余额度、今日调用次数、按天趋势、
-  按来源（诊断 / 代码分析）与按用户 Top10 —— 数据来自 `ai_diagnoses` 与 `ai_code_analyses` 的
+  按来源（诊断 / 代码分析）与按用户 Top10 —— 数据来自诊断记录表与代码分析表（真实表名
+  `a_idiagnoses` / `ai_code_analyses`，由 `model.TableNameOf` 推导，见 INC-019）的
   `cost_tokens`，都是真实调用记录，不做估算。
 - **一键验证**：页面上有「测试连接」，用当前生效配置发一次最小请求并返回耗时。
 
@@ -181,7 +182,8 @@ AI 设置与通知渠道共用一个后端分组（密钥整段加密存在 `pla
    `clear_api_key` / `clear_webhook` / `clear_secret` / `clear_password`；
 2. **密钥永不出现在响应、日志与审计里**：审计只记 `key_changed` / `key_cleared` 这类布尔；
    `base_url` 里的 userinfo（`https://user:pass@host`）会先脱敏再入库；
-3. **额度与消费都是真实数据**：直接聚合 `ai_diagnoses` / `ai_code_analyses` 的 `cost_tokens`，
+3. **额度与消费都是真实数据**：直接聚合诊断记录表与代码分析表的 `cost_tokens`（真实表名
+   `a_idiagnoses` / `ai_code_analyses`，由 `model.TableNameOf` 推导，见 INC-019），
    没有数据就是 0，不做估算也不补数（同 INC-016 的原则）。
 
 `postgres` 侧只有一张表 `platform_settings`（`name` 唯一，值为整段 AES-256-GCM 密文）：

@@ -5,6 +5,78 @@
 
 ---
 
+## INC-019 · 用量接口 500：按"直觉"写表名，GORM 实际建的是另一个名字
+
+**首次暴露**：2026-09-19，`GET /api/settings/ai/usage` 返回：
+
+```
+errors: "Error #01: [5000] 服务内部错误: ERROR: relation "ai_diagnoses" does not exist (SQLSTATE 42P01)"
+```
+
+**定位过程**
+
+1. 这条 SQL 是新写的用量统计（INC-018 的功能），表名 `ai_diagnoses` 是照"AI 诊断记录表"的
+   直觉写的，也照 `docs/SCHEMA.sql` 核对过——**文档里写的也是这个名字**；
+2. 让 GORM 自己解析一遍模型才看到真相（`schema.Parse` + `NamingStrategy{}`）：
+
+   ```
+   *model.AIDiagnosis   -> a_idiagnoses
+   *model.AICodeAnalysis-> ai_code_analyses
+   *model.KnowledgeBase -> knowledge_bases
+   ```
+
+   GORM 的 `toDBName` 会**先**把常见缩写替换成 `Id` 这类写法再切词，
+   `AIDiagnosis` 里的 `ID` 被这样改写，于是变成 `A_Idiagnosis` → `a_idiagnoses`；
+   而 `AICodeAnalysis` 不含常见缩写，才是正常的 `ai_code_analysis(s)`。
+   这就是"同一个项目里两张表，一张符合直觉、一张不符合"的原因；
+3. 顺着一查，发现**同一个直觉还写在别处**，而且更隐蔽：
+   - `internal/db/vector_plain.go`（默认构建）里有 `CREATE INDEX … ON ai_diagnoses(…)`，
+     错误被 `_ =` 忽略 → 这个索引**从来没建上过**，只在慢查询时才暴露；
+   - `internal/db/vector_pgvector.go`（`-tags pgvector`）里有 `ALTER TABLE knowledge_base` /
+     `CREATE INDEX … ON ai_diagnoses`，错误会向上返回 → 按文档开启 pgvector 的部署**直接启动失败**；
+   - `docs/SCHEMA.sql` 里两张表名都写错了（`ai_diagnoses`、`knowledge_base`），
+     于是"照文档核对"这一步天然拦不住这个故障。
+
+**根因**
+
+1. 表名在多个地方被**手写成字面量**，而唯一权威是 GORM 的命名策略：模型一改、或者对缩写的
+   直觉一错，SQL/DDL 就与真实表名脱钩，且报错发生在运行期（甚至被吞掉）；
+2. 参考文档 `docs/SCHEMA.sql` 只被测试校验过"唯一约束命名"，没有校验"表名与模型一致"，
+   导致文档与实现可以悄悄分叉，还反过来成了错误依据；
+3. 建索引失败被设计成"不阻塞启动"，但**连日志都没有**，静默失败无人发现（同 INC-009 的教训：
+   为了健壮性吞错，必须留下可定位的痕迹）。
+
+**修复**
+
+1. `model.TableNameOf(entity)`（`internal/model/naming.go`）：由 GORM 命名策略推导真实表名，
+   带缓存；解析失败返回空串，调用方必须显式处理；
+2. 用量统计（`service/setting.go`）不再出现任何表名字面量：表名由 `TableNameOf` 推导后拼进带
+   占位符的 SQL（拼进去的只有代码推导出的标识符，参数仍走 `?`），解析失败直接报
+   「无法解析用量统计的数据表名」而不是拼出一条必错的 SQL；
+3. `internal/db/vector_plain.go` / `vector_pgvector.go`：建索引与 `ALTER TABLE` 的表名同样改为
+   推导；默认构建下的失败**改为写警告日志**（索引仍不阻塞启动），pgvector 构建下的失败带上
+   具体语句再返回；
+4. `docs/SCHEMA.sql` 两张表名改正（`a_idiagnoses` / `knowledge_bases`）并加显著说明，
+   顶部补一段"不要凭直觉写表名"的警示。
+
+**防复发**
+
+1. `internal/model/naming_test.go`：
+   - `TestTableNameOfKnownTraps`：钉住 `a_idiagnoses` / `knowledge_bases` 等"反直觉"名字，
+     并附上原因；同时反向断言 `AIDiagnosis` 的表名不得等于 `ai_diagnoses`；
+   - `TestSchemaReferenceTableNamesMatchModels`：**解析 `docs/SCHEMA.sql` 的 CREATE TABLE 与模型
+     逐一对齐**——文档与实现从此不能再分叉（这条正是本次故障漏网的缺口）；
+   - `TestTablesAndColumnsUsedByRawSQLExist`：手写 SQL/DDL 引用的表与列（用量统计的
+     `created_at/cost_tokens/user_id`、补索引的 `error_signature/last_seen_at/…`）必须存在于模型，
+     把"列名写错"这类同族问题一起挡住；
+2. 约定：**凡是 SQL/DDL 里要出现表名的地方，一律用 `model.TableNameOf`**，禁止字面量。
+
+**给运行中环境的提示**：本次修复后重启后端，`postMigrate` 会用正确表名补建
+`idx_diagnosis_instance` 等索引（此前静默缺失）；若曾用 `-tags pgvector` 构建，则该版本此前根本
+起不来，重建镜像即可。
+
+---
+
 ## INC-018 · AI 密钥与通知 webhook 只能写在 .env 里：换一个渠道要改环境变量、重建容器
 
 **首次暴露**：2026-09-19，使用者提出要求：
@@ -26,7 +98,8 @@
 
 1. 配置的「来源」与「生效」耦合在启动流程里：整个系统只有"进程启动"这一条生效路径；
 2. 密钥类配置没有统一机制（加密落库、掩码回显、审计脱敏、清除语义）；
-3. 消费与额度没有真实数据出口——`ai_diagnoses` / `ai_code_analyses` 里已有 `cost_tokens`，
+3. 消费与额度没有真实数据出口——诊断记录表与代码分析表（`a_idiagnoses` / `ai_code_analyses`）
+   里已有 `cost_tokens`，
    但界面上看不到，使用者只能靠云厂商账单猜。
 
 **修复**（平台自管设置）
@@ -1019,3 +1092,11 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
 23. **"测试/自检"按钮如果永远成功，多半是发送链路在吞错**：为了不让一个渠道拖垮告警，
     `send()` 会吞掉渠道错误，于是自检恒为成功（INC-018）。正确的做法是先做**确定性预检**
     （配置齐不齐），再看真实调用结果，最后再看"是不是静默降级了"。
+24. **SQL 里的表名必须是"推导出来的"，不能是"写出来的"**：ORM 的命名策略会改写常见缩写再切词，
+    `AIDiagnosis` 落地成 `a_idiagnoses`，而同一个项目里的 `AICodeAnalysis` 又完全符合直觉
+    ——"看着一致的直觉"最不可靠（INC-019）。做法：表名一律从模型推导
+    （`model.TableNameOf`），并且**把参考文档也纳入测试**——文档同样会写错，
+    照着文档核对只是把错误又抄一遍（该故障正是这样漏过评审的）。
+25. **为了健壮性吞掉错误时，至少留一行日志**：建索引失败不阻塞启动是对的，
+    但 `_ = err` 让索引永远缺失、且没有任何痕迹，只在慢查询时才浮现（INC-019，同 INC-009）。
+    "不阻断"与"不留痕"是两件事，前者可以是决定，后者一定是缺陷。

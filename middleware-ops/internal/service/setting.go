@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/engine"
 	"middleware-ops/internal/engine/guardrail"
+	"middleware-ops/internal/model"
 	"middleware-ops/internal/repository"
 )
 
@@ -89,7 +91,7 @@ const (
 // settingSeedOperator 是「首次从 .env 导入」时记录的修改人，便于界面区分人工修改与自动导入。
 const settingSeedOperator = "env-import"
 
-// 用量统计来源（对应 ai_diagnoses / ai_code_analyses 两张表）。
+// 用量统计来源（对应诊断记录表与代码分析表，表名由 model.TableNameOf 推导，见 INC-019）。
 const (
 	usageSourceDiagnosis    = "diagnosis"
 	usageSourceCodeAnalysis = "code_analysis"
@@ -1086,7 +1088,7 @@ func (s *SettingService) ApplyNotify(ctx context.Context) error {
 
 // AIUsage 统计 token 消费与剩余额度。
 //
-// 数据来源就是已有的两张业务表（ai_diagnoses / ai_code_analyses 的 cost_tokens），
+// 数据来源就是已有的两张业务表（诊断记录 / 代码分析）的 cost_tokens，
 // 不额外维护"用量流水表"：流水表要保证与业务写入强一致，反而多一处可能对不上的账。
 func (s *SettingService) AIUsage(ctx context.Context, days int) (*AIUsageView, error) {
 	days = normalizeUsageDays(days)
@@ -1123,36 +1125,59 @@ func (s *SettingService) AIUsage(ctx context.Context, days int) (*AIUsageView, e
 	}, nil
 }
 
-// usageRows 聚合窗口内「按来源 + 按天」的 token 消耗。
+// usagePointColumns 是「一条消耗记录」的投影（两张表列名一致，便于 UNION ALL）。
 //
-// 日期分桶统一按 UTC（与 utils.DayKey、成本护栏的跨天清零同一口径），否则同一次调用
-// 在"今日卡片"和"折线图"里可能落到不同的日子。
+// 时间分桶用 to_char(... AT TIME ZONE 'UTC')：与 utils.DayKey、成本护栏的跨天清零同一口径，
+// 否则同一次调用在"今日卡片"和"折线图"里可能落到不同的日子。
+const usagePointColumns = `to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day_key,
+           COALESCE(cost_tokens, 0) AS tokens,
+           1 AS calls`
+
+// usageTables 解析用量统计需要的真实表名。
+//
+// 表名必须由 model.TableNameOf 推导，不能照直觉写：GORM 把 AIDiagnosis 落地成
+// a_idiagnoses（AI 里的 ID 被当作常见缩写改写后再切词），照直觉写 ai_diagnoses
+// 会在运行期报 SQLSTATE 42P01 relation does not exist（INC-019）。
+func usageTables() (diagnosis, codeAnalysis, user string, err error) {
+	diagnosis = model.TableNameOf(&model.AIDiagnosis{})
+	codeAnalysis = model.TableNameOf(&model.AICodeAnalysis{})
+	user = model.TableNameOf(&model.User{})
+	if diagnosis == "" || codeAnalysis == "" || user == "" {
+		// 空表名不能当成"没问题"：那会拼出一条永远报错的 SQL，把真实原因藏起来。
+		return "", "", "", apperr.New(apperr.CodeInternal, "无法解析用量统计的数据表名")
+	}
+	return diagnosis, codeAnalysis, user, nil
+}
+
+// usageRows 聚合窗口内「按来源 + 按天」的 token 消耗。
 //
 // calls 记的是"一次消耗记录"（含命中确定性缓存、cost_tokens=0 的那次请求）：
 // 缓存命中同样是用户发起的一次诊断，把它从调用次数里抹掉会让"调用量"看起来忽高忽低；
 // token 维度仍然是真实消耗，缓存命中天然贡献 0。
 func (s *SettingService) usageRows(ctx context.Context, start time.Time) ([]usageAggRow, error) {
-	const query = `
+	diagnosis, codeAnalysis, _, err := usageTables()
+	if err != nil {
+		return nil, err
+	}
+	// 拼接进去的是**代码推导出的表名**（不含任何用户输入），列名与占位符保持字面量。
+	query := fmt.Sprintf(`
 SELECT source, day_key, COALESCE(SUM(tokens), 0) AS tokens, COALESCE(SUM(calls), 0) AS calls
 FROM (
-    SELECT 'diagnosis' AS source,
-           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day_key,
-           COALESCE(cost_tokens, 0) AS tokens,
-           1 AS calls
-    FROM ai_diagnoses
+    SELECT ? AS source, %s
+    FROM %s
     WHERE created_at >= ?
     UNION ALL
-    SELECT 'code_analysis' AS source,
-           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day_key,
-           COALESCE(cost_tokens, 0) AS tokens,
-           1 AS calls
-    FROM ai_code_analyses
+    SELECT ? AS source, %s
+    FROM %s
     WHERE created_at >= ?
 ) t
 GROUP BY source, day_key
-ORDER BY day_key`
+ORDER BY day_key`,
+		usagePointColumns, diagnosis, usagePointColumns, codeAnalysis)
 	var rows []usageAggRow
-	if err := s.db.WithContext(ctx).Raw(query, start, start).Scan(&rows).Error; err != nil {
+	if err := s.db.WithContext(ctx).
+		Raw(query, usageSourceDiagnosis, start, usageSourceCodeAnalysis, start).
+		Scan(&rows).Error; err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
 	return rows, nil
@@ -1160,20 +1185,24 @@ ORDER BY day_key`
 
 // topUsageUsers 取窗口内消耗最高的 10 个用户，username 从 users 表 join。
 //
-// 只统计诊断记录：代码分析表（ai_code_analyses）没有 user_id 列，无法归属到人，
+// 只统计诊断记录：代码分析表没有 user_id 列，无法归属到人，
 // 强行按"服务"折算成用户会给出错误的责任归属。
 func (s *SettingService) topUsageUsers(ctx context.Context, start time.Time) ([]AIUsageUser, error) {
-	const query = `
+	diagnosis, _, user, err := usageTables()
+	if err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(`
 SELECT d.user_id AS user_id,
        COALESCE(u.username, '') AS username,
        COALESCE(SUM(COALESCE(d.cost_tokens, 0)), 0) AS tokens,
        COUNT(*) AS calls
-FROM ai_diagnoses d
-LEFT JOIN users u ON u.id = d.user_id
+FROM %s d
+LEFT JOIN %s u ON u.id = d.user_id
 WHERE d.created_at >= ?
 GROUP BY d.user_id, u.username
 ORDER BY tokens DESC, d.user_id ASC
-LIMIT 10`
+LIMIT 10`, diagnosis, user)
 	var rows []AIUsageUser
 	if err := s.db.WithContext(ctx).Raw(query, start).Scan(&rows).Error; err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)

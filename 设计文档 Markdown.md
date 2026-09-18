@@ -456,6 +456,10 @@ AI 诊断中心定位为「**单轮诊断 + 工具预采集**」：用户提问 
 
 #### AI 诊断记录表 ai_diagnoses（v0.2 增字段）
 
+> **实现注记（INC-019）**：GORM 命名策略会把常见缩写先改写再切词，`AIDiagnosis` 在数据库里的
+> **真实表名是 `a_idiagnoses`**。手写 SQL / DDL 时若按本节的标题写 `ai_diagnoses`，会报
+> SQLSTATE 42P01；实现里一律用 `model.TableNameOf` 推导表名。
+
 | 字段                  | 类型        | 说明                                     |
 |-----------------------|-------------|------------------------------------------|
 | id                    | BIGSERIAL   | PK                                       |
@@ -478,6 +482,9 @@ AI 诊断中心定位为「**单轮诊断 + 工具预采集**」：用户提问 
 | alert_embeddings | alert_id, alert_content, embedding vector(768), clustered                                                         | 告警向量（pgvector HNSW），离线聚类用 |
 
 #### 知识库表 knowledge_base
+
+> **实现注记（INC-019）**：真实表名是 **`knowledge_bases`**（GORM 复数化），不是本节标题里的
+> `knowledge_base`；实现里同样用 `model.TableNameOf` 推导。
 
 | 字段                     | 类型                 | 说明                                         |
 |--------------------------|----------------------|----------------------------------------------|

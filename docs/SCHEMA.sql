@@ -18,6 +18,10 @@
 -- 供确实需要手工建库的场景使用；此时请同时把配置项 database.auto_migrate 置为 false。
 --
 -- 执行顺序：先建表，再建索引；向量列在启用 pgvector 时使用 vector(768)。
+--
+-- 【表名警示】不要凭直觉写表名：GORM 命名策略会把常见缩写先改写再切词，
+-- AIDiagnosis 落地为 a_idiagnoses、KnowledgeBase 落地为 knowledge_bases。
+-- internal/model/naming_test.go 会校验本文件的表名与模型一致。
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -86,8 +90,13 @@ CREATE INDEX IF NOT EXISTS idx_middleware_instances_group_name ON middleware_ins
 
 -- ---------------------------------------------------------------------------
 -- AI 诊断（4.3 / 7.1，含 v0.2 新增字段 feedback / engine_status）
+--
+-- 【表名注意】真实表名是 a_idiagnoses 而不是 ai_diagnoses：GORM 的命名策略会先把常见缩写
+-- 改写（ID → Id）再切词，于是 AIDiagnosis → A_Idiagnosis → a_idiagnoses。
+-- 手工建库 / 手写 SQL 时按直觉写成 ai_diagnoses 会报 SQLSTATE 42P01（见 INC-019）。
+-- 本文件与模型的一致性由 internal/model/naming_test.go 守卫。
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS ai_diagnoses (
+CREATE TABLE IF NOT EXISTS a_idiagnoses (
     id                  BIGSERIAL PRIMARY KEY,
     created_at          TIMESTAMPTZ,
     updated_at          TIMESTAMPTZ,
@@ -107,9 +116,9 @@ CREATE TABLE IF NOT EXISTS ai_diagnoses (
     cache_hit           BOOLEAN DEFAULT FALSE,
     truncated           TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_diagnosis_instance ON ai_diagnoses(instance_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_diagnosis_user ON ai_diagnoses(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_diagnosis_feedback ON ai_diagnoses(feedback);
+CREATE INDEX IF NOT EXISTS idx_diagnosis_instance ON a_idiagnoses(instance_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnosis_user ON a_idiagnoses(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnosis_feedback ON a_idiagnoses(feedback);
 
 -- ---------------------------------------------------------------------------
 -- 告警域（4.4 / 7.1）
@@ -180,8 +189,10 @@ CREATE INDEX IF NOT EXISTS idx_alert_embeddings_alert_id ON alert_embeddings(ale
 
 -- ---------------------------------------------------------------------------
 -- 知识库（4.5 质量闭环）
+--
+-- 【表名注意】真实表名是 knowledge_bases（GORM 复数化），不是设计文档里的 knowledge_base。
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS knowledge_base (
+CREATE TABLE IF NOT EXISTS knowledge_bases (
     id             BIGSERIAL PRIMARY KEY,
     created_at     TIMESTAMPTZ,
     updated_at     TIMESTAMPTZ,
@@ -198,9 +209,9 @@ CREATE TABLE IF NOT EXISTS knowledge_base (
     diagnosis_id   BIGINT,
     embedding      TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_knowledge_base_status ON knowledge_base(status);
-CREATE INDEX IF NOT EXISTS idx_knowledge_base_mw_type ON knowledge_base(mw_type);
--- CREATE INDEX idx_knowledge_embedding ON knowledge_base USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_knowledge_base_status ON knowledge_bases(status);
+CREATE INDEX IF NOT EXISTS idx_knowledge_base_mw_type ON knowledge_bases(mw_type);
+-- CREATE INDEX idx_knowledge_embedding ON knowledge_bases USING hnsw (embedding vector_cosine_ops);
 
 -- ---------------------------------------------------------------------------
 -- 审计（4.7 / 6.4：只追加 + 哈希链）
