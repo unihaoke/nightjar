@@ -196,7 +196,7 @@ onBeforeUnmount(() => {
             告警趋势（近 24 小时）
             <el-tag size="small" effect="plain">引擎 {{ overview?.platform.engine?.name || '-' }}</el-tag>
           </h3>
-          <MetricChart :series="alertSeries" type="bar" :height="260" unit=" 条" />
+          <MetricChart :series="alertSeries" type="line" :height="260" unit=" 条" />
         </div>
       </el-col>
       <el-col :xs="24" :md="8">

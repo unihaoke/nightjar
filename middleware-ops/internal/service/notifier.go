@@ -104,9 +104,12 @@ func (s *NotifierService) NotifyAlert(ctx context.Context, alert *model.Alert, r
 	}
 	detailURL := fmt.Sprintf("%s%s?alert_id=%d", s.appURL, defaultString(cfg.CardConfirmPath, "/alerts"), alert.ID)
 
+	// 未勾选任何通知渠道 = 不发送（空即静默），不再兜底飞书/企微。
+	// 平台「通知渠道」页面负责配置各渠道，规则只决定「分配哪些渠道」，
+	// 两者解耦：管理员清空勾选即表示这条规则不需要 IM 通知。
 	channels := rule.NotifyChannels
 	if len(channels) == 0 {
-		channels = model.JSONStringSlice{"feishu", "wecom"}
+		return
 	}
 	for _, channel := range channels {
 		if !s.dedup(ctx, fmt.Sprintf("notify:%d:%s", alert.ID, channel)) {
