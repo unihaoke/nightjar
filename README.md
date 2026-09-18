@@ -191,8 +191,10 @@ AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管
 # 后端：格式 / 静态检查 / 单元测试
 cd middleware-ops && gofmt -l . && go vet ./... && go test ./...
 
-# 前端：类型检查 + 构建
+# 前端：响应式检查 + 类型检查 + 构建（build 已内置前两步）
 cd middleware-ops-web && npm run build
+# 只跑「按 key 绑定的表单是否响应式」这一条静态检查（捕获"控件点不动/选了没反应"，见 INC-020）
+cd middleware-ops-web && npm run check:reactivity
 # 前端运行时冒烟（无头浏览器加载产物，捕获白屏/TDZ 这类只在运行时暴露的问题）
 cd middleware-ops-web && npm run smoke
 

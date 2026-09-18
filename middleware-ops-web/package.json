@@ -6,10 +6,11 @@
   "description": "中间件智能问题解决平台 · 前端（Vue 3 + Vite + Element Plus，移动端适配）",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit -p tsconfig.app.json && vite build",
-    "build:only": "vite build",
+    "build": "node scripts/check-vue-reactivity.cjs && vue-tsc --noEmit -p tsconfig.app.json && vite build",
+    "build:only": "node scripts/check-vue-reactivity.cjs && vite build",
     "preview": "vite preview --host",
     "smoke": "node scripts/frontend-smoke.cjs --self-serve",
+    "check:reactivity": "node scripts/check-vue-reactivity.cjs",
     "typecheck": "vue-tsc --noEmit -p tsconfig.app.json"
   },
   "dependencies": {

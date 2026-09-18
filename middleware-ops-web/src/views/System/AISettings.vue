@@ -45,11 +45,17 @@ const form = reactive({
   per_user_daily_quota: 0,
 })
 
-/** 两组提供方表单（结构相同，避免重复代码）。 */
-const providers: Record<ProviderKey, ProviderForm> = {
+/**
+ * 两组提供方表单（结构相同，避免重复代码）。
+ *
+ * 必须用 reactive 包起来：模板里是 `v-model="providers[item.key].enabled"` 这种按 key 取值再绑定的写法。
+ * 若声明成普通对象，赋值本身会成功（保存时读到的是新值），但**视图不会重渲染**——
+ * 表现就是"启用开关点不动、协议下拉选了没反应"（INC-020）。
+ */
+const providers = reactive<Record<ProviderKey, ProviderForm>>({
   third_party: { enabled: false, kind: 'openai', base_url: '', model: '', max_tokens: 0, price_per_k_token: 0 },
   self_hosted: { enabled: false, kind: 'ollama', base_url: '', model: '', max_tokens: 0, price_per_k_token: 0 },
-}
+})
 
 /** 新填的密钥（空 = 不修改，绝不回显后端已有密钥）。 */
 const apiKeyDraft: Record<ProviderKey, string> = reactive({ third_party: '', self_hosted: '' })

@@ -47,12 +47,17 @@ const testResults = reactive<Record<string, NotifyTestResult | null>>({})
 /** 总开关与卡片确认落地页。 */
 const form = reactive({ enabled: true, card_confirm_path: '' })
 
-/** webhook 渠道表单（结构一致，合并成一张表避免重复代码）。 */
-const channels: Record<ChannelKey, WebhookForm> = {
+/**
+ * webhook 渠道表单（结构一致，合并成一张表避免重复代码）。
+ *
+ * 与 AI 设置同理，必须是 reactive：模板里按 key 取子对象再 v-model
+ * （`channels[item.key].enabled` / `.webhook` / `.mentions`），普通对象不会触发重渲染（INC-020）。
+ */
+const channels = reactive<Record<ChannelKey, WebhookForm>>({
   feishu: { enabled: false, webhook: '', webhookClear: false, secret: '', secretClear: false, mentions: [] },
   wecom: { enabled: false, webhook: '', webhookClear: false, secret: '', secretClear: false, mentions: [] },
   dingtalk: { enabled: false, webhook: '', webhookClear: false, secret: '', secretClear: false, mentions: [] },
-}
+})
 
 /** 后端返回的掩码，仅用于 placeholder 提示。 */
 const webhookMasked: Record<ChannelKey, string> = reactive({ feishu: '', wecom: '', dingtalk: '' })

@@ -5,6 +5,60 @@
 
 ---
 
+## INC-020 · AI 设置页「启用开关点不动、协议选了没反应」：表单模型漏了 reactive
+
+**首次暴露**：2026-09-19，使用者反馈（页面 `http://aiapx.icu:8000/system/ai-settings`）：
+
+> 「1.AI设置里面第三方API的启用按钮点不了，2.协议kind下拉框选择后没有反应」
+
+**定位过程**
+
+1. 先排掉"只读权限把控件禁用"这个可能：两个控件分别受 `:disabled="!canWrite"` 与
+   `<el-form :disabled="!canWrite">` 管辖，而 `canWrite = store.can('system:config:write')`；
+   后端 `AuthService.Bootstrap` **每次启动都用代码里的权限点覆盖内置角色**，
+   admin 一定含 `system:config:write`，所以不是权限问题；
+2. 再看表单模型声明，一眼看到根因：
+
+   ```ts
+   const providers: Record<ProviderKey, ProviderForm> = { … }   // ← 普通对象
+   // 而同文件里 apiKeyDraft / apiKeyClear / apiKeyMasked 都正确地用了 reactive()
+   ```
+
+   模板是 `v-model="providers[item.key].enabled"` 这种"遍历渲染 + 按 key 取子对象"的写法：
+   点击时赋值**确实成功**（保存时提交的是新值），但普通对象不参与依赖收集，父组件不会重渲染，
+   `el-switch` / `el-select` 收到的 `modelValue` 始终是旧值 → 开关弹回去、下拉显示不变；
+3. 通知渠道页有同一个错误（`const channels: Record<ChannelKey, WebhookForm> = { … }`）：
+   它的渠道开关、webhook 输入、@成员选择同样"点不动"，只是还没被点到；
+4. 关键点：**`vue-tsc` 与 `vite build` 全绿**——这既不是类型错误也不是模块错误，
+   只有"真的点一下页面"才会暴露；本次两个新页面交付时只跑了类型检查与打包。
+
+**根因**
+
+1. 「按 key 遍历渲染的表单对象」这一写法，漏 `reactive` 不会有任何编译期反馈，
+   而它在视觉上又极像"控件被禁用/坏了"；
+2. 前端当时只有"白屏级"的运行时冒烟（`frontend-smoke.cjs` 检查应用是否挂载、有无 console 错误），
+   没有覆盖"交互是否生效"这一层，也没有针对该写法的静态检查。
+
+**修复**
+
+1. `AISettings.vue` 的 `providers`、`NotifyChannels.vue` 的 `channels` 改为
+   `reactive<Record<...>>({...})`，并就地写明"为什么必须 reactive"，避免后来者又改回去；
+2. 新增静态检查 `scripts/check-vue-reactivity.cjs`（`npm run check:reactivity`）：
+   扫描所有 `.vue`，凡模板里出现 `v-model="X[...]"`，就要求同文件里 X 的声明被
+   `reactive / shallowReactive / ref / shallowRef / toRef / customRef` 包装，
+   否则报错并给出改法；对无法静态判定的写法（工厂函数返回值）只提示不失败，避免误报；
+3. 把它接进构建链：`npm run build`（本地/CI）与 `npm run build:only`（**Docker 镜像构建实际走的那条**）
+   都会先跑这条检查——否则镜像构建会绕过它。
+
+**防复发**
+
+1. 注入原始缺陷验证过守卫"会红"：把 `providers` 改回普通对象字面量 →
+   `src/views/System/AISettings.vue:51 v-model 绑定了 providers[...]，而 providers 是普通对象/数组字面量…`，退出码 1；恢复后通过；
+2. 与前一条对照记住责任边界：类型检查/打包管"代码能不能跑"，冒烟管"页面能不能渲染"，
+   本次这条静态检查管"控件能不能动"——三者互不替代。
+
+---
+
 ## INC-019 · 用量接口 500：按"直觉"写表名，GORM 实际建的是另一个名字
 
 **首次暴露**：2026-09-19，`GET /api/settings/ai/usage` 返回：
@@ -1100,3 +1154,9 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
 25. **为了健壮性吞掉错误时，至少留一行日志**：建索引失败不阻塞启动是对的，
     但 `_ = err` 让索引永远缺失、且没有任何痕迹，只在慢查询时才浮现（INC-019，同 INC-009）。
     "不阻断"与"不留痕"是两件事，前者可以是决定，后者一定是缺陷。
+26. **"控件点不动"不一定是权限或组件的问题，先看表单模型是不是响应式的**：
+    `v-model="obj[key].field"` 这种遍历渲染的写法，对象漏了 `reactive` 时赋值照样成功
+    （保存提交的甚至是新值），但视图不重渲染，看起来就像控件坏了（INC-020）。
+    这类问题**类型检查与打包 100% 发现不了**，"点一下页面"是唯一的原始手段；
+    既然手段有限，就把这条写法固化成静态检查（`npm run check:reactivity`）并接进构建链，
+    包括 Docker 镜像实际使用的那条 `build:only`。
