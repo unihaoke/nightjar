@@ -123,8 +123,26 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Auth = NewAuthService(cfg, deps.Users, deps.Roles, opt.Tokens, opt.Log)
 	deps.Middleware = NewMiddlewareService(deps.Instances, opt.Cipher, opt.Monitor, deps.Audit, opt.Log)
 	deps.Metrics = NewMetricsService(deps.Instances, opt.Monitor, opt.Log)
+	// 诊断服务必须先于告警服务装配：告警触发的自动诊断（3.1）要把 Diagnoser 注入 AlertService。
+	// DiagnoseDeps 此时均已就绪（仓储 / 六道护栏 / 审计 / 通知），且 DiagnoseService 不反向依赖
+	// AlertService，因此不存在循环依赖。
+	deps.Diagnoser = NewDiagnoseService(DiagnoseDeps{
+		Instances: deps.Instances, Diagnoses: deps.Diagnoses, Knowledge: deps.Knowledge,
+		LogEvents: deps.LogEvents, Engine: deps.Engine, Factory: opt.EngineFactory, Monitor: opt.Monitor,
+		Store: opt.Cache, Audit: deps.Audit, Notifier: deps.Notifier,
+		Budget: deps.Budget, Loop: deps.LoopGuard, Timeout: deps.Timeout, Quality: deps.Quality,
+		Cost: deps.Cost, Registry: deps.Registry, Log: opt.Log,
+		Settings: DiagnoseSettings{
+			InputBudget:     g.InputTokenBudget,
+			OutputBudget:    g.OutputTokenBudget,
+			MaxConcurrency:  g.MaxConcurrency,
+			CacheTTL:        g.CacheTTL,
+			VectorThreshold: g.VectorReferenceThreshold,
+			LLMRetry:        g.LLMRetry,
+		},
+	})
 	deps.AlertSvc = NewAlertService(deps.Rules, deps.Alerts, deps.AlertVec, deps.Instances, opt.Cache,
-		opt.Monitor, deps.Engine, deps.Notifier, deps.Audit, opt.Log)
+		opt.Monitor, deps.Engine, deps.Diagnoser, deps.Notifier, deps.Audit, opt.Log)
 	deps.KnowledgeSvc = NewKnowledgeService(deps.Knowledge, deps.Diagnoses, deps.Audit, opt.Log)
 	deps.Approval = NewApprovalService(deps.Approvals, deps.Notifier, deps.Audit, opt.Log)
 	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, deps.AlertSvc, opt.Log)
@@ -143,21 +161,6 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.CodeAnalysis = NewCodeAnalysisService(cfg, deps.Engine, deps.LogEvents, deps.CodeRepos,
 		deps.CodeAnalyses, redactor, deps.Audit, deps.Cost, opt.Log)
 
-	deps.Diagnoser = NewDiagnoseService(DiagnoseDeps{
-		Instances: deps.Instances, Diagnoses: deps.Diagnoses, Knowledge: deps.Knowledge,
-		LogEvents: deps.LogEvents, Engine: deps.Engine, Factory: opt.EngineFactory, Monitor: opt.Monitor,
-		Store: opt.Cache, Audit: deps.Audit, Notifier: deps.Notifier,
-		Budget: deps.Budget, Loop: deps.LoopGuard, Timeout: deps.Timeout, Quality: deps.Quality,
-		Cost: deps.Cost, Registry: deps.Registry, Log: opt.Log,
-		Settings: DiagnoseSettings{
-			InputBudget:     g.InputTokenBudget,
-			OutputBudget:    g.OutputTokenBudget,
-			MaxConcurrency:  g.MaxConcurrency,
-			CacheTTL:        g.CacheTTL,
-			VectorThreshold: g.VectorReferenceThreshold,
-			LLMRetry:        g.LLMRetry,
-		},
-	})
 	deps.Dashboard = NewDashboardService(DashboardDeps{
 		Instances: deps.Instances, Alerts: deps.Alerts, Diagnoses: deps.Diagnoses,
 		Audits: deps.Audits, Approvals: deps.Approvals, Events: deps.LogEvents,

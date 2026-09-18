@@ -45,6 +45,49 @@ func (r *AlertRuleRepository) AllEnabled(ctx context.Context) ([]model.AlertRule
 	return items, nil
 }
 
+// FindByInstanceMetric 按「实例 + 指标」查找承载意图的规则。
+//
+// 用途：外部告警（Alertmanager Webhook）进来时平台上并没有对应的规则记录，
+// ai_enabled / notify_channels 两个开关无从取值，需要从已有规则继承（见 AlertService.Ingest）。
+//
+// 两条约定（口径 3 + A）：
+//   - 不筛选 enabled：规则在这里只作「意图载体」，不参与阈值评估。enabled=false 表达的是
+//     "平台别再评估这条规则"，不等于撤回"要不要关注该实例的这个指标"；
+//   - 多条命中时按 updated_at DESC 取第一条，也就是用户最近一次表达过的意图。
+//     这样每条外部告警都能回答"它继承了哪条规则"，行为可解释、可复现。
+func (r *AlertRuleRepository) FindByInstanceMetric(ctx context.Context, instanceID int64, metricName string) (*model.AlertRule, error) {
+	var item model.AlertRule
+	err := r.withCtx(ctx).
+		Where("instance_id = ? AND metric_name = ?", instanceID, metricName).
+		Order("updated_at DESC").
+		First(&item).Error
+	if err != nil {
+		// 未命中会被 wrap 成 ErrNotFound，调用方用 EnsureNotFound 判断即可。
+		return nil, wrap(err, "find rule by instance and metric")
+	}
+	return &item, nil
+}
+
+// FindLatestByInstance 查找该实例最近更新的一条规则。
+//
+// 用途：外部告警按「实例 + 指标」回绑不到时的**降级路径**（口径 3 + A 的第二级）。
+// Alertmanager 推送往往不带平台认识的 metric_name，此时退化为回答一个更宽松的问题：
+// "这个实例到底有没有被人关注过"。
+//
+// 排序口径与 FindByInstanceMetric 保持一致（updated_at DESC），同样不筛选 enabled——
+// 两处理由相同，规则在此只作意图载体，不参与阈值评估。
+func (r *AlertRuleRepository) FindLatestByInstance(ctx context.Context, instanceID int64) (*model.AlertRule, error) {
+	var item model.AlertRule
+	err := r.withCtx(ctx).
+		Where("instance_id = ?", instanceID).
+		Order("updated_at DESC").
+		First(&item).Error
+	if err != nil {
+		return nil, wrap(err, "find latest rule by instance")
+	}
+	return &item, nil
+}
+
 // Get 按 ID 查询规则。
 func (r *AlertRuleRepository) Get(ctx context.Context, id int64) (*model.AlertRule, error) {
 	var item model.AlertRule

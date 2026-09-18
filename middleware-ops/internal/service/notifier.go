@@ -97,13 +97,6 @@ func (s *NotifierService) NotifyAlert(ctx context.Context, alert *model.Alert, r
 	if alert == nil || !cfg.Enabled {
 		return
 	}
-	title := fmt.Sprintf("【%s】%s", strings.ToUpper(defaultString(alert.AlertLevel, "warning")), instanceLabel(alert))
-	content := alert.AlertMessage
-	if alert.Count > 1 {
-		content = fmt.Sprintf("%s\n（窗口内已合并 %d 次重复告警）", content, alert.Count)
-	}
-	detailURL := fmt.Sprintf("%s%s?alert_id=%d", s.appURL, defaultString(cfg.CardConfirmPath, "/alerts"), alert.ID)
-
 	// 未勾选任何通知渠道 = 不发送（空即静默），不再兜底飞书/企微。
 	// 平台「通知渠道」页面负责配置各渠道，规则只决定「分配哪些渠道」，
 	// 两者解耦：管理员清空勾选即表示这条规则不需要 IM 通知。
@@ -111,33 +104,176 @@ func (s *NotifierService) NotifyAlert(ctx context.Context, alert *model.Alert, r
 	if len(channels) == 0 {
 		return
 	}
+	n := s.alertNotification(alert, rule, metric)
 	for _, channel := range channels {
 		if !s.dedup(ctx, fmt.Sprintf("notify:%d:%s", alert.ID, channel)) {
 			continue
 		}
-		s.send(ctx, AlertNotification{
-			Channel:     string(channel),
-			Title:       title,
-			Content:     content,
-			Level:       alert.AlertLevel,
-			AlertID:     alert.ID,
-			DetailURL:   detailURL,
-			MetricName:  metric.DisplayName,
-			MetricValue: fmt.Sprintf("%.4f%s", metric.Latest, metric.Unit),
+		n.Channel = string(channel)
+		s.send(ctx, n)
+	}
+}
+
+// NotifyAlertDiagnosis 在自动 AI 诊断完成后，按规则勾选的渠道追发诊断结论。
+//
+// 为什么不合并进第一条告警消息：诊断要跑一次 LLM（秒级到分钟级），而告警通知必须秒级触达，
+// 让 Ingest/Evaluate 阻塞等待会导致告警通道整体变慢甚至超时。因此拆成「先诊断、后外发」，
+// 诊断跑完才轮到这里的渠道判断。
+//
+// 两个开关职责互斥，此处只认第二个：
+//   - ai_enabled     → 决定是否跑诊断（在 AlertService.Trigger 里判断）；
+//   - notify_channels → 决定跑完之后是否外发（在这里判断）。
+//
+// 渠道来源一律是规则上的勾选结果，「没勾选 = 静默」，不做任何兜底/默认渠道。
+func (s *NotifierService) NotifyAlertDiagnosis(ctx context.Context, alert *model.Alert, channels []string, brief *DiagnosisBrief) {
+	cfg := s.current()
+	if alert == nil || brief == nil || !cfg.Enabled {
+		return
+	}
+	// 未勾选任何渠道：诊断结论只入库、不外发。
+	if len(channels) == 0 {
+		return
+	}
+	n := AlertNotification{
+		Title:     fmt.Sprintf("【AI 诊断】%s", instanceLabel(alert)),
+		Content:   alertContent(alert),
+		Level:     alert.AlertLevel,
+		AlertID:   alert.ID,
+		DetailURL: s.alertDetailURL(alert.ID),
+		Diagnosis: brief,
+	}
+	for _, channel := range channels {
+		// 去重键必须与告警通知区分：notify:<id> 已被第一条消息用掉且 TTL 10 分钟，
+		// 沿用会被判定成重复而静默丢弃，结论就永远发不出去。
+		if !s.dedup(ctx, fmt.Sprintf("notify-diag:%d:%s", alert.ID, channel)) {
+			continue
+		}
+		n.Channel = string(channel)
+		s.send(ctx, n)
+	}
+}
+
+// alertNotification 构造一条告警通知（各渠道共用）。
+func (s *NotifierService) alertNotification(alert *model.Alert, rule model.AlertRule, metric monitor.Metric) AlertNotification {
+	title := fmt.Sprintf("【%s】%s", levelLabel(alert.AlertLevel), instanceLabel(alert))
+	return AlertNotification{
+		Title:     title,
+		Content:   alertContent(alert),
+		Level:     alert.AlertLevel,
+		AlertID:   alert.ID,
+		DetailURL: s.alertDetailURL(alert.ID),
+		Fields:    buildAlertFields(alert, rule, metric),
+	}
+}
+
+// alertDetailURL 生成告警详情地址。
+func (s *NotifierService) alertDetailURL(alertID int64) string {
+	cfg := s.current()
+	return fmt.Sprintf("%s%s?alert_id=%d", s.appURL, defaultString(cfg.CardConfirmPath, "/alerts"), alertID)
+}
+
+// alertContent 生成告警正文（含窗口合并提示）。
+func alertContent(alert *model.Alert) string {
+	content := alert.AlertMessage
+	if alert.Count > 1 {
+		content = fmt.Sprintf("%s\n（窗口内已合并 %d 次重复告警）", content, alert.Count)
+	}
+	return content
+}
+
+// buildAlertFields 生成告警的结构化字段。
+//
+// IM 里要能「一眼判断要不要处理」：对象、级别、触发条件、当前值、持续时间缺一不可，
+// 否则值班同学还得点进平台查一遍，通知就失去了意义。
+func buildAlertFields(alert *model.Alert, rule model.AlertRule, metric monitor.Metric) []NotificationField {
+	unit := metric.Unit
+	fields := []NotificationField{
+		{Key: "告警对象", Value: instanceLabel(alert), Short: true},
+		{Key: "级别", Value: levelLabel(alert.AlertLevel), Short: true},
+	}
+	if rule.Name != "" {
+		fields = append(fields, NotificationField{Key: "触发规则", Value: rule.Name, Short: true})
+	}
+	name := metric.DisplayName
+	if name == "" {
+		name = metric.Name
+	}
+	if name != "" {
+		fields = append(fields, NotificationField{
+			Key:   "触发条件",
+			Value: fmt.Sprintf("%s %s %g%s", name, rule.Operator, rule.Threshold, unit),
+			Short: true,
 		})
+	}
+	fields = append(fields, NotificationField{
+		Key: "当前值", Value: fmt.Sprintf("%.4f%s", metric.Latest, unit), Short: true,
+	})
+	if alert.Count > 1 {
+		fields = append(fields, NotificationField{
+			Key: "窗口合并", Value: fmt.Sprintf("%d 次", alert.Count), Short: true,
+		})
+	}
+	if alert.ID > 0 {
+		fields = append(fields, NotificationField{
+			Key: "告警 ID", Value: fmt.Sprintf("#%d", alert.ID), Short: true,
+		})
+	}
+	if !alert.TriggeredAt.IsZero() {
+		fields = append(fields, NotificationField{
+			Key: "触发时间", Value: alert.TriggeredAt.Local().Format("2006-01-02 15:04:05"), Short: true,
+		})
+	}
+	return fields
+}
+
+// levelLabel 把告警级别翻译成中文结论标签（IM 里不暴露英文字面量）。
+func levelLabel(level string) string {
+	switch level {
+	case model.AlertLevelCritical:
+		return "严重"
+	case model.AlertLevelWarning:
+		return "警告"
+	default:
+		return level
 	}
 }
 
 // AlertNotification 是一条通知内容。
 type AlertNotification struct {
-	Channel     string `json:"channel"`
-	Title       string `json:"title"`
-	Content     string `json:"content"`
-	Level       string `json:"level"`
-	AlertID     int64  `json:"alert_id"`
-	DetailURL   string `json:"detail_url"`
-	MetricName  string `json:"metric_name"`
-	MetricValue string `json:"metric_value"`
+	Channel   string              `json:"channel"`
+	Title     string              `json:"title"`
+	Content   string              `json:"content"`
+	Level     string              `json:"level"`
+	AlertID   int64               `json:"alert_id"`
+	DetailURL string              `json:"detail_url"`
+	Fields    []NotificationField `json:"fields,omitempty"`
+	// Diagnosis 非空表示这条消息携带 AI 诊断结论（告警触发的自动诊断产出）。
+	Diagnosis *DiagnosisBrief `json:"diagnosis,omitempty"`
+}
+
+// NotificationField 是卡片里的一行结构化字段。
+type NotificationField struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	// Short 为 true 时与相邻的 short 字段并排成双列（飞书 is_short），false 独占整行。
+	Short bool `json:"short"`
+}
+
+// DiagnosisBrief 是随通知外发的 AI 诊断摘要。
+//
+// 边界（6.2）：只携带结论数据用于展示，不携带可执行动作——修复执行必须回平台走审批。
+type DiagnosisBrief struct {
+	DiagnosisID int64    `json:"diagnosis_id"`
+	RootCause   string   `json:"root_cause"`
+	Confidence  float64  `json:"confidence"`
+	Suggestions []string `json:"suggestions"`
+	ImpactScope string   `json:"impact_scope"`
+	EngineUsed  string   `json:"engine_used"`
+	DurationMS  int64    `json:"duration_ms"`
+	// Degraded 为 true 表示 AI 引擎不可用，结论来自规则引擎降级。
+	Degraded bool `json:"degraded"`
+	// Speculative 为 true 表示结论缺少证据支撑，属推测（质量护栏标注）。
+	Speculative bool `json:"speculative"`
 }
 
 // NotifyApproval 发送审批相关通知。
@@ -225,16 +361,52 @@ func (s *NotifierService) dedup(ctx context.Context, key string) bool {
 	return true
 }
 
-// sendFeishu 发送飞书消息卡片。
+// sendFeishu 发送飞书交互卡片。
+//
+// 卡片结构：告警正文 → 结构化字段（双列）→ AI 诊断结论（可选）→ 操作按钮 → 边界说明。
+// 之所以用 fields 而不是把全部信息拼成一坨 lark_md 文本：前者在飞书里对齐成两列，
+// 值班同学在手机上一屏能看完「对象/级别/触发条件/当前值」，不用横向拖动。
 func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) error {
 	cfg := s.current().Feishu
 	if !cfg.Enabled || cfg.Webhook == "" {
 		return fmt.Errorf("飞书渠道未启用")
 	}
 	template := "blue"
-	if n.Level == model.AlertLevelCritical {
+	switch n.Level {
+	case model.AlertLevelCritical:
 		template = "red"
+	case model.AlertLevelWarning:
+		// warning 走橙色：原来非 critical 一律用 blue，严重与警告在群里颜色相同，
+		// 扫一眼分不出轻重。
+		template = "orange"
+	default:
+		template = "blue"
 	}
+
+	elements := []map[string]any{
+		{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": n.Content}},
+	}
+	elements = append(elements, buildFeishuFields(n.Fields)...)
+	if n.Diagnosis != nil {
+		elements = append(elements, buildFeishuDiagnosis(n.Diagnosis)...)
+	}
+
+	actions := []map[string]any{
+		{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "查看详情 / 确认"},
+			"type": "primary", "url": n.DetailURL},
+	}
+	note := "IM 卡片仅做通知与确认；高危操作请前往平台审批后执行"
+	if n.Diagnosis != nil {
+		note = "诊断结论仅供参考，请人工复核后决策；高危操作需回平台走审批"
+	}
+	elements = append(elements,
+		map[string]any{"tag": "hr"},
+		map[string]any{"tag": "action", "actions": actions},
+		map[string]any{"tag": "note", "elements": []map[string]any{
+			{"tag": "plain_text", "content": note},
+		}},
+	)
+
 	payload := map[string]any{
 		"msg_type": "interactive",
 		"card": map[string]any{
@@ -243,20 +415,104 @@ func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) e
 				"title":    map[string]any{"tag": "plain_text", "content": n.Title},
 				"template": template,
 			},
-			"elements": []map[string]any{
-				{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": n.Content}},
-				{"tag": "hr"},
-				{"tag": "action", "actions": []map[string]any{
-					{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "查看详情 / 确认"},
-						"type": "primary", "url": n.DetailURL},
-				}},
-				{"tag": "note", "elements": []map[string]any{
-					{"tag": "plain_text", "content": "高危操作不支持在 IM 中一键执行，请前往平台完成审批与执行"},
-				}},
-			},
+			"elements": elements,
 		},
 	}
 	return s.postJSON(ctx, cfg.Webhook, payload, cfg.Secret, "feishu")
+}
+
+// buildFeishuFields 把结构化字段切成若干 div.fields。
+//
+// 飞书 fields 元素最多两列，且 is_short 必须成组出现：奇数个 short 字段会被拉伸成整行，
+// 与其他行的列宽不一致。这里统一两个一组切分，保证列宽稳定。
+func buildFeishuFields(fields []NotificationField) []map[string]any {
+	var (
+		elements []map[string]any
+		pending  []map[string]any
+	)
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		elements = append(elements, map[string]any{"tag": "div", "fields": pending})
+		pending = nil
+	}
+	for _, f := range fields {
+		if f.Value == "" {
+			continue
+		}
+		item := map[string]any{
+			"is_short": f.Short,
+			"text": map[string]any{
+				"tag":     "lark_md",
+				"content": fmt.Sprintf("**%s**\n%s", f.Key, f.Value),
+			},
+		}
+		if !f.Short {
+			flush()
+			elements = append(elements, map[string]any{"tag": "div", "fields": []map[string]any{item}})
+			continue
+		}
+		pending = append(pending, item)
+		if len(pending) == 2 {
+			flush()
+		}
+	}
+	flush()
+	return elements
+}
+
+// buildFeishuDiagnosis 渲染 AI 诊断结论区块。
+func buildFeishuDiagnosis(d *DiagnosisBrief) []map[string]any {
+	head := fmt.Sprintf("🤖 **AI 诊断结论**（置信度 %.0f%%", d.Confidence*100)
+	if d.EngineUsed != "" {
+		head += fmt.Sprintf(" · %s", d.EngineUsed)
+	}
+	if d.DurationMS > 0 {
+		head += fmt.Sprintf(" · %.1fs", float64(d.DurationMS)/1000)
+	}
+	head += "）"
+
+	elements := []map[string]any{
+		{"tag": "hr"},
+		{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": head}},
+		{"tag": "div", "text": map[string]any{"tag": "lark_md",
+			"content": fmt.Sprintf("**根因**：%s", truncateRunes(d.RootCause, 300))}},
+	}
+	if d.ImpactScope != "" {
+		elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md",
+			"content": fmt.Sprintf("**影响范围**：%s", truncateRunes(d.ImpactScope, 200))}})
+	}
+	if list := formatSuggestions(d.Suggestions); list != "" {
+		elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": list}})
+	}
+	// 降级与推测必须显式标注：不让值班同学把不可靠结论当成事实去执行。
+	switch {
+	case d.Degraded:
+		elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md",
+			"content": "⚠️ AI 引擎不可用，以上为规则引擎降级结论"}})
+	case d.Speculative:
+		elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md",
+			"content": "⚠️ 结论缺少证据支撑，属推测，请人工复核"}})
+	}
+	return elements
+}
+
+// formatSuggestions 渲染处置建议列表（最多 5 条，避免卡片过长被折叠）。
+func formatSuggestions(suggestions []string) string {
+	max := 5
+	if len(suggestions) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("**处置建议**：")
+	for i, item := range suggestions {
+		if i >= max {
+			break
+		}
+		b.WriteString(fmt.Sprintf("\n%d. %s", i+1, truncateRunes(item, 160)))
+	}
+	return b.String()
 }
 
 // sendWeCom 发送企业微信 markdown 消息。
@@ -265,8 +521,13 @@ func (s *NotifierService) sendWeCom(ctx context.Context, n AlertNotification) er
 	if !cfg.Enabled || cfg.Webhook == "" {
 		return fmt.Errorf("企业微信渠道未启用")
 	}
-	content := fmt.Sprintf("**%s**\n> %s\n\n[查看详情并确认](%s)\n\n<font color=\"comment\">高危操作请在平台内审批执行</font>",
-		n.Title, strings.ReplaceAll(n.Content, "\n", "\n> "), n.DetailURL)
+	// warning 色（橙）用于严重级别，让群聊里一眼能区分轻重。
+	color := "comment"
+	if n.Level == model.AlertLevelCritical {
+		color = "warning"
+	}
+	content := fmt.Sprintf("**%s**\n> %s\n\n[查看详情并确认](%s)\n\n<font color=\"%s\">高危操作请在平台内审批执行</font>",
+		n.Title, strings.ReplaceAll(n.renderText(), "\n", "\n> "), n.DetailURL, color)
 	payload := map[string]any{
 		"msgtype": "markdown",
 		"markdown": map[string]any{
@@ -286,7 +547,7 @@ func (s *NotifierService) sendDingTalk(ctx context.Context, n AlertNotification)
 		"msgtype": "markdown",
 		"markdown": map[string]any{
 			"title": n.Title,
-			"text":  fmt.Sprintf("### %s\n\n%s\n\n[查看详情](%s)", n.Title, n.Content, n.DetailURL),
+			"text":  fmt.Sprintf("### %s\n\n%s\n\n[查看详情](%s)", n.Title, n.renderText(), n.DetailURL),
 		},
 	}
 	return s.postJSON(ctx, cfg.Webhook, payload, cfg.Secret, "dingtalk")
@@ -343,13 +604,65 @@ func (s *NotifierService) sendEmail(n AlertNotification) error {
 	}
 	subject := fmt.Sprintf("=?UTF-8?B?%s?=", base64.StdEncoding.EncodeToString([]byte(n.Title)))
 	body := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n\r\n详情：%s\r\n",
-		cfg.From, strings.Join(cfg.To, ","), subject, n.Content, n.DetailURL)
+		cfg.From, strings.Join(cfg.To, ","), subject, n.renderText(), n.DetailURL)
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	var auth smtp.Auth
 	if cfg.Username != "" {
 		auth = smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
 	}
 	return smtp.SendMail(addr, auth, cfg.From, cfg.To, []byte(body))
+}
+
+// renderText 渲染统一正文（企微/钉钉/邮件共用）。
+//
+// 这些渠道没有卡片能力，结构化字段降级为「key：value」逐行罗列，诊断结论降级为分节文本，
+// 保证无论走哪个渠道，值班同学拿到的信息面是一致的。
+func (n AlertNotification) renderText() string {
+	var b strings.Builder
+	b.WriteString(n.Content)
+	if len(n.Fields) > 0 {
+		b.WriteString("\n")
+		for _, f := range n.Fields {
+			if f.Value == "" {
+				continue
+			}
+			b.WriteString(fmt.Sprintf("\n%s：%s", f.Key, f.Value))
+		}
+	}
+	b.WriteString(diagnosisText(n.Diagnosis))
+	return b.String()
+}
+
+// diagnosisText 渲染诊断摘要（文本渠道版，限制建议条数与长度避免消息被截断）。
+func diagnosisText(d *DiagnosisBrief) string {
+	if d == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\n—— AI 诊断结论 ——")
+	b.WriteString(fmt.Sprintf("\n置信度：%.0f%%", d.Confidence*100))
+	if d.EngineUsed != "" {
+		b.WriteString(fmt.Sprintf(" · 引擎：%s", d.EngineUsed))
+	}
+	if d.DurationMS > 0 {
+		b.WriteString(fmt.Sprintf(" · 耗时 %.1fs", float64(d.DurationMS)/1000))
+	}
+	b.WriteString(fmt.Sprintf("\n根因：%s", truncateRunes(d.RootCause, 300)))
+	if d.ImpactScope != "" {
+		b.WriteString(fmt.Sprintf("\n影响范围：%s", truncateRunes(d.ImpactScope, 200)))
+	}
+	for i, item := range d.Suggestions {
+		if i >= 5 {
+			break
+		}
+		b.WriteString(fmt.Sprintf("\n%d. %s", i+1, truncateRunes(item, 160)))
+	}
+	if d.Degraded {
+		b.WriteString("\n⚠️ AI 引擎不可用，以上为规则引擎降级结论")
+	} else if d.Speculative {
+		b.WriteString("\n⚠️ 结论缺少证据支撑，属推测，请人工复核")
+	}
+	return b.String()
 }
 
 // instanceLabel 生成告警对象标签。
