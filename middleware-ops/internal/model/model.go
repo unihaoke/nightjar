@@ -389,6 +389,26 @@ type AuditSnapshot struct {
 	VerifiedAt   *time.Time `json:"verified_at"`
 }
 
+// PlatformSetting 是平台自管的配置项（AI 提供方、通知渠道等），**密钥整体加密落库**。
+//
+// 为什么要有它：AI key 与通知渠道以前只能写在 .env 里 —— 改一个 webhook 地址要改环境变量、
+// 重建容器、还可能把密钥散落在多处。搬到平台后由界面管理，改完即时生效，且密钥加密存储。
+type PlatformSetting struct {
+	Base
+	// Name 为配置项标识（当前：ai / notify）。
+	//
+	// 刻意不叫 `key`：GORM 会生成索引名 idx_platform_settings_key，而该名字以 `_key` 结尾，
+	// 与 PostgreSQL 默认约束名（<表>_<列>_key）形式相撞 —— schema 守卫会直接判失败（见 schema_test.go）。
+	Name string `gorm:"size:64;uniqueIndex" json:"name"`
+	// PayloadEncrypted 为 AES-256-GCM 密文（复用平台主密钥）；响应里绝不回传。
+	PayloadEncrypted string `gorm:"type:text" json:"-"`
+	// UpdatedBy 记录最后一次修改人，便于审计（UpdatedAt 由 Base 提供，GORM 自动维护）。
+	UpdatedBy string `json:"updated_by"`
+}
+
+// TableName 显式指定表名，避免 GORM 复数化差异。
+func (PlatformSetting) TableName() string { return "platform_settings" }
+
 // MigrationList 返回 AutoMigrate 所需的实体顺序（外键语义上先主后从）。
 func MigrationList() []any {
 	return []any{
@@ -401,6 +421,7 @@ func MigrationList() []any {
 		&Approval{}, &FixRecord{},
 		&ServerInstance{}, &CodeRepo{}, &LogAlertEvent{}, &AICodeAnalysis{},
 		&NotificationLog{},
+		&PlatformSetting{},
 	}
 }
 

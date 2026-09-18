@@ -88,34 +88,37 @@ prometheus:
 
 被管实例需在纳管时填写 `prom_job` / `prom_instance` 以便 PromQL 标签匹配；未填写时按 `job="<前缀>-<类型>"` + `instance_name="<实例名>"` 匹配。抓取配置见 `deploy/prometheus/prometheus.yml`。
 
-### 4.2 接入第三方 LLM（DeepSeek / Claude / Codex 兼容网关）
+### 4.2 配置 AI（在平台内完成，不再改 .env）
+
+**登录平台 →「AI 设置」**：选策略（third_party / self_hosted / hybrid）、填提供方的协议、base_url、
+**API Key**、模型、max_tokens 与价格（元/千 token），保存即时生效（`Factory.Reload()` 原子重建引擎，
+不需要重建容器）。
+
+- **密钥安全**：整个配置以 AES-256-GCM 加密后存在 `platform_settings`（复用平台主密钥）；
+  接口只回显掩码（`sk-****cdef`），日志与审计里不含密钥；输入框留空＝不修改，点「清除」才清空。
+- **额度**：日额度 / 每人日额度也在这一页配置，超限即触发平台的配额护栏（`CodeQuotaExceeded`）。
+- **消费与剩余额度**：同一页展示今日已用 tokens、剩余额度、今日调用次数、按天趋势、
+  按来源（诊断 / 代码分析）与按用户 Top10 —— 数据来自 `ai_diagnoses` 与 `ai_code_analyses` 的
+  `cost_tokens`，都是真实调用记录，不做估算。
+- **一键验证**：页面上有「测试连接」，用当前生效配置发一次最小请求并返回耗时。
+
+`.env` / `configs/config.yaml` 里的 `ai_engine.*` **仅作首次启动的一次性导入**：平台启动时若
+`platform_settings` 里还没有 `ai` 记录，会把当前非空值导入并写一条启动日志；此后以平台内的配置为准，
+改环境变量不会再生效（想跳过导入就留空）。
+
+部署拓扑、熔断与降级链（连续失败 2 次 → self_hosted → 规则引擎）仍由配置决定：
 
 ```yaml
 ai_engine:
-  strategy: hybrid
-  third_party:
-    enabled: true
-    kind: openai            # anthropic 走兼容网关时改为 anthropic
-    base_url: https://api.deepseek.com/v1
-    api_key: sk-xxxx        # 建议用环境变量 MWOPS_AI_ENGINE_THIRD_PARTY_API_KEY 注入
-    model: deepseek-chat
-    price_per_k_token: 0.002
-    timeout: { connect: 5s, first_byte: 15s, total: 60s, tool_call: 10s, task_deadline: 120s }
   fallback: { failure_threshold: 2, open_duration: 60s, rules_engine_enabled: true }
+  third_party:
+    timeout: { connect: 5s, first_byte: 15s, total: 60s, tool_call: 10s, task_deadline: 120s }
 ```
-
-连续失败 2 次触发熔断并降级到 `self_hosted`，再失败则降级规则引擎（输出半自动结论 + AI 不可用提示）。
 
 ### 4.3 接入本地 LLM（Ollama / vLLM）
 
-```yaml
-ai_engine:
-  self_hosted:
-    enabled: true
-    kind: openai
-    base_url: http://ollama.internal:11434/v1
-    model: qwen2.5:7b
-```
+同样在「AI 设置」里填 `self_hosted`：协议 `openai`、base_url `http://ollama.internal:11434/v1`、
+模型 `qwen2.5:7b`、启用即可；API Key 一般留空。
 
 ### 4.4 启用 pgvector 原生向量
 
@@ -127,18 +130,22 @@ GO_BUILD_TAGS=pgvector docker compose build backend && docker compose up -d back
 
 未启用时向量以文本存储，检索走应用层余弦相似度（复用同一份 768 维本地嵌入），知识库规模可控时性能足够。
 
-### 4.5 接入通知渠道
+### 4.5 配置通知渠道（在平台内完成，不再改 .env）
 
-| 渠道 | 配置 | 说明 |
+**登录平台 →「通知渠道」**：四张卡片（飞书 / 企微 / 钉钉 / 邮件）各自启用并填 webhook、
+签名密钥、@成员（邮件填 SMTP 主机/端口/账号/口令/收发件人），每个渠道都有「发送测试」按钮。
+
+| 渠道 | 平台内配置项 | 说明 |
 |------|------|------|
-| 飞书 | `notify.feishu.webhook` + `secret`（可选签名） | 交互式消息卡片，含「查看详情」按钮 |
-| 企业微信 | `notify.wecom.webhook` | Markdown 消息 |
-| 钉钉 | `notify.dingtalk.webhook` + `secret` | Markdown 消息（备选） |
-| 邮件 | `notify.email.*` | 低优先级，SMTP |
+| 飞书 | webhook + 签名密钥（可选）+ @成员 | 交互式消息卡片，含「查看详情」按钮 |
+| 企业微信 | webhook + @成员 | Markdown 消息 |
+| 钉钉 | webhook + 签名密钥 + @成员 | Markdown 消息（备选） |
+| 邮件 | SMTP host/port/账号/口令/from/to + TLS | 低优先级 |
+
+- **密钥安全**：与 AI 设置同一套机制——整体加密落库、接口只回显掩码、输入框留空＝不修改。
+- `.env` 里的 `FEISHU_*` / `WECOM_*` 等同样只作**首次启动的一次性导入**，之后以平台内配置为准。
 
 **边界**：卡片仅支持「查看详情 / 确认 / 驳回」，**不支持一键执行**；高危操作统一回 Web 端执行（设计文档 6.2）。
-
-配置完成后在「告警规则」页点击渠道标签即可发送自检消息。
 
 ### 4.6 部署日志采集 Agent
 
@@ -152,6 +159,34 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o mwops-agent ./cmd/agent
 - 增量读取：偏移量写入 `position_file`，文件轮转（变小）时自动从头读取。
 - 上报失败**不推进偏移**，下轮重读同一批数据，保证日志不丢。
 - 也可完全不用 Agent：应用直接 POST `/api/hooks/logs`（零侵入）。
+
+### 4.7 平台自管设置的接口与权限
+
+AI 设置与通知渠道共用一个后端分组（密钥整段加密存在 `platform_settings` 的 `payload_encrypted`）：
+
+| 接口 | 权限点 | 说明 |
+|------|--------|------|
+| `GET /api/settings/ai` | `system:config` | 读 AI 设置：密钥只回 `api_key_set` / `api_key_masked` |
+| `PUT /api/settings/ai` | `system:config:write` | 保存并**立即生效**（重建引擎 + 热更新护栏配额） |
+| `GET /api/settings/ai/usage?days=30` | `system:config` | token 消费/剩余额度（`days` 上限 90；`remaining_today=-1` 表示不限额） |
+| `POST /api/settings/ai/test` | `system:config:write` | 发一次最小请求自检；失败返回 200 + `ok=false` + 原因（不是 500） |
+| `GET /api/settings/notify` | `system:config` | 读通知渠道：webhook 只回掩码、签名密钥与 SMTP 口令只回 `*_set` |
+| `PUT /api/settings/notify` | `system:config:write` | 保存并立即生效（通知服务原子换配置，不重启） |
+| `POST /api/settings/notify/test` | `system:config:write` | `{"channel":"feishu/wecom/dingtalk/email"}` 发测试消息 |
+
+写法约定（三条，改接口时不要破坏）：
+
+1. **空串＝不修改**：`api_key` / `webhook` / `secret` / `password` 留空表示保持原值——
+   界面不回显明文，若把"没动输入框"当成清空，只改模型名就会把密钥删掉；要清空必须显式传
+   `clear_api_key` / `clear_webhook` / `clear_secret` / `clear_password`；
+2. **密钥永不出现在响应、日志与审计里**：审计只记 `key_changed` / `key_cleared` 这类布尔；
+   `base_url` 里的 userinfo（`https://user:pass@host`）会先脱敏再入库；
+3. **额度与消费都是真实数据**：直接聚合 `ai_diagnoses` / `ai_code_analyses` 的 `cost_tokens`，
+   没有数据就是 0，不做估算也不补数（同 INC-016 的原则）。
+
+`postgres` 侧只有一张表 `platform_settings`（`name` 唯一，值为整段 AES-256-GCM 密文）：
+主密钥（`security.master_key` / `master.key`）一旦更换，旧密文解不开，接口会**显式报错**
+而不是悄悄回退 `.env`——避免"设置看着没了，再保存一次把旧值覆盖掉"。
 
 ---
 

@@ -38,12 +38,15 @@ type ContainerOptions struct {
 func NewContainer(opt ContainerOptions) (*Deps, error) {
 	cfg := opt.Config
 	deps := &Deps{
-		Config:        cfg,
-		DB:            opt.DB,
-		Log:           opt.Log,
-		Cache:         opt.Cache,
-		Queue:         opt.Queue,
-		Engine:        opt.EngineFactory.Engine(),
+		Config: cfg,
+		DB:     opt.DB,
+		Log:    opt.Log,
+		Cache:  opt.Cache,
+		Queue:  opt.Queue,
+		// Engine 直接持有工厂自身：工厂实现了 engine.Engine 接口，内部引擎在 Reload 后
+		// 原子替换，各服务早先存下的指针无需更换就能看到"当前生效的引擎"
+		// （否则在设置页改完 api_key 只是工厂自己换了引擎，诊断链路还在用旧的）。
+		Engine:        opt.EngineFactory,
 		EngineFactory: opt.EngineFactory,
 		Monitor:       opt.Monitor,
 		Cipher:        opt.Cipher,
@@ -94,6 +97,26 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	snapshotDir := "./data/audit-snapshots"
 	deps.Audit = NewAuditService(deps.Audits, snapshotDir, opt.Log)
 	deps.Notifier = NewNotifierService(&cfg.Notify, opt.AppURL, opt.Cache, deps.Notifies, opt.Log)
+
+	// 平台自管设置（AI 提供方 / 通知渠道）：密钥加密落库，改完即时生效。
+	deps.Settings = NewSettingService(SettingDeps{
+		Config: cfg, DB: opt.DB, Repo: repository.NewSettingRepository(opt.DB),
+		Cipher: opt.Cipher, Engine: opt.EngineFactory, Factory: opt.EngineFactory,
+		Cost: deps.Cost, Notifier: deps.Notifier, Audit: deps.Audit, Log: opt.Log,
+	})
+	// 启动时对齐「平台库 ↔ 内存配置」：
+	//   - 库里还没有记录：把 .env / config.yaml 里的非空密钥首次导入平台（之后由界面管理）；
+	//   - 库里已有记录：以库为准覆盖内存配置（否则"界面改完 → 重启 → 又变回 .env 旧值"）。
+	// 失败只告警不阻断启动：设置读不出来时平台仍可用 .env 配置与规则引擎对外服务，
+	// 把一个可恢复的配置问题升级成"平台起不来"是不划算的。
+	settingsCtx, cancelSettings := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := deps.Settings.ApplyAI(settingsCtx); err != nil {
+		opt.Log.Warn("AI 设置初始化失败，本次沿用 .env / config.yaml 配置", zap.Error(err))
+	}
+	if err := deps.Settings.ApplyNotify(settingsCtx); err != nil {
+		opt.Log.Warn("通知设置初始化失败，本次沿用 .env / config.yaml 配置", zap.Error(err))
+	}
+	cancelSettings()
 
 	// 领域服务
 	deps.Auth = NewAuthService(cfg, deps.Users, deps.Roles, opt.Tokens, opt.Log)

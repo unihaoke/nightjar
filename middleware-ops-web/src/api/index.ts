@@ -1,6 +1,10 @@
 /** 接口封装：与设计文档 8.2 接口总览一一对应。 */
 import { authHeaders, get, post, postSlow, put, del, withSignal, type PageResult } from './http'
 import type {
+  AISettingsInput,
+  AISettingsView,
+  AITestResult,
+  AIUsageView,
   Alert,
   AlertRule,
   Approval,
@@ -34,6 +38,9 @@ import type {
   MiddlewareInput,
   MiddlewareInstance,
   NotifyChannel,
+  NotifySettingsInput,
+  NotifySettingsView,
+  NotifyTestResult,
   Overview,
   Profile,
   Role,
@@ -396,6 +403,24 @@ export const systemApi = {
   overview: () => get<Overview>('/api/system/overview'),
   info: () => get<SystemInfo>('/api/system/info'),
   config: () => get<Record<string, unknown>>('/api/system/config'),
+}
+
+/** AI 设置与通知渠道设置（平台侧可写配置，需 system:config / system:config:write）。 */
+export const settingApi = {
+  /** 读取 AI Key 设置（策略、双提供方、额度）。 */
+  ai: () => get<AISettingsView>('/api/settings/ai'),
+  /** 保存 AI 设置：密钥留空表示不修改，clear_api_key=true 表示清空。 */
+  saveAI: (payload: AISettingsInput) => put<AISettingsView>('/api/settings/ai', payload),
+  /** token 消费与额度（含趋势、来源分布、Top 用户）。 */
+  aiUsage: (days = 30) => get<AIUsageView>('/api/settings/ai/usage', { days }),
+  /** 测试 AI 连接：失败也返回 ok=false 与原因，不抛错。 */
+  testAI: () => post<AITestResult>('/api/settings/ai/test'),
+  /** 读取通知渠道设置。 */
+  notify: () => get<NotifySettingsView>('/api/settings/notify'),
+  /** 保存通知渠道设置：密钥/口令留空表示不修改。 */
+  saveNotify: (payload: NotifySettingsInput) => put<NotifySettingsView>('/api/settings/notify', payload),
+  /** 给单个渠道发一条测试消息。 */
+  testNotify: (channel: string) => post<NotifyTestResult>('/api/settings/notify/test', { channel }),
 }
 
 /** 用户与角色（管理员）。 */

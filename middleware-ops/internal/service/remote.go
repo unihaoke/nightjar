@@ -154,7 +154,7 @@ func (s *IntegrationService) deployRemote(
 	opts := integration.RemoteOptions{
 		Host: host, SSHUser: creds.User, SSHPort: creds.Port,
 		ExporterPort: port, InstallMode: s.installMode(creds),
-		InstallDir: s.cfg.Integration.Ansible.InstallDir,
+		InstallDir:    s.cfg.Integration.Ansible.InstallDir,
 		DockerNetwork: s.cfg.Integration.Ansible.DockerNetwork,
 		Become:        become, ExtraArgs: s.cfg.Integration.Ansible.ExtraArgs,
 	}
@@ -327,7 +327,9 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	    无数据时界面显示「无数据」而不是 0。
 //	r9：补齐 redis/mysql 指标（含可用性指标，置于首位）；修正 PG 主从延迟告警引用了不存在的指标；
 //	    统一监控页切换实例时指标跟随切换（INC-017）。
-const CodeRevision = "r9"
+//	r10：AI 设置与通知渠道改由平台管理（platform_settings 加密落库、保存即生效、密钥只回掩码），
+//	     新增 token 消费/剩余额度统计；通知配置改为原子快照（INC-018）。
+const CodeRevision = "r10"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

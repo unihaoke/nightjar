@@ -31,11 +31,12 @@ import (
 
 // expectedUniqueIndexes 是模型当前的唯一索引全集（表名 → 列名）。
 var expectedUniqueIndexes = map[string]string{
-	"users":            "username",
-	"roles":            "code",
-	"approvals":        "ticket_id",
-	"log_alert_events": "event_id",
-	"audit_snapshots":  "snapshot_date",
+	"users":             "username",
+	"roles":             "code",
+	"approvals":         "ticket_id",
+	"log_alert_events":  "event_id",
+	"audit_snapshots":   "snapshot_date",
+	"platform_settings": "name",
 }
 
 // TestUniqueIndexNamingMatchesGormStrategy 校验模型生成的唯一索引命名。

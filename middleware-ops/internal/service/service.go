@@ -67,6 +67,8 @@ type Deps struct {
 	Integration  *IntegrationService
 	Dashboard    *DashboardService
 	Notifier     *NotifierService
+	// Settings 为平台自管设置（AI 提供方 / 通知渠道），密钥加密落库、保存即生效。
+	Settings *SettingService
 
 	// 六道护栏实例（进程级共享，承载配额与熔断状态）
 	Budget    *guardrail.Budget

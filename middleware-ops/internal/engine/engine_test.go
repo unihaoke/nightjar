@@ -106,6 +106,53 @@ func TestFactoryMockProvider(t *testing.T) {
 	}
 }
 
+// TestFactoryReloadSwitchesEngine 校验「工厂自身实现 Engine 接口」这一热加载前提。
+//
+// 场景：各 service 在装配期就把 engine.Engine 存进自己的字段。管理员在「AI 设置」里改完
+// 配置后只会调一次 Reload，因此**已经持有工厂指针的调用方必须立刻看到新引擎**——
+// 如果工厂只提供 Engine() 快照，改了配置也只有工厂自己知道，诊断链路仍在用旧引擎。
+func TestFactoryReloadSwitchesEngine(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AIEngine.Strategy = string(StrategyHybrid)
+	cfg.AIEngine.ThirdParty.Enabled = false
+	cfg.AIEngine.SelfHosted.Enabled = false
+
+	factory := NewFactory(FactoryOptions{Config: cfg})
+	// 模拟 service 侧持有的引用（接口类型，指向工厂本身）。
+	holder := Engine(factory)
+	if holder.Name() != RuleEngineName {
+		t.Fatalf("无提供方时应为规则引擎，实际 %s", holder.Name())
+	}
+	if !holder.Available() {
+		t.Fatal("规则引擎必须始终可用")
+	}
+	before := len(factory.Notes())
+	if before == 0 {
+		t.Fatal("应记录降级说明")
+	}
+
+	// 改配置并 Reload：同一个 holder 必须看到新引擎。
+	cfg.AIEngine.ThirdParty.Enabled = true
+	cfg.AIEngine.ThirdParty.Kind = "mock"
+	factory.Reload()
+	if holder.Name() != string(StrategyHybrid) {
+		t.Fatalf("Reload 后应为 hybrid，实际 %s", holder.Name())
+	}
+	if len(factory.Notes()) == 0 {
+		t.Fatal("Reload 后 Notes 应随之更新")
+	}
+	if !strings.Contains(factory.Notes()[0], "mock") {
+		t.Fatalf("Notes 应描述本次构建的提供方，实际 %v", factory.Notes())
+	}
+
+	// 再降回去：行为必须可逆（保存非法配置后仍能回退到规则引擎）。
+	cfg.AIEngine.ThirdParty.Enabled = false
+	factory.Reload()
+	if holder.Name() != RuleEngineName {
+		t.Fatalf("Reload 回退后应为规则引擎，实际 %s", holder.Name())
+	}
+}
+
 // TestLocalEmbeddingDeterministic 校验本地嵌入的确定性（无外部服务时的兜底）。
 func TestLocalEmbeddingDeterministic(t *testing.T) {
 	eng := NewRuleEngine("test")

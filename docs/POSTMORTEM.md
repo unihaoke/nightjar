@@ -5,6 +5,78 @@
 
 ---
 
+## INC-018 · AI 密钥与通知 webhook 只能写在 .env 里：换一个渠道要改环境变量、重建容器
+
+**首次暴露**：2026-09-19，使用者提出要求：
+
+> 「1.增加AI设置菜单，包括设置AI key，查看token消费情况，以及剩余额度 2.增加通知渠道管理。
+> 上述功能从.env中移除，由平台进行管理。」
+
+**定位过程**
+
+1. 现状：`ai_engine.third_party.api_key`、`notify.feishu.webhook` 这类值**只能**来自 `.env` /
+   `configs/config.yaml`，运行期没有任何写入口——换一个密钥就要改环境变量 + 重建容器，
+   密钥还随 `.env` 散落到每一台部署机；
+2. 引擎是启动期一次性装配的（`Factory.Engine()` 用 `sync.Once`）：即使有接口改了内存配置，
+   诊断链路抓着的仍是旧引擎——"改了 api_key 也不生效"；
+3. 护栏配额（日 token / 每人日配额）同样只在启动时读一次，界面上调大配额也不会生效；
+4. 通知服务当时持有 `&cfg.Notify` 指针，若就地逐字段改写，会与告警发送 goroutine 抢内存。
+
+**根因**
+
+1. 配置的「来源」与「生效」耦合在启动流程里：整个系统只有"进程启动"这一条生效路径；
+2. 密钥类配置没有统一机制（加密落库、掩码回显、审计脱敏、清除语义）；
+3. 消费与额度没有真实数据出口——`ai_diagnoses` / `ai_code_analyses` 里已有 `cost_tokens`，
+   但界面上看不到，使用者只能靠云厂商账单猜。
+
+**修复**（平台自管设置）
+
+1. 新表 `platform_settings`（`name` + `payload_encrypted` + `updated_by`）：整段 JSON 用平台主密钥
+   AES-256-GCM 加密后落库；列名刻意用 `name` 而不是 `key`——后者会让索引名以 `_key` 结尾，
+   撞上"唯一索引命名"的 schema 守卫；
+2. 7 条接口：`GET/PUT /api/settings/ai`、`GET /api/settings/ai/usage`、`POST /api/settings/ai/test`、
+   `GET/PUT /api/settings/notify`、`POST /api/settings/notify/test`；读要 `system:config`，
+   写与自检要 `system:config:write`；
+3. **引擎热重载**：`Factory` 自身实现 `engine.Engine`（RWMutex 双检锁转发的门面），
+   `Reload()` 原子替换内部引擎——各服务早先存下的指针自动指向"当前生效的引擎"，
+   不需要把指针挨个换一遍；配额走 `guardrail.Cost.UpdateQuotas`；
+4. **通知配置改为原子快照**：`NotifierService.cfg` 变成 `atomic.Pointer[config.NotifyConfig]`，
+   `UpdateConfig` 整份替换并防御性拷贝切片——发送方要么看到完整旧配置、要么看到完整新配置；
+5. 密钥三态语义（空串＝不修改 / `clear_xxx=true`＝清空 / 非空＝覆盖），响应里只有
+   `*_set` 与 `*_masked`，审计只记布尔与枚举；留空＝不修改这条尤其关键：
+   界面不回显明文，若把"没动输入框"当成清空，管理员只改模型名就会把密钥删掉；
+6. 用量统计直接聚合两张业务表的 `cost_tokens`（不另建流水表，免得又多一处对不上的账），
+   `remaining_today = -1` 表示"不限额"（用 0 会被读成"今天已用完"）；
+7. `.env` / `config.yaml` 只在**首次启动**导入一次（`updated_by=env-import`），此后以平台记录为准；
+   `ApplyAI` / `ApplyNotify` 失败只告警不阻断启动——把可恢复的配置问题升级成"平台起不来"不划算。
+
+**实现期当场发现并修掉的三个问题**
+
+1. 审计里记了 `base_url`，而 base_url 完全可能写成 `https://user:pass@host`（自建网关常这么要求）：
+   审计长期保存且支持检索，原样入库等于把凭据永久留下 → 新增 `redactCredentials()`，
+   只对「scheme 之后、第一个 `/` 之前」的 userinfo 打码（路径里的 `@` 不误伤，
+   没有 scheme 的写法无法区分用户名与协议名，就整段打码）；
+2. **「发送测试」永远成功**：`send()` 为了告警链路健壮性会吞掉渠道错误，`SendTest` 于是恒返回 nil——
+   没配 webhook 也显示"已发送" → 新增 `ReadyForTest(channel)` 预检（总开关 / 渠道开关 /
+   webhook / 收件人），把确定性配置问题在执行前暴露；
+3. 混合策略下坏密钥会静默降级到规则引擎并**返回成功**，只看 `err` 会把坏 key 报成"测试通过"
+   → 自检额外检查 `Status().Degraded` 并把真实原因显示出来。
+
+**防复发**
+
+1. `TestRedactCredentials`：凭据打码的表格用例，含"路径里的 `@` 不动"与"无 scheme 整段打码"；
+2. `TestNotifierConfigSnapshotIsolatedAndLive`：外部结构体被改不能带跑通知服务；
+   `UpdateConfig` 后必须立即生效；切片必须防御性拷贝；
+3. `TestApplyNotifyPayloadReachesNotifier`：锁住"保存后必须推给发送链路"——
+   只改内存配置是不够的，这类"界面说保存成功、实际没生效"最难排查；
+4. `TestNotifierConfigConcurrentSwap`：并发换配置 + 读配置，在 `-race` 下压出数据竞争；
+5. `internal/router/router_test.go`：断言 7 条路由注册成功且 gin 未 panic（路由冲突只有运行时才炸）；
+6. `internal/engine/engine_test.go::TestFactoryReloadSwitchesEngine`：锁住"Reload 后持有工厂指针的
+   一方看到新引擎"；
+7. 文档 `docs/OPERATIONS.md` §4.2 / §4.5 / §4.7 与 `.env.example` 明确"`.env` 仅作首次导入兜底"。
+
+---
+
 ## INC-017 · 统一监控切换组件时报「上游依赖异常」：指标没跟着切
 
 **首次暴露**：2026-09-18，使用者反馈：
@@ -933,6 +1005,17 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
 19. **"无数据"与"值为 0"必须在类型上就分开**：`float64` 的零值让两者在 JSON 里长得一模一样，
     前端只能靠 `status` 兜住（INC-016）。凡是"可能没有"的数值，都应该有显式的存在性标志
     （指针、`has_data`、或像这里的 status），而不是让 0 兼任两种语义。
-16. **测试可能正在保护 bug**：`TestRenderRedisIntegration` 断言的正是错误的地址写法，
+20. **测试可能正在保护 bug**：`TestRenderRedisIntegration` 断言的正是错误的地址写法，
     `TestRemoteEnvFileEscapesQuotes` 断言的正是错误的 shell 转义（INC-008）。
     改行为时要**先看有没有旧测试在锁定旧行为**，并在提交信息/注释里写明为什么改。
+21. **"把配置搬到界面"不是加几张表单，而是给配置补一条生效路径**：此前的配置只有"进程启动"
+    这一条生效路径，于是热更新会冒出两类新缺陷——「保存了但消费者还在用旧值」（保存必须
+    *落库 + 推给消费者*，成对出现）和「读配置的 goroutine 拿到半个配置」（整份替换 + 原子快照，
+    切片要防御性拷贝），见 INC-018。凡是运行期可改的配置，都要回答这两个问题。
+22. **密钥类配置只有四条规矩，但缺一条就等于泄露**：界面永不回显明文（只给掩码）、
+    空值＝不修改（不回显就不能把"没动"当"清空"）、清空必须显式（`clear_xxx`）、
+    审计只记布尔不记值。还要顺手检查**旁边的字段**：`base_url` 可能带 userinfo，
+    错误信息里也可能带着它（先脱敏再截断）。
+23. **"测试/自检"按钮如果永远成功，多半是发送链路在吞错**：为了不让一个渠道拖垮告警，
+    `send()` 会吞掉渠道错误，于是自检恒为成功（INC-018）。正确的做法是先做**确定性预检**
+    （配置齐不齐），再看真实调用结果，最后再看"是不是静默降级了"。

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -27,7 +28,14 @@ import (
 // 边界（6.2）：IM 卡片只做「通知 + 确认/驳回 + 查看详情」，
 // **不做一键执行**，执行统一回 Web 端并叠加二次确认。
 type NotifierService struct {
-	cfg    *config.NotifyConfig
+	// cfg 指向「当前生效的那一份通知配置」。
+	//
+	// 为什么是 atomic.Pointer 而不是直接持有 *config.NotifyConfig：「通知渠道」搬到平台界面后，
+	// 保存动作会在**运行期**整份替换通知配置（见 UpdateConfig），而告警发送链路在其它 goroutine
+	// 上读它。若就地逐字段改写，发送方可能拷到「半个旧配置 + 半个新配置」——Go 的 string/切片
+	// 拷贝都不是原子的——轻则用新 webhook 配旧签名密钥（必然 401），重则把消息发到刚被换掉的
+	// 群。改成「整份替换 + 原子读指针」后，读方永远拿到一份自洽的配置快照。
+	cfg    atomic.Pointer[config.NotifyConfig]
 	appURL string
 	store  cache.Store
 	repo   *repository.NotificationLogRepository
@@ -36,27 +44,57 @@ type NotifierService struct {
 }
 
 // NewNotifierService 构造通知服务。
+//
+// 传进来的 cfg 会**被复制**后持有：服务只认自己这一份快照，不与 config.Config 里的字段共享
+// 内存，避免"谁都能改到它"的隐性耦合（要改必须走 UpdateConfig）。
 func NewNotifierService(cfg *config.NotifyConfig, appURL string, store cache.Store, repo *repository.NotificationLogRepository, log *zap.Logger) *NotifierService {
-	return &NotifierService{
-		cfg: cfg, appURL: appURL, store: store, repo: repo,
+	s := &NotifierService{
+		appURL: appURL, store: store, repo: repo,
 		client: &http.Client{Timeout: 8 * time.Second},
 		log:    log,
 	}
+	if cfg != nil {
+		s.UpdateConfig(*cfg)
+	} else {
+		s.UpdateConfig(config.NotifyConfig{})
+	}
+	return s
+}
+
+// UpdateConfig 替换当前生效的通知配置（设置页保存后调用，立即生效，不需要重启）。
+func (s *NotifierService) UpdateConfig(cfg config.NotifyConfig) {
+	// To/Mentions 是切片：整份替换的是"快照指针"，但切片底层数组仍可能与调用方共享。
+	// 拷贝一份，保证快照之后不会被任何人从外部改写。
+	cfg.Email.To = append([]string(nil), cfg.Email.To...)
+	cfg.Feishu.Mentions = append([]string(nil), cfg.Feishu.Mentions...)
+	cfg.WeCom.Mentions = append([]string(nil), cfg.WeCom.Mentions...)
+	cfg.DingTalk.Mentions = append([]string(nil), cfg.DingTalk.Mentions...)
+	s.cfg.Store(&cfg)
+}
+
+// current 取当前生效配置；未初始化时返回零值（等价于「所有渠道未启用」），调用方不必判 nil。
+func (s *NotifierService) current() config.NotifyConfig {
+	if cfg := s.cfg.Load(); cfg != nil {
+		return *cfg
+	}
+	return config.NotifyConfig{}
 }
 
 // ChannelStatus 描述各渠道配置状态（不泄露 webhook 地址）。
 func (s *NotifierService) ChannelStatus() []map[string]any {
+	cfg := s.current()
 	return []map[string]any{
-		{"channel": "feishu", "enabled": s.cfg.Enabled && s.cfg.Feishu.Enabled && s.cfg.Feishu.Webhook != ""},
-		{"channel": "wecom", "enabled": s.cfg.Enabled && s.cfg.WeCom.Enabled && s.cfg.WeCom.Webhook != ""},
-		{"channel": "dingtalk", "enabled": s.cfg.Enabled && s.cfg.DingTalk.Enabled && s.cfg.DingTalk.Webhook != ""},
-		{"channel": "email", "enabled": s.cfg.Enabled && s.cfg.Email.Enabled && s.cfg.Email.Host != ""},
+		{"channel": "feishu", "enabled": cfg.Enabled && cfg.Feishu.Enabled && cfg.Feishu.Webhook != ""},
+		{"channel": "wecom", "enabled": cfg.Enabled && cfg.WeCom.Enabled && cfg.WeCom.Webhook != ""},
+		{"channel": "dingtalk", "enabled": cfg.Enabled && cfg.DingTalk.Enabled && cfg.DingTalk.Webhook != ""},
+		{"channel": "email", "enabled": cfg.Enabled && cfg.Email.Enabled && cfg.Email.Host != ""},
 	}
 }
 
 // NotifyAlert 发送告警通知。
 func (s *NotifierService) NotifyAlert(ctx context.Context, alert *model.Alert, rule model.AlertRule, metric monitor.Metric) {
-	if alert == nil || s.cfg == nil || !s.cfg.Enabled {
+	cfg := s.current()
+	if alert == nil || !cfg.Enabled {
 		return
 	}
 	title := fmt.Sprintf("【%s】%s", strings.ToUpper(defaultString(alert.AlertLevel, "warning")), instanceLabel(alert))
@@ -64,7 +102,7 @@ func (s *NotifierService) NotifyAlert(ctx context.Context, alert *model.Alert, r
 	if alert.Count > 1 {
 		content = fmt.Sprintf("%s\n（窗口内已合并 %d 次重复告警）", content, alert.Count)
 	}
-	detailURL := fmt.Sprintf("%s%s?alert_id=%d", s.appURL, defaultString(s.cfg.CardConfirmPath, "/alerts"), alert.ID)
+	detailURL := fmt.Sprintf("%s%s?alert_id=%d", s.appURL, defaultString(cfg.CardConfirmPath, "/alerts"), alert.ID)
 
 	channels := rule.NotifyChannels
 	if len(channels) == 0 {
@@ -101,7 +139,8 @@ type AlertNotification struct {
 
 // NotifyApproval 发送审批相关通知。
 func (s *NotifierService) NotifyApproval(ctx context.Context, ticket *model.Approval, state string) {
-	if ticket == nil || s.cfg == nil || !s.cfg.Enabled {
+	cfg := s.current()
+	if ticket == nil || !cfg.Enabled {
 		return
 	}
 	stateLabel := map[string]string{
@@ -185,7 +224,7 @@ func (s *NotifierService) dedup(ctx context.Context, key string) bool {
 
 // sendFeishu 发送飞书消息卡片。
 func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) error {
-	cfg := s.cfg.Feishu
+	cfg := s.current().Feishu
 	if !cfg.Enabled || cfg.Webhook == "" {
 		return fmt.Errorf("飞书渠道未启用")
 	}
@@ -219,7 +258,7 @@ func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) e
 
 // sendWeCom 发送企业微信 markdown 消息。
 func (s *NotifierService) sendWeCom(ctx context.Context, n AlertNotification) error {
-	cfg := s.cfg.WeCom
+	cfg := s.current().WeCom
 	if !cfg.Enabled || cfg.Webhook == "" {
 		return fmt.Errorf("企业微信渠道未启用")
 	}
@@ -236,7 +275,7 @@ func (s *NotifierService) sendWeCom(ctx context.Context, n AlertNotification) er
 
 // sendDingTalk 发送钉钉 markdown 消息（备选渠道）。
 func (s *NotifierService) sendDingTalk(ctx context.Context, n AlertNotification) error {
-	cfg := s.cfg.DingTalk
+	cfg := s.current().DingTalk
 	if !cfg.Enabled || cfg.Webhook == "" {
 		return fmt.Errorf("钉钉渠道未启用")
 	}
@@ -292,7 +331,7 @@ func (s *NotifierService) postJSON(ctx context.Context, endpoint string, payload
 
 // sendEmail 发送邮件通知（net/smtp）。
 func (s *NotifierService) sendEmail(n AlertNotification) error {
-	cfg := s.cfg.Email
+	cfg := s.current().Email
 	if !cfg.Enabled || cfg.Host == "" {
 		return fmt.Errorf("邮件渠道未启用")
 	}
@@ -316,6 +355,43 @@ func instanceLabel(alert *model.Alert) string {
 		return fmt.Sprintf("%s 实例 #%d", strings.ToUpper(alert.MWType), alert.InstanceID)
 	}
 	return fmt.Sprintf("实例 #%d", alert.InstanceID)
+}
+
+// ReadyForTest 预检渠道是否具备发送条件（设置页「测试」按钮前的自检）。
+//
+// 为什么需要单独一个预检：send() 把发送失败写进通知日志后**吞掉错误**（告警通知不能因为
+// 某一个渠道失败而中断整条链路），于是 SendTest 永远返回 nil——界面点「测试」会显示成功，
+// 实际一条都没发出去。这里把「渠道没启用 / 没配 webhook / 收件人为空」这类确定性配置问题
+// 提前暴露给配置人。
+func (s *NotifierService) ReadyForTest(channel string) error {
+	cfg := s.current()
+	if !cfg.Enabled {
+		return fmt.Errorf("通知总开关未启用：请先在通知设置里打开「启用通知」")
+	}
+	switch channel {
+	case "feishu":
+		if !cfg.Feishu.Enabled || cfg.Feishu.Webhook == "" {
+			return fmt.Errorf("飞书渠道未启用或未配置 webhook")
+		}
+	case "wecom":
+		if !cfg.WeCom.Enabled || cfg.WeCom.Webhook == "" {
+			return fmt.Errorf("企业微信渠道未启用或未配置 webhook")
+		}
+	case "dingtalk":
+		if !cfg.DingTalk.Enabled || cfg.DingTalk.Webhook == "" {
+			return fmt.Errorf("钉钉渠道未启用或未配置 webhook")
+		}
+	case "email":
+		if !cfg.Email.Enabled || cfg.Email.Host == "" {
+			return fmt.Errorf("邮件渠道未启用或未配置 SMTP 主机")
+		}
+		if len(cfg.Email.To) == 0 {
+			return fmt.Errorf("邮件收件人为空")
+		}
+	default:
+		return fmt.Errorf("未知通知渠道 %s", channel)
+	}
+	return nil
 }
 
 // SendTest 发送测试消息（系统配置页自检）。

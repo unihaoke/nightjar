@@ -109,6 +109,19 @@ func (c *Cost) Commit(userID int64, usage int) (reachedRatio float64, warning st
 	return reachedRatio, warning
 }
 
+// UpdateQuotas 热更新日配额与单用户日配额。
+//
+// 为什么需要：配额以前只来自配置文件，改一次要重启进程；搬到「AI 设置」后由管理员在界面上改，
+// 保存即生效。与既有字段读写一致地持锁，避免与并发的 Check/Commit 交叉读出半个新配额。
+// 注意：本方法不动 tripped 熔断标记——熔断可能来自「异常突增」而非配额，是否解除由管理员
+// 显式 Reset 决定，不能因为改了配额就悄悄把熔断打开。
+func (c *Cost) UpdateQuotas(daily, perUser int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dailyQuota = daily
+	c.perUserQuota = perUser
+}
+
 // Snapshot 返回成本快照，供 /api/system/overview 展示。
 func (c *Cost) Snapshot(userID int64) map[string]any {
 	c.mu.Lock()

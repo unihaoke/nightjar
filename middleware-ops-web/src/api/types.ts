@@ -842,3 +842,164 @@ export interface NotifyChannel {
   channel: string
   enabled: boolean
 }
+
+/** AI 提供方设置（单个提供方）。 */
+export interface AIProviderSetting {
+  enabled: boolean
+  /** openai | anthropic | ollama | mock */
+  kind: string
+  base_url: string
+  /** 只读：后端是否已存密钥。 */
+  api_key_set: boolean
+  /** 只读：形如 sk-****cdef；后端不返回明文。 */
+  api_key_masked: string
+  model: string
+  max_tokens: number
+  price_per_k_token: number
+}
+
+/** AI 设置视图（GET /api/settings/ai）。 */
+export interface AISettingsView {
+  /** third_party | self_hosted | hybrid */
+  strategy: string
+  third_party: AIProviderSetting
+  self_hosted: AIProviderSetting
+  daily_token_quota: number
+  per_user_daily_quota: number
+  updated_by: string
+  updated_at: string
+  /** 生效来源：platform（平台已保存）| env（仍是 .env 配置）。 */
+  source: string
+  /** 当前生效的提供方描述（不含密钥）。 */
+  providers_active: string[]
+}
+
+/** AI 提供方入参（不填 api_key 即保留原有密钥）。 */
+export interface AIProviderInput {
+  enabled: boolean
+  kind: string
+  base_url: string
+  api_key?: string
+  clear_api_key?: boolean
+  model: string
+  max_tokens: number
+  price_per_k_token: number
+}
+
+/** AI 设置入参（PUT /api/settings/ai）。 */
+export interface AISettingsInput {
+  strategy: string
+  third_party: AIProviderInput
+  self_hosted: AIProviderInput
+  daily_token_quota: number
+  per_user_daily_quota: number
+}
+
+/** token 消费趋势的单个数据点。 */
+export interface AIUsagePoint {
+  date: string
+  tokens: number
+  calls: number
+}
+
+/** AI 用量与额度视图（GET /api/settings/ai/usage）。 */
+export interface AIUsageView {
+  today_tokens: number
+  today_calls: number
+  daily_quota: number
+  per_user_daily_quota: number
+  /** -1 表示「不限」。 */
+  remaining_today: number
+  /** 0..1。 */
+  used_ratio: number
+  window_days: number
+  window_tokens: number
+  window_calls: number
+  series: AIUsagePoint[]
+  by_source: { source: string; tokens: number; calls: number }[]
+  top_users: { user_id: number; username: string; tokens: number; calls: number }[]
+}
+
+/** 通知渠道：AI 测试连接结果（POST /api/settings/ai/test）。 */
+export interface AITestResult {
+  ok: boolean
+  engine: string
+  message: string
+  latency_ms: number
+}
+
+/** 通知渠道：webhook 类渠道现状（飞书 / 企微 / 钉钉）。 */
+export interface NotifyWebhookChannelView {
+  enabled: boolean
+  webhook_set: boolean
+  webhook_masked: string
+  secret_set: boolean
+  mentions: string[]
+}
+
+/** 通知渠道：邮件渠道现状。 */
+export interface NotifyEmailChannelView {
+  enabled: boolean
+  host: string
+  port: number
+  username: string
+  password_set: boolean
+  from: string
+  to: string[]
+  use_tls: boolean
+}
+
+/** 通知渠道设置视图（GET /api/settings/notify）。 */
+export interface NotifySettingsView {
+  enabled: boolean
+  feishu: NotifyWebhookChannelView
+  wecom: NotifyWebhookChannelView
+  dingtalk: NotifyWebhookChannelView
+  email: NotifyEmailChannelView
+  /** 卡片确认落地页路径。 */
+  card_confirm_path: string
+  updated_by: string
+  updated_at: string
+  /** 生效来源：platform | env。 */
+  source: string
+}
+
+/** 通知渠道：webhook 类渠道入参（留空 = 不修改，clear_* = 清空）。 */
+export interface NotifyWebhookChannelInput {
+  enabled: boolean
+  webhook?: string
+  clear_webhook?: boolean
+  secret?: string
+  clear_secret?: boolean
+  mentions?: string[]
+}
+
+/** 通知渠道：邮件渠道入参。 */
+export interface NotifyEmailChannelInput {
+  enabled: boolean
+  host: string
+  port: number
+  username: string
+  password?: string
+  clear_password?: boolean
+  from: string
+  to: string[]
+  use_tls: boolean
+}
+
+/** 通知渠道设置入参（PUT /api/settings/notify）。 */
+export interface NotifySettingsInput {
+  enabled: boolean
+  feishu: NotifyWebhookChannelInput
+  wecom: NotifyWebhookChannelInput
+  dingtalk: NotifyWebhookChannelInput
+  email: NotifyEmailChannelInput
+  card_confirm_path: string
+}
+
+/** 通知渠道：发送测试结果（POST /api/settings/notify/test）。 */
+export interface NotifyTestResult {
+  ok: boolean
+  channel: string
+  message: string
+}

@@ -135,6 +135,18 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '用户与角色', group: '系统', permissions: ['user:manage'] },
       },
       {
+        path: 'system/ai-settings',
+        name: 'ai-settings',
+        component: () => import('@/views/System/AISettings.vue'),
+        meta: { title: 'AI 设置', group: '系统', permissions: ['system:config'] },
+      },
+      {
+        path: 'system/notify-channels',
+        name: 'notify-channels',
+        component: () => import('@/views/System/NotifyChannels.vue'),
+        meta: { title: '通知渠道', group: '系统', permissions: ['system:config'] },
+      },
+      {
         path: 'system/info',
         name: 'system-info',
         component: () => import('@/views/System/Info.vue'),

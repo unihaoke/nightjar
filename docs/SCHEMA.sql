@@ -384,3 +384,14 @@ CREATE TABLE IF NOT EXISTS notification_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_logs_alert_id ON notification_logs(alert_id);
 CREATE INDEX IF NOT EXISTS idx_notification_logs_event_id ON notification_logs(event_id);
+
+-- 平台自管配置（AI 提供方密钥、通知渠道）：payload 为 AES-256-GCM 密文，界面不回传明文。
+CREATE TABLE IF NOT EXISTS platform_settings (
+    id                BIGSERIAL PRIMARY KEY,
+    created_at        TIMESTAMPTZ,
+    updated_at        TIMESTAMPTZ,
+    name              VARCHAR(64),
+    payload_encrypted TEXT,
+    updated_by        VARCHAR(64),
+    CONSTRAINT uni_platform_settings_name UNIQUE (name)
+);

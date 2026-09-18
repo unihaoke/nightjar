@@ -232,6 +232,20 @@ func New(opt Options) *gin.Engine {
 		system.GET("/config", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigRead), h.ConfigView)
 	}
 
+	// 平台自管设置：AI 提供方与通知渠道由界面管理，保存即生效、密钥加密落库，
+	// 不再需要改 .env 重建容器。读写分别用 system:config / system:config:write 权限点。
+	settings := api.Group("/settings")
+	settings.Use(mw.Auth(opt.Deps.Auth, cfg))
+	{
+		settings.GET("/ai", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigRead), h.AISettings)
+		settings.PUT("/ai", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.SaveAISettings)
+		settings.GET("/ai/usage", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigRead), h.AIUsage)
+		settings.POST("/ai/test", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.TestAISettings)
+		settings.GET("/notify", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigRead), h.NotifySettings)
+		settings.PUT("/notify", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.SaveNotifySettings)
+		settings.POST("/notify/test", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.TestNotifySettings)
+	}
+
 	users := api.Group("/users")
 	users.Use(mw.Auth(opt.Deps.Auth, cfg), mw.RequirePerm(opt.Deps.Auth, service.PermUserManage))
 	{

@@ -417,6 +417,23 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 
 ---
 
+## 11.1 平台自管设置（AI 与通知渠道）
+
+密钥整段 AES-256-GCM 加密存在 `platform_settings`；响应只回 `*_set` / `*_masked`，
+入参留空＝不修改、`clear_*`＝显式清空（详见 `docs/OPERATIONS.md` §4.7）。
+
+| 方法 | 路径 | 权限点 | 级别 | 说明 |
+|------|------|--------|------|------|
+| GET | `/api/settings/ai` | `system:config` | L0 | AI 策略、双提供方（密钥掩码）、token 额度 |
+| PUT | `/api/settings/ai` | `system:config:write` | L1 | 保存并即时生效（重建引擎 + 热更新护栏配额） |
+| GET | `/api/settings/ai/usage?days=30` | `system:config` | L0 | 消费趋势、按来源分布、Top10 用户、剩余额度（`-1`＝不限） |
+| POST | `/api/settings/ai/test` | `system:config:write` | L0 | 引擎自检；失败为 200 + `ok=false` + 原因 |
+| GET | `/api/settings/notify` | `system:config` | L0 | 飞书/企微/钉钉/邮件渠道（webhook 掩码、口令只回 bool） |
+| PUT | `/api/settings/notify` | `system:config:write` | L1 | 保存并即时生效（通知服务原子换配置） |
+| POST | `/api/settings/notify/test` | `system:config:write` | L0 | `{"channel":"feishu\|wecom\|dingtalk\|email"}` 发测试消息 |
+
+---
+
 ## 12. 用户与角色
 
 | 方法 | 路径 | 权限点 | 级别 | 说明 |

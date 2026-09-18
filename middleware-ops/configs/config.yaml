@@ -82,12 +82,19 @@ security:
 
 ai_engine:
   # third_party / self_hosted / hybrid
+  #
+  # 注意：api_key 已改由平台「系统设置 → AI 设置」管理（AES-256-GCM 加密落库，改完即时生效）。
+  # 这里保留字段仅作两层兜底：
+  #   1) 首次启动时若平台库里还没有 AI 设置，且这里配了非空 key，平台会把它导入库并在日志里说明；
+  #   2) 平台库读取/解密失败时，引擎按本文件的值装配，保证诊断链路不至于完全不可用。
+  # 因此**升级后不要再往这里填 key**——填了也只在"库里没有记录"那一次生效，之后以平台库为准。
   strategy: hybrid
   third_party:
     enabled: false
     # openai / anthropic / mock
     kind: openai
     base_url: https://api.deepseek.com/v1
+    # 已改由平台「AI 设置」管理（此处仅作首次导入的兜底）
     api_key: ""
     model: deepseek-chat
     max_tokens: 2048
@@ -103,6 +110,8 @@ ai_engine:
     # mock 表示使用进程内确定性引擎（离线演示）；本地 LLM 填 ollama/vllm 的 base_url
     kind: mock
     base_url: http://127.0.0.1:11434/v1
+    # 已改由平台「AI 设置」管理（此处仅作首次导入的兜底）
+    api_key: ""
     model: qwen2.5:7b
     max_tokens: 2048
     price_per_k_token: 0
@@ -156,17 +165,23 @@ integration:
   default_environment: dev
 
 notify:
+  # webhook / secret / password 已改由平台「系统设置 → 通知设置」管理（加密落库、保存即生效）。
+  # 这里保留字段仅作兜底：首次启动时平台会把这里的非空值导入库（并在日志里说明），
+  # 之后一律以平台库为准——否则会出现"界面改完、重启又变回 .env 旧值"。
   enabled: true
   feishu:
     enabled: false
+    # 已改由平台「通知设置」管理（此处仅作首次导入的兜底）
     webhook: ""
     secret: ""
   wecom:
     enabled: false
+    # 已改由平台「通知设置」管理（此处仅作首次导入的兜底）
     webhook: ""
     secret: ""
   dingtalk:
     enabled: false
+    # 已改由平台「通知设置」管理（此处仅作首次导入的兜底）
     webhook: ""
     secret: ""
   email:
@@ -174,6 +189,7 @@ notify:
     host: ""
     port: 465
     username: ""
+    # 已改由平台「通知设置」管理（此处仅作首次导入的兜底）
     password: ""
     from: ""
     to: []
