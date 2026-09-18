@@ -105,13 +105,14 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 		Cost: deps.Cost, Notifier: deps.Notifier, Audit: deps.Audit, Log: opt.Log,
 	})
 	// 启动时对齐「平台库 ↔ 内存配置」：
-	//   - 库里还没有记录：把 .env / config.yaml 里的非空密钥首次导入平台（之后由界面管理）；
-	//   - 库里已有记录：以库为准覆盖内存配置（否则"界面改完 → 重启 → 又变回 .env 旧值"）。
-	// 失败只告警不阻断启动：设置读不出来时平台仍可用 .env 配置与规则引擎对外服务，
+	//   - 库里还没有 AI 记录：平台未配置，引擎按进程配置（config.yaml / .env 兜底）运行，
+	//     不再从 .env 导入（平台是 AI 设置的唯一来源）；
+	//   - 库里已有 AI 记录：以库为准覆盖内存配置（否则"界面改完 → 重启 → 又变回旧值"）。
+	// 失败只告警不阻断启动：设置读不出来时平台仍可用进程配置与规则引擎对外服务，
 	// 把一个可恢复的配置问题升级成"平台起不来"是不划算的。
 	settingsCtx, cancelSettings := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := deps.Settings.ApplyAI(settingsCtx); err != nil {
-		opt.Log.Warn("AI 设置初始化失败，本次沿用 .env / config.yaml 配置", zap.Error(err))
+		opt.Log.Warn("AI 设置初始化失败，本次沿用进程配置（.env 不再参与平台设置）", zap.Error(err))
 	}
 	if err := deps.Settings.ApplyNotify(settingsCtx); err != nil {
 		opt.Log.Warn("通知设置初始化失败，本次沿用 .env / config.yaml 配置", zap.Error(err))

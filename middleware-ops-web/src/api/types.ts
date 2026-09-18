@@ -920,12 +920,23 @@ export interface AIUsageView {
   top_users: { user_id: number; username: string; tokens: number; calls: number }[]
 }
 
-/** 通知渠道：AI 测试连接结果（POST /api/settings/ai/test）。 */
+/** AI 测试连接结果（POST /api/settings/ai/test、POST /api/settings/ai/test-provider）。 */
 export interface AITestResult {
   ok: boolean
   engine: string
   message: string
   latency_ms: number
+}
+
+/** 单个提供方自测连接入参（不保存，仅验证当前填写的调用是否正确）。 */
+export interface AIProviderTestInput {
+  provider: 'third_party' | 'self_hosted'
+  enabled: boolean
+  kind: string
+  base_url: string
+  api_key?: string
+  model: string
+  max_tokens: number
 }
 
 /** 通知渠道：webhook 类渠道现状（飞书 / 企微 / 钉钉）。 */

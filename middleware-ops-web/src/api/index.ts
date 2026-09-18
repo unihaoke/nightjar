@@ -3,6 +3,7 @@ import { authHeaders, get, post, postSlow, put, del, withSignal, type PageResult
 import type {
   AISettingsInput,
   AISettingsView,
+  AIProviderTestInput,
   AITestResult,
   AIUsageView,
   Alert,
@@ -415,6 +416,8 @@ export const settingApi = {
   aiUsage: (days = 30) => get<AIUsageView>('/api/settings/ai/usage', { days }),
   /** 测试 AI 连接：失败也返回 ok=false 与原因，不抛错。 */
   testAI: () => post<AITestResult>('/api/settings/ai/test'),
+  /** 按提供方自测连接（不保存）：用当前合并配置验证调用是否正确。 */
+  testAIProvider: (payload: AIProviderTestInput) => post<AITestResult>('/api/settings/ai/test-provider', payload),
   /** 读取通知渠道设置。 */
   notify: () => get<NotifySettingsView>('/api/settings/notify'),
   /** 保存通知渠道设置：密钥/口令留空表示不修改。 */

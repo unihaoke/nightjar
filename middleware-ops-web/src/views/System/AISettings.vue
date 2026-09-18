@@ -4,13 +4,13 @@
  *
  * 密钥安全约定：接口只返回「是否已配置」与掩码，页面永不回显明文；
  * 输入框留空 = 不修改，点「清除」= 保存后清空（clear_api_key）。
- * 当前生效来源仍是 .env 时提示「保存一次即改为平台管理」。
+ * 配置统一由平台数据库托管，页面不读取 .env。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { settingApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { AISettingsInput, AISettingsView, AITestResult, AIUsageView } from '@/api/types'
+import type { AIProviderTestInput, AISettingsInput, AISettingsView, AITestResult, AIUsageView } from '@/api/types'
 import StatCard from '@/components/StatCard.vue'
 import { formatTime } from '@/utils/format'
 import { useUserStore } from '@/stores/user'
@@ -80,9 +80,11 @@ const strategyOptions = [
 const kindOptions = ['openai', 'anthropic', 'ollama', 'mock']
 
 const canWrite = computed(() => store.can('system:config:write'))
-/** 仍是 .env 生效：保存一次即转为平台管理。 */
-const envManaged = computed(() => view.value?.source === 'env')
 const providersActive = computed(() => view.value?.providers_active || [])
+
+/** 每个提供方各自的测试连接状态与结果（与全局「测试连接」互不干扰）。 */
+const testingProvider = reactive<Record<ProviderKey, boolean>>({ third_party: false, self_hosted: false })
+const testResultProvider = reactive<Record<ProviderKey, AITestResult | null>>({ third_party: null, self_hosted: null })
 
 /** 额度展示：-1 表示不限。 */
 const remainingText = computed(() => {
@@ -128,6 +130,12 @@ const remainingStatus = computed<'neutral' | 'ok' | 'warning' | 'critical'>(() =
 
 /** 趋势表只展示最近 14 天（接口默认返回 30 天，表格不引图表库）。 */
 const recentSeries = computed(() => (usage.value?.series || []).slice(-14))
+/**
+ * 窗口内是否真的有消费：平台只展示真实数据，没有任何调用时（全是 0）不画一条「假」趋势，
+ * 而是直接显示「暂无消费数据」，避免把补零的空序列误读成有消耗。
+ */
+const hasRealUsage = computed(() => recentSeries.value.some((p) => p.tokens > 0 || p.calls > 0))
+const trendData = computed(() => (hasRealUsage.value ? recentSeries.value : []))
 
 /** 千分位展示。 */
 function thousand(value: number): string {
@@ -266,6 +274,33 @@ async function testConnection(): Promise<void> {
   }
 }
 
+/** 按提供方自测连接：用当前合并配置（含本次填写的密钥）验证调用是否正确，不保存。 */
+async function testProvider(key: ProviderKey): Promise<void> {
+  testingProvider[key] = true
+  testResultProvider[key] = null
+  try {
+    const item = providers[key]
+    const payload: AIProviderTestInput = {
+      provider: key,
+      enabled: item.enabled,
+      kind: item.kind,
+      base_url: item.base_url,
+      // 只在新填了密钥时下发，避免把空串当成「清空」去测一个空 key。
+      api_key: apiKeyDraft[key] ? apiKeyDraft[key] : undefined,
+      model: item.model,
+      max_tokens: Number(item.max_tokens) || 0,
+    }
+    testResultProvider[key] = await settingApi.testAIProvider(payload)
+    if (testResultProvider[key]?.ok) {
+      ElMessage({ type: 'success', message: `${providerList.find((p) => p.key === key)?.title} 连接正常` })
+    }
+  } catch (error) {
+    toastError(error)
+  } finally {
+    testingProvider[key] = false
+  }
+}
+
 onMounted(async () => {
   await load()
   await loadUsage()
@@ -305,27 +340,12 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 生效来源：仍是 .env 时给出明确预期 -->
-    <el-alert
-      v-if="envManaged"
-      type="warning"
-      :closable="false"
-      show-icon
-      class="mb"
-      title="当前仍是 .env 里的配置，保存一次即改为平台管理"
-    >
-      <p class="field-hint">
-        平台已读取到的密钥不会被回显；保存后配置改由平台数据库托管，
-        <span class="mono">.env</span> 里的同名字段不再覆盖页面设置。
-      </p>
-    </el-alert>
-
     <!-- 当前生效概览 -->
     <div class="card">
       <h3 class="card-title">
         <span>当前生效</span>
-        <el-tag size="small" effect="plain" :type="envManaged ? 'warning' : 'success'">
-          {{ envManaged ? '来源：环境变量（env）' : '来源：平台设置（platform）' }}
+        <el-tag size="small" effect="plain" type="success">
+          来源：平台设置
         </el-tag>
       </h3>
       <div class="kv-list">
@@ -383,6 +403,15 @@ onMounted(async () => {
           <div class="row">
             <el-tag v-if="apiKeyClear[item.key]" size="small" type="danger" effect="plain">保存后清空密钥</el-tag>
             <el-tag v-else-if="apiKeyDraft[item.key]" size="small" type="warning" effect="plain">保存后替换密钥</el-tag>
+            <el-button
+              :icon="'Connection'"
+              size="small"
+              :loading="testingProvider[item.key]"
+              :disabled="!canWrite || !providers[item.key].enabled"
+              @click="testProvider(item.key)"
+            >
+              测试连接
+            </el-button>
             <el-switch v-model="providers[item.key].enabled" :disabled="!canWrite" active-text="启用" />
           </div>
         </div>
@@ -472,9 +501,22 @@ onMounted(async () => {
             </el-col>
           </el-row>
         </el-form>
+
+        <!-- 该提供方自测结果：就地展示 ok / 失败原因 + 耗时 -->
+        <el-alert
+          v-if="testResultProvider[item.key]"
+          class="mb-top"
+          :type="testResultProvider[item.key]!.ok ? 'success' : 'error'"
+          :closable="false"
+          show-icon
+          :title="testResultProvider[item.key]!.ok ? `连接成功：${testResultProvider[item.key]!.engine}` : `连接失败：${testResultProvider[item.key]!.engine}`"
+        >
+          <p class="field-hint">{{ testResultProvider[item.key]!.message }}</p>
+          <p class="field-hint mono">耗时 {{ testResultProvider[item.key]!.latency_ms }} ms</p>
+        </el-alert>
       </div>
 
-      <!-- 测试连接结果：就地展示 ok / 失败原因 + 耗时 -->
+      <!-- 全局测试连接结果：就地展示 ok / 失败原因 + 耗时 -->
       <el-alert
         v-if="testResult"
         class="mb-top"
@@ -558,7 +600,7 @@ onMounted(async () => {
 
       <h4 class="section">消费趋势（最近 14 天）</h4>
       <div class="table-scroll">
-        <el-table :data="recentSeries" size="small" empty-text="暂无消费数据">
+        <el-table :data="trendData" size="small" empty-text="暂无消费数据">
           <el-table-column prop="date" label="日期" width="130" />
           <el-table-column label="tokens" min-width="120">
             <template #default="{ row }">

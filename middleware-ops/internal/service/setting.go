@@ -534,7 +534,7 @@ func (s *SettingService) persist(ctx context.Context, name string, payload any, 
 	return nil
 }
 
-// loadSetting 读取并解密设置项；DB 无记录时 found=false（调用方回退到 .env）。
+// loadSetting 读取并解密设置项；DB 无记录时 found=false（调用方自行决定回退策略）。
 func (s *SettingService) loadSetting(ctx context.Context, name string, target any) (updatedBy string, updatedAt time.Time, found bool, err error) {
 	item, err := s.repo.Get(ctx, name)
 	if err != nil {
@@ -574,23 +574,16 @@ func formatSettingTime(t time.Time) string {
 // ---------------------------------------------------------------------------
 
 // payloadFromConfig 以当前内存配置为基线生成 AI payload（DB 无记录时的合并基线 / 首次导入内容）。
-func aiPayloadFromConfig(cfg *config.Config) aiSettingsPayload {
+// defaultAISettingsPayload 是无平台记录时的「平台默认」配置：不读取任何 .env / config.yaml，
+// 提供方留空且未启用、额度归零（0 = 不限额），由管理员在界面上完成平台托管配置。
+// 平台是 AI 设置的唯一来源，.env / config.yaml 只作进程级兜底，不再参与平台设置。
+func defaultAISettingsPayload() aiSettingsPayload {
 	return aiSettingsPayload{
-		Strategy: cfg.AIEngine.Strategy,
-		ThirdParty: aiProviderPayload{
-			Enabled: cfg.AIEngine.ThirdParty.Enabled, Kind: cfg.AIEngine.ThirdParty.Kind,
-			BaseURL: cfg.AIEngine.ThirdParty.BaseURL, APIKey: cfg.AIEngine.ThirdParty.APIKey,
-			Model: cfg.AIEngine.ThirdParty.Model, MaxTokens: cfg.AIEngine.ThirdParty.MaxTokens,
-			PricePerKToken: cfg.AIEngine.ThirdParty.PricePerKToken,
-		},
-		SelfHosted: aiProviderPayload{
-			Enabled: cfg.AIEngine.SelfHosted.Enabled, Kind: cfg.AIEngine.SelfHosted.Kind,
-			BaseURL: cfg.AIEngine.SelfHosted.BaseURL, APIKey: cfg.AIEngine.SelfHosted.APIKey,
-			Model: cfg.AIEngine.SelfHosted.Model, MaxTokens: cfg.AIEngine.SelfHosted.MaxTokens,
-			PricePerKToken: cfg.AIEngine.SelfHosted.PricePerKToken,
-		},
-		DailyTokenQuota: cfg.Guardrail.DailyTokenQuota,
-		PerUserQuota:    cfg.Guardrail.PerUserQuota,
+		Strategy:   "hybrid",
+		ThirdParty: aiProviderPayload{Enabled: false, Kind: "openai", MaxTokens: 2048},
+		SelfHosted: aiProviderPayload{Enabled: false, Kind: "ollama", MaxTokens: 2048},
+		DailyTokenQuota: 0,
+		PerUserQuota:    0,
 	}
 }
 
@@ -615,11 +608,6 @@ func (p aiSettingsPayload) applyTo(cfg *config.AIEngineConfig) {
 	}
 }
 
-// hasSecrets 报告配置里是否有需要"搬家"的密钥（决定首次启动是否做 env → 平台导入）。
-func (p aiSettingsPayload) hasSecrets() bool {
-	return strings.TrimSpace(p.ThirdParty.APIKey) != "" || strings.TrimSpace(p.SelfHosted.APIKey) != ""
-}
-
 // view 生成对外展示形态。
 func (p aiProviderPayload) view() ProviderSettingsView {
 	return ProviderSettingsView{
@@ -640,18 +628,17 @@ func (p aiSettingsPayload) providersActive() []string {
 	return providers
 }
 
-// AISettings 读取 AI 设置；DB 无记录时回退到当前 .env / config.yaml 配置（source=env）。
+// AISettings 读取 AI 设置；DB 无记录时返回平台默认（不读取 .env / config.yaml）。
+// 平台是 AI 设置的唯一来源：来源恒为 platform，界面不再区分「环境变量 / 平台」。
 func (s *SettingService) AISettings(ctx context.Context) (*AISettingsView, error) {
 	var payload aiSettingsPayload
 	updatedBy, updatedAt, found, err := s.loadSetting(ctx, SettingNameAI, &payload)
 	if err != nil {
 		return nil, err
 	}
-	source := SettingSourceEnv
-	if found {
-		source = SettingSourcePlatform
-	} else {
-		payload = aiPayloadFromConfig(s.cfg)
+	// 无平台记录即视为「尚未在平台配置」：用平台默认，绝不回退 .env / config.yaml。
+	if !found {
+		payload = defaultAISettingsPayload()
 	}
 	return &AISettingsView{
 		Strategy:          payload.Strategy,
@@ -661,7 +648,7 @@ func (s *SettingService) AISettings(ctx context.Context) (*AISettingsView, error
 		PerUserDailyQuota: payload.PerUserQuota,
 		UpdatedBy:         updatedBy,
 		UpdatedAt:         formatSettingTime(updatedAt),
-		Source:            source,
+		Source:            SettingSourcePlatform,
 		ProvidersActive:   payload.providersActive(),
 	}, nil
 }
@@ -678,15 +665,15 @@ func (s *SettingService) SaveAISettings(ctx context.Context, in AISettingsInput,
 		return nil, apperr.New(apperr.CodeInvalidParam, "token 配额不能为负数（0 表示不限额）")
 	}
 
-	// 合并基线：DB 有记录用 DB，没有就用当前内存配置——保证 .env 里的密钥不会因为
-	// 管理员只改了模型名（没重新输入密钥）而被清空。
+	// 合并基线：DB 有记录用 DB，没有就用平台默认——保证 .env / config.yaml 的密钥绝不会因为
+	// 「管理员只改了模型名（没重新输入密钥）」而被悄悄读进平台库（平台是 AI 设置的唯一来源）。
 	var existing aiSettingsPayload
 	_, _, found, err := s.loadSetting(ctx, SettingNameAI, &existing)
 	if err != nil {
 		return nil, err
 	}
 	if !found {
-		existing = aiPayloadFromConfig(s.cfg)
+		existing = defaultAISettingsPayload()
 	}
 
 	next := existing
@@ -778,36 +765,27 @@ func (s *SettingService) applyAIPayload(payload aiSettingsPayload) {
 	}
 }
 
-// ApplyAI 在启动时把「生效的 AI 配置」对齐到平台库：
-//   - DB 无记录且 .env / config.yaml 里有非空密钥 → 首次导入平台（此后以平台为准）；
-//   - DB 有记录 → 以 DB 为准覆盖内存 cfg。
+// ApplyAI 在启动时把「平台库里的 AI 配置」对齐到内存：DB 有记录则以其为准覆盖内存 cfg；
+// 无记录则不做任何导入——平台未配置时引擎按进程配置（config.yaml / .env 兜底）运行，
+// 由管理员在「AI 设置」界面完成平台托管。平台是 AI 设置的唯一来源，启动阶段不再读取 .env。
 //
-// 为什么要"以 DB 为准"：否则会出现"界面改完 → 重启容器 → 又变回 .env 的旧值"，
-// 管理员会以为平台设置不生效；反过来首次导入则保证升级上来的老部署密钥不丢。
+// 为什么要"以 DB 为准"：否则会出现"界面改完 → 重启容器 → 又变回旧值"，
+// 管理员会以为平台设置不生效；反过来不再做"首次导入"，是因为导入会把 .env 密钥写进平台库，
+// 与"平台是唯一来源、不读 .env"的约定冲突。
 func (s *SettingService) ApplyAI(ctx context.Context) error {
 	var payload aiSettingsPayload
 	updatedBy, _, found, err := s.loadSetting(ctx, SettingNameAI, &payload)
 	if err != nil {
 		return err
 	}
-	if found {
-		s.applyAIPayload(payload)
-		s.log.Info("AI 设置已按平台记录生效（.env 中的同名配置不再覆盖平台设置）",
-			zap.String("updated_by", updatedBy),
-			zap.Strings("providers", payload.providersActive()))
+	if !found {
+		// 没有平台记录：不读 .env，不自动导入；引擎沿用进程级配置，等界面配置。
 		return nil
 	}
-
-	seed := aiPayloadFromConfig(s.cfg)
-	if !seed.hasSecrets() {
-		return nil
-	}
-	if err := s.persist(ctx, SettingNameAI, seed, settingSeedOperator); err != nil {
-		return err
-	}
-	s.applyAIPayload(seed)
-	s.log.Info("AI 设置已从 .env / config.yaml 首次导入平台，后续请用界面「AI 设置」管理（.env 仅作兜底）",
-		zap.Strings("providers", seed.providersActive()))
+	s.applyAIPayload(payload)
+	s.log.Info("AI 设置已按平台记录生效（平台为唯一来源，.env 不再参与）",
+		zap.String("updated_by", updatedBy),
+		zap.Strings("providers", payload.providersActive()))
 	return nil
 }
 
@@ -1220,20 +1198,17 @@ LIMIT 10`, diagnosis, user)
 // testAITimeout 限制自检耗时：设置页点「测试」不应把 HTTP 请求挂在那里等 60 秒。
 const testAITimeout = 20 * time.Second
 
-// TestAI 用当前生效配置发一次最小请求，返回是否可用与耗时。
+// probeEngine 用「ping」最小请求验证一个引擎是否可用，返回是否成功、可读原因与耗时（毫秒）。
 //
-// 失败**不返回 error**（即不产生 500）：自检的意义就是"把失败原因显示给配置人看"，
-// 用 500 反而会被前端统一处理成"服务异常"，看不到真正的原因（401 / 模型名不存在 / 连不上）。
-func (s *SettingService) TestAI(ctx context.Context) (bool, string, string, int64, error) {
-	if s.engine == nil {
-		return false, "", "AI 引擎未装配", 0, nil
-	}
+// 失败**不产生 error**：自检的意义就是把失败原因显示给配置人看（401 / 模型名不存在 /
+// 连不上），用 error 反而会被前端统一处理成"服务异常"，看不到真正原因。
+// 混合策略下提供方失败会自动降级到规则引擎并**返回成功**，只看 err 会把坏密钥报成"测试通过"，
+// 因此再看一眼引擎状态：处于降级态就如实把原因报出来。
+func probeEngine(ctx context.Context, eng engine.Engine) (ok bool, message string, latencyMs int64) {
 	ctx, cancel := context.WithTimeout(ctx, testAITimeout)
 	defer cancel()
-
-	engineName := s.engine.Name()
 	start := time.Now()
-	resp, err := s.engine.Chat(ctx, engine.ChatRequest{
+	resp, err := eng.Chat(ctx, engine.ChatRequest{
 		Messages: []engine.Message{{Role: engine.RoleUser, Content: "ping"}},
 		// 输出上限调到很小：自检只验证"地址/密钥/模型是否可用"，
 		// 不该为一次连通性测试消耗正常诊断的 token 预算。
@@ -1243,25 +1218,120 @@ func (s *SettingService) TestAI(ctx context.Context) (bool, string, string, int6
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		// 错误串里通常带完整 URL：先脱敏再截断，避免把 base_url 里的凭据显示到页面上。
-		return false, engineName, truncateMessage("调用失败：" + redactCredentials(err.Error())), latency, nil
+		return false, truncateMessage("调用失败：" + redactCredentials(err.Error())), latency
 	}
-
-	// 混合策略下提供方失败会自动降级到规则引擎并**返回成功**，只看 err 会把坏密钥报成"测试通过"。
-	// 因此再看一眼引擎状态：一旦处于降级态，就把真实原因报出来。
-	if status := s.engine.Status(); status.Degraded {
+	if status := eng.Status(); status.Degraded {
 		reason := strings.TrimSpace(status.LastError)
 		if reason == "" {
-			reason = "已降级为规则引擎"
+			reason = "已降级"
 		}
-		// 降级原因最终会出现在系统概览页与启动日志里，同样要脱敏。
-		return false, engineName, truncateMessage("提供方不可用，已降级：" + redactCredentials(reason)), latency, nil
+		return false, truncateMessage("提供方不可用：" + redactCredentials(reason)), latency
 	}
-
 	content := strings.TrimSpace(resp.Content)
 	if content == "" {
 		content = "引擎返回空内容"
 	}
-	return true, engineName, truncateMessage(content), latency, nil
+	return true, truncateMessage(content), latency
+}
+
+// TestAI 用当前生效配置发一次最小请求，返回是否可用与耗时。
+//
+// 失败**不返回 error**（即不产生 500）：自检的意义就是"把失败原因显示给配置人看"，
+// 用 500 反而会被前端统一处理成"服务异常"，看不到真正的原因（401 / 模型名不存在 / 连不上）。
+func (s *SettingService) TestAI(ctx context.Context) (bool, string, string, int64, error) {
+	if s.engine == nil {
+		return false, "", "AI 引擎未装配", 0, nil
+	}
+	ok, message, latency := probeEngine(ctx, s.engine)
+	return ok, s.engine.Name(), message, latency, nil
+}
+
+// buildTempProvider 用单个提供方的合并配置临时构造一个引擎（不落库、不改内存 cfg）。
+//
+// 返回 (nil, 原因) 表示无法构造（未启用 / 缺 base_url）；kind=mock 会返回规则引擎，
+// 由调用方决定如何展示（离线引擎没有外部连接可测，但调用链路可用）。口径与 factory.newProvider 一致。
+func buildTempProvider(name string, cfg *config.Config, p aiProviderPayload) (engine.Engine, string) {
+	if !p.Enabled {
+		return nil, "提供方未启用"
+	}
+	timeout := engine.Timeouts(cfg, name)
+	kind := strings.ToLower(strings.TrimSpace(p.Kind))
+	if kind == "" {
+		kind = "openai"
+	}
+	if kind == "mock" {
+		return engine.NewRuleEngine(name + " 使用内置 mock 引擎"), ""
+	}
+	if strings.TrimSpace(p.BaseURL) == "" {
+		return nil, "未配置 Base URL，无法测试外部连接（离线演示可改用 mock 引擎）"
+	}
+	prov, err := engine.NewHTTPProvider(engine.HTTPProviderOptions{
+		Name:             name,
+		Kind:             kind,
+		BaseURL:          p.BaseURL,
+		APIKey:           p.APIKey,
+		Model:            p.Model,
+		MaxTokens:        p.MaxTokens,
+		PricePerKToken:   p.PricePerKToken,
+		Timeout:          timeout,
+		FailureThreshold: cfg.AIEngine.Fallback.FailureThreshold,
+		OpenDuration:     cfg.AIEngine.Fallback.OpenDuration,
+	})
+	if err != nil {
+		return nil, "提供方初始化失败：" + err.Error()
+	}
+	return prov, ""
+}
+
+// TestAIProvider 在「不保存」的前提下，用单个提供方当前的合并配置验证其调用是否正确。
+//
+// 合并基线同 SaveAISettings：DB 有记录用 DB，没有就用平台默认——不读 .env。
+// 这样"只填了新密钥没动其它字段"时，自测用的是"已存密钥 + 新密钥"的合并结果，
+// 而不是把旧密钥清空后测一个空 key。失败时只返回原因（不抛 500），便于页面就地展示。
+func (s *SettingService) TestAIProvider(ctx context.Context, key string, in ProviderSettingsInput) (bool, string, string, int64, error) {
+	var existing aiSettingsPayload
+	_, _, found, err := s.loadSetting(ctx, SettingNameAI, &existing)
+	if err != nil {
+		return false, "", "", 0, err
+	}
+	if !found {
+		existing = defaultAISettingsPayload()
+	}
+	var old aiProviderPayload
+	switch key {
+	case "third_party":
+		old = existing.ThirdParty
+	case "self_hosted":
+		old = existing.SelfHosted
+	default:
+		return false, "", "", 0, apperr.Newf(apperr.CodeInvalidParam,
+			"provider %q 非法（可选 third_party/self_hosted）", key)
+	}
+	merged := mergeAIProvider(old, in)
+	eng, reason := buildTempProvider(key, s.cfg, merged)
+	if eng == nil {
+		return false, key, reason, 0, nil
+	}
+	// 规则 / mock 引擎是离线确定性引擎：没有外部连接可测，但调用链路可用。
+	// 单独走一条路径，避免被 Status().Degraded（规则引擎恒为降级态）误判成"测试失败"。
+	if eng.Name() == engine.RuleEngineName {
+		ctx, cancel := context.WithTimeout(ctx, testAITimeout)
+		defer cancel()
+		start := time.Now()
+		_, e := eng.Chat(ctx, engine.ChatRequest{
+			Messages: []engine.Message{{Role: engine.RoleUser, Content: "ping"}},
+			MaxTokens: 8, Temperature: 0,
+		})
+		latency := time.Since(start).Milliseconds()
+		if e != nil {
+			return false, eng.Name(), truncateMessage("调用失败：" + redactCredentials(e.Error())), latency, nil
+		}
+		return true, eng.Name(),
+			"离线确定性引擎（mock/规则），调用链路可用，不访问外部服务；如需验证真实密钥请改用 openai/ollama 并填写 Base URL",
+			latency, nil
+	}
+	ok, message, latency := probeEngine(ctx, eng)
+	return ok, eng.Name(), message, latency, nil
 }
 
 // truncateMessage 截断过长的引擎返回，避免把整篇模型输出塞进设置页提示。

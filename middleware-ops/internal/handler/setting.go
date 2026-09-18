@@ -59,6 +59,43 @@ func (h *Handler) TestAISettings(c *gin.Context) {
 	})
 }
 
+// testAIProviderInput 是「按提供方自测连接」的请求体（不保存，仅验证当前填写的调用是否正确）。
+type testAIProviderInput struct {
+	Provider  string `json:"provider"`
+	Enabled   bool   `json:"enabled"`
+	Kind      string `json:"kind"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+}
+
+// TestAIProviderSettings 用单个提供方「当前的合并配置」自测连通性，不落库、不改内存配置。
+//
+// 失败返回 HTTP 200 + ok=false + message（原因），而不是 500：自检目的就是把原因原样展示。
+// 密钥走「已存密钥 + 本次填写」的合并语义，与保存一致——只填了新密钥时测的是合并结果。
+func (h *Handler) TestAIProviderSettings(c *gin.Context) {
+	var in testAIProviderInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	ok, engineName, message, latencyMs, err := h.deps.Settings.TestAIProvider(c.Request.Context(), in.Provider, service.ProviderSettingsInput{
+		Enabled:  in.Enabled,
+		Kind:     in.Kind,
+		BaseURL:  in.BaseURL,
+		APIKey:   in.APIKey,
+		Model:    in.Model,
+		MaxTokens: in.MaxTokens,
+	})
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{
+		"ok": ok, "engine": engineName, "message": message, "latency_ms": latencyMs,
+	})
+}
+
 // NotifySettings 读取通知渠道设置（webhook 只回掩码，secret/口令只回 bool）。
 func (h *Handler) NotifySettings(c *gin.Context) {
 	data, err := h.deps.Settings.NotifySettings(c.Request.Context())
