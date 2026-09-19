@@ -89,6 +89,28 @@ func (s *IntegrationService) checkSSHPass(creds RemoteCreds) error {
 	return nil
 }
 
+// validateSSHKey 校验使用者填进来的私钥内容（形状检查，不做密码学解析）。
+//
+// 为什么要有这一步：最常见的误操作是把**公钥**（id_rsa.pub，界面上更常被复制的那一份）
+// 当成私钥贴进来。这时私钥文件照样写得出去，而 OpenSSH 只回一句
+// "Load key ...: invalid format"，使用者只会看到 ansible 的 UNREACHABLE，
+// 完全看不出是自己贴错了文件。这里提前给出"你贴的可能是公钥"的结论。
+//
+// 只判断是否含 "PRIVATE KEY"：覆盖 OPENSSH / RSA / EC / ENCRYPTED 各种 PEM 头，
+// 也不对私钥本身做任何解析或落盘。
+func validateSSHKey(key string) error {
+	k := strings.TrimSpace(key)
+	if k == "" {
+		return nil
+	}
+	if !strings.Contains(k, "PRIVATE KEY") {
+		return fmt.Errorf("SSH 私钥内容不含 \"PRIVATE KEY\"，通常说明粘贴的是**公钥**（*.pub）：" +
+			"请粘贴私钥全文（以 -----BEGIN OPENSSH PRIVATE KEY----- 或 -----BEGIN RSA PRIVATE KEY----- 开头）；" +
+			"PuTTY 的 .ppk 需先转换成 OpenSSH 格式")
+	}
+	return nil
+}
+
 // SSHPassAvailable 报告平台容器内是否具备 sshpass。
 //
 // /healthz 与 deploy/ansible/tools/check-backend-freshness.sh 用它判断镜像能力：
@@ -139,6 +161,9 @@ func (s *IntegrationService) deployRemote(
 			"凭据只在本次请求中使用、不落库，因此「重新应用」无法复用上一次的凭据")
 	}
 	if err := s.checkSSHPass(creds); err != nil {
+		return err
+	}
+	if err := validateSSHKey(creds.Key); err != nil {
 		return err
 	}
 
@@ -370,9 +395,12 @@ func (s *IntegrationService) accountSQLRemote(
 	}
 	if !creds.provided() {
 		return "", fmt.Errorf("远程建号/改号需要在目标机上执行 SQL，但本次没有 SSH 凭据：" +
-			"请在集成表单里填写 SSH 用户名与口令后重新保存（凭据不落库，因此「重新应用」无法复用）")
+			"请在集成表单里填写 SSH 用户名与口令或私钥后重新保存（凭据不落库，因此「重新应用」无法复用）")
 	}
 	if err := s.checkSSHPass(creds); err != nil {
+		return "", err
+	}
+	if err := validateSSHKey(creds.Key); err != nil {
 		return "", err
 	}
 	host := strings.TrimSpace(creds.Host)

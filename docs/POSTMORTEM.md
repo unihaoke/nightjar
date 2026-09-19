@@ -5,6 +5,120 @@
 
 ---
 
+## INC-026 · 自愈被 Docker 抵消：崩溃重启的容器反复把配置路径变回目录；且容器内挂载路径本身是错的
+
+**首次暴露**：2026-09-19，INC-024 的修复上线后**重试仍然失败**：
+
+```
+PLAY RECAP: 203.195.191.75 : ok=11  changed=1  failed=1
+TASK [下发 filebeat.yml（内容不变时不重启采集）]
+fatal: [...] => {"changed": false, "msg": "can not use content with a dir as dest"}
+```
+
+**定位过程**
+
+1. `ok=11 changed=1 failed=1` 恰好等于**修好后的 playbook 跑到第 12 个任务**：
+   探测×4 → 准备目录×2 → 决策×2 → `stat` → `absent`（自愈）→ `debug` → `copy`。
+   也就是说**自愈确实跑了**（`changed=1` 就是它删掉了目录），但 `copy` 时那个路径**又变回目录了**；
+2. 谁能在这中间创建目录？只有 **Docker**：第一次失败前 `docker run` 是成功的（容器建起来了，
+   并顺手把缺失的宿主路径创建成了目录）。之后容器里的 Filebeat 读不到有效配置 → 崩溃 →
+   `--restart=always` 反复重启 → **Docker 每次启动都把缺失的绑定源重新创建成目录**。
+   于是"删目录 → 写文件"之间又被插回一个目录，自愈被彻底抵消；
+3. 顺着"为什么 Filebeat 读不到配置"查下去，发现更根本的错误：**容器内挂载路径写错了**——
+   现在是 `-v <宿主配置>:/etc/filebeat/filebeat.yml:ro`，而**官方镜像读的是
+   `/usr/share/filebeat/filebeat.yml`**（[Elastic 官方 Docker 运行文档](https://www.elastic.co/docs/reference/beats/filebeat/running-on-docker)
+   的卷挂载示例挂的就是这个路径）。挂错位置的后果是：容器**根本没读我们的配置**，
+   用镜像内置默认配置去连 Elasticsearch → 必然失败 → 崩溃重启（正好触发第 2 步的循环）。
+   也就是说，即使上一次的修复让 `copy` 成功，用户拿到的也会是"部署成功但没有日志"。
+
+**根因**
+
+1. **单文件挂载 + 容器先于配置创建**（INC-024 已修顺序），但没意识到"容器会持续重建绑定源目录"——
+   上一次只处理了静态的一次性副作用，没处理**持续性的副作用源**（那个崩溃重启的容器）；
+2. **容器内配置路径没有对齐官方镜像的约定**：这是"照着直觉写路径"的又一次翻版
+   （同 INC-019 的表名、INC-012 的地址写法：**跨组件时必须以对方程序的约定为准**，不能凭常理推断）；
+3. 缺 `--user=root` 与 `--strict.perms=false`（官方示例都有）：前者影响读宿主日志，
+   后者影响挂载进来的配置文件属主校验。
+
+**修复**
+
+1. **写配置前先删掉平台托管的旧容器**（`docker rm -f mwops-filebeat`，存在才执行、`failed_when: false`）：
+   顺序固定为 `stat → absent(非普通文件) → docker rm -f → copy → assert → docker run`。
+   注释里写明"删容器不只是让新配置生效，更是**打断 Docker 重建绑定源目录的循环**"；
+2. **容器内配置路径改为 `/usr/share/filebeat/filebeat.yml`**（与官方镜像一致），并由变量推导；
+3. 容器命令补齐官方示例的 `--user=root` 与 `filebeat -e --strict.perms=false`；
+4. 启动前的 `assert`（配置必须是普通文件）保留——它是防止 Docker 再造目录的最后一道闸门。
+
+**防复发**
+
+1. 顺序断言升级为 **YAML 解析出的任务名下标**：`自愈(absent) < docker rm -f < copy < docker run`，
+   三种模式都跑，且 package 模式不得出现 `docker rm -f`；
+2. 路径断言：`docker run` 里容器内配置路径**必须是** `/usr/share/filebeat/filebeat.yml`，
+   且**不得**再出现 `:/etc/filebeat/filebeat.yml`；
+3. 命令断言：`docker run` 必须同时包含 `--user=root` 与 `--strict.perms=false`；
+4. 教训进经验提炼：**"某程序读哪个路径/用哪个名字"必须以该程序的官方文档为准**，
+   平台的直觉只在平台自己的代码里成立。
+
+**给现场的提示**：若目标机上已有那个崩溃重启的容器，先执行
+`docker rm -f mwops-filebeat; rm -rf /etc/filebeat/filebeat.yml; mkdir -p /etc/filebeat`
+再点「重新应用」；或在修复镜像发布前，把该日志集成的**安装方式改成 `package`**
+（deb + systemd 路径下 `/etc/filebeat/filebeat.yml` 是正确的，可立即跑通）。
+
+---
+
+## INC-025 · 日志集成被"Prometheus 抓取核验"认领了别人的目标：备注里出现「抓取目标 jd-redis 已 up」
+
+**首次暴露**：2026-09-19，使用者反馈：
+
+> 「平台自动完成：周期核验通过：抓取目标 jd-redis 已 up，已自动清除待处理（…），
+> 这个明明是 logs，为什么会显示 jd-redis？」
+
+**定位过程**
+
+1. 「周期核验」来自 `ReverifyIntegrations`（周期自愈）：它对处于**待处理**的集成，
+   按 Prometheus 的目标状态判断"是不是已经好了"，好一个清一个；
+2. 问题在于**它没有区分集成类型**：日志集成也被卷进了这条通道。而日志集成
+   **根本没有抓取目标**（它没有 Exporter，Prometheus 里不存在它的 target）；
+3. 目标匹配 `pickTargetStatus` 只按 `instance_name` 比对（外加"唯一无标签目标"的兜底），
+   于是日志集成匹配到了**同名的中间件目标**（抓取配置里 `instance_name` 就是集成名），
+   拿到 `up` 之后 `markApplied` + 写备注——**用别人的健康状态清掉了自己的待处理**；
+4. 更糟的是这条备注会一直显示在日志集成上（"平台自动完成：…抓取目标 jd-redis 已 up"），
+   而它真正的部署其实失败了——**故障被静默掩盖**；
+5. 顺带发现：`scheduleVerify`（部署后 3 次核验）同样对日志集成生效，`VerifyNow`（手动重新核验）
+   也是。三条通道都把它当成"有抓取目标的集成"。
+
+**根因**
+
+1. 判断"某集成该怎么核验"的依据，又一次被默认成"它是集成"，而不是**它有没有抓取目标**；
+2. 目标匹配缺少**类型维度**：`instance_name` 只保证集成记录之间不重名，
+   跨类型同名（日志集成叫 jd-redis、中间件也叫 jd-redis）时会互相认领，
+   "唯一无标签"的兜底还会让它认领到唯一那条别人的目标。
+
+**修复**
+
+1. 新增 `verifyViaPrometheus(mwType)` 作为唯一判据，**三条核验通道全部跳过日志集成**：
+   - `ReverifyIntegrations`（周期自愈）：直接 continue；
+   - `scheduleVerify`（部署后核验）：直接返回；
+   - `VerifyNow`（手动「重新核验」）：不改状态，直接把"该用哪个入口"写进备注——
+     「日志集成不参与 Prometheus 抓取核验（它没有抓取目标）：请用「自检」看日志链路」；
+2. 目标匹配加类型维度：`pickTargetStatus(statuses, name, mwType)` ——
+   要求 `instance_name` 相同**且** `mw_type` 一致（目标缺 `mw_type` 标签时按"无法确认类型"兼容处理，
+   避免把正常集成判成"没有目标"）；兜底分支同样要过类型判定；
+3. 核验备注带上类型：`抓取目标 jd-redis（redis）已 up`——同类困惑不会再发生；
+4. 日志集成的状态从此只由**部署结果**（Ansible 输出）与**按需自检**（平台→Kafka / 接入地址 /
+   日志是否已进入平台）负责。
+
+**防复发**
+
+1. `TestVerifyViaPrometheusSkipsLogIntegration`：日志类型必须不走该通道，
+   而有抓取目标的类型（redis/mysql/node…）必须继续走；
+2. `TestPickTargetStatusRefusesCrossTypeMatch`：同名但类型不同**绝不认领**（这正是本次现场）；
+3. `TestReverifyOnlyClearsOnExplicitUp` 新增用例「同名但类型不同 → 保持」，
+   把"不得清错对象"这条不对称风险钉在测试里；
+4. 兼容性用例保留：目标缺 `mw_type` 标签（早期产物）时仍按名字匹配，不会把老部署判成"没有目标"。
+
+---
+
 ## INC-024 · Filebeat 的 docker 单文件挂载把配置路径变成了目录，「下发配置」必然失败
 
 **首次暴露**：2026-09-19，日志集成在目标机 `203.195.191.75` 部署失败：

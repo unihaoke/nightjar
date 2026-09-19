@@ -621,6 +621,97 @@ func TestRenderFilebeatInstallHealsPollutedPath(t *testing.T) {
 	}
 }
 
+// TestRenderFilebeatInstallDataDirIsDedicated 锁定数据目录与系统 filebeat 分离。
+//
+// /var/lib/filebeat 是**系统包安装的 filebeat** 的注册表/位点目录，docker 模式是平台自己
+// 托管的那套采集。两者若共用：
+//   - 平台的部署会把系统 filebeat 的注册表 chown 给 1000；
+//   - 两套采集器往同一个注册表里写位点；
+//
+// 结果是系统 filebeat 重启后重复采集或状态错乱，平台侧只表现为"日志重复/丢失"，极难定位。
+// 因此 docker 模式必须用自己的数据目录，且**由平台显式创建并授权**。
+func TestRenderFilebeatInstallDataDirIsDedicated(t *testing.T) {
+	const wantDataDir = "/var/lib/mwops-filebeat"
+	// 系统包安装的目录不可被平台占用：产物里不该出现这个字面量。
+	const systemPackageDataDir = "/var/lib/filebeat"
+
+	cases := []struct {
+		mode        string
+		wantCreates bool
+	}{
+		{LogInstallDocker, true},
+		{LogInstallAuto, true}, // auto 的 docker 分支也要建（未安装且有 docker 时走它）
+		{LogInstallPackage, false},
+	}
+	for _, tc := range cases {
+		in := logTestInput()
+		in.InstallMode = tc.mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		play := valueNode(parseYAML(t, "playbook", art.Playbook)).Content[0]
+
+		// 断言 ①：变量值就是平台专属目录，且产物里没有系统 filebeat 的数据目录。
+		if got := yamlAt(t, play, "vars.filebeat_data_dir").Value; got != wantDataDir {
+			t.Fatalf("%s 模式：filebeat_data_dir 应为 %q（平台托管、与系统 filebeat 分离），实际 %q",
+				tc.mode, wantDataDir, got)
+		}
+		if strings.Contains(art.Playbook, systemPackageDataDir) {
+			t.Fatalf("%s 模式：产物不得出现系统 filebeat 的数据目录 %q（会污染它的注册表）：\n%s",
+				tc.mode, systemPackageDataDir, art.Playbook)
+		}
+
+		names := playbookTaskNames(t, art.Playbook)
+		dataTask := -1
+		for i, name := range names {
+			if strings.HasPrefix(name, "创建 Filebeat 数据目录") {
+				dataTask = i
+				break
+			}
+		}
+		if !tc.wantCreates {
+			// 断言 ③：package 分支不得创建这个目录，也不该有任何容器任务。
+			if dataTask >= 0 {
+				t.Fatalf("package 模式不应创建平台专属数据目录（系统 filebeat 自己会建自己的）：\n%s",
+					strings.Join(names, "\n"))
+			}
+			for _, name := range names {
+				if strings.Contains(name, "Filebeat 容器") || strings.Contains(name, "数据目录") {
+					t.Fatalf("package 模式不应出现容器/数据目录相关任务（%q）：\n%s", name, strings.Join(names, "\n"))
+				}
+			}
+			// 变量本身仍会渲染（vars 是全局的，供审计），只是没有任何任务碰它。
+			if !strings.Contains(art.Playbook, wantDataDir) {
+				t.Fatalf("package 模式的产物应保留 filebeat_data_dir 变量定义（供审计）：\n%s", art.Playbook)
+			}
+			continue
+		}
+		if dataTask < 0 {
+			t.Fatalf("%s 模式必须创建平台专属数据目录（否则容器写不进 meta.json）：\n%s",
+				tc.mode, strings.Join(names, "\n"))
+		}
+		// 断言 ②：创建任务必须带正确的权限与属主。
+		dataBlock := playbookTaskBlock(t, art.Playbook, "创建 Filebeat 数据目录")
+		for _, want := range []string{
+			"path: \"{{ filebeat_data_dir }}\"",
+			"mode: '0775'",
+			"owner: '1000'",
+			"group: '1000'",
+		} {
+			if !strings.Contains(dataBlock, want) {
+				t.Fatalf("%s 模式的数据目录任务应包含 %q：\n%s", tc.mode, want, dataBlock)
+			}
+		}
+		// 断言 ③：docker run 里挂的宿主侧必须来自变量，容器内仍是官方路径。
+		run := dockerRunCommand(t, art.Playbook)
+		if !strings.Contains(run, "-v \"{{ filebeat_data_dir }}:/usr/share/filebeat/data\"") {
+			t.Fatalf("%s 模式：数据目录挂载应写成「{{ filebeat_data_dir }}:/usr/share/filebeat/data」，实际：\n%s",
+				tc.mode, run)
+		}
+		if strings.Contains(run, wantDataDir+":") {
+			t.Fatalf("%s 模式：docker run 的宿主侧不得写死 %q（应由变量表达）：\n%s", tc.mode, wantDataDir, run)
+		}
+	}
+}
+
 // TestRenderFilebeatInstallConfigPathsShareOneVariable 锁定「配置目录只有一个来源」。
 //
 // INC-013 的次生根因：playbook 里同时存在写死的 /etc/filebeat 与 opts.InstallDir 两种
@@ -659,6 +750,199 @@ func TestRenderFilebeatInstallConfigPathsShareOneVariable(t *testing.T) {
 	copyBlock := playbookTaskBlock(t, art.Playbook, "下发 filebeat.yml")
 	if !strings.Contains(copyBlock, "dest: \"{{ filebeat_config_path }}\"") {
 		t.Fatalf("copy 的 dest 必须用 filebeat_config_path：\n%s", copyBlock)
+	}
+}
+
+// TestRenderFilebeatInstallRemovesStaleContainerBeforeCopy 锁定"删旧容器"这一步及其位置（INC-014）。
+//
+// 现场（用户第二次执行）：PLAY RECAP `ok=11 changed=1 failed=1`，失败的仍是
+// `can not use content with a dir as dest`。ok=11 恰好是修好后的前 11 条任务，
+// changed=1 就是自愈任务（它确实删掉了那个目录）——**紧接着的 copy 又看到目录回来了**。
+//
+// 原因：第一次失败的 docker run 已经把宿主路径创建成目录，容器里的 Filebeat 读不到有效配置
+// 就崩溃，`--restart=always` 让它不断重启，而 **Docker 每次启动都会把缺失的绑定源重新
+// 创建成目录**。所以"自愈删目录"必须在**删掉容器之后**才有意义：
+//
+//	stat → absent（非普通文件）→ docker rm -f 旧容器 → copy → assert → docker run
+//
+// 少了 `docker rm -f`，自愈跑多少次都会被打回原形。
+func TestRenderFilebeatInstallRemovesStaleContainerBeforeCopy(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		names := playbookTaskNames(t, art.Playbook)
+
+		statAt := taskIndex(t, names, "检查 filebeat.yml 是否被占用成目录")
+		removeAt := taskIndex(t, names, "清理非普通文件的 filebeat.yml")
+		copyAt := taskIndex(t, names, "下发 filebeat.yml")
+		if !(statAt < removeAt && removeAt < copyAt) {
+			t.Fatalf("%s 模式：自愈链必须满足「stat(%d) < absent(%d) < copy(%d)」：\n%s",
+				mode, statAt, removeAt, copyAt, strings.Join(names, "\n"))
+		}
+		if mode == LogInstallPackage {
+			// package 模式不碰容器：产物里不该出现删容器的任务（否则会误删目标机上别人的容器）。
+			for _, name := range names {
+				if strings.Contains(name, "Filebeat 容器") {
+					t.Fatalf("package 模式不应出现容器相关任务（%q）——package 装的是宿主机 filebeat，"+
+						"删容器会把用户自己跑的容器也一起删掉：\n%s", name, strings.Join(names, "\n"))
+				}
+			}
+			continue
+		}
+		rmAt := taskIndex(t, names, "删除平台托管的旧 Filebeat 容器")
+		// 关键顺序：删容器必须排在 copy 之前（打断 Docker 重建绑定源目录的循环）。
+		if !(removeAt < rmAt && rmAt < copyAt) {
+			t.Fatalf("%s 模式：顺序必须满足「自愈(%d) < 删旧容器(%d) < copy(%d)」。"+
+				"少了删容器这一步，崩溃重启的旧容器会在每次启动时把缺失的绑定源重新创建成目录，"+
+				"自愈等于白做：\n%s", mode, removeAt, rmAt, copyAt, strings.Join(names, "\n"))
+		}
+		// 删容器必须排在 docker run 之前（否则把自己的新容器删了）。
+		runAt := taskIndex(t, names, "创建 Filebeat 容器")
+		if rmAt >= runAt {
+			t.Fatalf("%s 模式：删旧容器(%d) 必须在 docker run(%d) 之前：\n%s",
+				mode, rmAt, runAt, strings.Join(names, "\n"))
+		}
+
+		// 幂等与安全：容器不存在时 docker rm 返回非 0，属正常结果，不得中断 playbook；
+		// 并且只在"这次真要走容器安装"的分支里执行。
+		rmBlock := playbookTaskBlock(t, art.Playbook, "删除平台托管的旧 Filebeat 容器")
+		for _, want := range []string{
+			"ansible.builtin.command: docker rm -f \"{{ filebeat_container }}\"",
+			"failed_when: false",
+			"when:",
+		} {
+			if !strings.Contains(rmBlock, want) {
+				t.Fatalf("%s 模式的删容器任务应包含 %q：\n%s", mode, want, rmBlock)
+			}
+		}
+		if mode == LogInstallAuto && !strings.Contains(rmBlock, "filebeat_has_docker") {
+			t.Fatalf("auto 模式的删容器任务应只在「没装 filebeat 且有 docker」时执行：\n%s", rmBlock)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallContainerConfigPath 锁定容器内的配置路径与启动命令（INC-014）。
+//
+// 这是比"顺序"更根本的一条：之前挂到 /etc/filebeat/filebeat.yml，容器里的 Filebeat
+// **根本不会读**那份配置（官方镜像的默认路径是 /usr/share/filebeat/filebeat.yml），
+// 于是它拿镜像内置配置去连 Elasticsearch → 连不上 → 崩溃重启。
+// 这类错误不会报错，只会表现为"部署成功、平台一条日志都没有"，因此必须用测试钉死。
+func TestRenderFilebeatInstallContainerConfigPath(t *testing.T) {
+	const wantContainerPath = "/usr/share/filebeat/filebeat.yml"
+	for _, mode := range []string{LogInstallAuto, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		play := valueNode(parseYAML(t, "playbook", art.Playbook)).Content[0]
+
+		// 容器内路径由变量表达（不写死两处），变量值必须是官方默认路径。
+		if got := yamlAt(t, play, "vars.filebeat_container_config_path").Value; got != wantContainerPath {
+			t.Fatalf("%s 模式：filebeat_container_config_path 应为 %q（官方镜像默认路径），实际 %q",
+				mode, wantContainerPath, got)
+		}
+		runBlock := playbookTaskBlock(t, art.Playbook, "创建 Filebeat 容器")
+		for _, want := range []string{
+			// 宿主路径仍来自变量，容器内路径来自另一个变量（同源、单一来源）。
+			"-v \"{{ filebeat_config_path }}:{{ filebeat_container_config_path }}:ro\"",
+			"{{ filebeat_data_dir }}:/usr/share/filebeat/data",
+			// 官方示例的三件套：root 起容器、-e 打日志、放行挂载文件的权限检查。
+			"--user=root",
+			"filebeat -e --strict.perms=false",
+		} {
+			if !strings.Contains(runBlock, want) {
+				t.Fatalf("%s 模式的 docker run 应包含 %q：\n%s", mode, want, runBlock)
+			}
+		}
+		// 数据目录必须「非 root 也能写」（INC-015）：playbook 以 become 执行时默认是
+		// 0755 root:root，官方镜像默认以 filebeat(uid 1000) 运行 → meta.json.new 写入被拒 →
+		// 容器起来就退出。--user=root 与显式属主是两道互补的保险，必须同时存在。
+		dataBlock := playbookTaskBlock(t, art.Playbook, "创建 Filebeat 数据目录")
+		for _, want := range []string{
+			"path: \"{{ filebeat_data_dir }}\"",
+			"mode: '0775'",
+			"owner: '1000'",
+			"group: '1000'",
+		} {
+			if !strings.Contains(dataBlock, want) {
+				t.Fatalf("%s 模式的数据目录任务应包含 %q（否则 filebeat 用户写不进 meta.json）：\n%s",
+					mode, want, dataBlock)
+			}
+		}
+		if strings.Contains(dataBlock, "mode: '0755'") {
+			t.Fatalf("%s 模式的数据目录不得是 0755（root:root 0755 会让非 root 运行的 filebeat 写不进去）：\n%s",
+				mode, dataBlock)
+		}
+		// 绝不能出现"把宿主的 filebeat.yml 挂到容器 /etc/filebeat"这种旧写法。
+		if strings.Contains(art.Playbook, ":/etc/filebeat/filebeat.yml") {
+			t.Fatalf("%s 模式：容器内配置路径不得再是 /etc/filebeat/filebeat.yml"+
+				"（容器不会读它 → 用镜像内置配置连 ES → 崩溃重启）：\n%s", mode, art.Playbook)
+		}
+		// 顶部注释要写清楚这条约定，避免以后有人改回去。
+		if !strings.Contains(art.Playbook, "容器内配置路径固定为 "+wantContainerPath) {
+			t.Fatalf("%s 模式：playbook 顶部应说明容器内配置路径的约定：\n%s", mode, art.Playbook)
+		}
+		// 顺序：assert（配置已是普通文件）必须紧跟在 copy 之后、docker run 之前。
+		names := playbookTaskNames(t, art.Playbook)
+		copyAt := taskIndex(t, names, "下发 filebeat.yml")
+		guardAt := taskIndex(t, names, "启动容器前确认 filebeat.yml 已是普通文件")
+		runAt := taskIndex(t, names, "创建 Filebeat 容器")
+		if !(copyAt < guardAt && guardAt < runAt) {
+			t.Fatalf("%s 模式：顺序应为 copy(%d) < 普通文件闸门(%d) < docker run(%d)：\n%s",
+				mode, copyAt, guardAt, runAt, strings.Join(names, "\n"))
+		}
+	}
+}
+
+// dockerRunCommand 从产物里抠出完整的 docker run 命令（跨行拼接成一行），
+// 便于对这种"多行 shell 命令"做逐字断言——只看单行会漏掉换行后的挂载与参数。
+func dockerRunCommand(t *testing.T, playbook string) string {
+	t.Helper()
+	lines := strings.Split(playbook, "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.Contains(line, "docker run -d") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("产物里找不到 docker run 命令：\n%s", playbook)
+	}
+	// 命令块是 YAML 块标量，每行以 \ 续行，最后一行不带 \ 即为结束。
+	var parts []string
+	for i := start; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		parts = append(parts, trimmed)
+		if !strings.HasSuffix(trimmed, "\\") {
+			break
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// TestRenderFilebeatInstallDockerRunCommand 逐字锁定 docker run 命令。
+//
+// 这条命令是"日志集成到底跑成什么样"的最终事实来源，任何一处改动（挂载路径、用户、
+// 启动参数）都会直接影响采集是否可用，而且失败往往**没有报错**（比如配置挂错路径时容器
+// 只是安静地用镜像内置配置连 ES）。因此这里做一次整体断言，而不只是零散的关键字包含。
+func TestRenderFilebeatInstallDockerRunCommand(t *testing.T) {
+	in := logTestInput()
+	in.InstallMode = LogInstallDocker
+	in.Paths = []string{"/var/log/app/*.log"}
+	art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+	got := dockerRunCommand(t, art.Playbook)
+	// 挂载顺序与参数顺序都是刻意固定的，因此这里可以逐字比对。
+	want := `docker run -d --name "{{ filebeat_container }}" --restart=always --user=root \` +
+		` -v "{{ filebeat_config_path }}:{{ filebeat_container_config_path }}:ro" \` +
+		` -v "{{ filebeat_data_dir }}:/usr/share/filebeat/data" \` +
+		` -v /var/log/app:/var/log/app:ro \` +
+		` "{{ filebeat_image }}" \` +
+		` filebeat -e --strict.perms=false`
+	if got != want {
+		t.Fatalf("docker run 命令与期望不符——这条命令直接决定采集是否可用，改动前请确认：\n"+
+			"want: %s\n got: %s\n完整产物：\n%s", want, got, art.Playbook)
 	}
 }
 
@@ -844,9 +1128,12 @@ func TestRenderFilebeatInstallModes(t *testing.T) {
 				"docker.elastic.co/beats/filebeat:8.16.0",
 				"docker run -d",
 				"--restart=always",
-				"/etc/filebeat/filebeat.yml:ro",
+				// 容器内配置路径必须与官方镜像默认一致（INC-014），宿主路径仍走变量。
+				"{{ filebeat_config_path }}:{{ filebeat_container_config_path }}:ro",
+				"--user=root",
+				"filebeat -e --strict.perms=false",
 			},
-			wantNone: []string{"ansible.builtin.apt", "dnf install"},
+			wantNone: []string{"ansible.builtin.apt", "dnf install", ":/etc/filebeat/filebeat.yml"},
 		},
 		{
 			mode:      LogInstallAuto,
@@ -949,7 +1236,8 @@ func TestRenderFilebeatInstallConfigMountsLogDirs(t *testing.T) {
 	for _, want := range []string{
 		"-v /var/log/app:/var/log/app:ro",
 		"-v /data/logs:/data/logs:ro",
-		"-v \"{{ filebeat_config_path }}:/etc/filebeat/filebeat.yml:ro\"",
+		// 配置挂载：宿主路径走变量，容器内路径必须与官方镜像默认一致（INC-014）。
+		"-v \"{{ filebeat_config_path }}:{{ filebeat_container_config_path }}:ro\"",
 	} {
 		if !strings.Contains(art.Playbook, want) {
 			t.Fatalf("docker 模式应挂载 %q：\n%s", want, art.Playbook)

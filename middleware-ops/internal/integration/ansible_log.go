@@ -42,8 +42,18 @@ const (
 	// 必须是这个路径：官方 unit 写死了 `filebeat -c /etc/filebeat/filebeat.yml`，
 	// 换成别的路径必须自己写单元文件（那会让"复用目标机已装的 Filebeat"变成不可能）。
 	filebeatRemoteConfigPath = "/etc/filebeat/filebeat.yml"
-	// filebeatDataDir 是 Filebeat 的注册表/缓冲目录（docker 模式挂进容器，保证位点不丢）。
-	filebeatDataDir = "/var/lib/filebeat"
+	// filebeatDataDir 是平台托管的 Filebeat 数据目录（注册表/位点 + 缓冲），
+	// docker 模式挂进容器，保证容器重建后断点续传不失效。
+	//
+	// 刻意**不用**系统包安装的 /var/lib/filebeat：那是"系统 filebeat"的注册表与位点目录，
+	// 两者是**两套互不干扰的采集状态**。如果 docker 模式复用它，就等于：
+	//   - 把系统 filebeat 的注册表 chown 给 1000；
+	//   - 再往里写容器版 Filebeat 的注册表；
+	// 结果是系统 filebeat 重启后可能重复采集、或状态错乱（同一批日志被两套采集器反复读），
+	// 而且在平台上表现为"日志重复/丢失"，很难追到是这里。
+	filebeatDataDir = "/var/lib/mwops-filebeat"
+	// filebeatContainerDataDir 是**容器内**的数据目录，必须与官方镜像约定一致。
+	filebeatContainerDataDir = "/usr/share/filebeat/data"
 	// filebeatDebURLTemplate / filebeatRPMURLTemplate 是官方制品地址（package 模式的兜底来源）。
 	filebeatDebURLTemplate = "https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-{version}-amd64.deb"
 	filebeatRPMURLTemplate = "https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-{version}-x86_64.rpm"
@@ -195,20 +205,38 @@ type filebeatVars struct {
 	mirror string
 	image  string
 	mode   string
+	// containerConfig 是**容器内**的配置文件路径，必须与官方镜像的默认路径一致
+	// （见 filebeatContainerConfigPath 的说明）。用变量表达，避免 docker run 与
+	// 排障说明里各写一遍、日后改一处漏一处。
+	containerConfig string
 }
 
 func filebeatCardinality() filebeatVars {
 	return filebeatVars{
-		container: "filebeat_container",
-		unit:      "filebeat_unit",
-		config:    "filebeat_config_path",
-		parent:    "filebeat_config_parent_dir",
-		dir:       "filebeat_config_dir",
-		mirror:    "filebeat_mirror_path",
-		image:     "filebeat_image",
-		mode:      "filebeat_tested_mode",
+		container:       "filebeat_container",
+		unit:            "filebeat_unit",
+		config:          "filebeat_config_path",
+		parent:          "filebeat_config_parent_dir",
+		dir:             "filebeat_config_dir",
+		mirror:          "filebeat_mirror_path",
+		image:           "filebeat_image",
+		mode:            "filebeat_tested_mode",
+		containerConfig: "filebeat_container_config_path",
 	}
 }
+
+// filebeatContainerConfigPath 是**容器内**配置文件必须落在的路径。
+//
+// 为什么必须是 /usr/share/filebeat/filebeat.yml（INC-014 的根因）：
+// Filebeat 官方 Docker 镜像的工作目录与默认配置路径就是 /usr/share/filebeat/，官方文档的
+// 卷挂载示例也是把配置挂到这个路径（https://www.elastic.co/docs/reference/beats/filebeat/running-on-docker）。
+// 之前挂到 /etc/filebeat/filebeat.yml 看着"像那么回事"（package 模式确实用这个路径），
+// 但容器里 Filebeat **根本不会读它** —— 它会用镜像内置的默认配置去连 Elasticsearch，
+// 必然失败并崩溃重启；表现出来就是"部署成功、平台一条日志都没有"，而且正好触发
+// Docker 反复重建绑定源目录的那个循环（INC-013/INC-014 是同一个坑的两面）。
+//
+// ⚠️ 改这个常量等于改变"容器读哪份配置"，改错不会有报错、只会没有日志，请勿随手改回 /etc/filebeat。
+const filebeatContainerConfigPath = "/usr/share/filebeat/filebeat.yml"
 
 // logMountDirs 从日志路径反推要在 docker 模式下挂进容器的目录。
 //
@@ -300,7 +328,12 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 	b.WriteString("# 由平台「集成中心」生成：日志集成（Filebeat " + in.Version + "，集成 " + in.Name + "）。\n")
 	b.WriteString("# 请勿手工修改：平台按此模板执行，改动会在下次「重新应用」时被覆盖。\n")
 	// 版本戳与 Exporter 产物保持一致的位置（第 3 行）：远程安装报错时先看这一行。
+	// 注意：新增注释要排在它**之后**，否则会破坏这个位置约定。
 	b.WriteString("# 渲染器: " + PlaybookRendererVersion + "\n")
+	// 容器内配置路径必须与镜像默认一致——写进产物注释，避免以后有人"顺手改回 /etc/filebeat/"。
+	// 这类改动不会报错，只会让容器用镜像内置默认配置去连 Elasticsearch，表现为"部署成功但没有日志"。
+	b.WriteString("# 容器内配置路径固定为 " + filebeatContainerConfigPath +
+		"（必须与 Filebeat 官方镜像的默认路径一致，改回 /etc/filebeat/ 会导致容器读不到平台下发的配置）。\n")
 	b.WriteString("- name: 部署 Filebeat 日志采集（" + in.Name + "）\n")
 	b.WriteString("  hosts: exporter_target\n")
 	if in.Become {
@@ -323,23 +356,31 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 	b.WriteString("    filebeat_mirror_path: " + yamlScalar(in.MirrorPath) + "\n")
 	b.WriteString("    filebeat_data_dir: " + yamlScalar(in.DataDir) + "\n")
 	b.WriteString("    filebeat_image: " + yamlScalar(in.Image) + "\n")
+	// 容器内配置路径也走变量：docker run 与排障说明必须同源，避免"改了一处漏一处"。
+	b.WriteString("    " + v.containerConfig + ": " + yamlScalar(filebeatContainerConfigPath) + "\n")
 	b.WriteString("  tasks:\n")
 	writeFilebeatDetectTasks(&b)
 	writeFilebeatConfigDirTask(&b)
 	writeFilebeatResolveTasks(&b, v)
-	// 顺序是**刻意**的，改动前请先读下面这段（线上真实故障 INC-013）：
+	// 顺序是**刻意**的，改动前请先读下面这段（线上真实故障 INC-013 / INC-014）：
 	//
-	//	docker 的单文件挂载 `-v /etc/filebeat/filebeat.yml:...` 在宿主路径不存在时，
-	//	Docker 会**把缺失的宿主路径创建成目录**。如果先起容器、后 copy 配置，
-	//	copy 就会拿到一个目录当 dest，直接报：
-	//	  can not use content with a dir as dest
-	//	只要走 docker 分支，这个顺序就 100% 失败（package 分支不会，因为 deb 已经装了真实文件）。
+	//	① docker 的单文件挂载 `-v <宿主缺失路径>:<容器内配置>` 会让 Docker
+	//	   **把缺失的宿主路径创建成目录**。如果先起容器、后 copy 配置，
+	//	   copy 就会拿到一个目录当 dest，直接报：
+	//	     can not use content with a dir as dest
+	//	② 更糟的是这个错误状态会**自我维持**：容器里的 Filebeat 读不到有效配置 → 崩溃 →
+	//	   `--restart=always` 让它反复重启 → **每次重启都把缺失的绑定源重新创建成目录**。
+	//	   于是"删目录 → 写文件"之间又被插回一个目录，自愈等于白做
+	//	   （INC-014 现场：自愈任务 changed=1 确实删掉了目录，紧接着的 copy 依然报同一个错）。
+	//	   所以清理必须把**旧容器一起删掉**：`docker rm -f` 才是打断这个循环的那一步——
+	//	   它不只是"让新配置生效"，而是让 Docker 失去"重建这个绑定源目录"的机会。
 	//
 	// 因此固定为：
-	//	  建目录 → 自愈历史遗留（把被 Docker 造成目录的 filebeat.yml 清掉）
-	//	  → 下发 filebeat.yml（容器挂载前文件必须已存在）
-	//	  → 起容器 → Kafka 连通性探测 → 自检
+	//	  建目录 → 自愈历史遗留（非普通文件则删）→ 删平台托管的旧容器（打断重建循环）
+	//	  → 下发 filebeat.yml（容器挂载前文件必须已存在且是普通文件）
+	//	  → assert 是普通文件 → 起容器 → Kafka 连通性探测 → 自检
 	writeFilebeatHealTasks(&b, v)
+	writeFilebeatContainerRemoveTask(&b, v, in.Mode)
 	writeFilebeatConfigTask(&b, in)
 	switch in.Mode {
 	case LogInstallPackage:
@@ -464,6 +505,40 @@ func writeFilebeatHealTasks(b *strings.Builder, v filebeatVars) {
 	b.WriteString("      ansible.builtin.debug:\n")
 	b.WriteString("        msg: \"检测到 {{ " + v.config + " }} 是目录（历史 docker 单文件挂载生成），已清理并重建为文件\"\n")
 	b.WriteString("      when: " + yamlScalar("filebeat_config_stat.stat.exists and not filebeat_config_stat.stat.isreg") + "\n")
+}
+
+// writeFilebeatContainerRemoveTask 在写配置之前删掉平台托管的旧容器（INC-014）。
+//
+// 为什么这一步是**必需**的（而不是"顺手重启一下"）：
+//
+//	第一次失败的 docker run 已经把缺失的宿主路径创建成了目录；容器里的 Filebeat 因为
+//	读不到有效配置而崩溃，`--restart=always` 让它不断重启，而 **Docker 每次启动都会把缺失的
+//	绑定源重新创建成目录**。于是"自愈删目录 → copy 写文件"这条链路中间，总会再被插一个目录，
+//	无论自愈跑多少次都失败。只有 `docker rm -f` 能把容器停掉，从根上断掉这个循环。
+//
+// 幂等与安全：
+//   - `failed_when: false`：容器不存在时 docker rm 返回非 0，这是**正常结果**（首次部署就是这种），
+//     不能让它中断 playbook；rc 仍然会打进日志便于核对；
+//   - `when` 只在"这次真的要（重）建容器"的分支里执行（docker 模式恒为真；auto 模式是
+//     "没装 filebeat 且有 docker"），package / reuse 分支不碰容器；
+//   - 只删**平台自己的固定容器名**（mwops-filebeat），不会误删目标机上别人的容器。
+func writeFilebeatContainerRemoveTask(b *strings.Builder, v filebeatVars, mode string) {
+	if mode == LogInstallPackage {
+		// package 模式完全不碰容器，产物里连这条任务都不该出现（避免误以为它会删容器）。
+		return
+	}
+	cond := "filebeat_has_docker | bool"
+	if mode == LogInstallAuto {
+		cond = "not (filebeat_present | bool) and (filebeat_has_docker | bool)"
+	}
+	b.WriteString("    # ---- 清理旧容器：打断 Docker 反复重建\"绑定源目录\"的循环（必须在写配置之前） ----\n")
+	logTask(b, "删除平台托管的旧 Filebeat 容器（存在才删，打断 Docker 重建绑定源目录的循环）")
+	b.WriteString("      ansible.builtin.command: docker rm -f \"{{ " + v.container + " }}\"\n")
+	b.WriteString("      register: filebeat_container_remove\n")
+	// 容器不存在时 rc=1 属正常：首次部署本来就没有容器。
+	b.WriteString("      failed_when: false\n")
+	b.WriteString("      changed_when: " + yamlScalar("(filebeat_container_remove.rc | default(0) | int) == 0") + "\n")
+	b.WriteString("      when: " + yamlScalar(cond) + "\n")
 }
 
 // writeFilebeatResolveTasks 计算"选哪条安装路径"，并把探测结果固化成可读变量。
@@ -657,7 +732,25 @@ func writeFilebeatDockerTasksWhen(b *strings.Builder, in filebeatPlaybookInput, 
 	b.WriteString("      ansible.builtin.file:\n")
 	b.WriteString("        path: \"{{ filebeat_data_dir }}\"\n")
 	b.WriteString("        state: directory\n")
-	b.WriteString("        mode: '0755'\n")
+	// 权限与属主是**刻意**的（线上真实故障 INC-015）：
+	//
+	//	playbook 以 become: true 执行，若用默认的 0755 root:root，官方 filebeat 镜像默认以
+	//	filebeat 用户（uid/gid 1000）运行，启动时会报
+	//	  Exiting: failed to create Beat meta file: open /usr/share/filebeat/data/meta.json.new: permission denied
+	//	即容器能起来但立刻退出 —— 采集整体哑掉。
+	//
+	//	下面两件事都做，是刻意的纵深防御：
+	//	  ① docker run 带 --user=root（官方示例如此，保证能读宿主日志、能写数据目录）；
+	//	  ② 数据目录做成 0775 且显式 owner/group=1000。
+	//	将来有人去掉 --user=root、或换成自己 build 的镜像（以非 root 运行）时，
+	//	②仍然让容器写得进数据目录，不会因为一个目录属主把整条采集链路弄哑。
+	//
+	// 目录本身是平台专属的 {{ filebeat_data_dir }}（/var/lib/mwops-filebeat），
+	// 与系统 filebeat 的 /var/lib/filebeat 分开：既不改动系统采集的属主，也不与它共用注册表。
+	// 因此这条任务**只出现在 docker 分支**——package 分支的目录由系统包自己创建，平台不碰。
+	b.WriteString("        mode: '0775'\n")
+	b.WriteString("        owner: '1000'\n")
+	b.WriteString("        group: '1000'\n")
 	b.WriteString("      when: " + yamlScalar(cond) + "\n")
 	writeFilebeatContainerTasks(b, in, v, cond)
 }
@@ -722,19 +815,33 @@ func configParentDir(configPath string) string {
 
 // dockerRunLineForFilebeat 生成 docker run 命令（含配置与日志目录挂载）。
 //
+// 三条与官方镜像对齐的硬性要求（INC-014）：
+//   - 配置挂到 `{{ filebeat_container_config_path }}`（= /usr/share/filebeat/filebeat.yml）。
+//     官方镜像的默认配置路径就在这里，挂到 /etc/filebeat/ 容器**根本不会读**，
+//     会拿镜像内置配置去连 Elasticsearch → 崩溃 → 触发 Docker 反复重建绑定源目录；
+//   - `--user=root`：容器要读宿主 /var/log 下的日志文件，非 root 通常没有权限
+//     （官方示例同样用 root 起容器）；
+//   - `filebeat -e --strict.perms=false`：`-e` 让日志打到 stderr（自检与 docker logs 能看到）；
+//     `--strict.perms=false` 是因为挂载进来的配置文件属主/权限必然不满足 Filebeat 的
+//     "配置文件不能 group/world 可写"检查，不加它容器会以
+//     `Exiting: error loading config file: config file must be owned by the beat user` 之类的原因退出。
+//
 // --restart=always 是刻意的（而不是 unless-stopped）：日志采集是"基础设施"，
 // 目标机重启后必须自己回来，不能因为一次手工 stop 就永久停采（那会让平台安静地收不到日志）。
 func dockerRunLineForFilebeat(in filebeatPlaybookInput, v filebeatVars) string {
 	var b strings.Builder
 	b.WriteString("docker run -d --name \"{{ " + v.container + " }}\" --restart=always")
+	b.WriteString(" --user=root")
 	// 配置只读挂载：容器不需要改配置，ro 能防止容器内的误写"骗过"下一次 checksum 比对。
-	b.WriteString(" \\\n          -v \"{{ " + v.config + " }}:/etc/filebeat/filebeat.yml:ro\"")
-	b.WriteString(" \\\n          -v \"{{ filebeat_data_dir }}:/usr/share/filebeat/data\"")
+	b.WriteString(" \\\n          -v \"{{ " + v.config + " }}:{{ " + v.containerConfig + " }}:ro\"")
+	b.WriteString(" \\\n          -v \"{{ filebeat_data_dir }}:" + filebeatContainerDataDir + "\"")
 	// 日志目录挂载：容器只能看见挂载进来的路径，少挂一个 = 那批日志永远采不到。
 	for _, dir := range in.LogMounts {
 		b.WriteString(" \\\n          -v " + shellArg(dir+":"+dir+":ro"))
 	}
+	// 镜像之后才是容器要执行的命令：`filebeat -e --strict.perms=false`。
 	b.WriteString(" \\\n          \"{{ " + v.image + " }}\"")
+	b.WriteString(" \\\n          filebeat -e --strict.perms=false")
 	return b.String()
 }
 

@@ -214,7 +214,8 @@ func (s *IntegrationService) selfCheckScrape(
 		stage.Advice = "确认平台能访问 Prometheus（prometheus.base_url）；这项不影响集成本身"
 		return stage
 	}
-	status, found := pickTargetStatus(statuses, name)
+	// 按 instance_name + mw_type 一起匹配：只认名字会让跨类型同名的集成互相认领目标。
+	status, found := pickTargetStatus(statuses, name, item.MWType)
 	if !found {
 		stage.Status = stageFail
 		stage.Detail = fmt.Sprintf("Prometheus 的 job=%s 下没有本实例的抓取目标（http_sd 默认 30s 刷新）", job)

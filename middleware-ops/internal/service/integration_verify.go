@@ -7,6 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"middleware-ops/internal/model"
 	"middleware-ops/internal/monitor"
 )
 
@@ -23,6 +24,19 @@ import (
 //  2. 周期自愈（ReverifyIntegrations）：只对当前处于「待处理」的集成做**由坏变好**的纠正，
 //     且只有**明确看到目标 up** 才清除错误——Prometheus 不可达或目标缺失一律保持原状。
 
+// verifyViaPrometheus 判断某个集成是否应该走「Prometheus 抓取核验」。
+//
+// 日志集成**不属于这条通道**：它没有 Exporter、没有抓取目标，核验只能得到
+// "没有目标"（或者更糟——认领到别的组件的目标）。真实故障 INC-025：
+// 日志集成的备注里出现了"周期核验通过：抓取目标 jd-redis 已 up，已自动清除待处理"，
+// 使用者看到的是"我的日志怎么会在核验 redis"。
+//
+// 日志集成的状态由**部署结果**（Ansible 输出）与**按需自检**（平台→Kafka / 接入地址 /
+// 日志是否已进入平台）负责，这条 Prometheus 通道对它全程不适用。
+func verifyViaPrometheus(mwType string) bool {
+	return mwType != model.MWTypeLog
+}
+
 // VerifyNow 按 Prometheus 现状重新核验一个集成并刷新状态（无副作用：不重装、不需要凭据）。
 func (s *IntegrationService) VerifyNow(ctx context.Context, id int64, operator Operator) (*IntegrationView, error) {
 	item, err := s.integrationInstance(ctx, id)
@@ -33,18 +47,30 @@ func (s *IntegrationService) VerifyNow(ctx context.Context, id int64, operator O
 	if !ok {
 		return nil, fmt.Errorf("该实例不是通过集成中心创建的")
 	}
+	// 日志集成：不做抓取核验，也不改状态——把"该用哪个入口"直接写进备注。
+	if !verifyViaPrometheus(meta.Template) {
+		note := "日志集成不参与 Prometheus 抓取核验（它没有抓取目标）：请用「自检」看日志链路" +
+			"（平台→Kafka / 接入地址 / 日志是否已进入平台）"
+		s.setDeployNote(ctx, item.ID, note)
+		s.record(ctx, operator, item.ID, "integration_verify", map[string]any{
+			"name": item.Name, "job": meta.Job, "ok": false, "note": "log 类型跳过 Prometheus 核验",
+		})
+		view := s.toView(ctx, *item)
+		view.DeployNote = note
+		return &view, nil
+	}
 	job := meta.Job
 	if job == "" {
 		job = s.jobName()
 	}
-	reason, verified := s.probeIntegration(ctx, job, item.Name)
+	reason, verified := s.probeIntegration(ctx, job, item.Name, meta.Template)
 	switch {
 	case !verified:
 		s.setDeployNote(ctx, item.ID, "重新核验未完成：暂时读不到 Prometheus 的目标状态（不影响集成本身），请稍后再试")
 	case reason == "":
 		s.markApplied(ctx, item.ID)
-		s.setDeployNote(ctx, item.ID, fmt.Sprintf("重新核验通过：抓取目标 %s 已 up（%s）",
-			item.Name, time.Now().UTC().Format(time.RFC3339)))
+		s.setDeployNote(ctx, item.ID, fmt.Sprintf("重新核验通过：抓取目标 %s（%s）已 up（%s）",
+			item.Name, meta.Template, time.Now().UTC().Format(time.RFC3339)))
 		s.log.Info("集成：重新核验通过", zap.String("integration", item.Name), zap.String("job", job))
 	default:
 		s.markError(ctx, item.ID, reason)
@@ -83,6 +109,11 @@ func (s *IntegrationService) ReverifyIntegrations(ctx context.Context) (checked,
 		if !metaOK || meta.LastError == "" {
 			continue
 		}
+		// 日志集成不在这条通道上（见 verifyViaPrometheus）：它没有抓取目标，
+		// 继续走下去只会认领到别的组件的目标，把别人的 up 当成自己的结论。
+		if !verifyViaPrometheus(meta.Template) {
+			continue
+		}
 		checked++
 		job := meta.Job
 		if job == "" {
@@ -103,13 +134,13 @@ func (s *IntegrationService) ReverifyIntegrations(ctx context.Context) (checked,
 			statuses = fetched
 			targetsByJob[job] = fetched
 		}
-		status, found := pickTargetStatus(statuses, item.Name)
+		status, found := pickTargetStatus(statuses, item.Name, meta.Template)
 		if !found || status.Health != "up" {
 			continue // 仍然没起来/没有目标：保持原样（原因由部署路径与接入自检给）
 		}
 		s.markApplied(ctx, item.ID)
-		s.setDeployNote(ctx, item.ID, fmt.Sprintf("周期核验通过：抓取目标 %s 已 up，已自动清除待处理（%s）",
-			item.Name, time.Now().UTC().Format(time.RFC3339)))
+		s.setDeployNote(ctx, item.ID, fmt.Sprintf("周期核验通过：抓取目标 %s（%s）已 up，已自动清除待处理（%s）",
+			item.Name, meta.Template, time.Now().UTC().Format(time.RFC3339)))
 		s.log.Info("集成：周期自愈清除了待处理", zap.String("integration", item.Name), zap.String("job", job))
 		cleared++
 	}

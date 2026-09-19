@@ -472,7 +472,7 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 				return err
 			}
 			s.markApplied(context.Background(), item.ID)
-			s.scheduleVerify(item.ID, item.Name, s.jobName())
+			s.scheduleVerify(item.ID, item.Name, s.jobName(), tpl.Type)
 			return nil
 		})
 	}
@@ -590,7 +590,7 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 				return err
 			}
 			s.markApplied(context.Background(), item.ID)
-			s.scheduleVerify(item.ID, item.Name, s.jobName())
+			s.scheduleVerify(item.ID, item.Name, s.jobName(), tpl.Type)
 			return nil
 		})
 	}
@@ -667,7 +667,7 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 			return err
 		}
 		s.markApplied(context.Background(), item.ID)
-		s.scheduleVerify(item.ID, item.Name, s.jobName())
+		s.scheduleVerify(item.ID, item.Name, s.jobName(), tpl.Type)
 		return nil
 	})
 	s.record(ctx, operator, item.ID, "integration_apply", map[string]any{"name": item.Name})
@@ -786,7 +786,12 @@ func (s *IntegrationService) fileSDPath() string {
 // 同步等待会把一次 HTTP 请求拖到 40s 以上；后台核验则把结论写回实例，
 // 前端刷新即可看到「待处理：<Prometheus 记录的失败原因>」，
 // 使用者不必再去 Prometheus 的 /targets 页面翻 lastError。
-func (s *IntegrationService) scheduleVerify(instanceID int64, name, job string) {
+func (s *IntegrationService) scheduleVerify(instanceID int64, name, job, mwType string) {
+	// 日志集成不在这条通道上（见 integration_verify.go 的 verifyViaPrometheus）：
+	// 它没有抓取目标，核验只会认领到别人的目标或凭空报"没有目标"。
+	if !verifyViaPrometheus(mwType) {
+		return
+	}
 	if s.monitor == nil {
 		return
 	}
@@ -803,7 +808,7 @@ func (s *IntegrationService) scheduleVerify(instanceID int64, name, job string) 
 				return
 			case <-time.After(delay):
 			}
-			reason, verified := s.probeIntegration(ctx, job, name)
+			reason, verified := s.probeIntegration(ctx, job, name, mwType)
 			if verified && reason == "" {
 				s.markApplied(context.Background(), instanceID)
 				s.log.Info("集成核验通过", zap.String("integration", name), zap.String("job", job))
@@ -833,7 +838,11 @@ func (s *IntegrationService) scheduleVerify(instanceID int64, name, job string) 
 //   - (原因, true) 明确失败（目标 up=0 / 目标缺失）；
 //   - ("", false)  **无法判定**（Prometheus 查询失败）——调用方不得据此改状态，
 //     否则一次 Prometheus 抖动就会把"待处理"抹掉或凭空造出失败。
-func (s *IntegrationService) probeIntegration(ctx context.Context, job, name string) (string, bool) {
+//
+// mwType 用于把"本集成的目标"限定在**同一组件类型**内：抓取配置里带了 mw_type 标签，
+// 而 instance_name 只保证集成记录之间不重名——跨类型同名（例如日志集成也叫 jd-redis）
+// 时若不看类型，就可能认领到别的组件的目标，把它的 up 当成自己的结论（INC-025）。
+func (s *IntegrationService) probeIntegration(ctx context.Context, job, name, mwType string) (string, bool) {
 	reporter, ok := s.monitor.(monitor.TargetReporter)
 	if !ok {
 		return "", false
@@ -845,7 +854,7 @@ func (s *IntegrationService) probeIntegration(ctx context.Context, job, name str
 		s.log.Debug("集成核验：查询 Prometheus 目标失败", zap.Error(err))
 		return "", false
 	}
-	status, found := pickTargetStatus(targets, name)
+	status, found := pickTargetStatus(targets, name, mwType)
 	if !found {
 		return "Prometheus 中还没有该集成对应的抓取目标：确认抓取配置里有 middleware-integration 任务（http_sd 默认 30s 刷新），" +
 			"必要时执行「重新应用」", true
@@ -858,17 +867,29 @@ func (s *IntegrationService) probeIntegration(ctx context.Context, job, name str
 
 // pickTargetStatus 从 job 下的全部目标里找出**本集成**那一条。
 //
-// 同一 job（middleware-integration）下通常有多个集成，因此优先用 instance_name 精确匹配。
-// 只有在"无法区分"时才兜底：job 下**唯一**一条且它**没有** instance_name 标签
-// （早期产物或人工配置）。唯一但名字是别人的，绝不认领——那会把别的集成的待处理清掉，
-// 真正的故障就静默消失了。
-func pickTargetStatus(statuses []monitor.TargetStatus, name string) (monitor.TargetStatus, bool) {
+// 同一 job（middleware-integration）下通常有多个集成，因此优先用 instance_name 精确匹配，
+// 并**同时确认 mw_type 一致**。只有在"无法区分"时才兜底：job 下**唯一**一条且它**没有**
+// instance_name 标签（早期产物或人工配置）；唯一但名字是别人的，绝不认领——
+// 那会把别的集成的待处理清掉，真正的故障就静默消失了（INC-015 的教训）。
+//
+// 为什么要比 mw_type：日志集成（mw_type=log）根本没有抓取目标，只按名字匹配时
+// 它可能认领到一个同名中间件的目标，于是界面上出现"日志集成：抓取目标 jd-redis 已 up"
+// 这种自相矛盾的结论（INC-025）。
+func pickTargetStatus(statuses []monitor.TargetStatus, name, mwType string) (monitor.TargetStatus, bool) {
+	typeMatches := func(status monitor.TargetStatus) bool {
+		if mwType == "" {
+			return true
+		}
+		label := strings.TrimSpace(status.Labels["mw_type"])
+		// 目标没写类型（人工配置/早期产物）时不因此拒绝，避免把正常集成判成"没有目标"。
+		return label == "" || label == mwType
+	}
 	for _, status := range statuses {
-		if label := strings.TrimSpace(status.Labels["instance_name"]); label == name {
+		if label := strings.TrimSpace(status.Labels["instance_name"]); label == name && typeMatches(status) {
 			return status, true
 		}
 	}
-	if len(statuses) == 1 && strings.TrimSpace(statuses[0].Labels["instance_name"]) == "" {
+	if len(statuses) == 1 && strings.TrimSpace(statuses[0].Labels["instance_name"]) == "" && typeMatches(statuses[0]) {
 		return statuses[0], true
 	}
 	return monitor.TargetStatus{}, false
@@ -1217,7 +1238,7 @@ func (s *IntegrationService) RotateAccountPassword(ctx context.Context, id int64
 	s.record(ctx, operator, id, "integration_account_rotate", map[string]any{
 		"name": item.Name, "monitor_user": item.Username,
 	})
-	s.scheduleVerify(item.ID, item.Name, s.jobName())
+	s.scheduleVerify(item.ID, item.Name, s.jobName(), tpl.Type)
 	// 明文口令只在这一个响应里返回（审计里仍然只有账号名）。
 	return &AccountRotateResult{View: s.viewOf(ctx, *item), NewPassword: newPassword}, nil
 }
@@ -1494,7 +1515,7 @@ func (s *IntegrationService) RetryAccount(
 		"name": item.Name, "created": result.Created, "connected": result.Connected, "ok": result.OK,
 	})
 	if result.OK {
-		s.scheduleVerify(item.ID, item.Name, s.jobName())
+		s.scheduleVerify(item.ID, item.Name, s.jobName(), tpl.Type)
 	}
 	result.View = s.viewOf(ctx, *item)
 	return result, nil

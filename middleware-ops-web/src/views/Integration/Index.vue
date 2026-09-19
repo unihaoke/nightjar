@@ -60,7 +60,11 @@ const form = reactive({
   install_mode: 'docker' as 'docker' | 'docker-systemd' | 'binary',
   ssh_user: '',
   ssh_port: 22,
+  // SSH 认证方式：口令（需平台镜像带 sshpass）或私钥（不需要 sshpass）。
+  // 与「重新应用」「账号操作」两个弹窗保持同一套语义：二选一，另一种不提交。
+  ssh_method: 'password' as 'password' | 'key',
   ssh_password: '',
+  ssh_key: '',
   ssh_become: true,
   labels: [] as { key: string; value: string }[],
   options: {} as Record<string, string>,
@@ -418,6 +422,16 @@ function sshCredsReady(src: { user: string; method: 'password' | 'key'; password
   return src.method === 'key' ? src.key.trim().length > 0 : src.password.length > 0
 }
 
+/**
+ * 主表单里的 SSH 输入（字段带 ssh_ 前缀，与两个弹窗里的 state 形状不同）。
+ *
+ * 做一次适配就能复用同一套校验与载荷组装：口令/私钥二选一的语义只在一处定义，
+ * 不会出现"弹窗支持私钥、主表单不支持"这种割裂。
+ */
+function formSshInput(): { user: string; method: 'password' | 'key'; password: string; key: string; port: number } {
+  return { user: form.ssh_user, method: form.ssh_method, password: form.ssh_password, key: form.ssh_key, port: form.ssh_port }
+}
+
 /** 载入账号清单。 */
 async function loadAccounts(): Promise<void> {
   accountsLoading.value = true
@@ -496,7 +510,9 @@ function openInstall(template: IntegrationTemplate, item?: IntegrationView): voi
   form.install_mode = (item?.install_mode as 'docker' | 'docker-systemd' | 'binary') || 'docker'
   form.ssh_user = ''
   form.ssh_port = 22
+  form.ssh_method = 'password'
   form.ssh_password = ''
+  form.ssh_key = ''
   form.ssh_become = true
   form.labels = Object.entries(item?.labels || {}).map(([key, value]) => ({ key, value }))
   const options: Record<string, string> = {}
@@ -549,7 +565,10 @@ function buildPayload(): IntegrationInput {
     payload.target_host = isLog.value ? form.address.trim() : form.target_host.trim()
     payload.ssh_user = form.ssh_user.trim()
     payload.ssh_port = form.ssh_port
-    payload.ssh_password = form.ssh_password
+    // 二选一：只提交选中的那种认证方式，另一种留空——
+    // 否则上次留下的内容会被当成"空口令/空私钥"传过去，或在目标机上混用两种认证。
+    payload.ssh_password = form.ssh_method === 'password' ? form.ssh_password : ''
+    payload.ssh_key = form.ssh_method === 'key' ? form.ssh_key : ''
     payload.ssh_become = form.ssh_become
     // Filebeat 的安装方式由模板参数（MWOPS_LOG_INSTALL_MODE）决定，
     // 指标集成的 install_mode/exporter_port 对日志集成没有意义，不能顺手带上。
@@ -606,6 +625,15 @@ async function handleSubmit(): Promise<void> {
   // 日志路径不是表单 rules 里的字段（它来自模板）却决定采集有没有内容，必须在这里拦住。
   if (isLog.value && !logPathsFilled.value) {
     ElMessage({ type: 'warning', message: '请填写日志路径（可多行或逗号分隔），否则 Filebeat 装好也不会采集任何日志' })
+    return
+  }
+  // 远程部署且勾选了"由平台部署"：凭据缺了不会让保存失败，只会留下一条
+  // 「远程安装需要 SSH 凭据」的待处理项，等于白跑一趟——这里当场收齐（口令或私钥二选一）。
+  if (form.deploy_target === 'remote' && form.deploy && !sshCredsReady(formSshInput())) {
+    ElMessage({
+      type: 'warning',
+      message: '远程部署需要 SSH 凭据：请填写 SSH 用户名，并选择「口令」或「私钥」其中一种认证方式（凭据仅本次使用、不落库）',
+    })
     return
   }
   submitting.value = true
@@ -1354,12 +1382,26 @@ onMounted(load)
               </el-form-item>
             </el-col>
             <el-col :xs="24" :sm="12">
-              <el-form-item label="SSH 口令（仅本次使用）">
-                <el-input v-model="form.ssh_password" type="password" show-password
-                  placeholder="不落库、不写审计、不回显" />
+              <el-form-item label="SSH 认证方式">
+                <el-radio-group v-model="form.ssh_method">
+                  <el-radio value="password">口令</el-radio>
+                  <el-radio value="key">私钥</el-radio>
+                </el-radio-group>
               </el-form-item>
             </el-col>
           </el-row>
+          <el-form-item v-if="form.ssh_method === 'password'" label="SSH 口令（仅本次使用）">
+            <el-input v-model="form.ssh_password" type="password" show-password
+              placeholder="不落库、不写审计、不回显" />
+          </el-form-item>
+          <el-form-item v-else label="SSH 私钥（仅本次使用）">
+            <el-input v-model="form.ssh_key" type="textarea" :rows="3"
+              placeholder="粘贴私钥全文（-----BEGIN OPENSSH PRIVATE KEY----- …）：写入 0600 临时文件、执行后立刻删除" />
+            <p class="field-hint">
+              私钥认证不经过 sshpass（口令方式才要求平台镜像装 sshpass）；
+              私钥方式下 sudo 需要密码时 ansible 会报 Missing sudo password，请改用口令方式或在目标机为登录用户配置 sudo 免密。
+            </p>
+          </el-form-item>
           <div class="switch-row">
             <el-switch v-model="form.ssh_become" />
             <span>远程安装使用 sudo（装到 /opt、写 systemd 单元时需要）</span>

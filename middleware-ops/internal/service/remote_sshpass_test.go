@@ -63,3 +63,36 @@ func TestCheckSSHPassWithSSHPass(t *testing.T) {
 		t.Fatalf("平台有 sshpass 时应放行：%v", err)
 	}
 }
+
+// TestValidateSSHKey 锁定「私钥内容形状」这条前置校验：
+// 贴成公钥是最常见的误操作，必须在执行前拦下并说清该贴什么。
+func TestValidateSSHKey(t *testing.T) {
+	// 未使用私钥认证（口令方式）时不做校验。
+	if err := validateSSHKey(""); err != nil {
+		t.Fatalf("空私钥（走口令认证）不应报错：%v", err)
+	}
+
+	// 公钥必须被拒，且提示要能让人想到"贴错了"。
+	pub := "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ test@example.com"
+	err := validateSSHKey(pub)
+	if err == nil {
+		t.Fatal("粘贴公钥时应报错")
+	}
+	for _, want := range []string{"PRIVATE KEY", "BEGIN"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误信息应提示正确的私钥格式（含 %q）：%v", want, err)
+		}
+	}
+
+	// 各种 PEM 私钥头都应放行。
+	for _, head := range []string{
+		"-----BEGIN OPENSSH PRIVATE KEY-----",
+		"-----BEGIN RSA PRIVATE KEY-----",
+		"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+		"-----BEGIN EC PRIVATE KEY-----",
+	} {
+		if err := validateSSHKey(head + "\nbody\n-----END-----"); err != nil {
+			t.Fatalf("%s 应被识别为私钥：%v", head, err)
+		}
+	}
+}

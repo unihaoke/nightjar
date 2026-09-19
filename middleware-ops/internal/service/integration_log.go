@@ -254,6 +254,9 @@ func (s *IntegrationService) deployLogIntegration(
 	if err := s.checkSSHPass(creds); err != nil {
 		return err
 	}
+	if err := validateSSHKey(creds.Key); err != nil {
+		return err
+	}
 
 	become := s.cfg.Integration.Ansible.Become
 	if creds.Become != nil {
