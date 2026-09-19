@@ -71,6 +71,11 @@ func (s *IntegrationService) SelfCheck(ctx context.Context, id int64) (*Integrat
 	if !ok {
 		return nil, fmt.Errorf("组件模板 %q 不存在", meta.Template)
 	}
+	// 日志集成：链路是"目标机 Filebeat → 平台 Kafka → 日志事件"，与 Exporter/Prometheus 无关，
+	// 因此走日志专用自检（三段：Kafka 可达 → 接入地址可用 → 日志是否真的进来了）。
+	if isLogTemplate(tpl) {
+		return s.selfCheckLog(ctx, item, meta), nil
+	}
 	address, _ := integration.ParseAddress(meta.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
 
 	out := &IntegrationSelfCheck{InstanceID: item.ID, Name: item.Name, Stages: make([]SelfCheckStage, 0, 4)}

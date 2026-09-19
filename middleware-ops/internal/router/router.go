@@ -101,8 +101,9 @@ func New(opt Options) *gin.Engine {
 		integrations.GET("/accounts", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.ListIntegrationAccounts)
 		integrations.POST("/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewIntegration)
 		// 日志接入：平台读取被管容器的 docker 配置反查日志位置，自建采集容器（被管项目零改动）
-		integrations.POST("/logs/preview", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareRead), h.PreviewLogCollect)
-		integrations.POST("/logs", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateLogCollect)
+		// 日志集成已改为「集成中心里的 log 类型集成」（docs/LOG_INTEGRATION.md）：
+		// 旧的 POST /integrations/logs/preview 与 POST /integrations/logs（docker 卷反查 +
+		// 平台起采集容器）整体移除，采集改由目标机上的 Filebeat 承担。
 		integrations.POST("", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.CreateIntegration)
 		integrations.PUT("/:id", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.UpdateIntegration)
 		integrations.POST("/:id/apply", mw.RequirePerm(opt.Deps.Auth, service.PermMiddlewareWrite), h.ApplyIntegration)
@@ -213,9 +214,22 @@ func New(opt Options) *gin.Engine {
 		logAlerts.DELETE("/servers/:id", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.DeleteServer)
 		logAlerts.GET("/code-repos", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListCodeRepos)
 		logAlerts.POST("/code-repos", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.SaveCodeRepo)
+		// 日志集成接收链路（Kafka）：状态用于页面卡片，probe 用于「测试 Kafka 连接」按钮。
+		logAlerts.GET("/pipeline", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.LogPipelineStatus)
+		logAlerts.POST("/pipeline/probe", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.ProbeLogPipeline)
+		// 日志告警规则：决定去重窗口 / 冷却期 / 通知渠道 / 是否自动 AI 分析。
+		logAlerts.GET("/rules", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListLogAlertRules)
+		logAlerts.GET("/rules/defaults", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.LogAlertRuleDefaults)
+		logAlerts.POST("/rules", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.CreateLogAlertRule)
+		logAlerts.PUT("/rules/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.UpdateLogAlertRule)
+		logAlerts.DELETE("/rules/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.DeleteLogAlertRule)
+		// 手动重新分析：打破冷却抑制，立即重跑通知与 AI 分析。
+		logAlerts.POST("/events/:id/reanalyze", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.ReanalyzeLogEvent)
 	}
 
-	// 日志/告警上报 Hook（供 Agent 与应用直接调用，使用共享令牌鉴权）。
+	// 日志/告警上报 Hook（供应用直接调用，使用共享令牌鉴权）。
+	// 说明：日志集成的主路径是「目标机 Filebeat → 平台 Kafka」，这个 HTTP 入口是零侵入兜底
+	// （应用不方便装 Filebeat、或只想推关键错误时用），两者最终落到同一套事件与指纹逻辑。
 	hooks := api.Group("/hooks")
 	hooks.Use(hookAuth(opt.HookToken))
 	{

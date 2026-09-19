@@ -53,6 +53,9 @@ type IntegrationService struct {
 	dockerOK bool
 	// selfImageName 缓存平台自身镜像名（采集容器复用它）。
 	selfImageName string
+	// logPipe 为「日志集成」的接收链路（Kafka 消费状态与探测）。
+	// 用接口注入而不是构造参数：日志链路的存在与否不影响指标集成，两者互不依赖。
+	logPipe LogPipelineProbe
 }
 
 // cipherCodec 是集成中心需要的加解密能力（口令加密存储 + 部署时读回明文）。
@@ -360,6 +363,10 @@ func pendingNote(what string) string {
 // 会带上**自动发现到的目标网络**：手工执行这段 compose 时，Exporter 必须能解析
 // 被管实例的主机名，而平台网络里通常没有这个名字——只列平台网络的产物是跑不通的。
 func (s *IntegrationService) Preview(ctx context.Context, in IntegrationInput) (*integration.Artifacts, error) {
+	// 日志集成走完全不同的产物（filebeat.yml + Filebeat playbook），与 Prometheus 抓取无关。
+	if tpl, ok := integration.TemplateOf(in.MWType); ok && isLogTemplate(tpl) {
+		return s.previewLogIntegration(in)
+	}
 	tpl, instance, err := s.build(in)
 	if err != nil {
 		return nil, err
@@ -430,7 +437,7 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 	meta := IntegrationMeta{
 		Template: tpl.Type, Address: instance.Address.Raw, Labels: instance.Labels,
 		Options: instance.Options, Job: s.jobName(), Image: tpl.Image,
-		Container: integration.ContainerName(instance.Name), ExporterPort: tpl.ExporterPort,
+		Container: containerNameFor(tpl, instance.Name), ExporterPort: tpl.ExporterPort,
 		JoinPlatformNetwork: s.shouldJoinPlatformNetwork(in),
 		// 部署位置与远程参数（SSH 凭据不入库，只记目标与端口）。
 		DeployTarget:     normalizeDeployTarget(in.DeployTarget),
@@ -620,6 +627,10 @@ func (s *IntegrationService) Apply(ctx context.Context, id int64, operator Opera
 	if !ok {
 		return nil, apperr.Newf(apperr.CodeInvalidParam, "组件模板 %q 不存在", meta.Template)
 	}
+	// 日志集成：不走 file_sd / Prometheus / 端口探测，直接重装 Filebeat。
+	if isLogTemplate(tpl) {
+		return s.applyLogIntegration(ctx, item, tpl, meta, in, operator)
+	}
 	// 远程部署缺凭据时**立刻**给出可操作提示（而不是排一个必然失败的后台任务，
 	// 再让界面显示一条需要编辑表单才能消掉的错误）。
 	if normalizeDeployTarget(meta.DeployTarget) == DeployTargetRemote && !in.provided() {
@@ -678,7 +689,7 @@ func (s *IntegrationService) Delete(ctx context.Context, id int64, operator Oper
 		return err
 	}
 	meta, _ := IntegrationMetaOf(*item)
-	if meta.Container != "" && s.docker != nil {
+	if meta.Container != "" && s.docker != nil && !isLogMeta(meta) {
 		if removeErr := s.docker.Remove(ctx, meta.Container); removeErr != nil {
 			s.log.Warn("集成：移除 Exporter 容器失败", zap.String("container", meta.Container), zap.Error(removeErr))
 		}
@@ -719,6 +730,11 @@ func (s *IntegrationService) ServiceDiscovery(ctx context.Context) (string, erro
 		}
 		tpl, ok := integration.TemplateOf(meta.Template)
 		if !ok {
+			continue
+		}
+		// 日志集成不进 Prometheus 服务发现：它没有 Exporter、没有指标端点，
+		// 混进抓取目标只会让 Prometheus 里多出一堆永远 up=0 的目标。
+		if isLogTemplate(tpl) {
 			continue
 		}
 		address, parseErr := integration.ParseAddress(meta.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
@@ -1828,9 +1844,26 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 			apperr.CodeInvalidParam, "不支持的组件类型 %q（可选 %s）",
 			in.MWType, strings.Join(integration.SupportedTypes(), "/"))
 	}
-	address, err := integration.ParseAddress(in.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
-	if err != nil {
-		return integration.Template{}, integration.Instance{}, apperr.New(apperr.CodeInvalidParam, err.Error())
+	// 日志集成的「地址」是**服务器地址**，没有服务端口概念（端口属于 SSH，由凭据字段承担）。
+	// 因此不走通用地址解析（它要求端口在 1-65535），只取主机部分；
+	// 允许使用者顺手写成 host:22 这类形式，端口对日志集成无意义、直接丢弃。
+	var address integration.Address
+	if isLogTemplate(tpl) {
+		host, _, splitErr := net.SplitHostPort(strings.TrimSpace(in.Address))
+		if splitErr != nil {
+			host = strings.TrimSpace(in.Address)
+		}
+		if host == "" {
+			return integration.Template{}, integration.Instance{}, apperr.New(
+				apperr.CodeInvalidParam, "日志集成需要填写目标服务器地址（如 10.0.0.9）")
+		}
+		address = integration.Address{Host: host, Raw: strings.TrimSpace(in.Address)}
+	} else {
+		parsed, err := integration.ParseAddress(in.Address, tpl.DefaultPort, tpl.URLScheme, tpl.URLPath)
+		if err != nil {
+			return integration.Template{}, integration.Instance{}, apperr.New(apperr.CodeInvalidParam, err.Error())
+		}
+		address = parsed
 	}
 	environment := strings.TrimSpace(in.Environment)
 	if environment == "" {
@@ -1855,6 +1888,16 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 	}
 	// 更新场景允许口令留空（表示沿用已存口令），因此这里按"空口令"再校验一次：
 	// 模板只需要账号非空，口令是否必填由 Validate 内部按组件类型判断。
+	// 日志集成的校验交给 Filebeat 渲染器：路径、Kafka 地址、topic、级别都是它的职责，
+	// 而模板的通用 Validate 里那些"监控账号/端口"要求对日志集成并不适用。
+	if isLogTemplate(tpl) {
+		if err := s.validateLogInstance(&model.MiddlewareInstance{
+			Name: instance.Name, MWType: tpl.Type, Environment: instance.Environment,
+		}, tpl, instance); err != nil {
+			return integration.Template{}, integration.Instance{}, apperr.New(apperr.CodeInvalidParam, err.Error())
+		}
+		return tpl, instance, nil
+	}
 	if err := tpl.Validate(instance); err != nil {
 		return integration.Template{}, integration.Instance{}, apperr.New(apperr.CodeInvalidParam, err.Error())
 	}
@@ -1867,6 +1910,14 @@ func (s *IntegrationService) build(in IntegrationInput) (integration.Template, i
 // 再把 Exporter 接进「监控面（平台网络）+ 目标网络」。被管项目因此
 // 不需要建互联网络、不需要加别名，也不需要把 compose 文件交给平台。
 func (s *IntegrationService) deploy(ctx context.Context, item *model.MiddlewareInstance, tpl integration.Template, instance integration.Instance, params deployParams) error {
+	// 日志集成：产物是 Filebeat + 平台 Kafka，没有 Exporter、也不进 Prometheus。
+	// 它**必须**是远程（Ansible over SSH）：装 Filebeat 需要目标机的包管理与 root，
+	// 平台容器自身没有这个能力，本机场景也让使用者填 127.0.0.1 + SSH 凭据。
+	if isLogTemplate(tpl) {
+		meta, _ := IntegrationMetaOf(*item)
+		s.ensureLogServer(ctx, item, meta)
+		return s.deployLogIntegration(ctx, item, tpl, instance, meta, params.creds, params.operator)
+	}
 	// 远程模式：不在本机起容器，改由 Ansible 安装到目标服务器——因此**不需要** docker.sock。
 	if meta, ok := IntegrationMetaOf(*item); ok && meta.DeployTarget == DeployTargetRemote {
 		portNote := s.fixRemoteExporterPortConflict(ctx, item, &meta, tpl, instance, params.creds.Host)

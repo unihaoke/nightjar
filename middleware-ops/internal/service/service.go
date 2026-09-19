@@ -35,22 +35,23 @@ type Deps struct {
 	StartedAt     int64
 
 	// 仓储
-	Instances    *repository.InstanceRepository
-	Users        *repository.UserRepository
-	Roles        *repository.RoleRepository
-	Diagnoses    *repository.DiagnosisRepository
-	Rules        *repository.AlertRuleRepository
-	Alerts       *repository.AlertRepository
-	AlertVec     *repository.AlertEmbeddingRepository
-	Knowledge    *repository.KnowledgeRepository
-	Audits       *repository.AuditRepository
-	Approvals    *repository.ApprovalRepository
-	Fixes        *repository.FixRepository
-	Servers      *repository.ServerRepository
-	CodeRepos    *repository.CodeRepoRepository
-	LogEvents    *repository.LogEventRepository
-	CodeAnalyses *repository.CodeAnalysisRepository
-	Notifies     *repository.NotificationLogRepository
+	Instances     *repository.InstanceRepository
+	Users         *repository.UserRepository
+	Roles         *repository.RoleRepository
+	Diagnoses     *repository.DiagnosisRepository
+	Rules         *repository.AlertRuleRepository
+	Alerts        *repository.AlertRepository
+	AlertVec      *repository.AlertEmbeddingRepository
+	Knowledge     *repository.KnowledgeRepository
+	Audits        *repository.AuditRepository
+	Approvals     *repository.ApprovalRepository
+	Fixes         *repository.FixRepository
+	Servers       *repository.ServerRepository
+	CodeRepos     *repository.CodeRepoRepository
+	LogEvents     *repository.LogEventRepository
+	LogAlertRules *repository.LogAlertRuleRepository
+	CodeAnalyses  *repository.CodeAnalysisRepository
+	Notifies      *repository.NotificationLogRepository
 
 	// 领域服务
 	Auth         *AuthService
@@ -69,6 +70,10 @@ type Deps struct {
 	Notifier     *NotifierService
 	// Settings 为平台自管设置（AI 提供方 / 通知渠道），密钥加密落库、保存即生效。
 	Settings *SettingService
+	// LogPipeline 为「日志集成」的平台侧接收链路（Kafka 消费 → 日志事件）。
+	LogPipeline *LogPipeline
+	// LogAlertWorker 为日志告警的后处理（通知 + AI 代码分析），由定时任务驱动。
+	LogAlertWorker *LogAlertWorker
 
 	// 六道护栏实例（进程级共享，承载配额与熔断状态）
 	Budget    *guardrail.Budget

@@ -12,13 +12,31 @@
 |--------|------|------------|
 | M1 基础闭环 | 纳管 + 监控 + 告警规则/通知 + RBAC + 审计 | ✅ 完整实现 |
 | M2 AI 诊断 | AI 诊断中心 + 知识库 + 六道工程护栏 + 成本治理 | ✅ 完整实现 |
-| M3 代码分析 | 日志告警 + AI 代码分析（第三方 + 本地兜底）+ 高危执行审批闭环 | ✅ 实现（执行器为预演实现，见下文「已知边界」） |
+| M3 代码分析 | 日志告警（日志集成 Filebeat → 平台 Kafka）+ 日志告警规则 + AI 代码分析（第三方 + 本地兜底）+ 高危执行审批闭环 | ✅ 实现（执行器为预演实现，见下文「已知边界」） |
 
 **一期核心能力（与设计文档 4.1 能力矩阵一致）**：Redis / MySQL / PostgreSQL / Kafka / Elasticsearch 支持纳管、监控、阈值告警与 AI 诊断；Nginx 支持纳管、监控与告警（不做 AI 诊断）；RabbitMQ 本版本仅纳管。
 
 **集成中心（M3 增强）**：在页面上选组件、填地址与账号即可完成「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」，
 对齐云厂商 Prometheus 控制台的「数据采集 → 集成中心」。抓取目标走 `file_sd`，新增集成无需重启 Prometheus；
 可选挂载 `docker.sock` 由平台一键拉起 Exporter 容器。详见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)。
+
+**日志集成（M3 增强）**：集成中心另有**日志类型集成**（模板 `type: "log"`、`category: "log"`）——平台用 **Ansible 在目标服务器幂等部署 Filebeat**
+（已安装则跳过安装、只在配置内容变化时重启），Filebeat 把日志推到**平台自带的 Kafka**（compose 里的 `kafka` 服务，KRaft 单节点），
+后端按消费组 `mwops-log-ingest` 消费 topic `mwops-logs`，复用既有日志事件链路（错误指纹 / 通知 / AI 代码分析入口）。
+它不装 Exporter、不经过 Prometheus、也不需要 `docker.sock`。详见 [`docs/LOG_INTEGRATION.md`](docs/LOG_INTEGRATION.md)。
+
+**日志告警规则与 AI 代码定位（M3 增强）**：日志事件的处理参数不写死在代码里，而由**日志告警规则**
+（页面「日志告警 → 日志告警规则」，表 `log_alert_rules`）按「服务 + 错误指纹 + 级别」逐条配置——
+**去重窗口**（窗口内同指纹只合并计数）、**冷却期**（冷却内不重复通知、不重复触发 AI，事件照常记录）、
+**通知渠道**、**AI 开关**与**优先级**（数字小者优先，让特例规则压过通用规则）；一条规则都没命中时
+回落到 `log_alert.default_*` 的平台默认值，所以零配置也能跑通。
+落库后的通知与 AI 由**后处理**（`service/logalert_worker.go`，定时扫描 `analysis_state=pending`，
+状态落库、重启不丢、多副本用条件更新抢占）完成：先外发通知，再按服务名拉取代码
+（`internal/repo`：**首次 clone、之后只更新到远端**，缓存目录 `code_repo.cache_dir`），
+最后产出**三点式代码结论**（定位文件行 / 根因 / 应急处置 / 修复建议）。
+「服务 → 代码仓库」映射没配时事件是 `analysis_state=disabled`，拉取或调用失败则是 `failed` +
+`analysis_error`（页面直接可读的中文原因），并可点「重新分析」打破冷却立即重跑。
+详见 [`docs/COLLECTOR.md`](docs/COLLECTOR.md) 6.5 / 6.6。
 
 ---
 
@@ -34,7 +52,7 @@ docker compose up -d --build
 
 启动后访问 `http://<主机>:8000`，使用 `.env` 中的管理员账号登录（默认 `admin`），**登录后请立即修改密码**。
 
-包含组件：PostgreSQL 15 + pgvector、Redis 7、Prometheus、**Grafana（统一监控大盘）**、后端（Go）、Nginx + 前端静态资源。
+包含组件：PostgreSQL 15 + pgvector、Redis 7、**Kafka（日志总线，默认启用）**、Prometheus、**Grafana（统一监控大盘）**、后端（Go）、Nginx + 前端静态资源。
 
 > **监控栈统一在本平台**：被管项目（如某业务系统）不再需要自带 Prometheus / Grafana / Exporter——
 > 平台按「集成中心」的配置创建只读监控账号、拉起 Exporter、自动接入对方网络并抓取；
@@ -83,7 +101,6 @@ npm run dev                                          # 监听 :5173
 .
 ├── middleware-ops/                 # 后端（Go，模块化单体）
 │   ├── cmd/server/                 # 入口：配置→日志→DB→缓存→引擎→服务→路由→调度
-│   ├── cmd/agent/                  # 轻量日志采集 Agent（零依赖，可交叉编译投放）
 │   ├── configs/config.yaml         # 默认配置（含全部注释说明）
 │   └── internal/
 │       ├── config/                 # viper 配置 + 环境变量覆盖 + 启动期校验
@@ -104,6 +121,8 @@ npm run dev                                          # 监听 :5173
 │       │       ├── quality.go      # ⑤ 质量护栏（结构化/证据/推测标注/评测集）
 │       │       └── cost.go         # ⑥ 成本治理（确定性缓存/配额/熔断）
 │       ├── monitor/                # Prometheus 查询封装（不含自研采集器）+ 模拟器
+│       ├── logpipe/                # 日志集成：Kafka 消费（消费组 mwops-log-ingest）+ Filebeat 事件解析
+│       ├── repo/                   # 服务代码仓库本地缓存：首次 clone、之后更新到远端（路径越界防护 + 凭据脱敏 + git 错误中文翻译）
 │       ├── integration/            # 集成中心：组件模板 + 采集配置渲染（纯函数，可单测）
 │       ├── docker/                 # Docker Engine API 最小客户端（一键拉起 Exporter）
 │       ├── pkg/cache/              # 缓存与任务队列抽象（Redis / 内存双实现）
@@ -111,6 +130,10 @@ npm run dev                                          # 监听 :5173
 │       │   ├── ai/                 # 上下文组装与固定 Prompt 模板
 │       │   ├── diagnose.go         # AI 诊断编排（六道护栏落点）
 │       │   ├── alert.go            # 告警收敛（窗口去重/冷却/语义聚类）
+│       │   ├── logpipeline.go      # 日志集成：Kafka 消费编排、链路状态与探测
+│       │   ├── logalertrule.go     # 日志告警规则：按服务/指纹/级别匹配（priority 小者优先），命中不到用平台默认值
+│       │   ├── logalert_worker.go  # 日志告警后处理：定时扫 pending → 通知渠道 + 拉代码 + AI 三点式分析
+│       │   ├── repo_adapter.go     # 把 internal/repo 的 Fetcher 适配成服务层的 RepoFetcher（进程级配置一次注入）
 │       │   ├── fix.go / approval.go# 操作分级、审批链路、结果回填
 │       │   ├── audit.go            # 审计哈希链与每日快照
 │       │   └── codeanalysis.go     # 三点式代码分析 + 出网合规
@@ -127,12 +150,11 @@ npm run dev                                          # 监听 :5173
 │   ├── postgres/init/              # 只建扩展与数据库参数，不建表
 │   ├── prometheus/                 # prometheus.yml / prometheus.with-exporters.yml / rules
 │   ├── grafana/                    # 统一大盘：provisioning（数据源+加载器）与 dashboards 目录
-│   ├── agent/                      # 自托管日志采集 Agent 模板（agent.example.yaml）
 │   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
 ├── docker-compose.yml              # 一键部署编排
 ├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
 ├── scripts/onboard.sh        # 一键接入/修复：只维护 .env，其余全自动
-├── scripts/doctor.sh       # 跨栈体检：平台/网络/别名/Exporter/采集/抓取
+├── scripts/doctor.sh       # 跨栈体检：平台/网络/别名/Exporter/日志集成/抓取
 └── Makefile                        # 常用开发/部署命令
 ```
 
@@ -166,7 +188,7 @@ npm run dev                                          # 监听 :5173
 埋点/阈值 → 去重收敛（指纹 + 窗口 + 冷却） → AI 按需介入 → 结构化诊断 → 多渠道通知 → 知识草稿沉淀 → 人工确认转正
 ```
 
-AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管线与调度器完成（`scheduler` 承载健康巡检、规则评估、语义聚类、审计快照、审批超时五类任务）。
+AI 不做苦力活：日志采集（目标机 Filebeat）、指标采集、规则评估全部由集成部署的采集组件与调度器完成（`scheduler` 承载健康巡检、规则评估、语义聚类、审计快照、审批超时五类任务）。
 
 ---
 
@@ -181,6 +203,7 @@ AI 不做苦力活：日志 tail、指标采集、规则评估全部由采集管
 完整接口清单见 [`docs/API.md`](docs/API.md)，接入与运维说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)，
 **「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-ONBOARD.md`](docs/GUIDE-ONBOARD.md)（以某业务系统为例）**，
 **「集成中心」的字段对照与落地方式见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)**，
+**「日志集成（Filebeat → 平台 Kafka）」的拓扑、自检与配置见 [`docs/LOG_INTEGRATION.md`](docs/LOG_INTEGRATION.md)**，
 **「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**。
 
 ---

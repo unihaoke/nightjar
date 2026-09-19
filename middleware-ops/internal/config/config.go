@@ -3,7 +3,10 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,10 +25,124 @@ type Config struct {
 	Prometheus  PrometheusConfig  `mapstructure:"prometheus"`
 	Integration IntegrationConfig `mapstructure:"integration"`
 	Notify      NotifyConfig      `mapstructure:"notify"`
+	Kafka       KafkaConfig       `mapstructure:"kafka"`
+	LogAlert    LogAlertConfig    `mapstructure:"log_alert"`
+	CodeRepo    CodeRepoConfig    `mapstructure:"code_repo"`
 	Guardrail   GuardrailConfig   `mapstructure:"guardrail"`
 	Scheduler   SchedulerConfig   `mapstructure:"scheduler"`
 	Log         LogConfig         `mapstructure:"log"`
 }
+
+// LogAlertConfig 是日志告警的**默认**处理参数。
+//
+// 为什么要有默认值：规则表是"按需细化"的——没人配规则时链路也必须能跑通
+// （去重合并 + 冷却 + 自动 AI 分析 + 通知）。因此在 log_alert_rules 里没有命中时，
+// 用这里的默认值构造一条虚拟规则（见 service.effectiveRuleFor）。
+type LogAlertConfig struct {
+	// DefaultDedupWindow 为默认去重窗口（分钟）：窗口内同指纹只合并计数。
+	DefaultDedupWindow int `mapstructure:"default_dedup_window"`
+	// DefaultCooldown 为默认冷却期（分钟）：冷却内不重复通知、不重复触发 AI。
+	DefaultCooldown int `mapstructure:"default_cooldown"`
+	// DefaultAIEnabled 为默认是否自动做 AI 代码分析。
+	DefaultAIEnabled bool `mapstructure:"default_ai_enabled"`
+	// DefaultNotifyChannels 为默认通知渠道（空表示用平台通知配置里的启用渠道）。
+	DefaultNotifyChannels []string `mapstructure:"default_notify_channels"`
+	// WorkerInterval 为后处理（通知 + AI 分析）的扫描间隔（秒）。
+	WorkerInterval int `mapstructure:"worker_interval_seconds"`
+	// WorkerBatch 为每轮处理的事件数上限（限流：AI 分析很贵，批量不能太大）。
+	WorkerBatch int `mapstructure:"worker_batch"`
+	// AnalyzeTimeout 为单条事件的 AI 分析超时。
+	AnalyzeTimeout time.Duration `mapstructure:"analyze_timeout"`
+}
+
+// CodeRepoConfig 是"AI 分析用的代码仓库本地缓存"的配置。
+type CodeRepoConfig struct {
+	// CacheDir 为仓库缓存根目录（每个服务一个子目录）。
+	CacheDir string `mapstructure:"cache_dir"`
+	// CloneTimeout / PullTimeout 为首次克隆与后续更新的超时。
+	CloneTimeout time.Duration `mapstructure:"clone_timeout"`
+	PullTimeout  time.Duration `mapstructure:"pull_timeout"`
+	// RefreshInterval 为同一仓库两次拉取的最小间隔（秒）：风暴期间同服务反复触发分析时，
+	// 不能每条都去 pull 一次远端（既慢又容易被代码托管限流）。
+	RefreshInterval int `mapstructure:"refresh_interval_seconds"`
+	// AllowOutbound 控制"平台是否允许从代码托管拉取代码"（默认允许）。
+	//
+	// 与 CodeRepo.AllowThirdParty 是**两件事**，刻意分开：
+	//   - 本开关管"能不能 git clone/pull"（内网 GitLab 也该允许）；
+	//   - AllowThirdParty 管"能不能把代码片段发给第三方 AI"（合规上更敏感）。
+	// 把它们合成一个开关的后果是：不想用第三方 AI 的团队会连内网仓库都拉不下来，
+	// 于是整个 AI 代码分析功能形同虚设。
+	AllowOutbound bool `mapstructure:"allow_outbound"`
+}
+
+// KafkaConfig 是日志总线配置（「日志集成」：Filebeat → Kafka → 平台消费）。
+//
+// 两套地址必须分清，这是本功能最容易配错的地方：
+//   - Brokers：**平台自己**消费用的地址（容器网络内的 INTERNAL 监听器，如 kafka:29092）；
+//   - ExternalHost/Port：**被管服务器上的 Filebeat** 要连的地址（宿主可达地址）。
+//
+// 两者来自同一套 advertised listeners；ExternalHost 填错（例如填 localhost）时，
+// 其他机器上的 Filebeat 会"连上又立刻断开"，因为 Kafka 把 broker 元数据里的地址
+// 换成了它自己的 127.0.0.1。日志集成的自检第 3 步专门探测这个地址。
+type KafkaConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Brokers 为平台侧 bootstrap 地址（INTERNAL 监听器）。
+	Brokers []string `mapstructure:"brokers"`
+	// LogTopic 为日志主题；Filebeat 往这里写，平台消费者从这里读。
+	LogTopic string `mapstructure:"log_topic"`
+	// GroupID 为消费组：平台多副本部署时同一组内的消息只被消费一次。
+	GroupID  string `mapstructure:"group_id"`
+	ClientID string `mapstructure:"client_id"`
+	// ExternalHost / ExternalPort 为被管服务器接入用的地址（写进 filebeat.yml 的 hosts）。
+	ExternalHost string `mapstructure:"external_host"`
+	ExternalPort int    `mapstructure:"external_port"`
+	// FilebeatVersion 为在目标机上安装的 Filebeat 版本。
+	FilebeatVersion string `mapstructure:"filebeat_version"`
+	// MaxBytes 为单条消息上限（字节）。日志里可能有很长的堆栈，默认给到 10MB，
+	// 与 Filebeat 侧 max_message_bytes 保持同一量级。
+	MaxBytes int `mapstructure:"max_bytes"`
+	// SessionTimeout / CommitInterval 是消费组与会话参数。
+	SessionTimeout time.Duration `mapstructure:"session_timeout"`
+	CommitInterval time.Duration `mapstructure:"commit_interval"`
+	// StartOffset 决定消费组第一次消费从哪里开始：earliest（默认，避免漏掉积压）| latest。
+	StartOffset string `mapstructure:"start_offset"`
+}
+
+// Active 报告日志总线是否可用：启用了且确实配了 broker。
+//
+// 为什么把"启用"与"配了地址"分开：`.env` 里 KAFKA_ENABLED 默认 true，
+// 而裸机/单容器调试时往往没有 Kafka——此时平台必须**照常启动**，只是日志集成不可用。
+func (k KafkaConfig) Active() bool { return k.Enabled && len(k.NonEmptyBrokers()) > 0 }
+
+// NonEmptyBrokers 去掉空串（环境变量写成 "a,b," 时会产生空项）。
+func (k KafkaConfig) NonEmptyBrokers() []string {
+	out := make([]string, 0, len(k.Brokers))
+	for _, broker := range k.Brokers {
+		if trimmed := strings.TrimSpace(broker); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// ExternalAddress 返回被管服务器上 Filebeat 要连的 host:port。
+func (k KafkaConfig) ExternalAddress() string {
+	host := strings.TrimSpace(k.ExternalHost)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := k.ExternalPort
+	if port <= 0 {
+		port = 9092
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// FilebeatHosts 返回渲染进 filebeat.yml 的 hosts。
+//
+// 当前只给一个对外地址（单节点 Kafka）；保留切片形态是为了将来接多 broker 时
+// 不用改渲染器签名与前端契约。
+func (k KafkaConfig) FilebeatHosts() []string { return []string{k.ExternalAddress()} }
 
 // AppConfig 应用元信息。
 type AppConfig struct {
@@ -394,6 +511,111 @@ func (c *Config) applyEnvOnly() {
 	if v := viper.GetString("notify.wecom.webhook"); v != "" {
 		c.Notify.WeCom.Webhook = v
 	}
+	// kafka.brokers 是切片，AutomaticEnv 无法把 "kafka:29092,a:9092" 解析成 []string，
+	// 因此显式补一次；逗号分隔（与 compose/.env 的写法一致）。
+	if raw := strings.TrimSpace(viper.GetString("MWOPS_KAFKA_BROKERS")); raw != "" {
+		c.Kafka.Brokers = splitAndTrim(raw)
+	} else if raw := strings.TrimSpace(viper.GetString("kafka.brokers")); raw != "" {
+		c.Kafka.Brokers = splitAndTrim(raw)
+	}
+	c.applyEnvLogAlert()
+	c.applyEnvCodeRepo()
+}
+
+// envOf 读取平台环境变量（MWOPS_ + 键名大写、点转下划线）。
+//
+// 为什么不用 viper.GetXxx：viper 的 AutomaticEnv 只在"该键已被显式访问过"时可靠，
+// 而 Unmarshal 走的是 AllSettings()，**不含**仅存在于环境变量里的嵌套键——
+// 结果是"在 .env 里改了 log_alert.default_cooldown 却毫无效果"，
+// 这种"配了不生效"比报错难查得多（本仓库已有 applyEnvOnly 的先例）。
+func envOf(key string) (string, bool) {
+	return os.LookupEnv("MWOPS_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_")))
+}
+
+// applyEnvLogAlert 用环境变量覆盖日志告警参数（只在变量真实存在时覆盖）。
+func (c *Config) applyEnvLogAlert() {
+	if raw, ok := envOf("log_alert.default_dedup_window"); ok {
+		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+			c.LogAlert.DefaultDedupWindow = v
+		}
+	}
+	if raw, ok := envOf("log_alert.default_cooldown"); ok {
+		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+			c.LogAlert.DefaultCooldown = v
+		}
+	}
+	if raw, ok := envOf("log_alert.default_ai_enabled"); ok {
+		c.LogAlert.DefaultAIEnabled = parseBool(raw, c.LogAlert.DefaultAIEnabled)
+	}
+	if raw, ok := envOf("log_alert.default_notify_channels"); ok {
+		c.LogAlert.DefaultNotifyChannels = splitAndTrim(raw)
+	}
+	if raw, ok := envOf("log_alert.worker_interval_seconds"); ok {
+		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+			c.LogAlert.WorkerInterval = v
+		}
+	}
+	if raw, ok := envOf("log_alert.worker_batch"); ok {
+		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+			c.LogAlert.WorkerBatch = v
+		}
+	}
+	if raw, ok := envOf("log_alert.analyze_timeout"); ok {
+		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
+			c.LogAlert.AnalyzeTimeout = v
+		}
+	}
+}
+
+// applyEnvCodeRepo 用环境变量覆盖代码仓库缓存参数。
+func (c *Config) applyEnvCodeRepo() {
+	if raw, ok := envOf("code_repo.cache_dir"); ok {
+		if v := strings.TrimSpace(raw); v != "" {
+			c.CodeRepo.CacheDir = v
+		}
+	}
+	if raw, ok := envOf("code_repo.clone_timeout"); ok {
+		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
+			c.CodeRepo.CloneTimeout = v
+		}
+	}
+	if raw, ok := envOf("code_repo.pull_timeout"); ok {
+		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
+			c.CodeRepo.PullTimeout = v
+		}
+	}
+	if raw, ok := envOf("code_repo.refresh_interval_seconds"); ok {
+		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+			c.CodeRepo.RefreshInterval = v
+		}
+	}
+	if raw, ok := envOf("code_repo.allow_outbound"); ok {
+		c.CodeRepo.AllowOutbound = parseBool(raw, c.CodeRepo.AllowOutbound)
+	}
+}
+
+// parseBool 解析开关型环境变量；无法识别时保留原值（不静默改成 false）。
+func parseBool(raw string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on", "y":
+		return true
+	case "0", "false", "no", "off", "n":
+		return false
+	default:
+		return fallback
+	}
+}
+
+// splitAndTrim 按逗号切分并去掉空项与首尾空白。
+func splitAndTrim(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // Validate 校验关键配置，把「启动即失败」的问题挡在启动阶段。
@@ -414,6 +636,21 @@ func (c *Config) Validate() error {
 	}
 	if c.Guardrail.MaxConcurrency <= 0 {
 		return fmt.Errorf("guardrail.max_concurrency 必须为正数")
+	}
+	// Kafka 只在真的启用时才校验：没配 broker 是合法的降级态（日志集成不可用，其余功能正常），
+	// 配置写错了则必须启动即失败——否则会变成"日志一直收不到"这种最难查的静默失效。
+	if c.Kafka.Active() {
+		for _, broker := range c.Kafka.NonEmptyBrokers() {
+			if _, _, err := net.SplitHostPort(broker); err != nil {
+				return fmt.Errorf("kafka.brokers 中的 %q 不是合法的 host:port", broker)
+			}
+		}
+		if strings.TrimSpace(c.Kafka.LogTopic) == "" {
+			return fmt.Errorf("kafka.log_topic 不能为空（Filebeat 与平台消费者靠它对接）")
+		}
+		if strings.TrimSpace(c.Kafka.GroupID) == "" {
+			return fmt.Errorf("kafka.group_id 不能为空（多副本部署时它决定消息只被消费一次）")
+		}
 	}
 	return nil
 }

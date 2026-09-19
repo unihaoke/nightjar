@@ -158,8 +158,13 @@ func TestNodeTemplateIsHostMode(t *testing.T) {
 	if tpl.ExporterPort != 9100 {
 		t.Fatalf("node_exporter 默认端口应为 9100，实际 %d", tpl.ExporterPort)
 	}
-	// 所有组件都应有二进制安装信息，否则「binary 安装方式」对它是不可用能力。
+	// 所有**指标监控**组件都应有二进制安装信息，否则「binary 安装方式」对它是不可用能力。
+	// 日志集成（category=log）刻意排除：它不装 Exporter，落地产物是 Filebeat 的包/容器安装
+	//（见 ansible_log.go），Release 对它没有语义——硬塞一个只会让前端渲染出一个并不存在的下载地址。
 	for _, item := range Templates() {
+		if item.CategoryOf() == CategoryLog {
+			continue
+		}
 		if item.Release == nil {
 			t.Fatalf("%s 缺少 Release 元数据（二进制安装模式不可用）", item.Type)
 		}
@@ -183,12 +188,12 @@ func TestBinaryInstallPlaybook(t *testing.T) {
 		t.Fatalf("渲染失败：%v", err)
 	}
 	for _, want := range []string{
-		"uname -m",                     // 需要识别架构选包
-		"ansible.builtin.get_url",      // 下载官方 release
-		"ansible.builtin.unarchive",    // 解压
-		"EnvironmentFile=",             // 口令走 env 文件（0600）
-		"/etc/systemd/system/",         // 原生 systemd 单元
-		"node_exporter-1.8.2.linux-",   // 默认下载地址规则
+		"uname -m",                   // 需要识别架构选包
+		"ansible.builtin.get_url",    // 下载官方 release
+		"ansible.builtin.unarchive",  // 解压
+		"EnvironmentFile=",           // 口令走 env 文件（0600）
+		"/etc/systemd/system/",       // 原生 systemd 单元
+		"node_exporter-1.8.2.linux-", // 默认下载地址规则
 	} {
 		if !strings.Contains(art.Playbook, want) {
 			t.Fatalf("二进制安装 playbook 应包含 %q：\n%s", want, art.Playbook)
@@ -278,11 +283,11 @@ func TestRemoteAccountSQLPlaybook(t *testing.T) {
 		t.Fatalf("渲染失败：%v", err)
 	}
 	for _, want := range []string{
-		"command -v mysql",         // 先探测目标机自带客户端
-		"command -v docker",        // 缺失时探测 docker 作为回退
+		"command -v mysql",  // 先探测目标机自带客户端
+		"command -v docker", // 缺失时探测 docker 作为回退
 		"docker run --rm --network host",
-		"MYSQL_PWD",                // 口令走环境变量
-		"ansible.builtin.fail",     // 两者都没有时明确失败（不擅自装包）
+		"MYSQL_PWD",            // 口令走环境变量
+		"ansible.builtin.fail", // 两者都没有时明确失败（不擅自装包）
 		"127.0.0.1",
 	} {
 		if !strings.Contains(art.Playbook, want) {
@@ -328,7 +333,7 @@ func TestRemoteAccountSQLPlaybook(t *testing.T) {
 //
 // 真实反馈：曾经加过一道"账号与口令都空则拒绝保存"的门槛，结果无 requirepass 的 Redis
 // 既填不出账号也填不出口令，使用者被彻底卡住。正确做法是放行 + 靠 Exporter 日志自证
-//（NOAUTH → 平台翻译成"需要认证/口令不一致"写回备注）。
+// （NOAUTH → 平台翻译成"需要认证/口令不一致"写回备注）。
 func TestAnonymousInstancesCanBeSaved(t *testing.T) {
 	for _, mwType := range []string{TypeRedis, TypeKafka, TypeNginx, TypeES} {
 		tpl, ok := TemplateOf(mwType)
@@ -356,7 +361,9 @@ func TestAnonymousInstancesCanBeSaved(t *testing.T) {
 //
 // 真实故障：生成的 playbook 里写了 `port: {{ exporter_port }}`，YAML 把行首的 `{{`
 // 当成 flow mapping 解析，ansible 直接报
-//   found unacceptable key (unhashable type: 'AnsibleMapping')
+//
+//	found unacceptable key (unhashable type: 'AnsibleMapping')
+//
 // 整个远程安装（含建号）全部失败。这里对所有渲染产物做一遍扫描，防止再犯。
 func TestRenderedPlaybooksQuoteJinjaValues(t *testing.T) {
 	for _, mwType := range []string{TypeRedis, TypeMySQL, TypeNode} {
@@ -537,11 +544,13 @@ func TestPlaybookHasNoMultilineQuotedScalar(t *testing.T) {
 		}
 	}
 }
+
 // TestCommandModuleAvoidsShellFeatures 锁定：ansible.builtin.command 只用于真正的可执行文件。
 //
 // ansible.builtin.command **不经 shell** 执行（直接 execvp），因此
 //   - shell 内建（`command -v`、`cd`、`source`）会以 "No such file or directory: b'command'" 失败；
 //   - 管道/重定向/`;`/`&&` 会被当成普通参数传给程序（`>` 变成字面量）。
+//
 // 需要这些能力必须用 ansible.builtin.shell。
 func TestCommandModuleAvoidsShellFeatures(t *testing.T) {
 	const prefix = "ansible.builtin.command:"

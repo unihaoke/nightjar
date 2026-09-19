@@ -35,6 +35,19 @@ const (
 	// TypeNode 是**主机监控**（node_exporter）：采集对象是服务器本身，
 	// 不是某个中间件实例。它是"跨机一键部署"里最常用的一类。
 	TypeNode = "node"
+	// TypeLog 是**日志集成**（Filebeat → 平台 Kafka），与上面七个有本质区别：
+	// 它不装 Exporter、不暴露端口、不被 Prometheus 抓取，因此 Image / ExporterPort /
+	// MetricsPath / Alerts / Dashboard 全部留空——那些字段是「指标监控」的语义，
+	// 给它填任何值都会让前端渲染出一个根本不存在的 Exporter（见 docs/LOG_INTEGRATION.md §四）。
+	TypeLog = "log"
+)
+
+// 集成分类：前端据此决定「新建集成」时展示哪一组表单与哪条落地链路。
+const (
+	// CategoryMonitor 是默认分类：Exporter + Prometheus + 告警 + 大盘。
+	CategoryMonitor = "monitor"
+	// CategoryLog 是日志分类：Filebeat + 平台 Kafka，没有 Exporter 与 Prometheus。
+	CategoryLog = "log"
 )
 
 // ReleaseSpec 描述「二进制安装模式」所需的 GitHub Release 资产信息。
@@ -107,6 +120,12 @@ type Template struct {
 	Name        string `json:"name"`
 	Component   string `json:"component"`
 	Description string `json:"description"`
+	// Category 为集成分类（monitor / log）。
+	//
+	// 只有日志模板会显式赋值，其余留空并由 CategoryOf 兜底成 monitor：
+	// 这样新增分类时不必改动既有 8 个模板字面量（少改一处就少一次"手滑改错值"的风险，
+	// 也保证既有模板的字段值逐字节不变）。
+	Category string `json:"category"`
 	// Phase 1 表示支持「纳管 + 监控 + 告警 + AI 诊断」，2 表示仅纳管。
 	Phase int `json:"phase"`
 	// Image 为官方 Exporter 镜像；平台可据此一键拉起容器。
@@ -151,6 +170,18 @@ type Template struct {
 	Docs      []string        `json:"docs"`
 	Alerts    []AlertTemplate `json:"alerts"`
 	Dashboard Dashboard       `json:"dashboard"`
+}
+
+// CategoryOf 返回模板所属的集成分类。
+//
+// 为什么用方法而不是"给每个模板填 Category 字段"：分类是**类型决定的**（log 类型必然是
+// 日志集成），逐个填字段只会多出 8 处可能与 Type 不一致的冗余数据。这里以 Type 为唯一依据，
+// Category 字段仅用于日志模板的显式声明（也便于外部序列化时直接读取）。
+func (t Template) CategoryOf() string {
+	if t.Type == TypeLog {
+		return CategoryLog
+	}
+	return CategoryMonitor
 }
 
 // ---------------------------------------------------------------------------
@@ -357,9 +388,9 @@ var templates = map[string]Template{
 	},
 	TypeNginx: {
 		Type: TypeNginx, Name: "Nginx", Component: "nginx-prometheus-exporter",
-		Description:  "Nginx 指标暴露（连接数、请求速率、5xx 错误率、upstream 响应时间）",
-		Phase:        1,
-		Image:        "nginx/nginx-prometheus-exporter:1.3.0",
+		Description: "Nginx 指标暴露（连接数、请求速率、5xx 错误率、upstream 响应时间）",
+		Phase:       1,
+		Image:       "nginx/nginx-prometheus-exporter:1.3.0",
 		// 该仓库的 release 资产用下划线命名，与默认规则不同，必须显式给出模板。
 		Release: &ReleaseSpec{
 			Repo: "nginx/nginx-prometheus-exporter", Version: "1.3.0", Binary: "nginx-prometheus-exporter",
@@ -400,9 +431,9 @@ var templates = map[string]Template{
 		Phase:        1,
 		Image:        "quay.io/prometheus/node-exporter:v1.8.2",
 		ExporterPort: 9100, DefaultPort: 9100, MetricsPath: "/metrics",
-		NeedsAuth:    false,
-		HostNetwork:  true,
-		HostPID:      true,
+		NeedsAuth:   false,
+		HostNetwork: true,
+		HostPID:     true,
 		// 宿主根目录只读挂载：node_exporter 依赖 /proc、/sys 才能读到宿主机真实指标。
 		HostMounts:   []string{"/:/host:ro,rslave"},
 		AddressLabel: "目标主机", AddressHint: "本机填 127.0.0.1，跨机填目标机 IP；端口默认 9100",
@@ -442,22 +473,99 @@ var templates = map[string]Template{
 		},
 		Dashboard: Dashboard{Title: "Node Exporter Full", ID: "1860"},
 	},
+	// ---------------------------------------------------------------------------
+	// 日志集成（Filebeat → 平台 Kafka）
+	//
+	// 与上面所有模板的**根本差异**：这条链路里没有 Exporter、没有抓取端口、没有 Prometheus。
+	// 因此：
+	//   - Image / ExporterPort / MetricsPath / Release / Alerts / Dashboard 全部留空——
+	//     它们是「指标监控」的语义，填任何值都会让前端渲染出一个并不存在的 Exporter；
+	//   - 参数全部是 Filebeat 渲染器的输入（见 filebeat.go 的 LogInput），
+	//     落地产物是 filebeat.yml + 一份幂等安装 playbook（见 ansible_log.go）；
+	//   - 幂等部署规则见 docs/LOG_INTEGRATION.md §四「已存在则不需要部署」。
+	// ---------------------------------------------------------------------------
+	TypeLog: {
+		Type: TypeLog, Name: "日志 / Filebeat", Component: "filebeat",
+		Category: CategoryLog,
+		Description: "把目标服务器上的应用日志经 Filebeat 采集并推送到平台 Kafka（多行合并、级别过滤、断点续传），" +
+			"支持物理机 / 容器 / K8s 节点等任意能被 SSH 到的机器",
+		Phase: 1,
+		// 刻意**不设** Image / ExporterPort / MetricsPath / Release / Alerts / Dashboard：
+		// 日志集成不暴露指标，平台只提供 Kafka 与消费链路（docs/LOG_INTEGRATION.md §二）。
+		// ExporterPort 保持 0 也是刻意的：filebeat.go 不拿它做任何事，前端也不会显示端口字段。
+		NeedsAuth:    false,
+		AddressLabel: "目标服务器",
+		AddressHint:  "填被管服务器地址（本机也填 127.0.0.1，日志集成统一走 SSH 安装）",
+		Options: []Option{
+			{Key: "MWOPS_LOG_PATHS", Label: "日志路径", Target: TargetEnv, Kind: "string",
+				Help: "日志文件通配，多个用换行或逗号分隔（如 /var/log/app/*.log 与 /data/logs/**/*.log）。" +
+					"必须写**目标机上**存在的真实路径；写错不会报错，只会「采不到日志」——自检第一步先看这个"},
+			{Key: "MWOPS_LOG_SERVICE", Label: "服务名", Target: TargetEnv, Kind: "string",
+				Help: "写进事件的 service 字段，用于日志页按服务归集；留空时回落为集成名"},
+			{Key: "MWOPS_LOG_ENVIRONMENT", Label: "环境", Target: TargetEnv, Kind: "string", Default: "dev",
+				Help: "写进事件的 environment 字段，用于区分 dev / test / prod"},
+			{Key: "MWOPS_LOG_LEVEL", Label: "最低级别", Target: TargetEnv, Kind: "string", Default: "ERROR",
+				Help: "ERROR 只收错误行，WARN 收 ERROR+WARN，INFO 不过滤（全收）。" +
+					"过滤在目标机的 Filebeat 里完成，所以能显著降低 Kafka 与平台的负载"},
+			{Key: "MWOPS_LOG_MULTILINE", Label: "合并多行堆栈", Target: TargetEnv, Kind: "bool", Default: "true",
+				Help: "开启后 Java / Python 的异常堆栈会被合并成一条事件；关闭则一行一条（堆栈会被拆散，不建议）"},
+			{Key: "MWOPS_LOG_MULTILINE_PATTERN", Label: "多行匹配正则", Target: TargetEnv, Kind: "string",
+				Help: "留空按 Java 日志默认（行首时间戳起新事件）；Python 等其它格式见 docs/LOG_INTEGRATION.md"},
+			{Key: "MWOPS_LOG_INSTALL_MODE", Label: "安装方式", Target: TargetEnv, Kind: "string", Default: "auto",
+				Help: "auto（已装则复用 → docker → 包安装）/ package（deb/rpm + systemd）/ docker（官方镜像容器）"},
+			{Key: "MWOPS_LOG_FILEBEAT_VERSION", Label: "Filebeat 版本", Target: TargetEnv, Kind: "string",
+				Default: "8.16.0",
+				Help:    "默认 8.16.0；必须 ≥ 7.15（filestream 输入从此版本起可用）"},
+		},
+		Notes: []string{
+			"需要目标机能被平台 SSH 到（走与 Exporter 集成同一套凭据），并且能访问**平台 Kafka 的对外地址**" +
+				"（docs/LOG_INTEGRATION.md §三的 KAFKA_ADVERTISED_HOST）。",
+			"**advertised 地址配错的典型现象**：Filebeat 能连上 9092、握手也成功，但拿到 broker 元数据后**立刻断开**，日志里报 " +
+				"`dial tcp 127.0.0.1:9092: connect: connection refused` —— 因为 broker 把它引导去了目标机自己的 127.0.0.1。" +
+				"这种「连上了又断开」不是网络问题，先把 KAFKA_ADVERTISED_HOST 改成目标机能访问到的宿主 IP/域名。",
+			"**目标机时钟偏移过大（NTP 未同步）会被拒收**：Kafka 3.6+ 默认校验 `message.timestamp.difference.max.ms`，" +
+				"时间戳超出容忍窗口的消息直接以 `InvalidTimestampException` 丢弃。报「Filebeat 显示已发送但平台没有日志」时，" +
+				"先在目标机跑 `chronyc tracking` / `timedatectl` 确认时钟。",
+			"**重复安装是安全的（幂等）**：playbook 先 `command -v filebeat` + `systemctl is-active filebeat` 探测，" +
+				"已安装则只校验/下发配置，不重装；配置内容用 `copy` 的 checksum 语义判定，内容不变时不重启 Filebeat" +
+				"（避免每次重放都抖动采集）。",
+			"本集成**不需要**平台侧 docker.sock，也不在平台起采集容器：采集在被管侧自洽运行，平台重启不影响采集" +
+				"（断点续传由 Filebeat 的注册表保证）。",
+			"「最低级别」只做**行内关键字**过滤（ERROR/WARN/INFO），不做结构化解析：以 JSON 输出的应用日志若级别字段不在正文里，" +
+				"请选 INFO 全收，由平台侧按字段判断。",
+		},
+		Docs: []string{
+			"https://www.elastic.co/guide/en/beats/filebeat/8.16/filebeat-input-filestream.html",
+			"https://www.elastic.co/guide/en/beats/filebeat/8.16/kafka-output.html",
+		},
+	},
 }
 
 // Templates 返回全部模板（按类型名排序，供前端渲染集成中心卡片）。
 func Templates() []Template {
 	out := make([]Template, 0, len(templates))
 	for _, tpl := range templates {
+		// 在这里补齐 Category：接口返回的模板必须自带分类，否则前端得自己按 Type 猜，
+		// 而"前端猜一遍、后端再猜一遍"正是分类字段走样的开始。
+		if tpl.Category == "" {
+			tpl.Category = tpl.CategoryOf()
+		}
 		out = append(out, tpl)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Type < out[j].Type })
 	return out
 }
 
-// TemplateOf 返回指定组件模板。
+// TemplateOf 返回指定组件模板（同样补齐 Category，保证单模板接口与列表接口一致）。
 func TemplateOf(mwType string) (Template, bool) {
 	tpl, ok := templates[strings.ToLower(strings.TrimSpace(mwType))]
-	return tpl, ok
+	if !ok {
+		return Template{}, false
+	}
+	if tpl.Category == "" {
+		tpl.Category = tpl.CategoryOf()
+	}
+	return tpl, true
 }
 
 // SupportedTypes 返回可集成的组件类型。
@@ -626,8 +734,14 @@ func (t Template) Validate(in Instance) error {
 	if in.Address.Host == "" {
 		return fmt.Errorf("连接地址不能为空")
 	}
-	if in.Address.Port <= 0 || in.Address.Port > 65535 {
-		return fmt.Errorf("连接地址的端口必须在 1-65535 之间")
+	// 日志集成的"地址"是**服务器地址**，没有服务端口的概念：端口属于 SSH，
+	// 由凭据字段（SSHUser/SSHPort）承担，服务层因此会传 Address.Port = 0。
+	// 这里必须放行——否则"目标机地址填了、但端口是 0"会被判非法，
+	// 使用者看到一个自己也填不出来的必填项（日志集成表单里根本没有端口输入框）。
+	if t.CategoryOf() != CategoryLog {
+		if in.Address.Port <= 0 || in.Address.Port > 65535 {
+			return fmt.Errorf("连接地址的端口必须在 1-65535 之间")
+		}
 	}
 	// 只有"平台确实要代建只读账号"的组件（MySQL / PostgreSQL）才强制填账号名。
 	//

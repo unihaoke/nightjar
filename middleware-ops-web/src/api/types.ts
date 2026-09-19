@@ -216,6 +216,12 @@ export interface IntegrationTemplate {
   name: string
   component: string
   description: string
+  /**
+   * 集成类型分类（后端模板注册表返回）：
+   * monitor=指标监控（Exporter + Prometheus），log=日志采集（Filebeat → 平台 Kafka）。
+   * 用 string 而非联合字面量：后端新增分类时前端只做分组展示，不该因此编译失败。
+   */
+  category: string
   phase: number
   image: string
   exporter_port: number
@@ -373,10 +379,13 @@ export interface IntegrationArtifacts {
   labels: Record<string, string>
   file_sd: string
   scrape_job: string
+  /** 指标集成是 Exporter 的 compose 片段；日志集成是渲染后的 filebeat.yml（后端复用同一字段承载）。 */
   compose: string
   deploy_cmd: string
   selector: string
   verify_steps: string[]
+  /** 网络/连通性说明（日志集成用它说明被管机需要能访问哪个 Kafka 地址）。 */
+  network_note?: string
 }
 
 /** 集成中心：新建/更新入参。 */
@@ -418,46 +427,35 @@ export interface IntegrationInput {
   admin_password?: string
 }
 
-/** 日志接入：入参（平台按目标容器名反查日志位置）。 */
-export interface LogCollectInput {
-  name: string
-  /** 被管容器名（docker ps 里的 NAMES 列）。 */
-  target_container: string
-  service?: string
-  environment?: string
-  glob?: string
-  level_filter?: string
+/** 日志集成：平台自带 Kafka 的采集链路现状（GET /api/log-alerts/pipeline）。 */
+export interface LogPipelineStatus {
+  /** Kafka 是否已配置（未配置时日志集成整体不可用）。 */
+  enabled: boolean
+  /** 平台内部消费用的 broker 列表。 */
+  brokers: string[]
+  /** 被管服务器上的 Filebeat 接入地址（EXTERNAL 监听器）。 */
+  external_address: string
+  topic: string
+  group_id: string
+  /** 消费者是否正在运行。 */
+  running: boolean
+  consumed: number
+  dropped: number
+  failed: number
+  /** 最近一条成功入库的消息时间；空串表示还没有数据。 */
+  last_message_at: string
+  last_error: string
+  note: string
 }
 
-/** 日志接入：发现到的日志位置。 */
-export interface LogSource {
-  container: string
-  networks: string[]
-  dir: string
-  mount_target: string
-  mount_source: string
-  mount_kind: 'volume' | 'bind' | string
-  mount_spec: string
-  glob: string
-  /** 判断依据（环境变量名 / 挂载点），供使用者核对。 */
-  evidence: string[]
-}
-
-/** 日志接入：预览/执行结果。 */
-export interface LogCollectPlan {
-  name: string
-  service: string
-  source: LogSource
-  collector_name: string
-  collector_image: string
-  binds: string[]
-  networks: string[]
-  agent_env: Record<string, string>
-  steps: string[]
-  discovered_from: string
-  target_container: string
-  existing?: { status: string; running: boolean } | null
-  warnings: string[]
+/** 日志集成：Kafka 连通性探测结果（POST /api/log-alerts/pipeline/probe）。 */
+export interface LogPipelineProbeResult {
+  ok: boolean
+  message: string
+  latency_ms: number
+  /** 实际探测的地址与 topic（后端已返回；用于"advertised 地址配错"这类排障）。 */
+  address?: string
+  topic?: string
 }
 
 /** 诊断证据。 */
@@ -704,6 +702,87 @@ export interface LogEvent {
   last_seen_at: string
   analyzed: boolean
   suppressed: boolean
+  /**
+   * 规则化处理结果。
+   *
+   * 这几列回答的是"这条告警为什么没有通知我"：命中哪条规则（rule_id）、
+   * 用了多长的去重窗口（dedup_window）、冷却到什么时候（cooldown_until）、
+   * 上次通知是什么时候（notified_at）、AI 分析走到哪一步（analysis_state / analysis_error）。
+   * 注意：cooldown_until / notified_at 在后端是"可空时间"，未设置时线路层是 null，
+   * 页面一律用真值判断后再展示，绝不把空值渲染成 0 或"未分析"。
+   */
+  rule_id: number
+  dedup_window: number
+  cooldown_until: string
+  notified_at: string
+  analysis_state: string
+  analysis_error: string
+  /** 这条日志来自哪个文件（Filebeat 的 log.file.path），为空调不展示。 */
+  log_path: string
+}
+
+/** 日志告警规则（GET /api/log-alerts/rules，4.8.2）。 */
+export interface LogAlertRule {
+  id: number
+  name: string
+  description: string
+  /** 只对某服务生效；为空表示任意服务。 */
+  service_name: string
+  /** 匹配错误指纹：普通文本按子串匹配，`/re/` 形式按正则匹配；为空表示任意。 */
+  signature_pattern: string
+  /** 最低级别 INFO/WARN/ERROR/FATAL；为空表示不限级别。 */
+  min_severity: string
+  /** 去重窗口（分钟）：窗口内同一指纹只合并计数，不重复通知。 */
+  dedup_window: number
+  /** 冷却期（分钟）：冷却期内同指纹不再通知、不再触发 AI，但事件仍记录。 */
+  cooldown: number
+  /** 通知渠道；为空表示使用平台默认渠道。 */
+  notify_channels: string[] | null
+  /** 是否自动做 AI 代码分析（需要该服务已配置代码仓库）。 */
+  ai_enabled: boolean
+  enabled: boolean
+  /** 数字小的优先；多条命中时取第一条。 */
+  priority: number
+}
+
+/** 日志告警规则入参（POST/PUT /api/log-alerts/rules）。 */
+export interface LogAlertRuleInput {
+  name: string
+  description: string
+  service_name: string
+  signature_pattern: string
+  min_severity: string
+  dedup_window: number
+  cooldown: number
+  notify_channels: string[]
+  ai_enabled: boolean
+  enabled: boolean
+  priority: number
+}
+
+/**
+ * 平台默认处理参数（GET /api/log-alerts/rules/defaults）。
+ *
+ * 用途：页面上必须能说清"没命中任何规则时会怎样"，否则使用者无法判断
+ * 某条事件为什么被合并、为什么没通知。这些值全部来自后端，前端不写死。
+ */
+export interface LogAlertRuleDefaults {
+  dedup_window: number
+  cooldown: number
+  ai_enabled: boolean
+  notify_channels: string[]
+  /** 后端给出的服务清单（填写 service_name 时可作参考）。 */
+  services: string[]
+}
+
+/** 重新触发 AI 代码分析的结果（POST /api/log-alerts/events/:id/reanalyze）。 */
+export interface ReanalyzeResult {
+  /** 受理结论，原样展示（如「已重新入队」或「该规则已关闭 AI 分析」）。 */
+  message: string
+  /** 触发后的分析状态（pending/running/done/failed/disabled）；后端未返回时按"已提交"提示。 */
+  analysis_state?: string
+  /** 被重新分析的事件 id。 */
+  event_id?: number
 }
 
 /** 代码分析报告。 */

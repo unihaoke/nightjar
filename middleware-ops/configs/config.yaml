@@ -164,6 +164,73 @@ integration:
   # 新建集成的默认环境（数据权限按 dev/staging/prod 隔离）。
   default_environment: dev
 
+# ---------------------------------------------------------------------------
+# 日志总线 Kafka（「日志集成」：目标机 Filebeat → 平台 Kafka → 平台消费）
+# 详见 docs/LOG_INTEGRATION.md。
+#
+# 两套地址别混：
+#   brokers       = 平台自己消费的地址（容器网络内的 INTERNAL 监听器）
+#   external_host = **被管服务器上的 Filebeat** 要连的地址（宿主可达地址）
+# external_host 填 localhost 只有"平台与被管机同一台"时才对；否则 Filebeat 会
+# 连上又立刻断开（Kafka 把它引导到它自己的 127.0.0.1）。日志集成自检第 3 步查这个。
+# ---------------------------------------------------------------------------
+kafka:
+  enabled: true
+  # 平台侧 bootstrap；compose 里通过 MWOPS_KAFKA_BROKERS 注入 kafka:29092。
+  # 留空即视为"未启用日志接入"（平台照常启动，只是日志集成不可用）。
+  brokers: []
+  log_topic: mwops-logs
+  group_id: mwops-log-ingest
+  client_id: mwops-backend
+  # 被管服务器接入地址（写进 filebeat.yml 的 hosts），须与 compose 的
+  # KAFKA_ADVERTISED_LISTENERS 里 EXTERNAL 完全一致。
+  external_host: 127.0.0.1
+  external_port: 9092
+  filebeat_version: 8.16.0
+  # 单条日志消息上限：堆栈可能很长，与 Filebeat 的 max_message_bytes 同量级。
+  max_bytes: 10485760
+  session_timeout: 30s
+  commit_interval: 1s
+  # earliest：首次消费从头开始（宁可重复，不漏）；latest：只消费新消息。
+  start_offset: earliest
+
+# ---------------------------------------------------------------------------
+# 日志告警的后处理参数（默认值）
+#
+# 完整链路：Kafka → 按规则做去重/冷却 → 落库 → 本段参数驱动的后处理
+#   （外发通知渠道 + 拉取代码仓库 + AI 分析定位代码）
+# 规则表 log_alert_rules 负责"按服务/指纹细化"，这里是没有命中规则时的兜底，
+# 也是"零配置也能跑通"的保证。详见 docs/LOG_INTEGRATION.md。
+# ---------------------------------------------------------------------------
+log_alert:
+  # 去重窗口（分钟）：窗口内同指纹只合并计数，不重复记录
+  default_dedup_window: 5
+  # 冷却期（分钟）：冷却内不重复通知、不重复触发 AI（事件仍记录）
+  default_cooldown: 10
+  default_ai_enabled: true
+  # 默认通知渠道（留空 = 用「通知渠道」里已启用的渠道）
+  default_notify_channels: []
+  # 后处理扫描间隔与每轮批量：AI 分析很贵，靠这两个值限流
+  worker_interval_seconds: 15
+  worker_batch: 10
+  analyze_timeout: 2m
+
+# ---------------------------------------------------------------------------
+# AI 分析用的代码仓库本地缓存（首次 clone，之后更新到远端）
+#
+# 为什么要有这件事：AI 要回答"日志里的错误对应哪一行代码"，就必须先把代码拉下来。
+# 缓存目录落在 backend-data 卷里，容器重建不丢；下次分析只做增量更新。
+# ---------------------------------------------------------------------------
+code_repo:
+  cache_dir: ./data/repos
+  clone_timeout: 10m
+  pull_timeout: 2m
+  # 同一仓库两次拉取的最小间隔（秒）：故障风暴期间避免反复拉远端
+  refresh_interval_seconds: 300
+  # 是否允许平台从代码托管拉取代码（与 CodeRepo.allow_third_party 是两件事：
+  # 后者管"能否把代码片段发给第三方 AI"，本项管"能否 git clone/pull"，内网 GitLab 也该允许）
+  allow_outbound: true
+
 notify:
   # webhook / secret / password 已改由平台「系统设置 → 通知设置」管理（加密落库、保存即生效）。
   # 这里保留字段仅作兜底：首次启动时平台会把这里的非空值导入库（并在日志里说明），

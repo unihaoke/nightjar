@@ -342,6 +342,7 @@ CREATE TABLE IF NOT EXISTS log_alert_events (
     error_signature  VARCHAR(255),
     raw_stacktrace   TEXT,
     context_lines    TEXT,
+    log_path         VARCHAR(512),
     error_count      INTEGER DEFAULT 1,
     severity         VARCHAR(16),
     status           VARCHAR(16),
@@ -349,12 +350,47 @@ CREATE TABLE IF NOT EXISTS log_alert_events (
     last_seen_at     TIMESTAMPTZ,
     analyzed         BOOLEAN DEFAULT FALSE,
     suppressed       BOOLEAN DEFAULT FALSE,
+    -- 规则化处理：命中的规则、本次窗口、冷却与通知、AI 分析状态
+    -- （页面靠这几列回答"这条告警为什么没通知我"）
+    rule_id          BIGINT DEFAULT 0,
+    dedup_window     INTEGER,
+    cooldown_until   TIMESTAMPTZ,
+    notified_at      TIMESTAMPTZ,
+    analysis_state   VARCHAR(16) DEFAULT 'pending',
+    analysis_error   VARCHAR(512),
     CONSTRAINT uni_log_alert_events_event_id UNIQUE (event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_log_event_sig ON log_alert_events(error_signature, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_log_event_srv ON log_alert_events(server_id, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_log_alert_events_service_name ON log_alert_events(service_name);
 CREATE INDEX IF NOT EXISTS idx_log_alert_events_status ON log_alert_events(status);
+
+-- ---------------------------------------------------------------------------
+-- 日志告警规则（日志集成的日志 → 去重窗口 / 冷却期 / 通知 / AI 分析）
+--
+-- 与指标告警规则（alert_rules）刻意分表：两者的判定输入不同——
+-- 指标规则比数值（metric > threshold），日志规则比**错误指纹与级别**。
+-- 但"去重窗口 / 冷却期 / 通知渠道 / AI 开关"四个概念同名同语义，使用者的心智模型一致。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS log_alert_rules (
+    id                BIGSERIAL PRIMARY KEY,
+    created_at        TIMESTAMPTZ,
+    updated_at        TIMESTAMPTZ,
+    name              VARCHAR(128) NOT NULL,
+    description       VARCHAR(255),
+    service_name      VARCHAR(128),           -- 空 = 任意服务
+    signature_pattern VARCHAR(255),           -- 普通文本=子串；/re/=正则；空 = 任意
+    min_severity      VARCHAR(16),            -- 空 = 不限级别
+    dedup_window      INTEGER DEFAULT 5,      -- 去重窗口（分钟）：窗口内同指纹只合并计数
+    cooldown          INTEGER DEFAULT 10,     -- 冷却期（分钟）：冷却内不通知、不触发 AI
+    notify_channels   TEXT,                   -- 逗号分隔；空 = 用平台默认渠道
+    ai_enabled        BOOLEAN DEFAULT TRUE,
+    enabled           BOOLEAN DEFAULT TRUE,
+    priority          INTEGER DEFAULT 100,    -- 数字小优先（特例压过通用）
+    CONSTRAINT uni_log_alert_rules_name UNIQUE (name)
+);
+CREATE INDEX IF NOT EXISTS idx_log_alert_rules_service_name ON log_alert_rules(service_name);
+CREATE INDEX IF NOT EXISTS idx_log_alert_rules_enabled ON log_alert_rules(enabled);
 
 CREATE TABLE IF NOT EXISTS ai_code_analyses (
     id              BIGSERIAL PRIMARY KEY,

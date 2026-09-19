@@ -102,13 +102,19 @@ const routes: RouteRecordRaw[] = [
         path: 'log-alerts',
         name: 'log-alerts',
         component: () => import('@/views/LogAlert/Index.vue'),
-        meta: { title: '日志告警', group: '应用', permissions: ['logalert:read'] },
+        meta: { title: '日志告警', group: '日志', permissions: ['logalert:read'] },
+      },
+      {
+        path: 'log-alerts/rules',
+        name: 'log-alert-rules',
+        component: () => import('@/views/LogAlert/Rules.vue'),
+        meta: { title: '日志告警规则', group: '日志', permissions: ['logalert:read'] },
       },
       {
         path: 'servers',
         name: 'servers',
         component: () => import('@/views/LogAlert/Servers.vue'),
-        meta: { title: '服务器与仓库', group: '应用', permissions: ['logalert:read'] },
+        meta: { title: '服务器与仓库', group: '日志', permissions: ['logalert:read'] },
       },
       {
         path: 'fix',

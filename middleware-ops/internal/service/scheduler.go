@@ -18,8 +18,10 @@ type Scheduler struct {
 	approvals  *ApprovalService
 	// integration 用于集成核验自愈（把"已修好但状态还停在待处理"的集成纠正回来）。
 	integration *IntegrationService
-	log         *zap.Logger
-	cfg         SchedulerConfig
+	// logAlertWorker 负责日志告警的后处理：外发通知 + AI 代码分析（见 logalert_worker.go）。
+	logAlertWorker *LogAlertWorker
+	log            *zap.Logger
+	cfg            SchedulerConfig
 }
 
 // SchedulerConfig 是调度参数。
@@ -32,15 +34,18 @@ type SchedulerConfig struct {
 	ApprovalExpire   time.Duration
 	SnapshotDir      string
 	ClusterThreshold float64
+	// LogAlertProcess 为日志告警后处理的扫描间隔（默认 15s）：
+	// 它决定"日志进来后多久会通知/开始分析"，因此默认给得比其它任务密。
+	LogAlertProcess time.Duration
 }
 
 // NewScheduler 构造调度器。
-func NewScheduler(cfg SchedulerConfig, middleware *MiddlewareService, alerts *AlertService, audit *AuditService, approvals *ApprovalService, integration *IntegrationService, log *zap.Logger) *Scheduler {
+func NewScheduler(cfg SchedulerConfig, middleware *MiddlewareService, alerts *AlertService, audit *AuditService, approvals *ApprovalService, integration *IntegrationService, logAlertWorker *LogAlertWorker, log *zap.Logger) *Scheduler {
 	return &Scheduler{
 		cron:       cron.New(cron.WithSeconds()),
 		middleware: middleware, alerts: alerts, audit: audit, approvals: approvals,
-		integration: integration,
-		log:         log, cfg: cfg,
+		integration: integration, logAlertWorker: logAlertWorker,
+		log: log, cfg: cfg,
 	}
 }
 
@@ -113,6 +118,32 @@ func (s *Scheduler) Start() error {
 		}
 	}); err != nil {
 		return fmt.Errorf("注册告警评估任务: %w", err)
+	}
+
+	// 日志告警后处理：通知渠道 + AI 代码分析（4.8.2）。
+	//
+	// 为什么放定时任务而不是在采集路径上同步做：AI 分析要拉代码、调 LLM，耗时几十秒；
+	// 放同步路径会把 Kafka 消费拖慢（位点积压 → 整条日志链路延迟）；
+	// 放定时任务则天然具备"重启不丢"（状态在 DB）与"可限流"（每轮批量 + 间隔）。
+	if s.logAlertWorker != nil {
+		logAlertInterval := s.cfg.LogAlertProcess
+		if logAlertInterval <= 0 {
+			logAlertInterval = 15 * time.Second
+		}
+		if _, err := s.cron.AddFunc("@every "+durationSpec(logAlertInterval), func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			processed, processErr := s.logAlertWorker.RunOnce(ctx)
+			if processErr != nil {
+				s.log.Warn("日志告警后处理失败", zap.Error(processErr))
+				return
+			}
+			if processed > 0 {
+				s.log.Info("日志告警后处理完成", zap.Int("processed", processed))
+			}
+		}); err != nil {
+			return fmt.Errorf("注册日志告警后处理任务: %w", err)
+		}
 	}
 
 	// 语义聚类：离线批处理，仅合并展示（4.4）。

@@ -13,7 +13,7 @@
 |------|--------------|--------------|----------|
 | 中间件指标采集 | ❌ 平台不直连中间件取指标 | 由 **官方 Exporter** 暴露，平台通过 **PromQL 查询 Prometheus** | `internal/monitor/prometheus.go` |
 | 连接可用性探测 | ⚠️ 仅 **TCP 端口连通性** | `net.DialTimeout` 探测 host:port，非协议级握手 | `internal/service/middleware.go: probe()` |
-| 应用日志采集 | ✅ | HTTP Hook 推送 / 轻量 Agent tail 文件 / 复用 Filebeat 等 | `/api/hooks/logs`、`cmd/agent` |
+| 应用日志集成 | ✅ | **Filebeat（平台用 Ansible 部署到目标机）→ 平台 Kafka**；应用也可 HTTP Hook 直推 | `internal/logpipe`、`internal/service/logpipeline.go`、`/api/hooks/logs` |
 | 中间件运行态配置 | ⚠️ 读的是**平台侧登记的配置**，不是从中间件实时读取 | 诊断时读取实例的 `config` 字段（纳管时填写） | `internal/service/diagnose.go: collectConfig()` |
 | 阈值告警 | ✅ | 平台按 PromQL 取当前值 → 比对规则阈值 → 指纹收敛 → 通知/触发 AI | `internal/service/alert.go` |
 | AI 根因分析 | ✅ | 采集上下文（指标摘要 + 日志指纹 + 登记配置 + 知识库）→ 一次 LLM 调用 → 结构化报告 | `internal/service/diagnose.go` |
@@ -34,7 +34,9 @@
 其他项目的中间件 ──▶ 官方 Exporter ──▶ Prometheus ──PromQL──▶ 平台监控/告警
  (Redis/Kafka/…)      :9121/:9308/…      :9090                  │
                                                                 ▼
-应用服务 ──② 日志(HTTP Hook / Agent)──▶ /api/hooks/logs ──▶ 指纹收敛 ──▶ 日志告警
+应用服务 ──② 日志(Filebeat → Kafka / HTTP Hook)──▶ 平台消费/接收 ──▶ 指纹收敛 ──▶ 日志告警
+                                                    │  按「日志告警规则」做窗口去重 + 冷却抑制
+                                                    └─▶ 后处理：通知渠道 + 拉代码 + AI 三点式结论
                                                                 │
 平台纳管记录 ──③ 登记配置(config 字段)──────────────────────────┼──▶ AI 诊断上下文
 知识库 ──────④ 历史案例(向量检索)───────────────────────────────┤   （六道护栏约束）
@@ -44,7 +46,7 @@
 | 编号 | 数据 | 来源 | 采集方式 | 是否需要 Exporter |
 |------|------|------|----------|-------------------|
 | ① | 性能/资源/可靠性指标 | 中间件官方 Exporter | 平台拉 Prometheus（PromQL） | **需要** |
-| ② | 应用 ERROR 日志、堆栈、GC | 应用自身 | 应用推送 Hook 或 Agent tail 文件 | 不需要 |
+| ② | 应用 ERROR 日志、堆栈、GC | 应用所在服务器上的日志文件 | 集成中心「日志集成」用 Ansible 部署 Filebeat → 平台 Kafka；或应用 HTTP Hook 直推 | 不需要 |
 | ③ | 连接信息、关键配置项 | 纳管表单 | 人工登记（`config` 字段） | 不需要 |
 | ④ | 历史相似故障案例 | 平台知识库 | 诊断沉淀 + 人工录入 | 不需要 |
 | ⑤ | 平台自检指标 | 平台后端 | Prometheus 抓 `/metrics` | 不需要 |
@@ -69,9 +71,12 @@
 | 出站 | Exporter → 中间件 | 中间件端口（6379/9092/3306/5432/9200/80） | Exporter 采集 |
 | 入站 | 平台后端 → Prometheus | Prometheus `:9090` | 平台执行 PromQL |
 | 入站 | 应用 → 平台后端 | 平台 `:8080` | 日志 Hook 上报 |
+| 入站 | 目标机 Filebeat → 平台 Kafka | 平台 `:9092`（`KAFKA_PORT`） | **日志集成主链路**：平台用 Ansible 装 Filebeat，它主动把日志推到平台 Kafka |
+| 入站 | 平台后端 → 目标机 | 目标机 SSH（22） | 平台用 Ansible 幂等部署 Filebeat 与 Exporter |
 | 出站 | 平台后端 → LLM（可选） | 443 | AI 诊断/代码分析（受出站白名单约束） |
 
-平台**不需要**直连中间件端口（除了 TCP 健康探测，可关）。
+平台**不需要**直连中间件端口（除了 TCP 健康探测，可关）。日志集成连的 `:9092` 是**平台自带的
+Kafka**（`docker compose` 里的 `kafka` 服务），不是被管项目的 Kafka 端口——两者不要混淆。
 
 ### 2.3 场景 A：一条命令起齐全套 Exporter
 
@@ -318,51 +323,133 @@ AI 诊断的上下文**只有四个来源**（受上下文预算约束）：指�
 
 ---
 
-## 6. 日志采集：两种接入方式
+## 6. 日志集成：Filebeat → 平台 Kafka（主路径）
 
 指标只能回答「资源/性能是否异常」，定位到**代码级根因**需要日志与堆栈。
 
-### 6.1 方式一：HTTP Hook（零侵入，推荐先跑通）
+日志采集已改为**日志集成**：平台在集成中心提供一个 `log` 类型模板，用 **Ansible 在目标服务器上幂等部署 Filebeat**，
+Filebeat 把日志推到**平台自带的 Kafka**（`docker compose` 的 `kafka` 服务，KRaft 单节点），
+平台后端按消费组 `mwops-log-ingest` 消费 topic `mwops-logs`，复用既有日志事件链路。
 
-应用侧把 ERROR 上报到平台，只需一个 HTTP 请求：
+```
+集成中心「日志集成」→ Ansible 装/复用 Filebeat（目标机）
+        │  日志路径 glob + 级别过滤 + 多行合并
+        ▼
+目标机 Filebeat ──output.kafka(JSON)──▶ 平台 Kafka :9092
+        ▼
+平台后端消费组 mwops-log-ingest → 错误指纹 / 规则化窗口去重与冷却抑制 / 通知 / AI 代码分析入口
+```
+
+平台只提供 Kafka 与消费链路，**采集在被管侧自洽运行**：Filebeat 有本地缓冲与断点续传，平台重启/升级不影响采集；
+日志集成**不需要平台侧 `docker.sock`**（它走 SSH + Ansible 到目标机），也不装 Exporter、不经过 Prometheus。
+
+| 采集方式 | 适用场景 | 入口 | 是否需要 Exporter |
+|---|---|---|---|
+| **日志集成：Filebeat（平台用 Ansible 部署到目标机）→ 平台 Kafka** | 主路径：任意能被 SSH 到的服务器（物理机 / 容器 / K8s 节点），需要多行合并、级别过滤、背压与断点续传 | 集成中心 → 日志集成（`mw_type=log`） | 不需要 |
+| HTTP Hook 直推 | 兜底：不能装 Filebeat、或只想推关键错误 | `POST /api/hooks/logs` | 不需要 |
+
+### 6.1 操作：在集成中心新建 `log` 类型集成
+
+> 完整的字段说明、幂等部署规则（已装则跳过安装、配置内容变化才重启）与日志集成的三段自检环节见
+> [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)，这里只给最短路径。
+
+1. 平台 → **集成中心 → 日志 / Filebeat** 卡片 → **集成**，填：
+
+   | 字段 | 示例 | 说明 |
+   |---|---|---|
+   | 名称 | `order-app-log` | 集成名，同时作为日志事件的服务标识与目标机上的 Filebeat 配置目录名（`/opt/mwops/filebeat/<集成名>/`，同一个目标机上可并存多个集成） |
+   | 目标服务器 | `10.0.0.21`（本机填 `127.0.0.1`） | **目标机自身地址**；日志集成统一走 SSH 安装 |
+   | 部署位置 | 远程服务器 / 本机 | 远程走 Ansible + SSH，与 Exporter 集成同一套凭据机制 |
+   | 日志路径 | `/var/log/order-service/*.log` | 多个 glob 用换行或逗号分隔；**必须写目标机上真实存在的路径**，写错不报错、只会采不到 |
+   | 服务名 / 环境 | `order-api` / `prod` | 写入事件字段 `service` / `environment`，用于日志页归集与筛选；服务名留空时回落为集成名，环境留空为 `dev` |
+   | 最低级别 | `ERROR` | ERROR 只收错误行，WARN 收 ERROR+WARN，INFO 不过滤；过滤在目标机完成，能显著降低负载 |
+   | 合并多行堆栈 | 开（默认） | Java / Python 堆栈合并成一条事件 |
+   | 安装方式 | `auto`（默认） | 已装 Filebeat 且 `systemctl is-active` → 复用；有 docker → 官方镜像容器；都没有 → deb/rpm + systemd |
+   | Filebeat 版本 | `8.16.0` | 与 `.env` 的 `FILEBEAT_VERSION` 一致 |
+
+2. 保存后点该集成的 **自检**，三段环节要全绿：
+   **① 平台 → Kafka 日志总线**、**② 被管机接入地址（Kafka EXTERNAL）**、**③ 日志是否已进入平台**。
+
+前置条件只有两条：目标机能被平台 SSH 到（与 Exporter 集成同一套凭据），
+以及目标机**能访问平台 Kafka 的对外地址**（`.env` 的 `KAFKA_ADVERTISED_HOST` + `KAFKA_PORT`，默认 `:9092`）。
+
+### 6.2 在目标机上核对（自检报红时逐条走）
+
+```bash
+# 1) Filebeat 在不在跑、配置是否合法
+systemctl status filebeat                     # docker 安装方式改为：docker ps | grep mwops-filebeat
+filebeat test config -c /etc/filebeat/filebeat.yml
+
+# 2) 能不能连上平台 Kafka（这一步专抓 advertised 地址配错）
+filebeat test output
+# 期望：kafka: <KAFKA_ADVERTISED_HOST>:9092... talk to server... OK
+
+# 3) 平台侧对外地址是否真的可达（在目标机上执行）
+nc -vz <KAFKA_ADVERTISED_HOST> 9092
+
+# 4) 端到端：往被采集的路径里塞一行错误日志，数秒内平台日志页应出现事件
+echo '2024-01-01 00:00:00 ERROR demo: boom' >> /var/log/order-service/error.log
+```
+
+三种安装方式的自检命令不同，别混用：
+
+| 安装方式 | 服务状态 | 自检命令 | 配置路径 |
+|---|---|---|---|
+| `package`（deb/rpm + systemd） | `systemctl is-active filebeat` | `filebeat test config; filebeat test output` | `/etc/filebeat/filebeat.yml` |
+| `docker`（官方镜像容器） | `docker ps \| grep mwops-filebeat` | `docker exec mwops-filebeat sh -c 'filebeat test config; filebeat test output'` | 宿主同一路径只读挂载进容器 |
+| 复用目标机已有的 Filebeat | `systemctl is-active filebeat` | 同 `package` | `/etc/filebeat/filebeat.yml`（官方 unit 写死该路径） |
+
+**幂等是设计目标，不是副作用**：平台先 `command -v filebeat` + `systemctl is-active filebeat` 探测，
+已安装就只校验/下发配置、不重装；配置内容用渲染后的 `filebeat.yml` 内容哈希判定，
+内容不变时不重启 Filebeat（避免每次重放都抖动采集）。所以**重复点集成不会重复安装，也不会重启**。
+
+内网目标机不能出网时，走 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md) §四的两条路：
+平台侧包分发（`deploy/filebeat/packages/` + 受 hook token 保护的 `GET /api/hooks/filebeat/pkg`，目标机只需能访问平台 8000 端口），
+或运维自行把包放到目标机（`filebeat.install_source=preinstalled`），平台只下发配置。
+
+### 6.3 方式二：HTTP Hook 直推（应用侧零侵入兜底）
+
+不能装 Filebeat 的应用（或只想推关键错误）直接把 ERROR 上报到平台，只需一个 HTTP 请求。
+**这是唯一保留的「应用侧零侵入」兜底通路**，字段与 Filebeat 路径统一映射，最终落到同一张事件表：
 
 ```bash
 curl -X POST http://<平台地址>/api/hooks/logs \
   -H 'Content-Type: application/json' \
   -H 'X-Hook-Token: <MWOPS_HOOK_TOKEN>' \
   -d '{
+    "server_name": "order-app-01",
     "service": "order-service",
     "level": "ERROR",
     "message": "Order 10086 处理失败",
     "stacktrace": "java.lang.NullPointerException\n\tat com.demo.OrderService.process(OrderService.java:42)",
     "context_lines": "…错误前后 20 行…",
+    "log_path": "/var/log/order-service/error.log",
     "alert_type": "stack",
     "count": 1
   }'
 ```
 
-响应中的 `signature` 为错误指纹，`merged=true` 表示与 5 分钟窗口内的既有事件合并。
+响应中的 `signature` 为错误指纹；`merged=true` 表示与**命中规则的去重窗口**（`dedup_window`，
+默认 5 分钟）内的既有事件合并，`suppressed=true` 表示正处于冷却期（事件已记录但本次不通知、不触发 AI，
+详见 6.5）。
 
-脚本接入用 `curl` 即可（`X-Hook-Token` 取自平台 `.env` 的 `MWOPS_HOOK_TOKEN`）：
+脚本接入用 `curl` 即可（`X-Hook-Token` 取自平台 `.env` 的 `HOOK_TOKEN` / `MWOPS_HOOK_TOKEN`）：
 
 ```bash
-# 单条上报
+# 单条上报（log_path 记录这条日志来自哪个文件）
 curl -sS -X POST http://127.0.0.1:8080/api/hooks/logs \
   -H "X-Hook-Token: $MWOPS_HOOK_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"server":"order-service","service":"order-api","level":"ERROR",
-       "message":"connection pool exhausted","file":"/var/log/order-service/error.log"}'
+  -d '{"server_name":"order-app-01","service":"order-api","level":"ERROR",
+       "message":"connection pool exhausted","log_path":"/var/log/order-service/error.log"}'
 
 # 直接扫描日志文件尾部 400 行批量上报（每条一行 JSON 的数组）
 tail -n 400 /var/log/order-service/error.log | while IFS= read -r line; do
   curl -sS -X POST http://127.0.0.1:8080/api/hooks/logs \
     -H "X-Hook-Token: $MWOPS_HOOK_TOKEN" -H 'Content-Type: application/json' \
-    -d "$(printf '{"server":"order-service","service":"order-api","level":"ERROR","message":%s}' \
+    -d "$(printf '{"server_name":"order-app-01","service":"order-api","level":"ERROR","log_path":"/var/log/order-service/error.log","message":%s}' \
           "$(printf '%s' "$line" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')")"
 done
 ```
-
-> 由平台托管的采集（无需在被管项目里写脚本）见 [`INTEGRATION.md`](INTEGRATION.md) 第 8.6 节：
-> 平台按 docker 配置发现日志位置，再用自带的 `mwops-agent` 容器读同一个卷。
 
 各语言框架的接入点（示意）：
 
@@ -372,61 +459,137 @@ done
 | Go | `recover()` 兜底 + `zap` 自定义 Core，ERROR 级别触发异步上报 |
 | Python | `logging.Handler` 子类，过滤 `levelno >= ERROR` |
 | Node.js | `process.on('uncaughtException')` + 日志库 transport |
-| 通用兜底 | 复用 Filebeat/Fluentd，用平台 Agent 或 hook 转发 |
+| 通用 | 先考虑第 6.1 节的日志集成（Filebeat 读同一个文件），不要为了采集改应用代码 |
 
-### 6.2 方式二：轻量 Agent（生产推荐）
+### 6.4 两条通路的字段映射（统一口径）
 
-Agent 常驻在**应用服务器**上，增量 tail 日志文件并上报：
+| 平台字段 | Filebeat 路径（日志集成） | HTTP Hook 直推 |
+|---|---|---|
+| `message` | `message`（多行合并后的"首行 + 堆栈"，平台拆开存 `message` 与 `stacktrace`） | `message`（必填） |
+| `timestamp` | `@timestamp` | `timestamp`（缺省取当前时间） |
+| `service` | `fields.service`（集成时写入；缺失依次退回 `fields.server`、`host.name`、`unknown`——指纹按服务归集，不能为空） | `service`（必填） |
+| `environment` | `fields.environment`（集成时写入） | 服务器自动登记时固定为 `dev`（HTTP Hook 不携带环境字段） |
+| `server_name` | `fields.server`（**目标机地址**，平台按它反查/登记 `server_instances`；缺失依次退回 `host.name`、服务名。另有 `fields.integration` = 集成名，平台暂不消费，仅供排障对号） | `server_name` / `server_id` / `server_ip` 至少一个 |
+| `log_path` | `log.file.path`（**这条日志来自哪个文件**） | `log_path` |
+| `level` | `log.level`（解析不到时按正文关键字推断，最终兜底 `ERROR`） | `level`（必填） |
+| `stacktrace` | 多行合并正文里的堆栈部分（自动拆出） | `stacktrace` |
+| `alert_type` | 固定为 `error` | `error` / `gc` / `stack` |
 
-```bash
-# 1) 编译（可在任意机器交叉编译）
-cd middleware-ops
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags '-s -w' -o mwops-agent ./cmd/agent
+### 6.5 规则驱动的去重与告警风暴抑制
 
-# 2) 配置（参考 cmd/agent/agent.example.yaml）
-cat > agent.yaml <<'EOF'
-platform_url: http://10.0.0.5:8080
-hook_token: "<MWOPS_HOOK_TOKEN>"
-service: order-service
-environment: prod
-server_name: order-app-01
-position_file: /var/lib/mwops-agent/position.json
-context_lines: 20
-files:
-  - path: /var/log/order-service/error.log
-    alert_type: error
-  - path: /var/log/order-service/gc.log
-    alert_type: gc
-EOF
-
-# 3) systemd 托管
-sudo tee /etc/systemd/system/mwops-agent.service >/dev/null <<'EOF'
-[Unit]
-Description=Middleware-Ops Log Agent
-After=network-online.target
-[Service]
-ExecStart=/usr/local/bin/mwops-agent -config /etc/mwops-agent/agent.yaml
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl enable --now mwops-agent
-```
-
-Agent 的两个可靠性设计（`cmd/agent/main.go`）：
-
-- **偏移量持久化**：每个文件的读取位置写入 `position_file`，进程重启不重复上报；文件轮转（变小）自动从头读；
-- **上报失败不推进偏移**：失败时下一轮重读同一批数据，保证日志不丢。
-
-### 6.3 去重与告警风暴抑制
+去重窗口与冷却期**不再写死在代码里**，而是由「日志告警规则」（页面：日志告警 → 日志告警规则，
+路由 `log-alerts/rules`；表 `log_alert_rules`）逐条配置。这样做的原因很实际：
+核心交易服务要立刻通知、批处理服务可以攒一攒——"多久打扰人一次"随服务重要性而变。
 
 | 机制 | 说明 |
 |------|------|
-| 错误指纹 | 异常类名 + 错误消息模板（去时间戳/IP/数字/引号内容）+ 首个业务栈帧 |
-| 窗口去重 | 5 分钟内同指纹合并为一条，累加 `error_count` |
-| 冷却静默 | 告警发送后 `cooldown` 分钟内不再重复通知 |
+| 错误指纹 | 异常类名 + 错误消息模板（去时间戳/IP/数字/引号内容）+ 首个业务栈帧（`ErrorSignature`，与规则无关，始终先生成） |
+| 规则匹配 | 按「服务 + 错误指纹 + 级别」匹配 `log_alert_rules`：**priority 数字小的优先，同优先级按 id 升序，取第一条命中的启用规则**（`MatchLogAlertRule`） |
+| 命中不到规则 | 用平台默认值（`log_alert.default_*`）构造一条虚拟规则（`effectiveRuleFor`）——**零配置也能跑通**，不是"不告警" |
+| 窗口去重 | 命中规则的 `dedup_window`（分钟，默认 5）内同指纹**合并计数**（累加 `error_count`、刷新 `last_seen_at`），**不新增事件**；窗口配 0 表示不合并 |
+| 冷却抑制 | 命中规则的 `cooldown`（分钟，默认 10）内**不重复通知、不重复触发 AI**，但**事件照常记录**（列表里 `suppressed=true` + `cooldown_until`）；冷却过后再次合并时才重新通知 |
 | 语义聚类 | 离线批处理，相似告警仅**合并展示**，不修改告警状态（可撤销） |
+
+规则的字段与语义（`service/logalertrule.go`）：
+
+| 字段 | 取值 | 说明 |
+|------|------|------|
+| `name` | 必填、唯一 | 规则名 |
+| `description` | 可选 | 备注 |
+| `service_name` | 空 = 任意服务 | 按服务名精确匹配（大小写不敏感） |
+| `signature_pattern` | 空 = 任意指纹 | **普通文本 = 子串匹配**（大小写不敏感）；`/正则/` 形式 = 正则匹配（大小写不敏感；正则写错会退化为子串匹配，不会让链路挂掉） |
+| `min_severity` | 空 / `INFO` / `WARN` / `ERROR` / `FATAL` | 低于该级别的日志不命中本条规则；留空表示不限 |
+| `dedup_window` | 分钟，默认 5 | 0 = 不合并（每条都新增事件） |
+| `cooldown` | 分钟，默认 10 | 0 = 不冷却（每条都通知/分析） |
+| `notify_channels` | `feishu` / `wecom` / `dingtalk` / `email`，留空 | 留空 = 用平台「通知渠道」里已启用的渠道 |
+| `ai_enabled` | 开/关 | 关掉后该规则命中的事件不自动做 AI 代码分析（`analysis_state=disabled`） |
+| `enabled` | 开/关 | 关掉的规则完全不参与匹配（按 id 顺序看列表，最容易犯的错就是"规则建了但没启用"） |
+| `priority` | 数字，默认 100 | **数字小的优先**；用它让"特例规则"压过"通用规则" |
+
+**两条必须记住的语义**（列表页和详情页都按这个语义展示）：
+
+1. **抑制 ≠ 丢弃**。冷却期内的日志只是不发通知、不触发 AI，事件仍然落库并累加计数，
+   列表里标记 `suppressed=true`，`cooldown_until` 给出抑制到什么时候。
+2. **冷却过后不会重跑 AI**。窗口内合并且冷却已过时，事件会被重新入队**只补一次通知**
+   （`notified_at` 更新），AI 分析沿用已有结论（`analyzed=true` 的事件不会重跑，避免白烧 token）。
+   确实要立刻重跑，用页面上的「重新分析」——它会**清掉冷却记录**并立即重跑通知与 AI。
+
+三列排障字段（列表与详情都有）：`rule_id`（命中的规则，0 = 平台默认值）、
+`suppressed` / `cooldown_until`（为什么没通知）、`analysis_state` / `analysis_error`（为什么没分析/分析失败）。
+
+> **`signature_pattern` 比的是"错误指纹"，不是原始错误消息**。指纹由异常类名 + 消息模板（去变量）
+> + 首个业务栈帧算出（`ErrorSignature`），是一条短串。最省事的做法：**先不配 `signature_pattern`
+> （留空 = 任意指纹），只按服务名与级别过滤**，等事件进来后在事件详情页看到 `error_signature`，
+> 再把它的一段（或 `/^前缀/` 正则）填进规则。
+
+### 6.6 AI 代码分析：先有「服务 → 代码仓库」映射，再谈结论
+
+日志的 AI 代码分析要回答的是「这条错误对应哪一行代码」，因此平台**必须先在本地有一份与服务
+当前版本一致的代码**。整条链路是：
+
+```text
+日志事件落库（analysis_state=pending）
+      │  定时任务（默认每 15s 扫一批，log_alert.worker_interval_seconds / worker_batch）
+      ▼
+① 外发通知（写 notified_at）─ 命中冷却则跳过（suppressed=true 的事件不重复打扰）
+      ▼
+② 按事件的服务名查「代码仓库」映射（CodeRepo.FindByService）
+      │   没配 → analysis_state=disabled，analysis_error 写明"服务 X 未配置代码仓库映射"
+      ▼
+③ 拉代码：**首次 clone，之后只做更新**（internal/repo，见下）
+      ▼
+④ AI 三点式代码分析（定位文件行 + 根因 / 应急处置 / 修复建议）
+```
+
+**怎么配**：日志告警 → **服务器与仓库**（`GET/POST /api/log-alerts/code-repos`）添加一条
+「服务名 → 仓库地址 + 分支（默认 `main`）+ 语言」。服务名必须与日志事件里的 `service`
+（Filebeat 路径下是 `fields.service`）**完全一致**，否则永远匹配不到。
+
+**缓存行为（`internal/repo`，首次 clone、之后更新到远端）**：
+
+| 项 | 取值 / 行为 |
+|---|---|
+| 缓存根目录 | `code_repo.cache_dir`（默认 `./data/repos`，容器内落在 `backend-data` 卷里，重建容器不丢） |
+| 目录布局 | `<cache_dir>/<净化后的服务名>`，每个服务一个子目录；服务名非 `[A-Za-z0-9._-]` 的字符会被替换成 `-` |
+| 首次 | `git clone`（配了分支就 `--branch <分支>`），超时 `code_repo.clone_timeout`（默认 10m） |
+| 之后（`branch` 非空） | `git fetch --prune origin` + `git checkout --force -B <branch> origin/<branch>`：**把缓存强制重置到远端**，本地手工改动会被丢弃（缓存不是工作区，脏缓存会让行号与线上堆栈对不上） |
+| 之后（`branch` 为空） | `git pull --ff-only`（不改写历史；分叉时报错，由运维决定） |
+| 最小拉取间隔 | `code_repo.refresh_interval_seconds`（默认 300s）：一次故障风暴里同服务的多条事件不会每条都去 pull 远端 |
+| 并发 | 同一缓存目录上的 git 操作串行化，同目标的并发请求复用同一次执行结果 |
+| 执行后写回 | `CodeRepo.local_path` 与 `CodeRepo.last_pull_at` 会更新（页面上能看到"什么时候拉过"） |
+| 越界防护 | 服务名净化为单层安全目录名；显式指定的 `local_path` 必须严格落在 `cache_dir` 之内（含软链接解析），越界直接拒绝 |
+| 目标目录已存在但不是 git 仓库 | **明确报错、绝不覆盖**（可能是别人的目录） |
+
+**拉取失败时页面显示什么**：`analysis_state=failed`，`analysis_error` 是一句可操作的中文结论，
+格式为「拉取代码失败：repo: git <操作> 失败：<中文结论>（远端仓库 <脱敏后的地址>）；git 输出：<脱敏片段>」。
+翻译表覆盖最常见的几类（见 `internal/repo/errors.go`）：
+
+| 现象 | 页面上的中文结论 |
+|---|---|
+| 令牌过期 / 不给交互式输入 | 认证失败：检查凭据是否有效（HTTPS 用访问令牌、SSH 用部署密钥）及令牌对该仓库的读权限 |
+| `Repository not found` / 404 | 仓库不存在或当前凭据无权访问：核对 `RepoURL` 拼写与令牌授权 |
+| 403 | 服务端拒绝访问：检查令牌权限范围与代码平台的 IP 白名单 |
+| `couldn't find remote ref` | 分支或引用不存在：核对 `Branch` 拼写，或该仓库还没有任何提交 |
+| `No space left on device` | 磁盘空间不足：清理仓库缓存目录后重试 |
+| DNS / 连接超时 | 无法访问远端：检查平台出网白名单、代理与网络连通性 |
+| clone/pull 超时 | `git ... 超时（超时上限 Xs…）`：仓库过大或网络过慢时调大 `clone_timeout` / `pull_timeout` |
+
+**凭据不会进日志**：`RepoURL` 里的 `user:token@`（以及 `?token=` / `?access_token=` 这类查询参数）
+一律脱敏成 `***` 后才进平台日志、错误信息与页面（`internal/repo/redact.go`）。
+但**建议仍用最小权限的只读令牌**，并纳入轮换。
+
+**两个出网开关不要混**（这是本功能最容易配错的地方）：
+
+| 开关 | 管什么 | 默认 | 关掉后的现象 |
+|---|---|---|---|
+| `code_repo.allow_outbound` | 平台**能不能 `git clone/pull` 代码**（内网 GitLab 也该允许） | `true` | 平台**不执行任何 git 命令**，事件 `analysis_state=failed`，`analysis_error` 写明出网许可未开启（通知不受影响） |
+| `CodeRepo.allow_third_party`（页面上的「出网白名单开关」，按服务维度） + `security.outbound_whitelist` | 能不能把**代码片段发给第三方 AI**（合规上更敏感） | `false` | AI 代码分析降级为本地分析/标注「不在出网白名单」 |
+
+关掉 `allow_outbound` 仍然能**拉取动作之外的一切**：错误指纹、去重合并、冷却抑制、多渠道通知、
+以及「没配仓库映射 / 规则关了 AI」这类明确结论照旧产生。
+
+拉取失败**不会丢结论链路**：事件照旧入库、照旧通知、照旧可以在页面上重试（「重新分析」）。
+进程重启也不丢——`analysis_state` 在数据库里，后处理是定时任务按队列重扫，不靠内存里的 goroutine。
 
 ---
 
@@ -476,8 +639,11 @@ curl -s -H "Authorization: Bearer $TOKEN" 'http://<平台>/api/metrics/1' | jq '
 | 只有部分指标有值 | Exporter 未暴露该指标 | 核对第 4 节表格的指标名；`curl exporter/metrics` 搜索 |
 | Kafka 全部无数据 | kafka-exporter 无 `instance_name` 标签 | 在 Prometheus 抓取配置里用 `relabel_configs` 补标签 |
 | ES 显示 warning | 集群为 yellow（1）属正常告警 | 若期望只在 red 告警，改用平台规则 `cluster_status < 1` |
-| 日志页无事件 | Hook 401 或字段不合规 | 核对 `X-Hook-Token` 与 `MWOPS_HOOK_TOKEN`；`service`/`level`/`message` 必填 |
-| AI 结论多为「推测」 | 上下文不足（config 为空 / 指标未采集） | 按第 5 节填写 config；确认指标链路已打通 |
+| 日志页无事件（走 Hook 直推） | Hook 401 或字段不合规 | 核对 `X-Hook-Token` 与 `MWOPS_HOOK_TOKEN`；`service`/`level`/`message` 必填 |
+| 日志页无事件（走日志集成） | 目标机没采到 / 连不上 Kafka / 时钟偏移 | ① 集成中心对该集成点**自检**看是哪一段红；② 目标机 `systemctl status filebeat` + `filebeat test output`；③ `nc -vz <KAFKA_ADVERTISED_HOST> <KAFKA_PORT>`；④ 目标机 `timedatectl` 核对时钟（偏移过大被 Kafka 以 `InvalidTimestampException` 拒收） |
+| **日志收到了但不通知 / 不分析** | 见 6.5 与 6.6：规则没命中 / 冷却抑制 / 规则关了 AI / 没配仓库映射 | ① 先看「日志告警规则」页顶部卡片给出的**默认值**（`GET /api/log-alerts/rules/defaults`）：没命中任何规则时就是按它处理；② 事件列表看「抑制 / 通知」列，`cooldown_until` 有值说明在冷却中（事件已记录，想立刻看结论点「重新分析」）；③ 看「AI 分析」列：`disabled` 表示规则关了 AI 或没配仓库映射、`failed` 表示拉代码/调用 AI 失败，原因都在 `analysis_error` 里 |
+| 日志事件 `analysis_state=disabled`，原因写「服务 X 未配置代码仓库映射」 | 该服务在「服务器与仓库」里没有映射（服务名必须与日志的 `service` 完全一致） | 加一条映射后对该条事件点「重新分析」 |
+| 日志事件 `analysis_state=failed`，原因写「拉取代码失败：repo: git …」 | 平台拉代码失败（认证/分支/网络/磁盘，或 `code_repo.allow_outbound=false`） | 按 6.6 的错误翻译表逐条处理；凭据用只读令牌（URL 内嵌 token 在日志里会被脱敏） |
 | 代码分析提示「不在出网白名单」 | 合规默认禁止第三方分析 | 「服务器与仓库」中为服务开启 `allow_third_party`，并把服务名加入 `security.outbound_whitelist` |
 | 连接测试通过但监控无数据 | 两者独立：前者是 TCP 探测，后者依赖 Exporter | 正常现象，按上表排查指标链路 |
 
@@ -520,5 +686,10 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1 -BaseUrl http://
 - [ ] 填写了 `config`（关键配置项）供 AI 诊断使用
 - [ ] 实例详情页能看到指标、状态与阈值判定
 - [ ] 按需创建告警规则，并点通知渠道标签发送自检消息
-- [ ] 应用日志已通过 Hook 或 Agent 接入，日志页能看到事件
-- [ ]（可选）在「服务器与仓库」登记服务→仓库映射，必要时开启出网白名单
+- [ ] 应用日志已通过**日志集成（Filebeat → 平台 Kafka）**接入并自检通过，或已用 Hook 直推，日志页能看到事件
+- [ ]（可选）在「日志告警规则」页为不同重要性的服务配规则（去重窗口 / 冷却期 / 通知渠道 / AI 开关）；
+      不配也能跑通——没命中规则时用平台默认值（页面上能看到具体取值）
+- [ ] 想要 AI 代码结论，就在「服务器与仓库」登记服务→仓库映射（服务名与日志的 `service` 完全一致），
+      必要时开启出网白名单；否则事件会是 `analysis_state=disabled`
+- [ ] 造一条错误日志验证：事件出现 → 数秒内「AI 分析」列从 pending 变成 done / disabled / failed，
+      且 `analysis_error` 能解释原因；冷却期内的重复日志只累加 `error_count` 且 `suppressed=true`

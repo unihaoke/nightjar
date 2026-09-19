@@ -412,9 +412,10 @@ dial unix /var/run/docker.sock: connect: permission denied
 - Exporter：平台拉起（同时接入监控面与数据面）；
 - 抓取与大盘：平台自带的 Prometheus + Grafana，被管项目**不再需要自带监控栈**。
 
-> 唯一仍需被管项目配合的是**日志链路**：日志文件在被管容器里，
-> 平台侧的采集需要共享日志卷（被管项目的 `docker-compose.yml` 里那一行 `backend-logs` 挂载）。
-> 这是"读对方文件"的物理前提，与监控栈无关。
+> 日志是**另一条独立链路**，且已不再需要被管项目配合：集成中心的「日志集成」
+> （`category=log`）用 Ansible 在目标服务器上部署 Filebeat、把日志推到平台自带的 Kafka，
+> 既不需要共享日志卷、也不读对方的 docker 配置，更不需要 `docker.sock`——
+> 详见 §8.6 与 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)。
 
 **结论**：①②③④⑤⑥ 已经做到"配置即接入"；**唯一的硬缺口是 ⑦**——
 没有只读账号，mysqld_exporter 必然 `up=0`（表现为 `Access denied`）。
@@ -431,53 +432,58 @@ dial unix /var/run/docker.sock: connect: permission denied
 
 ---
 
-## 8.6 日志接入（平台侧采集，被管项目零改动）
+## 8.6 日志集成（Filebeat → 平台 Kafka）
 
-集成中心顶部有 **日志接入** 入口，用于采集被管项目的应用日志。与中间件集成的区别是
-**它不止配置，还会真的去读对方的 docker 配置**：
+> 本节是摘要，**权威说明见 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)**（拓扑、幂等部署规则、自检环节、配置项速查）。
+
+集成中心除 `monitor` 类组件外，还有 `log` 类（模板 `type: "log"`、`category: "log"`，
+名为「日志 / Filebeat」）。它与中间件集成的**根本区别**：不装 Exporter、不经过 Prometheus、
+也不要求目标机上有 Docker——平台用 **Ansible 在目标服务器上幂等部署 Filebeat**，
+Filebeat 把日志推到**平台自带的 Kafka**。
 
 ```
-① 你填「目标容器名」（如 app-backend）
+① 你在集成中心填：目标服务器 + 日志路径 glob + 服务名/环境 + 最低级别 + 多行合并
         ↓
-② 平台 docker inspect 该容器，读 env 与 Mounts
+② 平台渲染 filebeat.yml（inputs: filestream → output.kafka，JSON 编码）
+   并渲染一份 Ansible playbook（与 Exporter 集成同一套 SSH 凭据机制）
         ↓
-③ 发现日志位置（按可信度）：
-     a) 环境变量 LOG_PATH/LOG_DIR/... 指向的目录，且该目录被某个卷/宿主目录覆盖；
-     b) 挂载点的容器内路径或卷名/宿主路径含 "log"；
-     c) 都没有 → **拒绝配置**（不猜路径）
+③ Ansible 在目标机上按 auto 顺序判定：
+     已有 filebeat 且 systemctl is-active → 复用，只下发/校验配置
+     有 docker                          → 官方 docker.elastic.co/beats/filebeat 容器
+     都没有                             → 官方仓库装 deb/rpm + systemd 单元
         ↓
-④ 用**平台自身镜像**创建一个采集容器（只覆盖 Entrypoint=mwops-agent）：
-     挂载同一份存储（命名卷按名字 / 宿主目录按路径）→ /logs:ro
-     挂载 mwops-log-agent-state:/data（偏移量，重启不重复上报）
-     接入平台网络 → 环境变量注入 platform_url / hook_token / service / files=/logs/*.log
+④ 配置内容变化才重启（渲染后的 filebeat.yml 内容哈希判定）；重复点集成不会重复安装
         ↓
-⑤ 日志事件进入「日志告警 → 事件」，按服务名归集
+⑤ Filebeat ──▶ 平台 Kafka（EXTERNAL :9092）──▶ 消费组 mwops-log-ingest 消费 topic mwops-logs
+        ↓
+⑥ 后端 internal/logpipe 解析事件 → service/logpipeline.go 编排 → LogAlertService.Ingest
+   （错误指纹 + 窗口去重 + 告警 + AI 诊断入口）→ 日志告警 → 事件
 ```
 
 要点：
 
-- **为什么拒绝而不是猜**：猜错的后果是采集容器起来了、但日志页永远为空，
-  比直接报错难排查得多。拒绝时会明确告诉你"环境变量指了目录但没被挂载"或
-  "没有任何像日志的挂载"。
-- **为什么不需要额外镜像**：Agent 二进制已打进平台镜像（`middleware-ops/Dockerfile`
-  同时构建 `cmd/server` 与 `cmd/agent`），采集容器复用它并覆盖 Entrypoint，
-  因此不存在"另一个镜像要构建/分发/对版本"的问题。
-- **通配采集**：默认采集 `<挂载点>/*.log` 里符合级别的行——平台不需要知道具体文件名，
-  logback 轮转出的新文件也会被采到；`INFO` 级别会连 GC 这类无级别日志一起采（可选）。
-- **对生产环境的写操作走审批**：`environment=prod` 时，由平台创建只读监控账号
-  （见 §8.5 ⑦）不会立即执行，而是**创建审批工单**（工单里带将执行的固定 SQL，不含口令），
-  审批通过后再点「重新应用」由平台建号。
+- **目标机出网与接入地址**：被管机必须能访问 `.env` 里的 `KAFKA_ADVERTISED_HOST:KAFKA_PORT`。
+  这个值写 `localhost`/`127.0.0.1` 时，Filebeat 会**握手成功、随后立刻断开**并报
+  `dial tcp 127.0.0.1:9092: connect: connection refused`——它被 broker 元数据引导去了自己那台机器。
+  集成自检第 2 段「被管机接入地址」专门检测这个地址。
+- **不需要 `docker.sock`**：日志集成走 SSH + Ansible 到目标机，采集在被管侧自洽运行；
+  平台侧即使关掉 Docker 通道（`INTEGRATION_DOCKER_ENABLED=false`）它依然可用。
+- **平台重启不影响采集**：Filebeat 有本地缓冲与断点续传（注册表），
+  消费位点只在 Ingest 成功后提交，因此不会因为平台升级而丢日志。
+- **自检返回日志专用环节**（`POST /api/integrations/:id/selfcheck`）：
+  ① 平台 → Kafka 日志总线；② 被管机接入地址（Kafka EXTERNAL）；③ 日志是否已进入平台。
+  它不再检查 Exporter 端口与 Prometheus 抓取。
+- **兜底通路**：`POST /api/hooks/logs`（应用直推）保留，用于不能装 Filebeat 的场景，
+  字段与 Filebeat 路径统一映射（`log_path` ↔ `log.file.path`）。
 
-> 备选方案（被管项目侧自建 Agent）仍保留：`cmd/agent` 支持 YAML 与**纯环境变量**两种配置，
-> 既可以由平台代管，也可以在被管项目里自己跑一个容器；后者适合网络不允许平台访问
-> docker.sock 的环境。
+> `environment=prod` 时的审批语义与中间件集成一致：写操作先建审批工单，审批通过后再由「重新应用」执行。
 
 ---
 
 ## 9. 已知边界
 
-1. **一键部署依赖 docker.sock**：默认关闭；平台不会（也无法）在无 Docker 的环境里拉起容器，
-   此时只渲染配置。
+1. **一键部署依赖 docker.sock**：默认关闭；平台不会（也无法）在无 Docker 的环境里拉起 Exporter 容器，
+   此时只渲染配置。**日志集成不受此限制**：它走 SSH + Ansible（见 §8.6），关掉 Docker 通道后依然可用。
 2. **容器重建策略**：每次「应用」都会删除并重建同名 Exporter 容器（保证 env/参数与页面一致），
    因此容器内的历史状态不会保留——Exporter 本身无状态，这是有意的取舍。
 3. **Kafka SASL/ACL、ES 自签证书、MySQL `my.cnf` 挂载** 等复杂场景未做成表单字段，

@@ -327,20 +327,87 @@ type CodeRepo struct {
 // LogAlertEvent 应用日志告警事件（错误指纹 + 窗口去重 + 冷却）。
 type LogAlertEvent struct {
 	Base
-	EventID        string    `gorm:"size:40;uniqueIndex" json:"event_id"`
-	ServerID       int64     `gorm:"index" json:"server_id"`
-	ServiceName    string    `gorm:"size:128;index" json:"service_name"`
-	AlertType      string    `gorm:"size:32;index" json:"alert_type"`
-	ErrorSignature string    `gorm:"size:255;index" json:"error_signature"`
-	RawStacktrace  string    `gorm:"type:text" json:"raw_stacktrace"`
-	ContextLines   string    `gorm:"type:text" json:"context_lines"`
-	ErrorCount     int       `gorm:"default:1" json:"error_count"`
-	Severity       string    `gorm:"size:16" json:"severity"`
-	Status         string    `gorm:"size:16;index" json:"status"`
-	FirstSeenAt    time.Time `json:"first_seen_at"`
-	LastSeenAt     time.Time `gorm:"index" json:"last_seen_at"`
-	Analyzed       bool      `json:"analyzed"`
-	Suppressed     bool      `json:"suppressed"`
+	EventID        string `gorm:"size:40;uniqueIndex" json:"event_id"`
+	ServerID       int64  `gorm:"index" json:"server_id"`
+	ServiceName    string `gorm:"size:128;index" json:"service_name"`
+	AlertType      string `gorm:"size:32;index" json:"alert_type"`
+	ErrorSignature string `gorm:"size:255;index" json:"error_signature"`
+	RawStacktrace  string `gorm:"type:text" json:"raw_stacktrace"`
+	ContextLines   string `gorm:"type:text" json:"context_lines"`
+	// LogPath 为这条日志来自哪个文件（日志集成：Filebeat 的 log.file.path）。
+	// 排查时"哪个文件在报错"往往比"报了什么"更快定位到服务与模块。
+	LogPath string `gorm:"size:512" json:"log_path"`
+	// ErrorCount 为窗口期内同指纹事件的累计次数。
+	ErrorCount  int       `gorm:"default:1" json:"error_count"`
+	Severity    string    `gorm:"size:16" json:"severity"`
+	Status      string    `gorm:"size:16;index" json:"status"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `gorm:"index" json:"last_seen_at"`
+	Analyzed    bool      `json:"analyzed"`
+	Suppressed  bool      `json:"suppressed"`
+	// ---------------------------------------------------------------
+	// 规则化处理（4.8.2 增强）：命中的规则、本次使用的窗口、冷却与通知、AI 分析状态
+	//
+	// 为什么把这些"处理过程"落库而不是只放在内存/日志里：页面必须能回答
+	// "这条告警为什么没通知我"——是命中冷却（cooldown_until）、还是规则关了 AI（analysis_state=disabled）、
+	// 还是分析失败（analysis_error）。没有这几列，使用者只能靠猜。
+	// ---------------------------------------------------------------
+	// RuleID 为命中的日志告警规则（0 表示按平台默认值处理）。
+	RuleID int64 `gorm:"index;default:0" json:"rule_id"`
+	// DedupWindow 为本次使用的去重窗口（分钟）。
+	DedupWindow int `json:"dedup_window"`
+	// CooldownUntil 为冷却截止时间：在此之前同指纹不再通知、不再触发 AI。
+	CooldownUntil *time.Time `gorm:"index" json:"cooldown_until"`
+	// NotifiedAt 为最近一次外发通知的时间（空表示还没通知过）。
+	NotifiedAt *time.Time `json:"notified_at"`
+	// AnalysisState 为 AI 代码分析的排队与执行状态：pending/running/done/failed/disabled。
+	AnalysisState string `gorm:"size:16;index;default:pending" json:"analysis_state"`
+	// AnalysisError 为分析失败或跳过的原因（页面直接展示，避免"分析中"永远转圈）。
+	AnalysisError string `gorm:"size:512" json:"analysis_error"`
+}
+
+// 日志事件的处理状态常量（AnalysisState）。
+const (
+	// LogAnalysisPending 表示已入队，等待通知与 AI 分析。
+	LogAnalysisPending = "pending"
+	// LogAnalysisRunning 表示正在分析（避免并发重复分析同一条事件）。
+	LogAnalysisRunning = "running"
+	// LogAnalysisDone 表示分析已完成（可能有结论，也可能是"没有代码仓库"这类正常结束）。
+	LogAnalysisDone = "done"
+	// LogAnalysisFailed 表示分析失败（原因在 AnalysisError，页面上可点「重新分析」）。
+	LogAnalysisFailed = "failed"
+	// LogAnalysisDisabled 表示规则关闭了 AI 分析：这是明确的配置结果，不是故障。
+	LogAnalysisDisabled = "disabled"
+)
+
+// LogAlertRule 日志告警规则（4.8.2）。
+//
+// 为什么日志告警需要独立一套规则、而不是复用指标告警的 AlertRule：
+// 两者的"判定输入"根本不同——指标规则比的是数值（metric > threshold），
+// 日志规则比的是**错误指纹与级别**（哪个服务的哪类错误）。硬塞进一张表会让两边都读不懂。
+// 但"去重窗口 / 冷却期 / 通知渠道 / AI 开关"这四个概念刻意与指标规则**同名同语义**，
+// 使用者在两个页面看到的是一套心智模型。
+type LogAlertRule struct {
+	Base
+	Name        string `gorm:"size:128;not null;uniqueIndex" json:"name"`
+	Description string `gorm:"size:255" json:"description"`
+	// ServiceName 为空表示匹配任意服务。
+	ServiceName string `gorm:"size:128;index" json:"service_name"`
+	// SignaturePattern 匹配错误指纹：普通文本按子串匹配，`/re/` 形式按正则匹配；为空表示任意。
+	SignaturePattern string `gorm:"size:255" json:"signature_pattern"`
+	// MinSeverity 为最低级别（INFO/WARN/ERROR/FATAL）；为空表示不限级别。
+	MinSeverity string `gorm:"size:16" json:"min_severity"`
+	// DedupWindow 为去重窗口（分钟）：窗口内同指纹只合并计数，不新增事件。
+	// 列名刻意用 dedup_window：window 是 PostgreSQL 保留字（同 AlertRule.time_window 的教训）。
+	DedupWindow int `gorm:"default:5" json:"dedup_window"`
+	// Cooldown 为冷却期（分钟）：冷却期内同指纹不再通知、不再触发 AI，但**事件仍记录**。
+	Cooldown       int             `gorm:"default:10" json:"cooldown"`
+	NotifyChannels JSONStringSlice `gorm:"type:text" json:"notify_channels"`
+	// AIEnabled 表示是否自动做代码分析（需要该服务在「代码仓库」里配了映射）。
+	AIEnabled bool `gorm:"default:true" json:"ai_enabled"`
+	Enabled   bool `gorm:"default:true;index" json:"enabled"`
+	// Priority 数字小的优先：多条规则同时命中时取第一条，便于"特例压过通用"。
+	Priority int `gorm:"default:100" json:"priority"`
 }
 
 // AICodeAnalysis AI 代码分析报告（4.8.3 三点式模板）。
@@ -419,7 +486,7 @@ func MigrationList() []any {
 		&KnowledgeBase{},
 		&AuditLog{}, &AuditSnapshot{},
 		&Approval{}, &FixRecord{},
-		&ServerInstance{}, &CodeRepo{}, &LogAlertEvent{}, &AICodeAnalysis{},
+		&ServerInstance{}, &CodeRepo{}, &LogAlertEvent{}, &LogAlertRule{}, &AICodeAnalysis{},
 		&NotificationLog{},
 		&PlatformSetting{},
 	}

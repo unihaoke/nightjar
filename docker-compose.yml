@@ -1,7 +1,9 @@
 # 中间件智能问题解决平台 · 一键部署（Docker Compose）
 #
 # 必装组件（设计文档 2.3）：PostgreSQL 15 + pgvector、Redis、Prometheus、Nginx、平台服务。
-# 可选组件（Kafka / MinIO / VictoriaMetrics）默认不启用，规模触发时再打开。
+# Kafka 默认启用：它是「日志集成」的日志总线（被管服务器上的 Filebeat 推到这里，
+# 平台后端按消费组消费），见 docs/LOG_INTEGRATION.md。
+# 其余可选组件（MinIO / VictoriaMetrics）默认不启用，规模触发时再打开。
 #
 # 使用方式：
 #   1. cp .env.example .env 并修改密码与密钥；
@@ -55,6 +57,61 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks: [mwops]
+
+  # ---------------------------------------------------------------------------
+  # 日志总线：Kafka（KRaft 单节点，无 ZooKeeper）
+  #
+  # 用途：接收被管服务器上 Filebeat 推送的日志（docs/LOG_INTEGRATION.md）。
+  # 三个监听器分工必须分清楚，否则被管机连不上：
+  #   CONTROLLER :9093  仅容器网络，KRaft 仲裁用，不对外
+  #   INTERNAL   :29092 仅容器网络，平台后端消费用（brokers 填 kafka:29092）
+  #   EXTERNAL   :9092  暴露到宿主，**被管服务器上的 Filebeat 用这个端口**
+  #
+  # 【最容易配错的一处】KAFKA_ADVERTISED_LISTENERS 里的 EXTERNAL 地址必须是
+  # **被管机能访问到的平台地址**（宿主 IP 或域名），不能是 localhost、也不能是容器名。
+  # 配错时的现象极具迷惑性：Filebeat 能连上 9092、握手成功，但拿到 broker 元数据后
+  # 立刻断开并报 `dial tcp 127.0.0.1:9092: connect: connection refused` ——
+  # 因为它被引导去了它自己那台机器的 127.0.0.1。
+  # 日志集成的自检第 3 步专门探测这个地址（在目标机上执行连通性检查）。
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: mwops-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://${KAFKA_ADVERTISED_HOST:-127.0.0.1}:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # 显式指定数据目录并挂卷：不指定时会落在容器临时目录，重启即丢日志
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # topic 自动创建：平台后端启动时也会幂等创建 mwops-logs，这里是双保险——
+      # 否则"第一条日志到达时 topic 不存在"会被直接丢弃
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS:-3}
+      # 日志是事件源不是归档：Kafka 只做削峰解耦，长期留存由平台的事件表承担
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-72}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # KRaft 集群 ID（16 字节 base64）；换 ID 等于换集群，已有数据卷会被拒绝挂载
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - '${KAFKA_PORT:-9092}:9092'
+    healthcheck:
+      test: ['CMD-SHELL', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1 || exit 1']
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     networks: [mwops]
 
   # ---------------------------------------------------------------------------
@@ -135,6 +192,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # Kafka 只要求"已启动"（service_started），不等它 healthy：
+      # 它是「日志集成」的依赖，不是平台启动的依赖——Kafka 慢一点或暂时不可用，
+      # 平台其余功能必须照常可用（后端启动时连不上 Kafka 只写一条说明，消费者持续重试）。
+      kafka:
+        condition: service_started
     environment:
       MWOPS_APP_MODE: ${APP_MODE:-release}
       MWOPS_SERVER_HOST: 0.0.0.0
@@ -170,6 +232,30 @@ services:
       MWOPS_NOTIFY_WECOM_ENABLED: ${WECOM_ENABLED:-false}
       MWOPS_LOG_LEVEL: ${LOG_LEVEL:-info}
       MWOPS_HOOK_TOKEN: ${HOOK_TOKEN:-}
+      # ---------- 日志总线 Kafka（日志集成：Filebeat → Kafka → 平台消费）----------
+      # brokers 用 INTERNAL 监听器（容器网络内的 kafka:29092）；
+      # external_host/port 是被管服务器上 Filebeat 要连的地址，必须与 compose 里
+      # KAFKA_ADVERTISED_LISTENERS 的 EXTERNAL 完全一致，否则自检第 3 步会红。
+      MWOPS_KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+      MWOPS_KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      MWOPS_KAFKA_LOG_TOPIC: ${KAFKA_LOG_TOPIC:-mwops-logs}
+      MWOPS_KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-mwops-log-ingest}
+      MWOPS_KAFKA_CLIENT_ID: ${KAFKA_CLIENT_ID:-mwops-backend}
+      MWOPS_KAFKA_EXTERNAL_HOST: ${KAFKA_ADVERTISED_HOST:-127.0.0.1}
+      MWOPS_KAFKA_EXTERNAL_PORT: '${KAFKA_PORT:-9092}'
+      MWOPS_KAFKA_FILEBEAT_VERSION: ${FILEBEAT_VERSION:-8.16.0}
+      # ---------- 日志告警（规则默认值 + 后处理）与代码仓库缓存 ----------
+      # 规则本身在页面上配（log_alert_rules 表）；这里是"没命中规则时"的默认值与限流参数。
+      MWOPS_LOG_ALERT_DEFAULT_DEDUP_WINDOW: ${LOG_ALERT_DEDUP_WINDOW:-5}
+      MWOPS_LOG_ALERT_DEFAULT_COOLDOWN: ${LOG_ALERT_COOLDOWN:-10}
+      MWOPS_LOG_ALERT_DEFAULT_AI_ENABLED: ${LOG_ALERT_AI_ENABLED:-true}
+      MWOPS_LOG_ALERT_WORKER_INTERVAL_SECONDS: ${LOG_ALERT_WORKER_INTERVAL:-15}
+      MWOPS_LOG_ALERT_WORKER_BATCH: ${LOG_ALERT_WORKER_BATCH:-10}
+      MWOPS_LOG_ALERT_ANALYZE_TIMEOUT: ${LOG_ALERT_ANALYZE_TIMEOUT:-2m}
+      # AI 代码分析用的仓库缓存：首次 clone、之后更新到远端（落在 backend-data 卷里）
+      MWOPS_CODE_REPO_CACHE_DIR: /app/data/repos
+      MWOPS_CODE_REPO_ALLOW_OUTBOUND: ${CODE_REPO_ALLOW_OUTBOUND:-true}
+      MWOPS_CODE_REPO_REFRESH_INTERVAL_SECONDS: ${CODE_REPO_REFRESH_INTERVAL:-300}
       # ---------- 集成中心（页面一键集成，见 docs/INTEGRATION.md）----------
       MWOPS_INTEGRATION_ENABLED: ${INTEGRATION_ENABLED:-true}
       MWOPS_INTEGRATION_OUTPUT_DIR: /app/data/integrations
@@ -246,6 +332,7 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  kafka-data:
   prometheus-data:
   backend-data:
   grafana-data:

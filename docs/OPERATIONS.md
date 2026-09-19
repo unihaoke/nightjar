@@ -10,18 +10,22 @@
                     ┌───────────────────┐        ┌──────────────┐
                     │ 平台后端（Go 单体）│───────▶│ PostgreSQL 15│
                     │  :8080            │        │  + pgvector  │
-                    └────┬─────────┬────┘        └──────────────┘
-                         │         │
-              ┌──────────▼──┐  ┌───▼─────────┐   ┌─────────────────────┐
-              │ Redis 7      │  │ Prometheus  │◀──│ 各中间件官方 Exporter│
-              │ 缓存/队列    │  │  指标存储   │   └─────────────────────┘
-              └──────────────┘  └─────────────┘
+                    └──┬──────┬─────┬───┘        └──────────────┘
+                       │      │     │
+          ┌────────────▼─┐ ┌──▼───────┐ ┌▼────────────────────────┐
+          │ Redis 7      │ │Prometheus│ │ Kafka（KRaft 单节点）   │
+          │ 缓存/队列    │ │ 指标存储 │ │ 日志总线 :9092 对外     │
+          └──────────────┘ └────▲─────┘ └▲────────────────────────┘
+                                │        │ Filebeat 推送
+                     ┌──────────┴──┐     │（平台用 Ansible 装到目标机）
+                     │官方 Exporter│─────┘
+                     └─────────────┘
 ```
 
 | 项目 | 最低 | 推荐 |
 |------|------|------|
 | CPU / 内存 | 2C / 4G | 4C / 8G |
-| 磁盘 | 40G（含 Prometheus 15 天指标） | 100G+ SSD |
+| 磁盘 | 40G（含 Prometheus 15 天指标 + Kafka 日志总线） | 100G+ SSD |
 | 部署方式 | 单机 Docker Compose | 单机 + 定时 pg_dump 备份 |
 | 规模上限（一期） | 纳管 ≤200 实例、采集 ≤50 QPS、诊断并发 ≤4 | — |
 
@@ -73,6 +77,33 @@
 | `scheduler.approval_expire_interval` | `1m` | 审批超时扫描周期（工单 TTL 30 分钟） |
 | `scheduler.audit_snapshot_cron` | `0 10 0 * * *` | 每日 00:10 生成审计哈希链快照 |
 | `security.outbound_whitelist` | 空 | 空 = **禁止**任何第三方 AI 分析 |
+| `kafka.enabled` | `true` | 日志总线开关（`MWOPS_KAFKA_ENABLED`）；`false` 时平台照常启动、日志集成不可用 |
+| `kafka.brokers` | 空 | 平台侧消费地址（`MWOPS_KAFKA_BROKERS`），compose 注入 `kafka:29092`；留空 = 未启用 |
+| `kafka.log_topic` | `mwops-logs` | 日志 topic（`MWOPS_KAFKA_LOG_TOPIC`），平台启动时幂等确保存在 |
+| `kafka.group_id` | `mwops-log-ingest` | 平台消费组（`MWOPS_KAFKA_GROUP_ID`） |
+| `kafka.external_host` / `external_port` | `127.0.0.1` / `9092` | **被管服务器上的 Filebeat 要连的地址**（`MWOPS_KAFKA_EXTERNAL_HOST`），必须与 compose 的 `KAFKA_ADVERTISED_HOST` 一致 |
+| `kafka.filebeat_version` | `8.16.0` | 目标机安装的 Filebeat 版本（`FILEBEAT_VERSION`） |
+| `log_alert.default_dedup_window` | `5` | **没命中任何日志告警规则时**的去重窗口（分钟）：窗口内同指纹只合并计数 |
+| `log_alert.default_cooldown` | `10` | 默认冷却期（分钟）：冷却内不重复通知、不重复触发 AI（事件仍记录） |
+| `log_alert.default_ai_enabled` | `true` | 默认是否对日志事件自动做 AI 代码分析（需该服务已配仓库映射） |
+| `log_alert.default_notify_channels` | `[]` | 默认通知渠道（`feishu/wecom/dingtalk/email`）；空 = 用「通知渠道」里已启用的渠道 |
+| `log_alert.worker_interval_seconds` | `15` | 日志告警**后处理**（通知 + AI）的扫描间隔（秒） |
+| `log_alert.worker_batch` | `10` | 每轮最多处理的事件数（AI 很贵，靠它与间隔限流） |
+| `log_alert.analyze_timeout` | `2m` | 单条事件的 AI 分析超时 |
+| `code_repo.cache_dir` | `./data/repos` | 代码仓库本地缓存根目录（容器内落 `backend-data` 卷，每个服务一个子目录） |
+| `code_repo.clone_timeout` | `10m` | **首次 clone** 的超时（仓库大就调大） |
+| `code_repo.pull_timeout` | `2m` | 之后 `fetch`/`checkout`/`pull` 的超时 |
+| `code_repo.refresh_interval_seconds` | `300` | 同一仓库两次拉取的**最小间隔**（秒），风暴期避免反复拉远端 |
+| `code_repo.allow_outbound` | `true` | 平台**能否 `git clone/pull` 代码**；`false` 时不执行任何 git 命令（详见 5.10） |
+
+> 环境变量名按同一规则拼：`log_alert.worker_interval_seconds` → `MWOPS_LOG_ALERT_WORKER_INTERVAL_SECONDS`，
+> `code_repo.cache_dir` → `MWOPS_CODE_REPO_CACHE_DIR`。
+> **这两组已支持环境变量覆盖**（后端启动时显式读取，不依赖 viper 对嵌套键的自动覆盖），
+> 且 `.env.example` 与 compose 都提供了对应的短名（如 `LOG_ALERT_COOLDOWN` → `MWOPS_LOG_ALERT_DEFAULT_COOLDOWN`）：
+> 改 `.env` 后 `docker compose up -d backend` 即可生效，不必重建镜像。
+> 注意**只有**写进 `docker-compose.yml` 的那几项能这样传（`default_notify_channels`、`clone_timeout`
+> 等未注入的项请直接改 `middleware-ops/configs/config.yaml`）。
+> 日常调参应优先在页面「日志告警规则」里改（保存即生效，不需要重启）；这一组只是"没命中规则时的兜底"。
 
 ---
 
@@ -148,18 +179,36 @@ GO_BUILD_TAGS=pgvector docker compose build backend && docker compose up -d back
 
 **边界**：卡片仅支持「查看详情 / 确认 / 驳回」，**不支持一键执行**；高危操作统一回 Web 端执行（设计文档 6.2）。
 
-### 4.6 部署日志采集 Agent
+### 4.6 日志集成（Filebeat → 平台 Kafka）
 
-```bash
-cd middleware-ops
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o mwops-agent ./cmd/agent
-# 上传二进制与 agent.yaml（参考 cmd/agent/agent.example.yaml）
-./mwops-agent -config agent.yaml            # 前台运行；生产用 systemd 托管
-```
+日志采集不再由平台侧完成（旧的「平台起采集容器」实现与那个采集二进制已整体删除，见 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)）。
+现在的做法是：集成中心新建 **`log` 类型集成**（模板「日志 / Filebeat」），
+平台用 **Ansible 在目标服务器上幂等部署 Filebeat**，Filebeat 把日志推到**平台自带的 Kafka**，
+后端按消费组 `mwops-log-ingest` 消费 topic `mwops-logs`，复用既有日志事件链路。
 
-- 增量读取：偏移量写入 `position_file`，文件轮转（变小）时自动从头读取。
-- 上报失败**不推进偏移**，下轮重读同一批数据，保证日志不丢。
-- 也可完全不用 Agent：应用直接 POST `/api/hooks/logs`（零侵入）。
+**完整说明（拓扑、字段、幂等部署规则、自检环节、配置项）见
+[`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)**，这里只列运维要点：
+
+- **平台侧组件**：`docker-compose.yml` 里的 `kafka` 服务（`apache/kafka:3.8.0`，KRaft 单节点、无 ZooKeeper），
+  容器名 `mwops-kafka`；平台后端用 INTERNAL 监听器 `kafka:29092` 消费；
+- **目标机侧**：不要求有 Docker（`auto` 模式会在 deb/rpm + systemd 与官方容器之间自动选择）、
+  不要求出网（可用平台包分发）、也**不需要平台挂载 `docker.sock`**——
+  它走 SSH + Ansible，所以关掉 `INTEGRATION_DOCKER_ENABLED` 后日志集成依然可用；
+- **核对目标机**（自检报红时在目标机上执行，按安装方式选）：
+
+  ```bash
+  systemctl status filebeat              # docker 模式：docker ps | grep mwops-filebeat
+  filebeat test config                   # 配置文件是否合法
+  filebeat test output                   # 能否连上平台 Kafka（抓 advertised 地址配错）
+  nc -vz <KAFKA_ADVERTISED_HOST> 9092    # 平台对外地址是否可达
+  timedatectl                            # 时钟是否同步（偏移过大被 Kafka 拒收）
+  ```
+
+- **重复点集成不会重复安装**：`auto` 模式先探测已装的 Filebeat 并复用，只在渲染后的
+  `filebeat.yml` 内容变化时才重启（`systemctl restart filebeat` / 容器重建）。
+
+`POST /api/hooks/logs`（应用 HTTP 直推）作为零侵入兜底保留，字段与 Filebeat 路径统一映射：
+`service` / `level` / `message` 必填，`log_path` 记录日志来自哪个文件。
 
 ### 4.7 平台自管设置的接口与权限
 
@@ -246,6 +295,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/audit/verify
 | AI 诊断为「规则引擎」结论 | 第三方/本地引擎均不可用；检查 `ai_engine.*` 配置、API Key、出网连通性、熔断状态（`/api/system/info`） |
 | 诊断报 4033（需要审批） | 目标动作是 L2；到「审批管理」创建/审批工单后凭 `ticket_id` 执行 |
 | 代码分析提示「不在出网白名单」 | 需在「服务器与仓库」中为该服务开启 `allow_third_party`，并在 `security.outbound_whitelist` 中加入服务名 |
+| 日志收到了但**不通知 / 不分析** | 见 5.10：① 规则没命中 → 看「日志告警规则」页顶部给出的平台默认值；② 冷却中 → 看事件的 `cooldown_until` / `suppressed`；③ `analysis_state=disabled/failed` → 看 `analysis_error` |
+| 日志事件 `analysis_state=failed`，`analysis_error` 以「拉取代码失败：repo: git …」开头 | 平台拉代码失败：认证过期 / 分支不存在 / 出网或 DNS 不通 / 磁盘满 / `code_repo.allow_outbound=false`。中文结论就在 `analysis_error` 里（见 5.10） |
+| 日志事件 `analysis_state=disabled`，`analysis_error` 写「服务 X 未配置代码仓库映射」 | 该服务没在「服务器与仓库」里登记映射（服务名要与日志的 `service` 完全一致）；补上后对该条点「重新分析」 |
 | 上报 Hook 返回 401 | `X-Hook-Token` 与后端 `MWOPS_HOOK_TOKEN` 不一致 |
 | 前端刷新 404 | Nginx 未启用 history 回退（确认 `try_files $uri $uri/ /index.html`） |
 | SSE 诊断被截断 | 反向代理开启了缓冲；确认 `proxy_buffering off;` 且 `server.write_timeout=0` |
@@ -354,6 +406,182 @@ docker compose down -v && docker compose up -d --build
 
 > 同理，`DB_USER` / `DB_NAME` 也是**卷初始化时定死的**：改了 `DB_USER` 会报
 > `role "xxx" does not exist`，此时只能改回原值或重建数据卷。
+
+### 5.9 日志总线 Kafka 的启停、健康检查与排障
+
+日志集成（目标机 Filebeat → 平台 Kafka → 平台消费）依赖 compose 里的 `kafka` 服务。
+平台后端**没有 Kafka 也能启动**：未配置 `kafka.brokers`（或 `kafka.enabled=false`）时不启动消费者，
+日志页的「Kafka 采集链路」卡片给出「未配置 Kafka：日志集成不可用 / 日志总线已关闭」并附原因，
+其余功能不受影响（降级只减少展示，不伪造数据）。
+
+**启停与健康检查**
+
+```bash
+cd <nightjar>
+
+# 启动/重启日志总线
+docker compose up -d kafka
+docker compose restart kafka
+
+# 健康检查：容器状态 + topic 列表（健康检查用的就是同一条命令）
+docker compose ps kafka
+docker exec mwops-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list
+# 期望输出里含 mwops-logs；没有就说明 topic 还没被创建（平台后端启动时会幂等创建）
+
+# 平台侧 brokers 是否真的连得上（容器内没有 nc，直接问 Kafka 要元数据）
+docker exec mwops-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null \
+  && echo "INTERNAL kafka:29092 OK"
+
+# 页面/接口视角：消费链路状态与探测
+TOKEN=<登录后的 JWT>
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/log-alerts/pipeline | jq
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/log-alerts/pipeline/probe | jq
+```
+
+**topic 与保留时长**
+
+| 项 | 取值 | 说明 |
+|---|---|---|
+| topic | `mwops-logs`（`KAFKA_LOG_TOPIC`） | 平台后端启动时幂等确保存在，`KAFKA_AUTO_CREATE_TOPICS_ENABLE=true` 是双保险 |
+| 分区数 | `KAFKA_NUM_PARTITIONS`（默认 3） | 也是平台消费的并行度上限 |
+| 保留时长 | `KAFKA_LOG_RETENTION_HOURS`（默认 72） | 改完需重建容器生效：`docker compose up -d kafka` |
+
+```bash
+# 核对 topic 的生效配置（含 retention.ms）
+docker exec mwops-kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:29092 \
+  --entity-type topics --entity-name mwops-logs --describe
+
+# 查看消费组积压（Lag 持续不降 = 平台消费跟不上或消费者没起来）
+docker exec mwops-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:29092 \
+  --describe --group mwops-log-ingest
+```
+
+**`KAFKA_ADVERTISED_HOST` 配错的现象与修法**
+
+- 现象：目标机上 `systemctl status filebeat` 正常、Filebeat 也能连上 9092 握手成功，但**随后立刻断开**，
+  日志里报 `dial tcp 127.0.0.1:9092: connect: connection refused`；平台日志页始终没有该 server 的事件。
+  根因是 broker 把客户端引导去了它自己被通告的地址——通告成 `localhost`/`127.0.0.1`（或容器名 `kafka`）时，
+  别的机器上的 Filebeat 就会去连**它自己**的 127.0.0.1。
+- 修法：
+
+  ```bash
+  # 取宿主机 IP（被管机能访问到的那个地址）
+  ip route get 1 | awk '{print $7; exit}'      # 或 hostname -I | awk '{print $1}'
+  # 写进 .env
+  #   KAFKA_ADVERTISED_HOST=<上面的 IP 或域名>
+  docker compose up -d kafka                   # 重建 kafka，让 advertised listeners 生效
+  # 在**目标机**上复验
+  nc -vz <KAFKA_ADVERTISED_HOST> 9092
+  filebeat test output
+  ```
+
+  集成中心对该日志集成点**自检**，第 2 段「被管机接入地址（Kafka EXTERNAL）」就是查这个地址。
+  只有平台与被管机在同一台机器时，`localhost` 才成立。
+
+**磁盘占用与清理**
+
+- Kafka 只做**削峰与解耦**，不承担长期留存：日志的长期留存由平台的事件表
+  （`log_alert_events`，含 `log_path`）与告警记录负责，所以保留时长可以设得很短（默认 72h）。
+- 磁盘大头是 `kafka-data` 卷；占用异常时按顺序处理：
+
+  ```bash
+  docker system df -v | grep -i kafka          # 看卷占用
+  # 1) 缩短保留时长（治本）：.env 里调小 KAFKA_LOG_RETENTION_HOURS → docker compose up -d kafka
+  # 2) 让清理立刻发生：Kafka 的日志段清理是周期性的，缩短后等一个 log.retention.check.interval
+  # 3) 确认没有消费积压再动手（见上面的 kafka-consumer-groups.sh）
+  ```
+
+  平台侧的事件表清理按平台保留策略执行；**不要**用 `docker compose down -v` 清 Kafka——
+  那会连同 PostgreSQL 数据卷一起删掉（见 5.6 / 5.8）。
+
+**日志集成不需要 `docker.sock`**
+
+- 日志集成走 **SSH + Ansible** 到目标机装 Filebeat，既不起平台侧采集容器、也不读对方的 docker 配置，
+  因此平台**不需要挂载 `/var/run/docker.sock`**，`INTEGRATION_DOCKER_ENABLED=false` 也不影响它。
+- 这与「指标集成的一键拉起 Exporter」是两条独立通道：后者需要 `docker.sock`，前者不需要。
+  只有平台侧仍要一键拉起 Exporter 时才需要挂 socket（见 `.env.example` 的 `INTEGRATION_DOCKER_ENABLED` 说明）。
+
+### 5.10 日志告警后处理与代码仓库缓存
+
+日志事件的落库只是第一步：**通知渠道与 AI 代码分析由后处理（`LogAlertWorker`）完成**，
+它由定时任务驱动（间隔 `log_alert.worker_interval_seconds`，默认 15s；每轮 `log_alert.worker_batch`，默认 10），
+扫描 `analysis_state=pending` 的事件，先外发通知（写 `notified_at`），再按事件的服务名拉代码 + 做 AI 三点式分析。
+
+**为什么是定时任务而不是采集路径上同步做**：AI 要拉代码、调 LLM，耗时几十秒；放同步路径会把 Kafka
+消费拖慢（位点积压 → 整条日志链路延迟）。状态落在数据库（`analysis_state`）里，所以**进程重启不丢**；
+多副本部署时用「带条件的 UPDATE 抢占」（`pending → running`）保证一条事件只被处理一次。
+
+#### 排查：日志收到了但不通知 / 不分析
+
+按下面三条顺序定位（页面上就能看到，不用先翻数据库）：
+
+| 现象 | 看哪里 | 含义与处理 |
+|---|---|---|
+| 没通知 | 「日志告警规则」页顶部的**平台默认值**卡片（`GET /api/log-alerts/rules/defaults`） | 日志没命中任何启用规则时，按 `log_alert.default_*`（去重窗口 5 分钟 / 冷却 10 分钟 / AI 开 / 渠道 = 平台已启用渠道）处理。规则匹配是「priority 小者优先、同优先级按 id 升序、取第一条命中」——最常见的错是规则建了但 `enabled=false` |
+| 没通知 | 事件列表的「抑制 / 通知」列：`suppressed=true` + `cooldown_until` | 处于**冷却期**：事件已记录，只是不重复打扰。想立刻拿到结论，对该条点「**重新分析**」（会清掉冷却记录，立即重跑通知与 AI） |
+| 没分析 | 事件列表 / 详情的「AI 分析」列：`analysis_state` 与 `analysis_error` | `disabled` = 规则关了 AI、或该服务没配仓库映射（原因写在 `analysis_error`，照做即可）；`failed` = 拉代码或调用 AI 失败（原因写在 `analysis_error`）；`pending/running` 停留过久 = 后处理没在跑（见下）；`done` = 已有结论 |
+
+数据库直查（排查"是不是只卡了某几条"）：
+
+```bash
+docker exec mwops-postgres psql -U mwo -d middleware_ops -c \
+ "SELECT analysis_state, count(*) FROM log_alert_events GROUP BY 1 ORDER BY 2 DESC;"
+
+# 最近 20 条异常：失败/跳过原因一目了然
+docker exec mwops-postgres psql -U mwo -d middleware_ops -c \
+ "SELECT id, service_name, analysis_state, analysis_error, cooldown_until, notified_at
+    FROM log_alert_events WHERE analysis_state IN ('failed','disabled')
+   ORDER BY id DESC LIMIT 20;"
+```
+
+`pending` 数量长期不降 = 后处理没在跑或跑不动：`docker compose logs backend | grep -i "日志告警后处理"`
+（正常每轮处理完会打一条 `日志告警后处理完成 processed=N`）；`processed=0` 且 `pending` 不减，
+查数据库连通性与 `log_alert.worker_*` 配置；AI 分析慢就调大间隔/减小批量，别让它与诊断抢并发。
+
+#### 代码仓库缓存目录：磁盘占用与清理
+
+平台为了回答「这条日志对应哪一行代码」，必须持有一份**与服务当前版本一致**的代码：
+首次分析 **clone** 到本地缓存，之后每次分析只**更新到远端**，不重复 clone
+（`internal/repo`：分支非空走 `fetch --prune` + `checkout --force -B <branch> origin/<branch>`，
+分支为空走 `pull --ff-only`）。
+
+| 项 | 说明 |
+|---|---|
+| 目录 | `code_repo.cache_dir`（默认 `./data/repos`），容器内即 `/app/data/repos`，落在 **`backend-data` 卷**里 |
+| 布局 | `<cache_dir>/<服务名>`，每个服务一个子目录（服务名会被净化为单层安全目录名） |
+| 增长 | 与「仓库数 × 仓库体积 × 分支历史深度」成正比：缓存是**全量克隆**（不做浅克隆），大仓库很占空间 |
+| 观察占用 | `docker system df -v \| grep -i backend-data`，或 `docker exec mwops-backend du -sh /app/data/repos/*` |
+| 清理单个服务 | `docker exec mwops-backend rm -rf /app/data/repos/<服务名>`；**下次分析会自动重新 clone**（不影响数据库里的映射与历史事件） |
+| 清理全部 | 删掉整个 `repos` 目录即可；注意**不要**用 `docker compose down -v`（会连库一起删，见 5.6 / 5.8） |
+| 空间不足的报错 | `analysis_error` 里会出现「磁盘空间不足：请清理仓库缓存目录…」 |
+| 目录已存在但不是 git 仓库 | 平台**拒绝覆盖**并报错（可能是别人的目录）：确认可清理后手工删除该子目录再重试 |
+
+#### git 凭据与脱敏
+
+- 私有仓库用 **HTTPS + 只读访问令牌**（URL 形如 `https://oauth2:<token>@gitlab.internal/group/repo.git`）
+  或 **SSH 部署密钥**；令牌只需 `read_repository` 之类的读权限，并纳入轮换。
+- **URL 内嵌的凭据会被脱敏**：userinfo 段（`user:token@`）与 `?token=` / `?access_token=` / `?private_token=`
+  这类查询参数在平台日志、错误信息与页面上统一替换为 `***`（`internal/repo/redact.go`），
+  连 git 回显的 stderr 也先脱敏再截断（≤400 字符）后才落库/打日志。
+- 平台以服务方式运行、**关闭了交互式输入**：凭据不对时 git 不会弹窗等待，而是直接失败并给出
+  「认证失败：请检查凭据是否有效/未过期…」的中文结论。
+- 真实凭据在数据库里仍是明文存储（`code_repos.repo_url`），因此**数据库与备份同等敏感**，按 5.1 的备份策略保护。
+
+#### `code_repo.allow_outbound=false` 的后果
+
+这是"平台能否访问代码托管"的总开关（`CodeRepo.allow_third_party` 管的是另一件事：**能否把代码片段
+发给第三方 AI**，两者刻意分开）。设为 `false` 后：
+
+- 平台**不执行任何 git 命令**（连路径都不解析，零副作用），日志里会出现
+  「拒绝拉取远端代码：出网许可未开启（合规开关）」；
+- 命中的日志事件**照常记录、照常外发通知、照常累加计数**，只是 `analysis_state=failed`，
+  `analysis_error` 写明「拉取代码失败：…未开启第三方代码出网许可…」；
+- AI 代码定位**不可能产出结论**（没有代码就无法定位行）；修复建议/根因这类只在代码上下文里有意义的
+  结论随之中断——但中间件指标诊断、告警、通知完全不受影响。
+
+所以：**只有当合规上不允许平台访问代码托管时才关它**；只是不想用第三方 AI 时，
+请保持 `allow_outbound=true` 并让 `allow_third_party` / `security.outbound_whitelist` 保持关闭
+（此时走本地分析），否则内网仓库也拉不下来，AI 代码分析功能会整体形同虚设。
 
 ---
 

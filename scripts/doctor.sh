@@ -161,11 +161,24 @@ else
   done
 fi
 
-collectors=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mwops-exporter-.*-logs$|^mwops-logcollect|^mwops-.*-logs$' || true)
-if [ -n "$collectors" ]; then
-  for name in $collectors; do ok "日志采集容器 $name 运行中"; done
+# 日志集成健康检查：日志链路是「目标机 Filebeat → 平台 Kafka → 平台消费」，
+# 平台上不再有采集容器（旧方案会在本机跑 mwops-logcollect/mwops-*-logs，已随重构删除）。
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mwops-kafka$'; then
+  if docker exec mwops-kafka /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server localhost:29092 --list 2>/dev/null | grep -q '^mwops-logs$'; then
+    ok '日志总线 Kafka 可达且日志主题 mwops-logs 存在（目标机 Filebeat 推送 → 平台消费）'
+  else
+    warn 'Kafka 在运行，但还没有 mwops-logs 主题：尚未有日志集成推送（部署第一个日志集成后会自动创建）'
+  fi
 else
-  info '尚无日志采集容器（在「集成中心 → 日志接入」创建）'
+  warn '未发现 mwops-kafka 容器：日志集成不可用（docker compose up -d kafka 后重启后端）'
+  hint 'Kafka 是「日志集成」的日志总线，见 docs/LOG_INTEGRATION.md；平台其余功能不受影响'
+fi
+# 兼容旧版本残留：若发现旧方案的采集容器，说明平台镜像/集成记录还是重构前的，提醒清理。
+legacy_collectors=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mwops-logcollect|^mwops-.*-logs$' || true)
+if [ -n "$legacy_collectors" ]; then
+  warn "发现旧版日志采集容器：$legacy_collectors（重构为日志集成后不再使用）"
+  hint '确认新日志集成已生效后，可 docker rm -f 掉这些容器；它们读的是被管容器的日志卷'
 fi
 
 if curl -fsS --max-time 5 "http://127.0.0.1:$NJ_PROM/-/healthy" >/dev/null 2>&1; then

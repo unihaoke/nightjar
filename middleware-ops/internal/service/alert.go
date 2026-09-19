@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -35,10 +34,10 @@ type AlertService struct {
 	engine     engine.Engine
 	// diagnoser 是告警触发的自动 AI 诊断入口（3.1 事件驱动）。
 	// 为 nil 表示未装配（如最小化部署/单测），此时自动降级为「只发通知、不诊断」。
-	diagnoser  *DiagnoseService
-	notifier   *NotifierService
-	audit      *AuditService
-	log        *zap.Logger
+	diagnoser *DiagnoseService
+	notifier  *NotifierService
+	audit     *AuditService
+	log       *zap.Logger
 }
 
 // NewAlertService 构造告警服务。
@@ -749,38 +748,16 @@ func (s *AlertService) Compare(value float64, operator string, threshold float64
 }
 
 // inCooldown 判断指纹是否处于冷却期。
+//
+// 实现委托给共享的 cooldownTracker：日志告警用的是同一套语义与 key 规则
+// （见 cooldown.go 的注释），避免两边分叉出"两种冷却行为"。
 func (s *AlertService) inCooldown(ctx context.Context, fingerprint string, cooldownMinutes int, now time.Time) (bool, error) {
-	if cooldownMinutes <= 0 || s.store == nil {
-		return false, nil
-	}
-	raw, err := s.store.Get(ctx, "alert:cd:"+fingerprint)
-	if err != nil {
-		if err == cache.ErrNotFound {
-			return false, nil
-		}
-		return false, err
-	}
-	var last time.Time
-	if err := json.Unmarshal([]byte(raw), &last); err != nil {
-		return false, nil
-	}
-	return now.Sub(last) < time.Duration(cooldownMinutes)*time.Minute, nil
+	return newCooldownTracker(s.store, "alert:cd:").inCooldown(ctx, fingerprint, cooldownMinutes, now)
 }
 
 // markSent 记录最近发送时间。
 func (s *AlertService) markSent(ctx context.Context, fingerprint string, now time.Time, cooldownMinutes int) error {
-	if s.store == nil {
-		return nil
-	}
-	payload, err := json.Marshal(now)
-	if err != nil {
-		return err
-	}
-	ttl := time.Duration(cooldownMinutes) * time.Minute * 2
-	if ttl <= 0 {
-		ttl = 20 * time.Minute
-	}
-	return s.store.Set(ctx, "alert:cd:"+fingerprint, string(payload), ttl)
+	return newCooldownTracker(s.store, "alert:cd:").markSent(ctx, fingerprint, now, cooldownMinutes)
 }
 
 // enqueueEmbedding 异步生成告警向量。

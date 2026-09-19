@@ -76,8 +76,6 @@
 | GET | `/api/integrations` | `middleware:read` | L0 | 集成列表 |
 | GET | `/api/integrations/:id` | `middleware:read` | L0 | 集成详情（含 Exporter 容器状态与查询选择器） |
 | POST | `/api/integrations/preview` | `middleware:read` | L0 | **只渲染不落库**：服务发现 JSON / 显式 job / compose / docker run / 核对步骤 |
-| POST | `/api/integrations/logs/preview` | `middleware:read` | L0 | **日志接入探测**：读目标容器的 docker 配置反查日志位置；**读不到则返回 400，不猜路径** |
-| POST | `/api/integrations/logs` | `middleware:write` | L1 | 创建平台侧日志采集容器（复用平台镜像，`Entrypoint=mwops-agent`），并登记服务器 |
 | POST | `/api/integrations` | `middleware:write` | L1 | 新建集成：纳管实例 + 服务发现更新 + 可选拉起容器 + 可选推荐告警规则；**需要账号的组件默认由平台代建只读账号**（传 `bootstrap_account=false` 可关闭） |
 | GET | `/api/integrations/accounts` | `middleware:read` | L0 | 监控账号清单：账号名、是否平台创建、权限摘要、最近轮换时间、能否自助轮换 |
 | POST | `/api/integrations/:id/account/rotate` | `middleware:write` | L1 | **轮换监控账号口令**：用账号自己的旧口令执行 `ALTER USER USER()` / `ALTER ROLE CURRENT_USER`（不需要管理员凭据），随后重建 Exporter |
@@ -122,6 +120,14 @@
     若它原本只在 `internal` 网络里会因此获得出网路径，故默认关闭、需显式勾选；
   - 抓取目标恒为平台自己的 Exporter 容器（`mwops-exporter-<名称>:<模板端口>`），
     不会去抓 MySQL/Redis 自身的端口。
+
+> **日志类型集成（`mw_type=log`）走同一套增删改查接口**：新建/PUT/DELETE/应用仍用上面的
+> `POST /api/integrations`、`PUT /api/integrations/:id`、`POST /api/integrations/:id/apply`、
+> `DELETE /api/integrations/:id`，只是落地产物换成「平台用 Ansible 在目标机幂等部署 Filebeat」；
+> `POST /api/integrations/:id/selfcheck` 对日志类型返回**日志专用环节**（① 平台 → Kafka 日志总线、
+> ② 被管机接入地址（Kafka EXTERNAL）、③ 日志是否已进入平台），而不是 Exporter/抓取那一套。
+> 日志集成不暴露指标、不经过 Prometheus，也不需要 `docker.sock`；详见
+> [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)。
 
 `GET /api/sd/integrations` 是 Prometheus `http_sd_configs` 的服务发现文档，形如：
 
@@ -382,7 +388,15 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | PUT | `/api/log-alerts/events/:id/status` | `logalert:write` | L1 | 更新状态（pending/analyzing/resolved/ignored） |
 | GET/POST/PUT/DELETE | `/api/log-alerts/servers[/:id]` | `logalert:read` / `server:manage` | L1 | 服务器实例管理 |
 | GET/POST | `/api/log-alerts/code-repos` | `logalert:read` / `server:manage` | L1 | 服务→仓库映射与**出网白名单开关** |
-| POST | `/api/hooks/logs` | Hook 令牌 | — | 日志上报（应用 HTTP Hook / Agent） |
+| GET | `/api/log-alerts/pipeline` | `logalert:read` | L0 | **日志集成接收链路状态**：brokers / topic / 消费组、消费者是否运行、对外接入地址、最近错误与一句话说明（页面「Kafka 采集链路」卡片） |
+| POST | `/api/log-alerts/pipeline/probe` | `logalert:write` | L0 | **探测平台侧 Kafka 可达性**：连 broker、列出 topic、确认 `mwops-logs` 存在；返回 `ok` / `message` / `address` / `topic` / `latency_ms`，失败为 200 + `ok=false` + 原因（不是 500） |
+| GET | `/api/log-alerts/rules` | `logalert:read` | L0 | **日志告警规则列表**（`keyword` / `page` / `page_size`）；按 `priority ASC, id ASC` 返回——**列表顺序即匹配顺序** |
+| GET | `/api/log-alerts/rules/defaults` | `logalert:read` | L0 | **没命中任何规则时平台用的默认值**：`dedup_window` / `cooldown` / `ai_enabled` / `notify_channels` + `services`（已配仓库映射、可能真的产出 AI 代码结论的服务名） |
+| POST | `/api/log-alerts/rules` | `logalert:write` | L1 | 新建规则（改动写审计 `log_alert_rule_create`） |
+| PUT | `/api/log-alerts/rules/:id` | `logalert:write` | L1 | 更新规则：**未传的开关/窗口保持原值**（只改名字不会把 AI 悄悄关掉）；改 `dedup_window`/`cooldown` 传 `0` 才是显式关闭去重/冷却 |
+| DELETE | `/api/log-alerts/rules/:id` | `logalert:write` | L1 | 删除规则（审计 `log_alert_rule_delete`） |
+| POST | `/api/log-alerts/events/:id/reanalyze` | `logalert:write` | L1 | **手动重新入队**：把事件置回 `pending`、解除抑制并**清掉冷却记录**，立即重跑通知与 AI；响应 `{"ok":true,"message":"已重新入队：通知与分析会在数秒内执行（可在列表中查看状态）"}` |
+| POST | `/api/hooks/logs` | Hook 令牌 | — | 日志上报（应用 HTTP Hook 直推，零侵入兜底） |
 | POST | `/api/hooks/alerts` | Hook 令牌 | — | 外部告警推送（Alertmanager / 自定义） |
 
 **日志上报请求**
@@ -395,11 +409,78 @@ data: {"code":5002,"message":"AI 引擎不可用"}
   "stacktrace": "java.lang.NullPointerException\n\tat com.demo.OrderService.process(OrderService.java:42)",
   "context_lines": "…错误前后 20 行…",
   "alert_type": "stack",
+  "log_path": "/var/log/order-service/error.log",
   "server_ip": "10.0.0.21"
 }
 ```
 
-响应中的 `signature` 为错误指纹（异常类名 + 消息模板去变量 + 首个业务栈帧），`merged=true` 表示与 5 分钟窗口内的既有事件合并。
+响应中的 `signature` 为错误指纹（异常类名 + 消息模板去变量 + 首个业务栈帧），
+`merged=true` 表示与**命中规则的去重窗口**（`dedup_window`，默认 5 分钟）内的既有事件合并，
+`suppressed=true` 表示该次上报正处于冷却期（事件已记录，但不重复通知、不重复触发 AI）。
+`log_path` 记录这条日志来自哪个文件——Filebeat 路径写的是 `log.file.path`，两条链路字段统一映射。
+
+**规则驱动的窗口与冷却（语义必须按此理解）**
+
+去重窗口与冷却期不写死在代码里，而由 `log_alert_rules` 逐条配置：匹配按「服务 + 错误指纹 + 级别」，
+**priority 数字小者优先、同优先级按 id 升序取第一条命中的启用规则**；**没有命中任何规则时**用
+`log_alert.default_*` 构造的默认值（页面在「日志告警规则」顶部展示 `GET /api/log-alerts/rules/defaults`）。
+两条容易误读的语义：
+
+1. **抑制 ≠ 丢弃**：冷却期内同指纹**只合并计数**（`error_count` 累加），事件仍在列表里，标 `suppressed=true` + `cooldown_until`；
+2. **冷却过后只补通知、不重跑 AI**：窗口内合并且冷却已过时，事件重新入队**只再发一次通知**；
+   要立刻重跑通知 + AI，用 `POST /api/log-alerts/events/:id/reanalyze`。
+
+**日志事件字段**（`log_alert_events`；前一段是原始字段，后一段是规则化处理的结果）：
+
+| 字段 | 说明 |
+|------|------|
+| `event_id` / `server_id` / `service_name` / `alert_type` / `error_signature` | 事件标识、归集维度与错误指纹 |
+| `raw_stacktrace` / `context_lines` / `log_path` | 堆栈原文、错误上下文、日志文件路径（Filebeat 的 `log.file.path`） |
+| `error_count` / `severity` / `status` | 窗口内累计次数、级别、处理状态（pending/analyzing/resolved/ignored） |
+| `first_seen_at` / `last_seen_at` | 窗口起止（`last_seen_at` 每次合并刷新） |
+| `analyzed` | 是否已产出过代码分析结论（true 时冷却过后不会重跑 AI） |
+| `rule_id` | **命中的规则 ID**（0 = 按平台默认值处理） |
+| `dedup_window` | **本次使用的去重窗口**（分钟，来自命中的规则） |
+| `cooldown_until` | **冷却截止时间**：在此之前同指纹不通知、不触发 AI |
+| `suppressed` | 是否处于冷却抑制（true = 事件已记录但未外发通知） |
+| `notified_at` | 最近一次**成功外发通知**的时间（空 = 还没通知过） |
+| `analysis_state` | AI 分析状态：`pending`（已入队）/ `running`（处理中）/ `done`（已产出结论）/ `failed`（失败）/ `disabled`（规则关了 AI、或没配仓库映射——是配置结果，不是故障） |
+| `analysis_error` | 失败或跳过的**中文原因**（页面直接展示，例如「拉取代码失败：repo: git clone 失败：认证失败…」） |
+
+事件详情 `GET /api/log-alerts/events/:id` 同时返回代码分析报告（三点式：定位文件行 / 根因 /
+应急处置 / 修复建议 + 置信度与证据）。
+
+**创建/更新日志告警规则请求**（`LogAlertRuleInput`）：
+
+```json
+{
+  "name": "订单服务空指针立即告警",
+  "description": "核心服务：窗口短、通知快，且要 AI 代码结论",
+  "service_name": "order-api",
+  "signature_pattern": "a1b2c3",
+  "min_severity": "ERROR",
+  "dedup_window": 2,
+  "cooldown": 5,
+  "notify_channels": ["feishu", "wecom"],
+  "ai_enabled": true,
+  "enabled": true,
+  "priority": 10
+}
+```
+
+- `service_name` 留空 = 匹配任意服务；`signature_pattern` 留空 = 匹配任意指纹。
+  **注意匹配对象是「错误指纹」而不是原始错误消息**（指纹是异常类名 + 消息模板 + 首个业务栈帧算出的短串），
+  所以 `signature_pattern` 通常填指纹里的**一段子串**（从事件详情页的 `error_signature` 复制，或先留空跑一条看实际取值）；
+  写成 `/正则/` 时按正则匹配（大小写不敏感），例如 `/^a1b2/`；
+- `min_severity` 取 `INFO/WARN/ERROR/FATAL`（留空 = 不限级别）；
+- `notify_channels` 取 `feishu/wecom/dingtalk/email`（留空 = 用平台「通知渠道」里已启用的渠道）；
+- `dedup_window` / `cooldown` 单位是分钟，显式传 `0` 表示「不合并 / 不冷却」，
+  **不传则新建时取平台默认值、更新时保持原值**（避免编辑一次把去重关掉）；
+- `priority` 数字**小**者优先，不填或 ≤0 按 `100` 处理；`name` 唯一、长度 ≤128。
+
+**直推只是兜底**：日志集成的主路径是「目标机 Filebeat → 平台 Kafka」（见
+[`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)），`POST /api/hooks/logs` 用于不能装 Filebeat 的
+应用侧零侵入场景，两者最终落到同一套事件表、指纹与告警逻辑。
 
 **Hook 鉴权**：请求头 `X-Hook-Token: <MWOPS_HOOK_TOKEN>`（或 `?token=`）；平台未配置令牌时不校验（仅建议内网单机使用）。
 

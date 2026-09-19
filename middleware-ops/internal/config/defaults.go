@@ -137,6 +137,38 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("notify.email.use_tls", true)
 	v.SetDefault("notify.card_confirm_path", "/alerts")
 
+	// 日志总线（日志集成）：enabled 默认 true 但 brokers 默认为空——
+	// "没配地址"是合法的降级态（裸机调试、暂不接日志），平台照常启动。
+	v.SetDefault("kafka.enabled", true)
+	v.SetDefault("kafka.brokers", []string{})
+	v.SetDefault("kafka.log_topic", "mwops-logs")
+	v.SetDefault("kafka.group_id", "mwops-log-ingest")
+	v.SetDefault("kafka.client_id", "mwops-backend")
+	v.SetDefault("kafka.external_host", "127.0.0.1")
+	v.SetDefault("kafka.external_port", 9092)
+	v.SetDefault("kafka.filebeat_version", "8.16.0")
+	v.SetDefault("kafka.max_bytes", 10*1024*1024)
+	v.SetDefault("kafka.session_timeout", 30*time.Second)
+	v.SetDefault("kafka.commit_interval", time.Second)
+	// 首次消费从头开始：宁可重复处理（日志事件本身按指纹去重），也不要漏掉积压日志。
+	v.SetDefault("kafka.start_offset", "earliest")
+
+	// 日志告警的默认处理参数（没有命中任何规则时用它，链路必须能"零配置跑通"）。
+	v.SetDefault("log_alert.default_dedup_window", 5)
+	v.SetDefault("log_alert.default_cooldown", 10)
+	v.SetDefault("log_alert.default_ai_enabled", true)
+	v.SetDefault("log_alert.default_notify_channels", []string{})
+	v.SetDefault("log_alert.worker_interval_seconds", 15)
+	v.SetDefault("log_alert.worker_batch", 10)
+	v.SetDefault("log_alert.analyze_timeout", 2*time.Minute)
+
+	// AI 代码分析用的仓库本地缓存：首次 clone、之后按最小间隔更新（见 internal/repo）。
+	v.SetDefault("code_repo.cache_dir", "./data/repos")
+	v.SetDefault("code_repo.clone_timeout", 10*time.Minute)
+	v.SetDefault("code_repo.pull_timeout", 2*time.Minute)
+	v.SetDefault("code_repo.refresh_interval_seconds", 300)
+	v.SetDefault("code_repo.allow_outbound", true)
+
 	v.SetDefault("guardrail.input_token_budget", 8192)
 	v.SetDefault("guardrail.output_token_budget", 2048)
 	v.SetDefault("guardrail.log_context_lines", 20)

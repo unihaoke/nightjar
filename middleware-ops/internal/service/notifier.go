@@ -306,8 +306,16 @@ func (s *NotifierService) NotifyApproval(ctx context.Context, ticket *model.Appr
 	}
 }
 
-// send 按渠道发送消息。
+// send 按渠道发送消息（吞掉错误：告警广播不能因为一个渠道失败而中断整条链路）。
 func (s *NotifierService) send(ctx context.Context, n AlertNotification) {
+	_ = s.sendSync(ctx, n)
+}
+
+// sendSync 与 send 相同，但把渠道错误返回给调用方。
+//
+// 为什么需要两个入口：广播式告警（一个渠道失败不影响其它渠道）与"日志告警后处理"
+// （必须知道到底发出去没有，才能决定是否标记已通知、是否在冷却后重发）对错误的态度不同。
+func (s *NotifierService) sendSync(ctx context.Context, n AlertNotification) error {
 	var err error
 	switch n.Channel {
 	case "feishu":
@@ -322,6 +330,92 @@ func (s *NotifierService) send(ctx context.Context, n AlertNotification) {
 		err = fmt.Errorf("未知通知渠道 %s", n.Channel)
 	}
 	s.recordLog(ctx, n, err)
+	return err
+}
+
+// NotifyLogEvent 发送一条日志告警通知（日志告警后处理专用）。
+//
+// channels 为空时用通知配置里**已启用的渠道**（与指标告警的选择逻辑一致）。
+// brief 非空时把 AI 代码结论一起发出去——收消息的人据此判断要不要立刻处理，
+// 不必再回平台点一次；结论来自规则引擎降级时会显式标注，避免被当成确定结论。
+// 返回 nil 表示"至少有一个渠道发出去了"：部分成功也算通知成功——
+// 否则一次渠道抖动会让同一条告警在冷却结束后反复重发，变成新的噪音源。
+func (s *NotifierService) NotifyLogEvent(ctx context.Context, event model.LogAlertEvent, channels []string, brief *LogAnalysisBrief) error {
+	cfg := s.current()
+	if !cfg.Enabled {
+		return fmt.Errorf("通知总开关未启用：日志告警不会外发（请到「通知渠道」启用）")
+	}
+	targets := append([]string{}, channels...)
+	if len(targets) == 0 {
+		for _, item := range s.ChannelStatus() {
+			enabled, _ := item["enabled"].(bool)
+			name, _ := item["channel"].(string)
+			if enabled && name != "" {
+				targets = append(targets, name)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("没有任何可用通知渠道：请在「通知渠道」启用至少一个渠道，或在规则里指定")
+	}
+
+	title := fmt.Sprintf("【日志告警·%s】%s", strings.ToUpper(defaultString(event.Severity, "error")), event.ServiceName)
+	fields := []NotificationField{
+		{Key: "服务", Value: event.ServiceName, Short: true},
+		{Key: "级别", Value: defaultString(event.Severity, "error"), Short: true},
+		{Key: "次数", Value: fmt.Sprintf("%d（%d 分钟窗口内合并）", event.ErrorCount, event.DedupWindow), Short: true},
+	}
+	if event.LogPath != "" {
+		fields = append(fields, NotificationField{Key: "日志文件", Value: event.LogPath})
+	}
+	if brief != nil {
+		if brief.LocatedFile != "" {
+			location := brief.LocatedFile
+			if brief.LocatedLine > 0 {
+				location = fmt.Sprintf("%s:%d", brief.LocatedFile, brief.LocatedLine)
+			}
+			fields = append(fields, NotificationField{Key: "代码位置", Value: location})
+		}
+		if brief.RootCause != "" {
+			fields = append(fields, NotificationField{Key: "根因（AI）", Value: brief.RootCause})
+		}
+		if brief.FixSuggestion != "" {
+			fields = append(fields, NotificationField{Key: "修复建议（AI）", Value: brief.FixSuggestion})
+		}
+		engine := brief.EngineUsed
+		if brief.Degraded {
+			engine = defaultString(engine, "规则引擎") + "（已降级，请人工复核）"
+		}
+		if engine != "" {
+			fields = append(fields, NotificationField{
+				Key: "分析引擎", Value: fmt.Sprintf("%s，置信度 %.0f%%", engine, brief.Confidence*100), Short: true,
+			})
+		}
+	}
+
+	var failed []string
+	sent := 0
+	// 详情地址指向日志告警页并直接带上事件；不带可执行动作——修复必须回平台走审批。
+	detailURL := fmt.Sprintf("%s/log-alerts?event_id=%d", s.appURL, event.ID)
+	for _, channel := range targets {
+		err := s.sendSync(ctx, AlertNotification{
+			Channel: channel, Title: title, Content: event.ErrorSignature,
+			Level: defaultString(event.Severity, "error"), AlertID: event.ID,
+			DetailURL: detailURL, Fields: fields,
+		})
+		if err != nil {
+			failed = append(failed, channel+"："+err.Error())
+			continue
+		}
+		sent++
+	}
+	if sent == 0 {
+		return fmt.Errorf("全部渠道发送失败（%s）", strings.Join(failed, "；"))
+	}
+	if len(failed) > 0 {
+		s.log.Warn("日志告警部分渠道发送失败", zap.Strings("failed", failed))
+	}
+	return nil
 }
 
 // recordLog 记录通知结果。

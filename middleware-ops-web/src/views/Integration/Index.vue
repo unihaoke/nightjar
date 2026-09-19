@@ -2,17 +2,17 @@
 /**
  * 集成中心。
  *
- * 对齐云厂商 Prometheus 控制台的「数据采集 → 集成中心」：
- * 在页面上选组件（Redis / MySQL / PostgreSQL / Kafka / Elasticsearch / Nginx），
- * 填写名称、地址、账号口令、自定义标签与 Exporter 参数，保存即完成
- * 「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」。
+ * 集成类型分两类（由后端模板的 category 决定）：
+ *   - 指标监控（monitor）：Redis / MySQL / ... —— Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则；
+ *   - 日志采集（log）：Filebeat —— 平台用 Ansible 在目标机安装，日志推送到平台 Kafka 后落入日志事件链路。
+ * 两者的表单与状态语义不同：日志集成没有 Exporter/端口/抓取目标，因此这里按 category 分支渲染。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { integrationApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationOverview, IntegrationSelfCheck, IntegrationTemplate, IntegrationView, LogCollectInput, LogCollectPlan } from '@/api/types'
+import type { AccountSecurePayload, IntegrationAccount, IntegrationArtifacts, IntegrationInput, IntegrationOverview, IntegrationSelfCheck, IntegrationTemplate, IntegrationView } from '@/api/types'
 import { envLabels, formatTime } from '@/utils/format'
 
 const router = useRouter()
@@ -31,6 +31,8 @@ const activeTemplate = ref<IntegrationTemplate | null>(null)
 const artifactsVisible = ref(false)
 const artifacts = ref<IntegrationArtifacts | null>(null)
 const artifactsTab = ref('compose')
+/** 产物属于日志集成还是指标集成：同一份产物结构承载两种内容，标签页与文案必须跟着变。 */
+const artifactsIsLog = ref(false)
 
 /** 表单模型：通用字段 + 动态标签 + 动态 Exporter 参数。 */
 const form = reactive({
@@ -129,8 +131,45 @@ function isTruthyValue(value: string): boolean {
   return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase())
 }
 
+/**
+ * 日志集成参数的控件类型。
+ *
+ * 为什么按键名判定而不是只看模板的 kind：日志路径是"多个 glob"、安装方式是固定三选一，
+ * 后端模板把它们声明成 string 也无法表达"该用文本域/下拉"；靠人记这些键名写一次成本最低，
+ * 也避免把 Filebeat 的安装方式做成手打字符串（打错只会到目标机上才失败）。
+ * 「环境」也单独拿出来：它与表单顶部的「环境」是同一个语义，必须绑同一份数据。
+ */
+function logOptionControl(option: IntegrationTemplate['options'][number]): 'paths' | 'bool' | 'install_mode' | 'environment' | 'text' {
+  switch (option.key) {
+    case 'MWOPS_LOG_PATHS':
+      return 'paths'
+    case 'MWOPS_LOG_MULTILINE':
+      return 'bool'
+    case 'MWOPS_LOG_INSTALL_MODE':
+      return 'install_mode'
+    case 'MWOPS_LOG_ENVIRONMENT':
+      return 'environment'
+    default:
+      return option.kind === 'bool' ? 'bool' : 'text'
+  }
+}
+
+/** 日志路径是否已填写：装了 Filebeat 却没有路径，等于什么都没采。 */
+const logPathsFilled = computed(() => String(form.options.MWOPS_LOG_PATHS ?? '').trim().length > 0)
+
 /** 是否处于编辑态。 */
 const isEdit = computed(() => Boolean(editing.value?.instance_id))
+
+/** 当前弹窗里的模板是否为日志集成（Filebeat → 平台 Kafka，不涉及 Exporter 与 Prometheus）。 */
+const isLog = computed(() => activeTemplate.value?.category === 'log')
+
+/** 提交按钮文案：日志集成走 Filebeat 部署，指标集成走 Exporter 抓取。 */
+const submitLabel = computed(() => {
+  if (isEdit.value) {
+    return isLog.value ? '保存并用 Ansible 重新部署' : '保存并重新应用'
+  }
+  return isLog.value ? '保存并部署 Filebeat' : '保存并集成'
+})
 
 /** 本机一键部署（Docker API）是否可用。 */
 const dockerReady = computed(() => Boolean(overview.value?.docker_ok))
@@ -148,8 +187,35 @@ const deployReadyLabel = computed(() => {
   }
   return '仅生成配置'
 })
-/** 日志接入始终需要平台侧 docker（采集容器读同一个卷），因此单独判断。 */
-const logCollectReady = computed(() => dockerReady.value)
+/** 日志集成由 Ansible 在目标机安装 Filebeat，因此与平台本机 Docker 通道无关。 */
+const logDeployReady = computed(() => remoteReady.value)
+
+// ---------------------------------------------------------------------------
+// 集成类型分类（后端模板的 category）：monitor=指标监控，log=日志采集
+// ---------------------------------------------------------------------------
+/** 分类中文标签：后端只给 category 值，展示文案统一在前端维护。 */
+const categoryLabels: Record<string, string> = { monitor: '指标监控', log: '日志采集' }
+/** 分类展示顺序：指标监控是平台主体能力，日志采集排在其后。 */
+const categoryOrder = ['monitor', 'log']
+
+/** 按 category 分组的模板；出现未知分类时按原值兜底展示，而不是把它藏起来。 */
+const templateGroups = computed(() => {
+  const groups: { key: string; label: string; items: IntegrationTemplate[] }[] = []
+  for (const tpl of overview.value?.templates || []) {
+    const key = tpl.category || 'monitor'
+    let group = groups.find((candidate) => candidate.key === key)
+    if (!group) {
+      group = { key, label: categoryLabels[key] || key, items: [] }
+      groups.push(group)
+    }
+    group.items.push(tpl)
+  }
+  const orderOf = (key: string) => {
+    const index = categoryOrder.indexOf(key)
+    return index < 0 ? categoryOrder.length : index
+  }
+  return groups.sort((a, b) => orderOf(a.key) - orderOf(b.key))
+})
 
 /** 已集成总数。 */
 const total = computed(() => items.value.length)
@@ -175,6 +241,8 @@ const applyVisible = ref(false)
 const applying = ref(false)
 const applyTarget = ref<IntegrationView | null>(null)
 const applySsh = reactive({ user: '', method: 'password' as 'password' | 'key', password: '', key: '', port: 22 })
+/** 「重新应用」的对象是否为日志集成：决定弹窗文案（Filebeat 还是 Exporter）。 */
+const applyIsLog = computed(() => (applyTarget.value ? isLogItem(applyTarget.value) : false))
 /** 正在"重新核验"的集成 ID。 */
 const verifyingId = ref<number | null>(null)
 const probingId = ref<number | null>(null)
@@ -454,6 +522,11 @@ function buildPayload(): IntegrationInput {
       options[key] = String(value)
     }
   }
+  // 日志集成的「环境」只保留表单顶部这一个入口（后端优先读模板参数），
+  // 提交时把两者对齐，避免表单显示 prod 而 Filebeat 下发 dev。
+  if (isLog.value) {
+    options.MWOPS_LOG_ENVIRONMENT = form.environment || 'dev'
+  }
   const payload: IntegrationInput = {
     name: form.name.trim(),
     mw_type: activeTemplate.value?.type || '',
@@ -471,14 +544,20 @@ function buildPayload(): IntegrationInput {
   }
   // 远程安装：只在选中 remote 时提交目标与 SSH 凭据（凭据仅本次请求使用，平台不落库）
   if (form.deploy_target === 'remote') {
-    payload.target_host = form.target_host.trim()
-    payload.install_mode = form.install_mode
+    // 日志集成的表单只有一个地址栏（就是目标服务器），这里把它同时作为 target_host 下发，
+    // 避免同一个地址在两个输入框里各存一份、改了一个另一个还是旧值。
+    payload.target_host = isLog.value ? form.address.trim() : form.target_host.trim()
     payload.ssh_user = form.ssh_user.trim()
     payload.ssh_port = form.ssh_port
     payload.ssh_password = form.ssh_password
     payload.ssh_become = form.ssh_become
-    if (form.exporter_port) {
-      payload.exporter_port = form.exporter_port
+    // Filebeat 的安装方式由模板参数（MWOPS_LOG_INSTALL_MODE）决定，
+    // 指标集成的 install_mode/exporter_port 对日志集成没有意义，不能顺手带上。
+    if (!isLog.value) {
+      payload.install_mode = form.install_mode
+      if (form.exporter_port) {
+        payload.exporter_port = form.exporter_port
+      }
     }
   }
   // 代建账号：只有勾选时才提交管理凭据（否则一个字节也不上传）
@@ -505,6 +584,7 @@ async function handlePreview(): Promise<void> {
   previewing.value = true
   try {
     artifacts.value = await integrationApi.preview(buildPayload())
+    artifactsIsLog.value = isLog.value
     artifactsTab.value = 'compose'
     artifactsVisible.value = true
   } catch (error) {
@@ -523,6 +603,11 @@ async function handleSubmit(): Promise<void> {
   if (!valid) {
     return
   }
+  // 日志路径不是表单 rules 里的字段（它来自模板）却决定采集有没有内容，必须在这里拦住。
+  if (isLog.value && !logPathsFilled.value) {
+    ElMessage({ type: 'warning', message: '请填写日志路径（可多行或逗号分隔），否则 Filebeat 装好也不会采集任何日志' })
+    return
+  }
   submitting.value = true
   try {
     const payload = buildPayload()
@@ -531,6 +616,13 @@ async function handleSubmit(): Promise<void> {
       : await integrationApi.create(payload)
     if (saved.last_error) {
       ElMessage({ type: 'warning', message: `已保存，但存在待处理项：${saved.last_error}` })
+    } else if (isLog.value) {
+      ElMessage({
+        type: 'success',
+        message: editing.value
+          ? '日志集成已更新：平台将重放一次 Filebeat 部署（已安装则只校验配置）'
+          : '日志集成已创建：平台将用 Ansible 在目标机安装 Filebeat 并把日志推送到平台 Kafka',
+      })
     } else {
       ElMessage({ type: 'success', message: editing.value ? '集成已更新' : '集成已创建，指标将在 30 秒内出现在监控页' })
     }
@@ -571,6 +663,8 @@ async function runApply(item: IntegrationView, payload: AccountSecurePayload): P
     const saved = await integrationApi.apply(item.instance_id, payload)
     if (saved.last_error) {
       ElMessage({ type: 'warning', message: saved.last_error })
+    } else if (isLogItem(item)) {
+      ElMessage({ type: 'success', message: '已开始重新应用：后台用 Ansible 安装/校验 Filebeat（已装则跳过），完成后此处显示结果（可点刷新）' })
     } else {
       ElMessage({ type: 'success', message: '已开始重新应用：后台重建/重装 Exporter，完成后此处显示结果（可点刷新）' })
     }
@@ -599,15 +693,19 @@ async function submitApply(): Promise<void> {
  * 集成自检：一次点击按**环节**回答"哪一环断了"。
  *
  * 覆盖：平台→Exporter 端口、Exporter 是否在位、Prometheus 是否已抓取、业务指标是否真的有数据。
+ * 日志集成由后端换成另一条链路（平台 Kafka → 目标机 Filebeat → 目标机到 Kafka 的连通性 → 是否真的收到日志）。
  * 只读、不需要凭据、不重装 —— 比"翻日志猜"直接得多（真实反馈）。
  */
 const selfCheckVisible = ref(false)
 const selfCheckLoading = ref(false)
 const selfCheckResult = ref<IntegrationSelfCheck | null>(null)
 const selfCheckName = ref('')
+/** 当前自检对象是否为日志集成：决定加载文案与失败后的动作，别把 Filebeat 说成 Exporter。 */
+const selfCheckIsLog = ref(false)
 
 async function handleSelfCheck(item: IntegrationView): Promise<void> {
   selfCheckName.value = item.name
+  selfCheckIsLog.value = isLogItem(item)
   selfCheckResult.value = null
   selfCheckVisible.value = true
   selfCheckLoading.value = true
@@ -661,6 +759,8 @@ async function handleVerify(item: IntegrationView): Promise<void> {
     const saved = await integrationApi.verify(item.instance_id)
     if (saved.last_error) {
       ElMessage({ type: 'warning', message: '仍未通过：' + saved.last_error })
+    } else if (isLogItem(item)) {
+      ElMessage({ type: 'success', message: '核验通过：部署结论已按现状刷新，待处理已清除' })
     } else {
       ElMessage({ type: 'success', message: '核验通过：抓取目标已 up，待处理已清除' })
     }
@@ -675,6 +775,23 @@ async function handleVerify(item: IntegrationView): Promise<void> {
 /** 按类型取模板。 */
 function templateOf(mwType: string): IntegrationTemplate | null {
   return overview.value?.templates.find((candidate) => candidate.type === mwType) || null
+}
+
+/** 某条集成是否为日志集成（按模板 category 判定；模板缺失时按指标集成处理，避免误显示）。 */
+function isLogItem(item: IntegrationView): boolean {
+  return templateOf(item.mw_type)?.category === 'log'
+}
+
+/**
+ * 日志集成的部署结论提示。
+ *
+ * 平台不持有目标机的进程视图（Ansible 装完就结束），所以这里只回答
+ * "装在哪台机器、什么时候装的/核验的"，运行状态由自检与日志页数据回答。
+ */
+function logDeployTooltip(item: IntegrationView): string {
+  const host = item.target_host || item.address || '目标机'
+  const stamp = item.remote_installed_at ? `，最近一次安装/核验：${formatTime(item.remote_installed_at)}` : ''
+  return `目标机 ${host}：由平台经 Ansible 安装并校验 Filebeat（已装则跳过）${stamp}。采集是否在跑请看自检结论或日志页数据。`
 }
 
 /** 打开编辑弹窗。 */
@@ -705,6 +822,7 @@ async function handleShowArtifacts(item: IntegrationView): Promise<void> {
       group_name: item.group_name,
     })
     artifactsTab.value = 'compose'
+    artifactsIsLog.value = isLogItem(item)
     artifactsVisible.value = true
   } catch (error) {
     toastError(error)
@@ -715,7 +833,9 @@ async function handleShowArtifacts(item: IntegrationView): Promise<void> {
 async function handleDelete(item: IntegrationView): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `删除集成「${item.name}」会同时移除其抓取目标与 Exporter 容器，历史告警与诊断记录保留。是否继续？`,
+      isLogItem(item)
+        ? `删除日志集成「${item.name}」后平台不再下发/校验它的 Filebeat 配置（目标机上已装的 Filebeat 不会自动卸载），历史日志事件与告警记录保留。是否继续？`
+        : `删除集成「${item.name}」会同时移除其抓取目标与 Exporter 容器，历史告警与诊断记录保留。是否继续？`,
       '删除集成',
       { type: 'warning' },
     )
@@ -751,68 +871,6 @@ function addLabel(): void {
   form.labels.push({ key: '', value: '' })
 }
 
-// ---------------------------------------------------------------------------
-// 日志接入：平台读被管容器的 docker 配置反查日志位置，自建采集容器（被管项目零改动）
-// ---------------------------------------------------------------------------
-const logDialogVisible = ref(false)
-const logLoading = ref(false)
-const logPlan = ref<LogCollectPlan | null>(null)
-const logForm = reactive<LogCollectInput>({
-  name: '',
-  target_container: '',
-  service: '',
-  environment: 'dev',
-  level_filter: 'ERROR',
-})
-
-/** 打开日志接入弹窗。 */
-function openLogDialog(): void {
-  logForm.name = ''
-  logForm.target_container = ''
-  logForm.service = ''
-  logForm.environment = 'dev'
-  logForm.level_filter = 'ERROR'
-  logPlan.value = null
-  logDialogVisible.value = true
-}
-
-/** 预览：读取被管容器配置并反查日志位置（读不到会直接报错）。 */
-async function handleLogPreview(): Promise<void> {
-  logLoading.value = true
-  try {
-    logPlan.value = await integrationApi.previewLog(buildLogPayload())
-  } catch (error) {
-    logPlan.value = null
-    toastError(error)
-  } finally {
-    logLoading.value = false
-  }
-}
-
-/** 保存并创建采集容器。 */
-async function handleLogSubmit(): Promise<void> {
-  logLoading.value = true
-  try {
-    logPlan.value = await integrationApi.createLog(buildLogPayload())
-    ElMessage({ type: 'success', message: '日志采集已创建（被管项目无需任何改动）' })
-    await load()
-  } catch (error) {
-    toastError(error)
-  } finally {
-    logLoading.value = false
-  }
-}
-
-/** 组装日志接入载荷（服务名缺省取接入名）。 */
-function buildLogPayload(): LogCollectInput {
-  return {
-    ...logForm,
-    name: logForm.name.trim(),
-    target_container: logForm.target_container.trim(),
-    service: (logForm.service || logForm.name).trim(),
-  }
-}
-
 /** 删除一行自定义标签。 */
 function removeLabel(index: number): void {
   form.labels.splice(index, 1)
@@ -830,12 +888,12 @@ onMounted(load)
           <el-tag v-if="total > 0" size="small" effect="plain">已集成 {{ total }}</el-tag>
         </h2>
         <p class="page-subtitle">
-          选组件 → 填地址与账号 → 保存即完成指标暴露与接入。<span class="mono">{{ overview?.file_sd_path }}</span>
+          指标监控：选组件 → 填地址与账号 → 保存即完成 Exporter 暴露与 Prometheus 抓取（<span class="mono">{{ overview?.file_sd_path }}</span>）；
+          日志采集：填目标服务器与日志路径 → 平台用 Ansible 安装 Filebeat 并推送到平台 Kafka。
         </p>
       </div>
       <div class="row">
         <el-button size="small" @click="load">刷新</el-button>
-        <el-button size="small" :disabled="!logCollectReady" @click="openLogDialog">日志接入</el-button>
         <el-button size="small" @click="openAccounts">监控账号</el-button>
         <el-tag size="small" :type="deployReady ? 'success' : 'info'" effect="light">
           {{ deployReadyLabel }}
@@ -844,31 +902,48 @@ onMounted(load)
     </div>
 
 
-    <!-- 组件模板 -->
+    <!-- 集成类型：按后端返回的 category 分组（指标监控 / 日志采集）。
+         日志类型的文案全部取自模板本身，前端不写死任何中间件名。 -->
     <div class="card">
-      <h3 class="card-title">可集成组件</h3>
-      <div class="tpl-grid">
-        <div v-for="tpl in overview?.templates || []" :key="tpl.type" class="tpl-card">
-          <div class="tpl-head">
-            <span class="tpl-name">{{ tpl.name }}</span>
-            <el-tag v-if="tpl.integrated" size="small" effect="light" type="success">已集成 {{ tpl.integrated }}</el-tag>
-            <el-tag v-else-if="tpl.phase === 2" size="small" effect="plain">仅纳管</el-tag>
-          </div>
-          <p class="tpl-component mono">{{ tpl.component }}</p>
-          <p class="tpl-desc">{{ tpl.description }}</p>
-          <div class="tpl-foot">
-            <span class="muted mono">:{{ tpl.exporter_port }}</span>
-            <el-button type="primary" size="small" @click="openInstall(tpl)">集成</el-button>
+      <h3 class="card-title">可集成类型</h3>
+      <div v-for="group in templateGroups" :key="group.key" class="tpl-group">
+        <div class="tpl-group-head">
+          <el-tag size="small" effect="plain" :type="group.key === 'log' ? 'warning' : 'info'">{{ group.label }}</el-tag>
+          <span class="muted">
+            {{ group.key === 'log'
+              ? 'Filebeat 在目标机采集 → 平台 Kafka 消费 → 日志事件链路（不涉及 Exporter 与 Prometheus）'
+              : 'Exporter 暴露指标 → Prometheus 抓取 → 实例纳管 → 推荐告警规则' }}
+          </span>
+          <span v-if="group.key === 'log' && !logDeployReady" class="text-warning">
+            Ansible 通道不可用：日志集成当前无法自动部署
+          </span>
+        </div>
+        <div class="tpl-grid">
+          <div v-for="tpl in group.items" :key="tpl.type" class="tpl-card">
+            <div class="tpl-head">
+              <span class="tpl-name">{{ tpl.name }}</span>
+              <el-tag v-if="tpl.integrated" size="small" effect="light" type="success">已集成 {{ tpl.integrated }}</el-tag>
+              <el-tag v-else-if="tpl.phase === 2" size="small" effect="plain">仅纳管</el-tag>
+            </div>
+            <p class="tpl-component mono">{{ tpl.component }}</p>
+            <p class="tpl-desc">{{ tpl.description }}</p>
+            <div class="tpl-foot">
+              <!-- 日志集成没有 Exporter 端口：显示端口号只会让人以为要去开放它 -->
+              <span v-if="tpl.category === 'log'" class="muted">由 Ansible 部署到目标机</span>
+              <span v-else class="muted mono">:{{ tpl.exporter_port }}</span>
+              <el-button type="primary" size="small" @click="openInstall(tpl)">集成</el-button>
+            </div>
           </div>
         </div>
       </div>
+      <el-empty v-if="templateGroups.length === 0" description="模板注册表为空（后端未返回任何集成类型）" :image-size="72" />
     </div>
 
     <!-- 已集成 -->
     <div class="card">
       <h3 class="card-title">已集成实例</h3>
       <div v-if="items.length === 0">
-        <el-empty description="还没有集成任何组件，从上面的组件卡片开始" :image-size="72" />
+        <el-empty description="还没有集成任何类型，从上面的类型卡片开始" :image-size="72" />
       </div>
       <div v-else class="table-scroll">
         <el-table :data="items" size="small">
@@ -886,12 +961,16 @@ onMounted(load)
           <el-table-column label="环境/分组" width="130">
             <template #default="{ row }">{{ envLabels[row.environment] || row.environment }} / {{ row.group_name || '-' }}</template>
           </el-table-column>
-          <el-table-column label="Exporter" width="140">
+          <el-table-column label="采集部署" width="150">
             <template #default="{ row }">
+              <!-- 日志集成没有 Exporter 容器可 inspect，结论由 Ansible 的安装/校验结果给出 -->
+              <el-tooltip v-if="isLogItem(row)" placement="top" :content="logDeployTooltip(row)">
+                <el-tag size="small" type="info" effect="plain">Filebeat（目标机）</el-tag>
+              </el-tooltip>
               <!-- 远程部署：容器在**目标机**上，平台没有那台机器的 docker 通道，
                    因此 container_status 必然为空——此时说「未托管」是误导（真实反馈）。 -->
               <el-tooltip
-                v-if="row.deploy_target === 'remote'"
+                v-else-if="row.deploy_target === 'remote'"
                 placement="top"
                 :content="`由平台经 Ansible 安装到 ${row.target_host || '目标机'}:${row.exporter_host_port || ''}，` +
                   `容器归那台机器管理${row.remote_installed_at ? '（' + formatTime(row.remote_installed_at) + ' 安装）' : ''}。` +
@@ -913,14 +992,27 @@ onMounted(load)
               </template>
             </template>
           </el-table-column>
-          <el-table-column label="状态" min-width="150">
+          <el-table-column label="部署结论" min-width="150">
             <template #default="{ row }">
-              <!-- 待处理必须能就地看到原因：否则只能去底部横幅猜是哪一条（真实反馈）。 -->
+              <!-- 待处理必须能就地看到原因：否则只能去底部横幅猜是哪一条（真实反馈）。
+                   日志集成与指标集成同用 last_error / next_action，只是结论口径不同。 -->
               <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
                 <el-tag size="small" type="danger" effect="light">待处理</el-tag>
               </el-tooltip>
-              <el-tag v-else-if="row.applied_at" size="small" type="success" effect="light">已应用</el-tag>
-              <el-tag v-else size="small" effect="plain">待应用</el-tag>
+              <el-tooltip
+                v-else-if="row.applied_at"
+                placement="top"
+                :content="isLogItem(row) ? '部署结论：Ansible 已在目标机安装/校验 Filebeat' : '部署结论：抓取目标已写入并核验通过'"
+              >
+                <el-tag size="small" type="success" effect="light">已应用</el-tag>
+              </el-tooltip>
+              <el-tooltip
+                v-else
+                placement="top"
+                :content="isLogItem(row) ? '尚未部署：点「重新应用」让平台用 Ansible 在目标机安装 Filebeat' : '尚未应用：保存后平台会写入抓取目标'"
+              >
+                <el-tag size="small" effect="plain">待应用</el-tag>
+              </el-tooltip>
             </template>
           </el-table-column>
           <el-table-column label="最近应用" width="150">
@@ -930,8 +1022,11 @@ onMounted(load)
           </el-table-column>
           <el-table-column label="操作" width="270" fixed="right">
             <template #default="{ row }">
-              <el-button text size="small" @click="goDetail(row)">监控/自检</el-button>
-              <el-button text size="small" @click="handleShowArtifacts(row)">配置</el-button>
+              <!-- 实例详情页是 Prometheus 指标视图，对日志集成没有意义；日志看自检与日志页 -->
+              <el-button v-if="!isLogItem(row)" text size="small" @click="goDetail(row)">监控/自检</el-button>
+              <el-button text size="small" @click="handleShowArtifacts(row)">
+                {{ isLogItem(row) ? 'Filebeat 配置' : '配置' }}
+              </el-button>
               <el-button text size="small" @click="openEdit(row)">编辑</el-button>
               <el-button
                 text
@@ -957,9 +1052,10 @@ onMounted(load)
         >重新核验</el-button>
         <el-button text size="small" @click="handleSelfCheck(pendingItem)">自检</el-button>
         <!-- 按钮由后端的 next_action 决定：部署类失败→重新应用（远程会先问 SSH 凭据），
-             账号类失败→去重试建号。避免两个入口互相推诿、让人以为功能重复。 -->
+             账号类失败→去重试建号。避免两个入口互相推诿、让人以为功能重复。
+             日志集成没有监控账号，那类动作（重试建号）不出现，只留自检与重新应用。 -->
         <el-button
-          v-if="pendingItem.next_action === 'retry_account'"
+          v-if="pendingItem.next_action === 'retry_account' && !isLogItem(pendingItem)"
           text
           size="small"
           type="primary"
@@ -972,7 +1068,13 @@ onMounted(load)
           type="primary"
           @click="handleApply(pendingItem)"
         >{{ pendingItem.next_action_label || '重新应用' }}</el-button>
-        <el-button v-else text size="small" type="primary" @click="openAccounts">去重试 / 测试连接</el-button>
+        <el-button
+          v-else-if="!isLogItem(pendingItem)"
+          text
+          size="small"
+          type="primary"
+          @click="openAccounts"
+        >去重试 / 测试连接</el-button>
       </div>
       <p v-if="items.some((item) => item.deploy_note)" class="muted note">
         平台自动完成：{{ items.find((item) => item.deploy_note)?.deploy_note }}
@@ -992,17 +1094,27 @@ onMounted(load)
             <el-form-item label="集成名称" prop="name">
               <el-input v-model="form.name" placeholder="如 legacy-redis" />
             </el-form-item>
-            <p class="field-hint">
+            <p v-if="isLog" class="field-hint">
+              唯一，同时作为日志事件里的服务标识与目标机上 Filebeat 的配置目录名。
+            </p>
+            <p v-else class="field-hint">
               唯一，且必须与 Prometheus 的 <span class="mono">instance_name</span> 一致（平台按它定位指标）。
             </p>
           </el-col>
           <el-col :xs="24" :sm="12">
-            <el-form-item :label="activeTemplate?.address_label || '连接地址'" prop="address">
-              <el-input v-model="form.address" :placeholder="activeTemplate?.address_hint || ''" />
+            <el-form-item :label="activeTemplate?.address_label || (isLog ? '目标服务器' : '连接地址')" prop="address">
+              <el-input
+                v-model="form.address"
+                :placeholder="activeTemplate?.address_hint || (isLog ? '如 10.0.0.31；平台与被管机同机时填 127.0.0.1' : '')"
+              />
             </el-form-item>
-            <p class="field-hint">端口可省略，默认 {{ activeTemplate?.default_port }}。</p>
+            <!-- 日志集成的地址就是"哪台机器"，不存在端口可省略这回事 -->
+            <p v-if="isLog" class="field-hint">
+              被管服务器地址：平台经 SSH + Ansible 在它上面安装 Filebeat，它也是日志事件的服务器标识。
+            </p>
+            <p v-else class="field-hint">端口可省略，默认 {{ activeTemplate?.default_port }}。</p>
           </el-col>
-          <template v-if="activeTemplate?.needs_auth">
+          <template v-if="activeTemplate?.needs_auth && !isLog">
             <el-col :xs="24" :sm="12">
               <el-form-item label="只读监控账号（采集用）">
                 <el-input v-model="form.username" placeholder="留空用默认 mwops_exporter" />
@@ -1046,17 +1158,88 @@ onMounted(load)
           </el-col>
         </el-row>
 
-        <el-divider content-position="left">自定义标签（写入指标 label）</el-divider>
-        <div v-for="(row, index) in form.labels" :key="index" class="kv-row">
-          <el-input v-model="row.key" placeholder="标签名，如 team" />
-          <el-input v-model="row.value" placeholder="标签值，如 interview" />
-          <el-button text type="danger" @click="removeLabel(index)">删除</el-button>
-        </div>
-        <el-button text size="small" @click="addLabel">+ 添加标签</el-button>
+        <!-- 自定义标签写入的是指标 label，日志集成用的是模板参数，此处不显示以免产生"标签会进日志字段"的误解 -->
+        <template v-if="!isLog">
+          <el-divider content-position="left">自定义标签（写入指标 label）</el-divider>
+          <div v-for="(row, index) in form.labels" :key="index" class="kv-row">
+            <el-input v-model="row.key" placeholder="标签名，如 team" />
+            <el-input v-model="row.value" placeholder="标签值，如 interview" />
+            <el-button text type="danger" @click="removeLabel(index)">删除</el-button>
+          </div>
+          <el-button text size="small" @click="addLabel">+ 添加标签</el-button>
+        </template>
 
-        <!-- Exporter 参数：默认收起。绝大多数场景用模板默认值即可，
+        <!-- 采集参数（日志集成）：日志路径/多行合并/安装方式是这套集成的核心，
+             不能像 Exporter 参数那样折叠进"高级"里。 -->
+        <template v-if="isLog">
+          <el-divider content-position="left">采集参数</el-divider>
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            class="mb"
+            title="平台会用 Ansible 在目标机安装 Filebeat（已安装则跳过），Filebeat 将日志推送到平台 Kafka"
+          >
+            <p class="field-hint">
+              采集在目标机上由 Filebeat 完成：日志先落到平台 Kafka，再由平台消费进既有的日志事件链路
+              （错误指纹聚合 → 告警 → AI 诊断）。平台不接触你的应用容器，也不需要目标机额外开放端口，
+              只需目标机能连上平台 Kafka 的对外地址。
+            </p>
+            <p class="field-hint">
+              平台按<b>渲染后的配置内容</b>判断是否需要重启：内容没变就不动它，重复保存不会反复重启采集。
+            </p>
+          </el-alert>
+          <div v-for="option in activeTemplate?.options || []" :key="option.key" class="option-row">
+            <div class="option-main">
+              <span class="option-label">{{ option.label }}</span>
+              <p class="field-hint">{{ option.help }}</p>
+              <p v-if="logOptionControl(option) === 'environment'" class="field-hint">
+                与顶部的「环境」是同一个值：这里改了那里也会变。
+              </p>
+            </div>
+            <!-- 日志路径常是多个 glob：普通输入框会把它们挤成一行 -->
+            <el-input
+              v-if="logOptionControl(option) === 'paths'"
+              v-model="form.options[option.key]"
+              type="textarea"
+              :rows="3"
+              class="option-textarea"
+              :placeholder="option.default || '/var/log/app/*.log'"
+            />
+            <!-- 值是固定的枚举/布尔，用控件而不是让使用者手打 -->
+            <el-switch
+              v-else-if="logOptionControl(option) === 'bool'"
+              v-model="form.options[option.key]"
+              active-value="true"
+              inactive-value="false"
+            />
+            <el-select
+              v-else-if="logOptionControl(option) === 'install_mode'"
+              v-model="form.options[option.key]"
+              class="option-input"
+            >
+              <el-option label="auto（已有 Filebeat 就复用，否则按 Docker/安装包二选一）" value="auto" />
+              <el-option label="package（官方 deb/rpm + systemd 单元）" value="package" />
+              <el-option label="docker（官方 Filebeat 容器，需目标机有 Docker）" value="docker" />
+            </el-select>
+            <!-- 与顶部「环境」是同一个值：后端解析时优先取模板参数，绑同一份数据才不会两边打架 -->
+            <el-select
+              v-else-if="logOptionControl(option) === 'environment'"
+              v-model="form.environment"
+              class="option-input"
+            >
+              <el-option label="开发" value="dev" />
+              <el-option label="预发" value="staging" />
+              <el-option label="生产" value="prod" />
+            </el-select>
+            <el-input v-else v-model="form.options[option.key]" class="option-input" :placeholder="option.default" />
+          </div>
+          <p class="field-hint">平台只透传模板声明的参数，不接受任意自定义配置。</p>
+        </template>
+
+        <!-- Exporter 参数（指标集成）：默认收起。绝大多数场景用模板默认值即可，
              只有少数"看环境"的开关（云 Redis 集群架构、node 的挂载排除正则）才需要动。 -->
-        <el-collapse v-if="(activeTemplate?.options || []).length > 0" class="advanced-collapse">
+        <el-collapse v-else-if="(activeTemplate?.options || []).length > 0" class="advanced-collapse">
           <el-collapse-item name="exporter-options">
             <template #title>
               <span class="collapse-title">
@@ -1093,16 +1276,26 @@ onMounted(load)
           </el-collapse-item>
         </el-collapse>
 
-        <el-divider content-position="left">Exporter 部署位置</el-divider>
+        <el-divider content-position="left">{{ isLog ? '部署位置与目标机' : 'Exporter 部署位置' }}</el-divider>
         <el-form-item label="部署到">
           <el-select v-model="form.deploy_target" class="mobile-block">
-            <el-option label="远程服务器（平台用内置 Ansible playbook 一键安装）— 默认" value="remote" />
-            <el-option label="本机（平台用 Docker API 创建容器，需要 docker.sock）" value="local" />
+            <el-option
+              :label="isLog
+                ? '远程服务器（平台用内置 Ansible playbook + SSH 安装 Filebeat）— 默认'
+                : '远程服务器（平台用内置 Ansible playbook 一键安装）— 默认'"
+              value="remote"
+            />
+            <el-option
+              :label="isLog
+                ? '本机（平台在这台机器上执行 Ansible，目标服务器请填 127.0.0.1）'
+                : '本机（平台用 Docker API 创建容器，需要 docker.sock）'"
+              value="local"
+            />
           </el-select>
         </el-form-item>
-        <!-- Docker 通道提示只在「本机」时出现：选远程时它不相关，不该打扰使用者 -->
+        <!-- Docker 通道提示只在「本机」且是指标集成时出现：日志集成本机走的是 Ansible，不是 Docker -->
         <el-alert
-          v-if="form.deploy_target === 'local' && overview?.docker_note"
+          v-if="!isLog && form.deploy_target === 'local' && overview?.docker_note"
           type="info"
           :closable="false"
           show-icon
@@ -1125,7 +1318,9 @@ onMounted(load)
           </p>
         </el-alert>
         <template v-if="form.deploy_target === 'remote'">
-          <el-row :gutter="12">
+          <!-- 日志集成的目标服务器就是上面的地址栏，这里不再重复一个同义输入框；
+               Exporter 端口 / Exporter 安装方式对 Filebeat 也不适用（安装方式在「采集参数」里选） -->
+          <el-row v-if="!isLog" :gutter="12">
             <el-col :xs="24" :sm="10">
               <el-form-item label="目标服务器">
                 <el-input v-model="form.target_host" placeholder="如 10.0.0.31（被管实例所在机器）" />
@@ -1176,7 +1371,12 @@ onMounted(load)
               写入 0600 临时文件并在执行后立即删除，因此「重新应用」需要重新填写凭据；
               生产环境会先创建审批工单，审批通过后才执行。
             </p>
-            <p class="field-hint">
+            <p v-if="isLog" class="field-hint">
+              目标机需有 sudo 权限；平台会先探测是否已有 Filebeat（在位则复用，只下发/校验配置），
+              安装后由自检回答「Filebeat 是否在位」与「目标机能否连上平台 Kafka」。
+              该能力同样需要平台镜像带 ansible-playbook 且已开启 INTEGRATION_ALLOW_REMOTE_INSTALL。
+            </p>
+            <p v-else class="field-hint">
               目标机需有 sudo 权限；选 docker/docker-systemd 时还需已安装 Docker（选 binary 则不需要）；
               安装完成后平台会主动探测一次「目标IP:端口」，探不通会把原因写进集成备注。
               该能力还需平台镜像带 ansible-playbook 且已开启 INTEGRATION_ALLOW_REMOTE_INSTALL。
@@ -1191,14 +1391,18 @@ onMounted(load)
                因为"平台不部署"本身也是合法选择（手工模式），
                而灰掉开关只会让人不知道发生了什么（本次反馈的问题）。 -->
           <el-switch v-model="form.deploy" />
-          <span v-if="form.deploy_target === 'remote'">
+          <span v-if="isLog">
+            由平台用 Ansible 在目标机安装 Filebeat（{{ remoteReady ? 'Ansible 通道可用' : '需平台镜像带 ansible-playbook' }}）
+          </span>
+          <span v-else-if="form.deploy_target === 'remote'">
             由平台远程安装 Exporter（{{ remoteReady ? 'Ansible 通道可用' : '需平台镜像带 ansible-playbook' }}）
           </span>
           <span v-else>
             由平台一键拉起 Exporter 容器（{{ dockerReady ? 'Docker API 可用' : '需开启 integration.docker_enabled' }}）
           </span>
         </div>
-        <div class="switch-row">
+        <!-- 推荐告警规则基于 Prometheus 指标，日志集成的告警来自日志指纹，不在此处开关 -->
+        <div v-if="!isLog" class="switch-row">
           <el-switch v-model="form.auto_rules" />
           <span>自动创建推荐告警规则（{{ (activeTemplate?.alerts || []).length }} 条）</span>
         </div>
@@ -1207,8 +1411,9 @@ onMounted(load)
           生产请用 <span class="mono">WITH_ANSIBLE=true</span> 构建后端镜像（见 deploy/ansible/README.md）。
         </p>
 
-        <!-- 反向接网：只对本机容器有意义（远程目标是别的机器上的容器，平台碰不到它的网络） -->
-        <template v-if="form.deploy_target === 'local'">
+        <!-- 反向接网：只对本机容器有意义（远程目标是别的机器上的容器，平台碰不到它的网络）；
+             日志集成不接管任何容器，也不存在接网这件事 -->
+        <template v-if="form.deploy_target === 'local' && !isLog">
           <div class="switch-row">
             <el-switch v-model="form.join_platform_network" :disabled="!dockerReady" />
             <span>改为把「目标容器」接入平台网络（仅在平台接不进去时使用）</span>
@@ -1289,35 +1494,48 @@ onMounted(load)
 
       <template #footer>
         <div class="dialog-footer">
-          <el-button :loading="previewing" @click="handlePreview">预览生成的配置</el-button>
+          <!-- 日志集成同样有可预览的产物：渲染后的 filebeat.yml 与安装命令（后端同一接口承载） -->
+          <el-button :loading="previewing" @click="handlePreview">
+            {{ isLog ? '预览 Filebeat 配置与安装命令' : '预览生成的配置' }}
+          </el-button>
           <div class="spacer" />
           <el-button @click="dialogVisible = false">取消</el-button>
           <el-button type="primary" :loading="submitting" @click="handleSubmit">
-            {{ isEdit ? '保存并重新应用' : '保存并集成' }}
+            {{ submitLabel }}
           </el-button>
         </div>
       </template>
     </el-dialog>
 
     <!-- 生成的配置 -->
-    <el-drawer v-model="artifactsVisible" title="生成的采集配置" size="640px">
+    <el-drawer
+      v-model="artifactsVisible"
+      :title="artifactsIsLog ? '将下发的 Filebeat 配置与安装命令' : '生成的采集配置'"
+      size="640px"
+    >
       <template v-if="artifacts">
+        <!-- 日志集成没有 file_sd / scrape_job：产物的语义按 category 换标签，
+             否则 filebeat.yml 会挂在「Exporter(compose)」这个标题下 -->
         <el-tabs v-model="artifactsTab">
-          <el-tab-pane label="Exporter(compose)" name="compose">
+          <el-tab-pane :label="artifactsIsLog ? 'Filebeat(filebeat.yml)' : 'Exporter(compose)'" name="compose">
+            <p v-if="artifactsIsLog" class="muted">
+              平台会把它下发到目标机的 <span class="mono">/etc/filebeat/filebeat.yml</span>；
+              内容未变化时不重启 Filebeat，避免采集抖动。
+            </p>
             <el-button text size="small" @click="copy(artifacts.compose)">复制</el-button>
             <pre class="code">{{ artifacts.compose }}</pre>
           </el-tab-pane>
-          <el-tab-pane label="Prometheus(file_sd)" name="filesd">
+          <el-tab-pane v-if="!artifactsIsLog" label="Prometheus(file_sd)" name="filesd">
             <p class="muted">平台会写入 <span class="mono">{{ overview?.file_sd_path }}</span>，Prometheus 周期性重读，无需重启。</p>
             <el-button text size="small" @click="copy(artifacts.file_sd)">复制</el-button>
             <pre class="code">{{ artifacts.file_sd }}</pre>
           </el-tab-pane>
-          <el-tab-pane label="Prometheus(显式 job)" name="job">
+          <el-tab-pane v-if="!artifactsIsLog" label="Prometheus(显式 job)" name="job">
             <p class="muted">file_sd 不便接入时，把下面片段并入 <span class="mono">scrape_configs</span>（两者二选一）。</p>
             <el-button text size="small" @click="copy(artifacts.scrape_job)">复制</el-button>
             <pre class="code">{{ artifacts.scrape_job }}</pre>
           </el-tab-pane>
-          <el-tab-pane label="docker run" name="run">
+          <el-tab-pane :label="artifactsIsLog ? '安装命令' : 'docker run'" name="run">
             <el-button text size="small" @click="copy(artifacts.deploy_cmd)">复制</el-button>
             <pre class="code">{{ artifacts.deploy_cmd }}</pre>
           </el-tab-pane>
@@ -1325,9 +1543,10 @@ onMounted(load)
             <ol class="steps">
               <li v-for="(step, index) in artifacts.verify_steps" :key="index">{{ step }}</li>
             </ol>
-            <p class="muted">
+            <p v-if="!artifactsIsLog" class="muted">
               平台查询选择器：<span class="mono">{{ artifacts.selector }}</span>
             </p>
+            <p v-if="artifacts.network_note" class="muted">{{ artifacts.network_note }}</p>
           </el-tab-pane>
         </el-tabs>
       </template>
@@ -1547,80 +1766,6 @@ onMounted(load)
         </div>
       </template>
     </el-dialog>
-    <!-- 日志接入：从被管容器的 docker 配置反查日志位置（读不到不允许配置） -->
-    <el-dialog v-model="logDialogVisible" title="日志接入" width="720px" :close-on-click-modal="false">
-      <el-alert
-        type="info"
-        :closable="false"
-        show-icon
-        class="mb"
-        title="平台会读取被管容器的 docker 配置（环境变量与挂载点）来确定日志位置，并创建自己的采集容器；读不到位置时会拒绝配置，不会猜路径。被管项目无需任何改动。"
-      />
-      <el-form label-position="top">
-        <el-row :gutter="12">
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="接入名称">
-              <el-input v-model="logForm.name" placeholder="如 app-backend-logs" />
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="目标容器名">
-              <el-input v-model="logForm.target_container" placeholder="docker ps 里的 NAMES，如 app-backend" />
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="服务名（日志事件按它归集）">
-              <el-input v-model="logForm.service" placeholder="留空取接入名称" />
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="最低采集级别">
-              <el-select v-model="logForm.level_filter" class="mobile-block">
-                <el-option label="ERROR" value="ERROR" />
-                <el-option label="WARN" value="WARN" />
-                <el-option label="INFO（含 GC 等无级别日志）" value="INFO" />
-              </el-select>
-            </el-form-item>
-          </el-col>
-        </el-row>
-      </el-form>
-
-      <template v-if="logPlan">
-        <el-divider content-position="left">发现结果</el-divider>
-        <el-descriptions :column="1" border size="small">
-          <el-descriptions-item label="日志目录">
-            <span class="mono">{{ logPlan.source.dir }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="承载位置">
-            {{ logPlan.source.mount_kind === 'volume' ? '命名卷' : '宿主目录' }}
-            <span class="mono">{{ logPlan.source.mount_source }}</span> → 采集容器 <span class="mono">{{ logPlan.source.mount_target }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="判断依据">
-            <span v-for="(item, index) in logPlan.source.evidence" :key="index">{{ item }}<br /></span>
-          </el-descriptions-item>
-          <el-descriptions-item label="采集容器">
-            <span class="mono">{{ logPlan.collector_name }}</span>（镜像 {{ logPlan.collector_image }}，Entrypoint=mwops-agent）
-          </el-descriptions-item>
-        </el-descriptions>
-        <el-alert v-for="(item, index) in logPlan.warnings" :key="index" class="mt" type="warning" :closable="false" show-icon :title="item" />
-        <h4 class="diag-title">平台将执行</h4>
-        <ol class="steps">
-          <li v-for="(step, index) in logPlan.steps" :key="index">{{ step }}</li>
-        </ol>
-      </template>
-
-      <template #footer>
-        <div class="dialog-footer">
-          <el-button :loading="logLoading" @click="handleLogPreview">读取 docker 配置并预览</el-button>
-          <div class="spacer" />
-          <el-button @click="logDialogVisible = false">取消</el-button>
-          <el-button type="primary" :disabled="!logPlan" :loading="logLoading" @click="handleLogSubmit">
-            创建采集容器
-          </el-button>
-        </div>
-      </template>
-    </el-dialog>
-
     <!-- 重新应用：远程部署需要 SSH 凭据（仅本次使用，不落库） -->
     <el-dialog
       v-model="applyVisible"
@@ -1629,9 +1774,11 @@ onMounted(load)
       :close-on-click-modal="false"
     >
       <el-alert type="info" :closable="false" show-icon
-        title="将重写抓取配置并在目标机上重建/重装 Exporter">
+        :title="applyIsLog
+          ? '将用 Ansible 在目标机安装/校验 Filebeat（已安装则跳过）'
+          : '将重写抓取配置并在目标机上重建/重装 Exporter'">
         <p class="field-hint">
-          平台会重写 Prometheus 抓取目标并重新安装 Exporter。
+          平台会{{ applyIsLog ? '重放一次 Filebeat 部署并下发最新配置' : '重写 Prometheus 抓取目标并重新安装 Exporter' }}。
           SSH 凭据仅本次使用、不落库、不回显；用<b>私钥</b>认证时不需要平台安装 sshpass。
         </p>
       </el-alert>
@@ -1686,7 +1833,9 @@ onMounted(load)
         class="mb"
         :title="selfCheckResult.summary"
       />
-      <div v-else-if="selfCheckLoading" class="muted">正在按环节检查（平台端口 → Exporter → Prometheus → 业务指标）…</div>
+      <div v-else-if="selfCheckLoading" class="muted">
+        正在按环节检查（{{ selfCheckIsLog ? '平台 Kafka → 目标机 Filebeat → 目标机到 Kafka 的连通性 → 是否收到日志' : '平台端口 → Exporter → Prometheus → 业务指标' }}）…
+      </div>
 
       <el-table v-if="selfCheckResult" :data="selfCheckResult.stages" size="small" :show-header="false">
         <el-table-column label="环节" width="210">
@@ -1731,6 +1880,20 @@ onMounted(load)
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 12px;
+}
+
+/* 同一分类的卡片成组展示：类型不同，表单与状态语义完全不同，混在一起容易选错 */
+.tpl-group + .tpl-group {
+  margin-top: 14px;
+}
+
+.tpl-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 11.5px;
 }
 
 .tpl-card {
@@ -1837,6 +2000,12 @@ onMounted(load)
   width: 200px;
 }
 
+/* 日志路径可能是多个 glob（每行一个或逗号分隔），输入框必须放得下多行 */
+.option-textarea {
+  width: 320px;
+  flex: 0 0 320px;
+}
+
 .switch-row {
   display: flex;
   align-items: center;
@@ -1873,5 +2042,19 @@ onMounted(load)
   padding-left: 18px;
   font-size: 12.5px;
   line-height: 1.9;
+}
+
+/* 窄屏：参数行改为上下排列，否则"说明 + 控件"会被挤在一起 */
+@media (max-width: 767px) {
+  .option-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .option-input,
+  .option-textarea {
+    width: 100%;
+    flex: none;
+  }
 }
 </style>

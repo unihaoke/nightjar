@@ -331,7 +331,13 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	     新增 token 消费/剩余额度统计；通知配置改为原子快照（INC-018）。
 //	r11：表名不再手写字面量，改由 model.TableNameOf 推导（用量统计 + 启动期建索引/向量升级）；
 //	     参考 schema 的表名一并修正（INC-019）。
-const CodeRevision = "r11"
+//	r12：「日志接入」重构为「日志集成」：平台自带 Kafka（compose 新增 kafka 服务）接收目标机
+//	     Filebeat 推送的日志，后端按消费组消费并复用既有日志事件链路；移除 docker 卷反查与
+//	     mwops-agent 采集容器（INC-021）。
+//	r13：日志告警补齐完整链路：可配置规则（去重窗口/冷却期/通知渠道/AI 开关，log_alert_rules）、
+//	     冷却抑制与窗口合并语义、后处理编排（通知 + AI 代码分析，DB 队列 + 定时任务）、
+//	     代码仓库本地缓存（首次 clone、之后更新到远端）；新增「重新分析」打破冷却。
+const CodeRevision = "r13"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

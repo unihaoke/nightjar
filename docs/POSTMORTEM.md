@@ -5,6 +5,139 @@
 
 ---
 
+## INC-022 · 日志进了平台就断了：没有规则、没有通知、没有 AI 分析、代码也拉不下来
+
+**首次暴露**：2026-09-19，使用者指出链路应该是完整的一段：
+
+> 「kafka消费的地方其实就是本项目，然后应该输出到日志告警中，规则也是需要设置对应的去重窗口，
+> 冷却期等，也就是说现在的完整链路是 kafka 接收到日志，根据页面上设置的去重窗口，比如 5 分钟内
+> 相同的警告忽略 → 记录到日志告警中 → AI 分析并拉取对应仓库的代码（记住将其保存在本地，下次
+> 获取的时候直接 git pull 就可以了），并分析日志中代码的位置给出对应的 ai 处理结果 → 发送到告警渠道」
+
+**定位过程（逐段核对，发现只完成了前两段）**
+
+| 链路环节 | 当时的真实状态 |
+|---|---|
+| Kafka 接收日志（平台自己消费） | ✅ 已完成 |
+| 落库到日志告警 | ✅ 已完成（`log_alert_events`） |
+| 按页面配置的去重窗口 | ❌ 窗口是代码里的常量（5 分钟），`EnsureWindow` 这个"可调"入口**没有任何调用方** |
+| 冷却期 | ❌ 概念都不存在：`log_alert_events.suppressed` 字段有人读、**没人写** |
+| 自动 AI 分析 | ❌ `CodeAnalysisService.Analyze` 只被 HTTP 手工接口调用，Ingest 之后什么都不做 |
+| 拉取代码仓库 | ❌ **全仓没有一行 `git clone` / `git pull`**；`locateCode` 直接读 `CodeRepo.local_path`，而那个目录通常根本不存在 |
+| 发送到告警渠道 | ❌ 日志链路从不调用通知服务（指标告警才有） |
+
+结论：这一版只做到"接进来、存下来"，把"处理"整段留给了人工；而且 AI 分析的**输入（代码）
+从来没被准备过**——即使有人手工点"AI 代码分析"，也只能在空目录上检索。
+
+**根因**
+
+1. 把"采集"当成了终点，没有把"告警生命周期"走完（发现 → 抑制 → 通知 → 定位 → 结论）；
+2. 参数（窗口/冷却）写在代码里，而它其实是**业务决策**（核心服务要立刻通知、批处理可以攒一攒），
+   必须由页面配置；
+3. "AI 能定位代码"这句承诺缺了前置条件：代码得先在本地有一份，且要能增量更新。
+
+**修复**
+
+1. **日志告警规则** `log_alert_rules`：按「服务 + 指纹 + 最低级别」匹配，配置去重窗口、冷却期、
+   通知渠道、AI 开关与优先级；没有命中时用 `log_alert.default_*` 兜底，保证零配置也能跑通；
+   提供完整 CRUD 接口与页面（权限 `logalert:read/write`，改动写审计）；
+2. **Ingest 语义明确化**（与指标告警对齐）：窗口内同指纹**合并计数**；冷却期内**不重复通知、
+   不重复触发 AI**，但**事件照常记录**（`suppressed=true` + `cooldown_until`，页面标「冷却中」）；
+   冷却过后再次合并时只重新通知，不重复跑 AI；
+3. **后处理编排** `LogAlertWorker`：Ingest 只负责记录与判定，通知与 AI 分析交给定时任务
+   （默认 15 秒）异步执行——AI 要拉代码调 LLM，同步做会把 Kafka 消费拖慢；
+   状态落在 `analysis_state`（pending/running/done/failed/disabled）所以**重启不丢**；
+   多副本用「带条件的 UPDATE 抢占」保证同一条只处理一次；
+4. **代码仓库本地缓存** `internal/repo`：首次 clone、之后更新到远端（分支非空时
+   `fetch --prune` + `checkout -B <branch> origin/<branch>`，否则 `pull --ff-only`）；
+   同服务并发只跑一次 git、有最小拉取间隔、路径越界防护、URL 凭据脱敏、错误翻译成中文；
+   拉取结果写回 `local_path`/`last_pull_at` 供页面查看；
+5. **「重新分析」入口**：手动指定某条事件立即重跑（会**清掉冷却记录**，否则使用者点了没反应）；
+6. 文档与配置同步：`docs/LOG_INTEGRATION.md` 补 §5.1–5.3，配置项 `log_alert.*` / `code_repo.*`，
+   并把两个容易混淆的开关写清楚——`code_repo.allow_outbound` 管"能否 git 拉代码"，
+   `CodeRepo.allow_third_party` 管"能否把代码片段发给第三方 AI"。
+
+**防复发**
+
+1. `TestMatchLogAlertRule` / `TestSignatureMatches` / `TestSeverityRank`：规则匹配的四个维度
+   （优先级、服务过滤、级别门槛、指纹子串/正则），含"未知级别按 ERROR 处理"这条
+   容易静默失效的边界；
+2. `TestCooldownTracker` + `TestCooldownTrackerNeverSuppressesOnStoreFailure`：冷却判定，
+   并钉住"Redis 读失败时绝不判成冷却中"——那等于把告警静默掉；
+3. `TestAnalysisDecision`：把"该不该分析、不分析给什么原因"抽成纯函数逐条钉住，
+   页面上显示的 `disabled/failed` 原因就是它给的；
+4. `TestBuildLogAlertRuleValidation`：窗口/冷却用**指针**区分"没传"与"显式传 0"——
+   省略字段不能悄悄关掉去重（那会在下一次日志风暴里把人淹了）；
+5. `internal/repo` 的测试用本地裸库验证 **clone → unchanged → updated** 全流程
+   （"下次直接 pull"是用户明确要求的行为），以及路径越界、非 git 目录拒绝覆盖、合规开关关闭时
+   一条 git 命令都不执行。
+
+---
+
+## INC-021 · 「日志接入」只能看见容器日志：重构为 Filebeat + 平台 Kafka 的日志集成
+
+**首次暴露**：2026-09-19，使用者提出要求：
+
+> 「优化日志接入，修改为日志集成，集成方案：使用 Ansible 在 B 目标服务器自动部署 Filebeat，
+> 如果存在则不需要部署，然后 Filebeat 推送日志到平台服务所在的 Kafka，也就是当前的 Nightjar
+> 需要安装 Kafka，帮我修改相关 docker compose。用来接收日志。」
+
+**定位过程（旧方案的三个硬约束）**
+
+1. 采集对象只能是**被管容器**：旧实现靠 `docker inspect` 反查容器的环境变量与挂载点，
+   再从**同一个卷**里读日志（`DiscoverLogSource`）。物理机、K8s 节点、非容器化应用、
+   日志没落在挂载卷里的容器——一律采不到；
+2. 平台必须挂 `docker.sock`：等于把宿主机 root 权限交给平台容器。合规上不允许时，
+   日志能力整块消失（连"只渲染配置、人工执行"的退路都没有）；
+3. 采集与平台同生共死：采集容器由平台创建、复用平台镜像跑 `mwops-agent`，
+   平台重启/升级期间日志会断（没有本地缓冲），而被管项目侧**什么都做不了**。
+
+**根因**
+
+把"采集"和"平台"耦合在了一起。采集本质上是**被管侧**的事（它离日志最近、能本地缓冲、
+能断点续传），平台只该做"下发配置 + 接收 + 分析"——这正是腾讯云式集成中心的定位，
+而旧方案让平台既当裁判又当运动员。
+
+**修复（重构为「日志集成」）**
+
+1. **平台自带 Kafka**：`docker-compose.yml` 新增 `kafka` 服务（`apache/kafka:3.8.0`，KRaft 单节点、
+   无 ZooKeeper），三个监听器分工明确——CONTROLLER 内部仲裁、INTERNAL `kafka:29092` 供平台消费、
+   EXTERNAL `${KAFKA_ADVERTISED_HOST}:${KAFKA_PORT}` 供被管机接入；数据落 `kafka-data` 卷，
+   健康检查用 `kafka-topics.sh`；
+2. **集成中心新增 `log` 类型集成**（模板新增 `category: monitor|log`）：填目标服务器、日志 glob、
+   服务名/环境/级别、多行合并与安装方式，平台渲染 `filebeat.yml` 并用 **Ansible 幂等部署**：
+   先探测目标机是否已有 Filebeat（`command -v filebeat` + `systemctl is-active`），
+   有则**只校验配置**（`copy` 的 checksum 语义：内容不变不重启，避免采集抖动），
+   无则按 `auto`（复用已装 → 有 docker 用容器 → 否则包安装）/`package`/`docker` 安装；
+3. **后端消费链路**：新增 `internal/logpipe`（kafka-go 消费组 `mwops-log-ingest`，topic `mwops-logs`），
+   把 Filebeat 的 JSON 事件解析成平台记录后交给 **既有的** `LogAlertService.Ingest`——
+   指纹、窗口去重、告警、AI 诊断入口一处不重复实现。位点策略写死为：
+   解析失败**提交**（一条脏消息不能堵死整个分区）、落库失败**不提交**（数据库抖一下不能丢日志）；
+4. **自检按新链路重写**（日志类型三段）：平台 → Kafka 可达 → 被管机接入地址（advertised）可用 →
+   日志是否真的进来了（按 `server_instances.last_seen_at` 判"多久没收到"）。
+   刻意**不需要 SSH**：目标机上 Filebeat 是否在跑，最终一定体现在数据面上，与其猜不如看数据；
+5. **旧路径整体移除**：`service/logcollect.go`、`internal/integration/logs.go`（含测试）、
+   `cmd/agent`（`mwops-agent`）以及两个 `/api/integrations/logs*` 接口与 Dockerfile 里的 Agent 构建全部删除；
+   **保留** `POST /api/hooks/logs`（应用直推，零侵入兜底）；
+6. `.env` / compose / config.yaml 新增 `kafka.*` 配置，文档新增 `docs/LOG_INTEGRATION.md`
+   并从 README / API / ARCHITECTURE / COLLECTOR / INTEGRATION / OPERATIONS 全面同步。
+
+**防复发**
+
+1. `internal/logpipe` 的单测钉住三件事：Filebeat 事件 → 平台记录的字段映射（映射错了日志页全是
+   `unknown` 服务、指纹跟着失效）、脏消息必须走"提交并丢弃"分支、`Status` 的 snake_case 字段名
+   （前端契约，改名只会让页面静默变空）；
+2. `integration_alert_metrics_test.go` 的守卫改成"**日志模板不得携带任何推荐告警**"：
+   它没有指标画像，塞进去的规则会静默失效（同 INC-017 的坑）；
+3. `LogPipelineStatus.Note` 必须说明"为什么收不到日志"（未启用 / 未配 brokers / 消费未运行 / 最近错误），
+   不允许只给一个 `consumed=0`（同 INC-016 的"没有数据要说原因"）。
+
+**现场提示（写给运维）**：`KAFKA_ADVERTISED_HOST` 填成 `127.0.0.1` 是最容易犯的错——
+平台同一台机器上自测没问题，其他机器上的 Filebeat 会"握手成功、随后被引导连自己的 127.0.0.1"
+而报 `connection refused`。日志集成的自检第 2 步专门把这个地址摆出来。
+
+---
+
 ## INC-020 · AI 设置页「启用开关点不动、协议选了没反应」：表单模型漏了 reactive
 
 **首次暴露**：2026-09-19，使用者反馈（页面 `http://aiapx.icu:8000/system/ai-settings`）：

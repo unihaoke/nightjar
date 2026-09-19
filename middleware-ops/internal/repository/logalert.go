@@ -332,6 +332,196 @@ func (r *LogEventRepository) CountByStatus(ctx context.Context, since time.Time)
 	return out, nil
 }
 
+// CountByAnalysisState 统计各分析状态的事件数（页面用来说明"还有多少条在排队"）。
+func (r *LogEventRepository) CountByAnalysisState(ctx context.Context) (map[string]int64, error) {
+	type row struct {
+		AnalysisState string
+		Total         int64
+	}
+	var rows []row
+	if err := r.withCtx(ctx).Model(&model.LogAlertEvent{}).
+		Select("analysis_state, COUNT(*) AS total").Group("analysis_state").Scan(&rows).Error; err != nil {
+		return nil, wrap(err, "count log events by analysis state")
+	}
+	out := make(map[string]int64, len(rows))
+	for _, item := range rows {
+		out[item.AnalysisState] = item.Total
+	}
+	return out, nil
+}
+
+// MarkNotified 记录一次成功外发通知的时间。
+func (r *LogEventRepository) MarkNotified(ctx context.Context, id int64, at time.Time) error {
+	return wrap(r.withCtx(ctx).Model(&model.LogAlertEvent{}).Where("id = ?", id).
+		Updates(map[string]any{"notified_at": at}).Error, "mark log event notified")
+}
+
+// SetCooldown 设置冷却截止时间（窗口合并时用来续期，避免"合并一次就立刻又能通知"）。
+func (r *LogEventRepository) SetCooldown(ctx context.Context, id int64, until time.Time) error {
+	return wrap(r.withCtx(ctx).Model(&model.LogAlertEvent{}).Where("id = ?", id).
+		Updates(map[string]any{"cooldown_until": until}).Error, "set log event cooldown")
+}
+
+// SetSuppressed 标记/解除"冷却期内被抑制"（抑制不是丢弃：事件仍在列表里，只是不外发）。
+func (r *LogEventRepository) SetSuppressed(ctx context.Context, id int64, suppressed bool) error {
+	return wrap(r.withCtx(ctx).Model(&model.LogAlertEvent{}).Where("id = ?", id).
+		Updates(map[string]any{"suppressed": suppressed}).Error, "set log event suppressed")
+}
+
+// SetAnalysisState 更新 AI 分析状态与原因（失败原因会直接显示在页面上）。
+func (r *LogEventRepository) SetAnalysisState(ctx context.Context, id int64, state, reason string) error {
+	updates := map[string]any{"analysis_state": state, "analysis_error": reason}
+	if state == model.LogAnalysisDone {
+		updates["analyzed"] = true
+	}
+	return wrap(r.withCtx(ctx).Model(&model.LogAlertEvent{}).Where("id = ?", id).
+		Updates(updates).Error, "set log event analysis state")
+}
+
+// ClaimForAnalysis 抢占一条待分析事件：pending → running。
+//
+// 为什么用"带条件的 UPDATE + 影响行数"而不是先查再改：后端可能多副本部署，
+// 或者同一次定时任务与"重新分析"按钮并发——只有影响行数为 1 的那个调用者才算抢到，
+// 否则同一条事件会被分析两次（浪费额度，还会写出两份结论）。
+// 返回 claimed=false 表示别人已经拿走了，安静跳过即可（不是错误）。
+func (r *LogEventRepository) ClaimForAnalysis(ctx context.Context, id int64) (claimed bool, err error) {
+	res := r.withCtx(ctx).Model(&model.LogAlertEvent{}).
+		Where("id = ? AND analysis_state = ?", id, model.LogAnalysisPending).
+		Updates(map[string]any{"analysis_state": model.LogAnalysisRunning, "analysis_error": ""})
+	if res.Error != nil {
+		return false, wrap(res.Error, "claim log event for analysis")
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// ListPendingAnalysis 取待处理事件（按 id 升序：先来的先处理，避免老事件永远排在队尾）。
+func (r *LogEventRepository) ListPendingAnalysis(ctx context.Context, limit int) ([]model.LogAlertEvent, error) {
+	var items []model.LogAlertEvent
+	err := r.withCtx(ctx).
+		Where("analysis_state = ?", model.LogAnalysisPending).
+		Order("id ASC").Limit(limit).Find(&items).Error
+	if err != nil {
+		return nil, wrap(err, "list pending log events")
+	}
+	return items, nil
+}
+
+// RequeueAnalysis 把事件重新放回待处理队列（页面上的「重新分析」）。
+func (r *LogEventRepository) RequeueAnalysis(ctx context.Context, id int64) error {
+	res := r.withCtx(ctx).Model(&model.LogAlertEvent{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"analysis_state": model.LogAnalysisPending, "analysis_error": ""})
+	if res.Error != nil {
+		return wrap(res.Error, "requeue log event analysis")
+	}
+	if res.RowsAffected == 0 {
+		return wrap(gorm.ErrRecordNotFound, "requeue log event analysis")
+	}
+	return nil
+}
+
+// LogAlertRuleRepository 提供日志告警规则数据访问。
+type LogAlertRuleRepository struct {
+	Base
+}
+
+// NewLogAlertRuleRepository 构造日志告警规则仓储。
+func NewLogAlertRuleRepository(db *gorm.DB) *LogAlertRuleRepository {
+	return &LogAlertRuleRepository{Base: Base{db: db}}
+}
+
+// List 分页检索规则（按优先级升序：页面顺序即匹配顺序，便于对照）。
+func (r *LogAlertRuleRepository) List(ctx context.Context, keyword string, limit, offset int) ([]model.LogAlertRule, int64, error) {
+	q := r.withCtx(ctx).Model(&model.LogAlertRule{})
+	if keyword != "" {
+		like := "%" + keyword + "%"
+		q = q.Where("name LIKE ? OR service_name LIKE ? OR signature_pattern LIKE ?", like, like, like)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, wrap(err, "count log alert rules")
+	}
+	var items []model.LogAlertRule
+	if err := q.Order("priority ASC, id ASC").Limit(limit).Offset(offset).Find(&items).Error; err != nil {
+		return nil, 0, wrap(err, "list log alert rules")
+	}
+	return items, total, nil
+}
+
+// ListEnabled 取全部启用规则（匹配时用；规则数量是人工维护的，量级很小）。
+func (r *LogAlertRuleRepository) ListEnabled(ctx context.Context) ([]model.LogAlertRule, error) {
+	var items []model.LogAlertRule
+	if err := r.withCtx(ctx).Where("enabled = ?", true).
+		Order("priority ASC, id ASC").Find(&items).Error; err != nil {
+		return nil, wrap(err, "list enabled log alert rules")
+	}
+	return items, nil
+}
+
+// Get 按 ID 查询。
+func (r *LogAlertRuleRepository) Get(ctx context.Context, id int64) (*model.LogAlertRule, error) {
+	var item model.LogAlertRule
+	if err := r.withCtx(ctx).First(&item, id).Error; err != nil {
+		return nil, wrap(err, "get log alert rule")
+	}
+	return &item, nil
+}
+
+// Create 新增规则。
+func (r *LogAlertRuleRepository) Create(ctx context.Context, item *model.LogAlertRule) error {
+	if err := r.withCtx(ctx).Create(item).Error; err != nil {
+		return wrap(err, "create log alert rule")
+	}
+	return nil
+}
+
+// Update 更新规则。
+func (r *LogAlertRuleRepository) Update(ctx context.Context, item *model.LogAlertRule) error {
+	res := r.withCtx(ctx).Model(&model.LogAlertRule{}).Where("id = ?", item.ID).
+		Updates(map[string]any{
+			"name":              item.Name,
+			"description":       item.Description,
+			"service_name":      item.ServiceName,
+			"signature_pattern": item.SignaturePattern,
+			"min_severity":      item.MinSeverity,
+			"dedup_window":      item.DedupWindow,
+			"cooldown":          item.Cooldown,
+			"notify_channels":   item.NotifyChannels,
+			"ai_enabled":        item.AIEnabled,
+			"enabled":           item.Enabled,
+			"priority":          item.Priority,
+		})
+	if res.Error != nil {
+		return wrap(res.Error, "update log alert rule")
+	}
+	if res.RowsAffected == 0 {
+		return wrap(gorm.ErrRecordNotFound, "update log alert rule")
+	}
+	return nil
+}
+
+// Delete 删除规则。
+func (r *LogAlertRuleRepository) Delete(ctx context.Context, id int64) error {
+	res := r.withCtx(ctx).Delete(&model.LogAlertRule{}, id)
+	if res.Error != nil {
+		return wrap(res.Error, "delete log alert rule")
+	}
+	if res.RowsAffected == 0 {
+		return wrap(gorm.ErrRecordNotFound, "delete log alert rule")
+	}
+	return nil
+}
+
+// GetByService 按服务名取启用规则（页面提示"这个服务当前命中哪条规则"）。
+func (r *LogAlertRuleRepository) GetByService(ctx context.Context, service string) ([]model.LogAlertRule, error) {
+	var items []model.LogAlertRule
+	if err := r.withCtx(ctx).Where("enabled = ? AND (service_name = ? OR service_name = '')", true, service).
+		Order("priority ASC, id ASC").Find(&items).Error; err != nil {
+		return nil, wrap(err, "get log alert rules by service")
+	}
+	return items, nil
+}
+
 // CodeAnalysisRepository 提供 AI 代码分析报告数据访问。
 type CodeAnalysisRepository struct {
 	Base

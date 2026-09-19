@@ -284,12 +284,41 @@ else
   fi
 fi
 
+# Kafka 对外地址（KAFKA_ADVERTISED_HOST）：**被管服务器上的 Filebeat 用它连平台 Kafka**，
+# 因此必须是"被管机可达"的地址，不能是 127.0.0.1（除非平台与被管机就是同一台）。
+# 填错的现场极有迷惑性：Filebeat 能连上 9092 握手成功，随后被 Kafka 的 broker 元数据
+# 引导去连它**自己**的 127.0.0.1，于是报 connection refused（见 docs/LOG_INTEGRATION.md）。
+# 只在"空值或默认回环"时自动探测：用户显式填了域名/IP 就不覆盖。
+detect_host_ip() {
+  local ip=""
+  ip=$(ip route get 1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  printf '%s' "$ip"
+}
+CURRENT_KAFKA_HOST=$(env_get "$NJ" KAFKA_ADVERTISED_HOST)
+if [ -z "$CURRENT_KAFKA_HOST" ] || [ "$CURRENT_KAFKA_HOST" = "127.0.0.1" ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    dryskip "跳过 Kafka 对外地址探测（正式运行会写入 KAFKA_ADVERTISED_HOST）"
+  else
+    HOST_IP=$(detect_host_ip)
+    if [ -n "$HOST_IP" ]; then
+      set_env_reported "$NJ" KAFKA_ADVERTISED_HOST "$HOST_IP"
+      ok "已写入 KAFKA_ADVERTISED_HOST=$HOST_IP（跨机采集日志时被管机的 Filebeat 用它连平台）"
+    else
+      warn '未能探测宿主 IP：跨机采集时请手工把 KAFKA_ADVERTISED_HOST 改成被管机可达的平台地址'
+      hint '取法：ip route get 1 | awk '\''{print $7; exit}'\''   或   hostname -I | awk '\''{print $1}'\'''
+    fi
+  fi
+else
+  ok "KAFKA_ADVERTISED_HOST 已是 $CURRENT_KAFKA_HOST（沿用已有配置）"
+fi
+
 # ---------------------------------------------------------------------------
 step '3/7 端口错开（被占用时自动换端口）'
 # 说明：宿主上已经有 Prometheus/Grafana/其他 Web 服务时，默认端口会冲突，
 # 表现为 docker compose 报 "port is already allocated" —— 修的就是这里。
-declare -a PORT_KEYS=(WEB_PORT PROMETHEUS_PORT GRAFANA_PORT)
-declare -a PORT_DEFAULTS=(8000 9090 3000)
+declare -a PORT_KEYS=(WEB_PORT PROMETHEUS_PORT GRAFANA_PORT KAFKA_PORT)
+declare -a PORT_DEFAULTS=(8000 9090 3000 9092)
 for idx in "${!PORT_KEYS[@]}"; do
   key="${PORT_KEYS[$idx]}"; want="${PORT_DEFAULTS[$idx]}"
   cur=$(port_of "$NJ" "$key"); [ -z "$cur" ] && cur="$want"

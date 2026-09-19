@@ -1,7 +1,8 @@
 # 接入 nightjar · 操作指南（平台托管监控 · 被管项目零配置）
 
 > 架构已定：**监控栈统一在 nightjar**。被管项目（被管项目）只跑业务，不装 Exporter、不装 Agent、
-> 不跑 Prometheus/Grafana；平台负责建只读账号、拉起 Exporter、自动接入对方网络、抓取、出大盘、采日志。
+> 不跑 Prometheus/Grafana；平台负责建只读账号、拉起 Exporter、自动接入对方网络、抓取、出大盘，
+> 日志则由平台用 Ansible 在目标机部署 Filebeat 推到平台自带 Kafka（见 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)）。
 >
 > 设计细节见 [`INTEGRATION.md`](INTEGRATION.md)，接口见 [`API.md`](API.md)，运维见 [`OPERATIONS.md`](OPERATIONS.md)。
 
@@ -15,7 +16,7 @@
 │ mwops-grafana      大盘（数据源已自动配好）              │
 │ mwops-backend      纳管/查询/告警/AI 诊断/日志接收        │
 │ mwops-exporter-*   按「集成」创建，自动接入两张网         │
-│ mwops-*-logs       日志采集容器，挂载被管项目的日志卷      │
+│ mwops-kafka        日志总线：Filebeat 推送日志            │
 └──────────┬─────────────────────────────────────────────┘
            │ 平台用 Docker API 自己发现目标容器所在网络并接入（被管项目零改动）
 ┌──────────┴─ 被管项目（零监控配置）───────────────────────────┐
@@ -32,7 +33,7 @@
 | 网络接入 | 平台（`ResolveTarget` 反查容器所在网络并自动接入） | **无**（不建网络、不加别名、不改 compose） |
 | 指标抓取 | 平台自带 Prometheus | 无 |
 | 大盘 | 平台自带 Grafana | 无（可选：按编号导入官方大盘） |
-| 日志采集 | 平台侧采集容器读同一日志卷 | 无 |
+| 日志集成 | 平台用 Ansible 在目标机部署 Filebeat → 平台 Kafka（`mwops-kafka`） | 目标机能被平台 SSH 到、且能访问平台 Kafka 的对外地址 |
 | 告警规则 | 平台按模板自动创建 | 无 |
 
 ---
@@ -82,7 +83,14 @@ cd <nightjar>
 |---|---|
 | ③ 集成 MySQL | 名称 `legacy-mysql`、地址 `app-mysql:3306`；**只读账号自动创建**（默认 `mwops_exporter`、口令平台生成），只需填一次 root 管理凭据 |
 | ④ 集成 Redis | 名称 `legacy-redis`、地址 `app-redis:6379`、口令填 `.env` 的 `REDIS_PASSWORD`（Redis 不需要建号） |
-| ⑤ 日志接入 | 目标容器名 `app-backend`、服务名 `app-review-api`、级别 `ERROR` → 先「读取 docker 配置并预览」再「创建采集容器」 |
+| ⑤ 日志集成 | 集成中心 → **日志 / Filebeat** 选 `log` 类型 → 集成名 `order-app-log`、目标机 `app-backend` 所在主机、日志路径 `/app/data/logs/*.log`、服务名 `app-review-api`、级别 `ERROR` → 保存后点**自检**，三段环节（平台 → Kafka / 被管机接入地址 / 日志是否真的进来了）全绿 |
+
+日志接入之后还有两步**可选但强烈建议**的配置（都在「日志告警」分组里，不配也能跑通）：
+
+| 步骤 | 操作 | 为什么 |
+|---|---|---|
+| ⑥ **配规则（可选）** | 日志告警 → **日志告警规则** → 新建：`service_name` 填 `app-review-api`（留空 = 任意服务）、`signature_pattern` 填**错误指纹**的一段子串（从事件详情页的 `error_signature` 复制；留空 = 任意指纹，写 `/正则/` 则按正则匹配）、`min_severity` 选 `ERROR`，再定 **去重窗口**（默认 5 分钟）、**冷却期**（默认 10 分钟）、**通知渠道**（留空 = 平台已启用的渠道）与 **AI 分析**开关 | 决定"多久打扰人一次"以及要不要自动出代码结论。匹配按「priority 数字小者优先、同优先级按 id 升序取第一条命中的**启用**规则」；**一条都没命中**时用平台默认值（`log_alert.default_*`，该页顶部卡片会显示具体取值）。建完规则记得确认它是**启用**状态 |
+| ⑦ **配服务→代码仓库映射（要 AI 代码结论就必填）** | 日志告警 → **服务器与仓库** → 新增映射：服务名填 `app-review-api`（**必须与日志事件里的 `service` 完全一致**）、仓库地址（HTTPS + 只读令牌或 SSH 部署密钥）、分支（默认 `main`）、语言 | AI 要回答"这条错误对应哪一行代码"，平台必须先在本地有一份与服务当前版本一致的代码。首次分析 **clone** 到 `code_repo.cache_dir`（默认 `./data/repos`，落在 `backend-data` 卷里），之后**只做更新**（分支非空时强制重置到远端）。没配映射时事件是 `analysis_state=disabled`，原因写在 `analysis_error`。要真出结论还需按服务开启 `allow_third_party` 并把服务名加入 `security.outbound_whitelist`；`code_repo.allow_outbound=false` 会让平台**完全不执行 git 命令** |
 
 账号相关补充：
 
@@ -135,8 +143,13 @@ cd <nightjar>
 | 报 `Access denied for user 'exporter'` | 只读账号不存在或口令不一致 | 重新保存并勾选「由平台创建只读监控账号」（等效手工：见 `INTEGRATION.md` 的模板 SQL） |
 | 报 `invalid DSN` | 旧版 Exporter 配置在拼 `DATA_SOURCE_NAME` | 已被官方方式取代（`--mysqld.username` + `MYSQLD_EXPORTER_PASSWORD`）；重建 Exporter 即可 |
 | Exporter 起来了但 up=0，且 lastError 是 `connection refused` | Exporter 不在目标网络上（例如平台没有 docker.sock，无法自动接网） | 挂上 docker.sock 后点该集的「重新应用」；或按 `INTEGRATION.md` §6 手工把网络写进 `INTEGRATION_EXPORTER_NETWORK` |
-| 日志接入报「未从 docker 配置中发现日志位置」 | 目标容器没有日志环境变量，也没有像日志的挂载 | 在 被管项目的 compose 里保留 `backend-logs:/app/data/logs`（已有）并重启后端；**平台不会猜路径** |
-| 日志页没有事件 | 采集容器没起来 / 令牌不一致 / 级别过滤太严 | `docker logs mwops-*-logs`；`doctor.sh` 会检查采集容器 |
+| 日志集成：Filebeat **连上又断开**，报 `dial tcp 127.0.0.1:9092: connect: connection refused` | `.env` 的 `KAFKA_ADVERTISED_HOST` 填成了 `localhost`/`127.0.0.1`（或容器名）。Filebeat 先连上平台 9092 握手成功，随后被 broker 元数据引导去连**它自己那台机器**的 127.0.0.1，于是立刻断开 | 把 `KAFKA_ADVERTISED_HOST` 改成**被管机能访问到的平台宿主机 IP 或域名**（`ip route get 1 \| awk '{print $7; exit}'`），重建 kafka 容器（`docker compose up -d kafka`）；然后在目标机 `nc -vz <KAFKA_ADVERTISED_HOST> 9092` + `filebeat test output` 复验。集成自检第 2 段「被管机接入地址」专门抓这个问题 |
+| 日志集成：Filebeat 显示已发送，但平台一条日志都没有 | 目标机时钟偏移过大（NTP 未同步）。Kafka 3.6+ 默认校验 `message.timestamp.difference.max.ms`，超出容忍窗口的消息以 `InvalidTimestampException` 被直接丢弃 | 目标机执行 `timedatectl` / `chronyc tracking` 确认已同步；偏差大的先修 NTP 再重启 Filebeat。自检第 3 段「日志是否已进入平台」会持续显示"还没有收到日志" |
+| 担心重复点集成会重复安装 Filebeat | 不需要担心：`auto` 模式先 `command -v filebeat` + `systemctl is-active filebeat` 探测，**已装 Filebeat 不会被重复安装**，只校验/下发配置；配置内容用渲染后的 `filebeat.yml` 内容哈希判定，**内容不变就不会重启** Filebeat | 直接再点一次「保存并集成」即可；想核实就在目标机跑 `systemctl status filebeat`（或 `docker ps \| grep mwops-filebeat`）与 `filebeat test output` |
+| 日志集成自检第 1 段红「平台 → Kafka 日志总线」 | 平台侧 `kafka` 容器没起来，或 `KAFKA_BROKERS` 被改错（平台侧要填容器网络的 `kafka:29092`，不是宿主端口） | `docker compose ps kafka`；`docker exec mwops-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list` 应列出 `mwops-logs`；恢复 `.env` 的 `KAFKA_BROKERS=kafka:29092` 后重建 backend |
+| 日志页没有事件 | 目标机 Filebeat 没起来 / 目标机连不上平台 Kafka / 日志路径 glob 写错 / 级别过滤太严 | 目标机 `systemctl status filebeat`（docker 模式 `docker ps \| grep mwops-filebeat`）与 `filebeat test output`；再在集成中心点**自检**，按红色那一段定位；`doctor.sh` 会检查平台 Kafka 与日志链路 |
+| **日志收到了但不通知、也不分析** | ① 规则没命中：日志页上的规则与事件的服务名/指纹/级别对不上（或规则建了但没启用），于是走了平台默认值；② 冷却中：同指纹在冷却期内只合并计数；③ 规则关了 AI，或该服务没配代码仓库映射 / 拉代码失败 | ① 打开**日志告警 → 日志告警规则**，页顶卡片就是"没命中任何规则时平台用的默认值"（去重窗口/冷却期/AI 开关/通知渠道）；再核对规则的 `service_name`、`signature_pattern`、`min_severity`、`enabled` 与 `priority`（数字小者优先，取第一条命中）；② 看事件列表的「抑制 / 通知」列：`suppressed=true` 且有 `cooldown_until` 即处于冷却（**事件已记录，只是不重复打扰**），要立刻拿结论就点该条的「**重新分析**」（会清掉冷却记录立即重跑通知与 AI）；③ 看「AI 分析」列 `analysis_state` 与 `analysis_error`：`disabled` = 规则关了 AI 或没配仓库映射（去「服务器与仓库」补映射后点「重新分析」）；`failed` = 拉代码或调用 AI 失败，原因就在 `analysis_error` 里（认证/分支不存在/网络/磁盘/出网许可未开启） |
+| 日志事件 `analysis_state=failed`，`analysis_error` 以「拉取代码失败：repo: git …」开头 | 平台拉代码失败：凭据过期、分支写错、DNS/网络不通、磁盘满，或 `code_repo.allow_outbound=false` | 按 `analysis_error` 里的中文结论处理（平台已把 git 的英文 stderr 翻译成"该怎么办"；URL 内嵌 token 会被脱敏成 `***`）；缓存目录满了就清 `code_repo.cache_dir`（默认 `./data/repos`）下的对应服务子目录，下次分析会自动重新 clone；修完点「重新分析」。详见 `COLLECTOR.md` 6.6 与 `OPERATIONS.md` 5.10 |
 | 趋势图是一条直线 | 指标本身波动极小（如内存使用率 1%~3%） | Y 轴已改为按数据自适应；仍不动说明确实没变化 |
 | 点某指标报 `Cannot read properties of undefined (reading 'series')` | 修复前 NaN 会破坏 JSON 编码（见 `POSTMORTEM.md` INC-004） | 升级后端 + 前端产物即可；该指标此后显示「暂无采样数据」 |
 
@@ -145,8 +158,11 @@ cd <nightjar>
 ## 5. 回滚
 
 ```bash
-# 平台侧：删掉集成（同时移除抓取目标与 Exporter/采集容器）
-#   「集成中心 → 该行 → 删除」；日志采集容器可用 docker rm -f 删除
+# 平台侧：删掉集成（同时移除抓取目标与 Exporter 容器）
+#   「集成中心 → 该行 → 删除」
+# 日志集成：删除集成**不会**卸载目标机上的 Filebeat，需要就手工收尾——
+#   systemctl disable --now filebeat && rm -f /etc/filebeat/filebeat.yml   （package 模式）
+#   docker rm -f mwops-filebeat                                            （docker 模式）
 cd <nightjar> && docker compose down            # 平台下线（保留数据卷）
 
 # 被管项目侧：本来就什么都没改，停掉业务即可
@@ -165,8 +181,9 @@ cd <被管项目> && ./start.sh stop
 
 | 文档 | 内容 |
 |---|---|
-| [`INTEGRATION.md`](INTEGRATION.md) | 集成中心：字段对照、自动化矩阵、日志接入原理、安全边界 |
-| [`API.md`](API.md) | 接口清单（集成、日志接入、服务发现、接入自检） |
+| [`INTEGRATION.md`](INTEGRATION.md) | 集成中心：字段对照、自动化矩阵、日志集成原理、安全边界 |
+| [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md) | 日志集成权威说明：Kafka 拓扑、Filebeat 幂等部署、自检与配置项 |
+| [`API.md`](API.md) | 接口清单（集成、日志集成、服务发现、接入自检） |
 | [`COLLECTOR.md`](COLLECTOR.md) | 接入契约与标签约定（自建 Prometheus/Exporter 场景） |
 | [`OPERATIONS.md`](OPERATIONS.md) | 平台运维（备份、升级、审计校验） |
 | [`POSTMORTEM.md`](POSTMORTEM.md) | 交付期真实故障记录（含指标 NaN、白屏、建表冲突） |

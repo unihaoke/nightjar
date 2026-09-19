@@ -198,11 +198,22 @@ func run(configPath string) error {
 		AuditSnapshot:    cfg.Scheduler.AuditSnapshot,
 		ApprovalExpire:   cfg.Scheduler.ApprovalExpire,
 		ClusterThreshold: cfg.Guardrail.VectorReferenceThreshold,
-	}, deps.Middleware, deps.AlertSvc, deps.Audit, deps.Approval, deps.Integration, log)
+		LogAlertProcess:  time.Duration(cfg.LogAlert.WorkerInterval) * time.Second,
+	}, deps.Middleware, deps.AlertSvc, deps.Audit, deps.Approval, deps.Integration, deps.LogAlertWorker, log)
 	if err := scheduler.Start(); err != nil {
 		return fmt.Errorf("启动定时任务: %w", err)
 	}
 	defer scheduler.Stop()
+
+	// 日志集成接收链路：Filebeat → 平台 Kafka → 日志事件。
+	// 与 HTTP 服务同生命周期：进程退出时停止消费（未提交的位点下次会重新消费，日志事件层按指纹去重）。
+	// 未配置 Kafka 时它只写一条说明日志，不阻断启动。
+	deps.LogPipeline.Start(ctx)
+	defer func() {
+		if err := deps.LogPipeline.Close(); err != nil {
+			log.Warn("关闭日志消费失败", zap.Error(err))
+		}
+	}()
 
 	// 监听
 	serverErr := make(chan error, 1)

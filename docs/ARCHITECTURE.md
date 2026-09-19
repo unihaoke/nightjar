@@ -12,9 +12,11 @@ router（路由表：权限点 + 操作级别的显式声明）
 middleware（追踪/恢复/限流/认证/数据权限）
    │
 service（业务编排：resource / ai / control 三域）
-   ├── resource：纳管、监控、告警、日志告警、服务器与仓库
+   ├── resource：纳管、监控、告警、日志告警（规则 + 后处理编排）、服务器与仓库
    ├── ai      ：诊断编排、知识库、代码分析、上下文与 Prompt
    └── control ：认证授权、修复执行、审批、审计、通知
+   │
+repo（服务代码仓库的本地缓存：首次 clone、之后更新到远端；供 AI 代码分析定位代码行）
    │
 engine（AI 引擎抽象 + 六道护栏；与业务解耦，可整体替换）
    │
@@ -24,6 +26,83 @@ model / db（实体与迁移，pgvector 适配）
 ```
 
 依赖方向单向向下，`engine` 与 `service` 之间只通过接口交互，便于替换引擎与独立测试护栏。
+`internal/repo`（代码仓库本地缓存）是 `service` 之下的能力包：服务层只依赖 `RepoFetcher` 接口并每次描述
+「要哪个服务的哪条分支」，缓存根目录、git 路径与超时等**进程级**配置在容器装配时一次性注入
+（见 `service/repo_adapter.go`），换实现（本地镜像解包、对象存储下载）不需要动服务层。
+
+## 一之一、日志集成的数据流（Filebeat → 平台 Kafka）
+
+日志已不再由平台侧采集（旧的「反查 docker 卷 + 平台起采集容器」实现已整体删除，
+见 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)）。现在的通路是：
+
+```text
+目标服务器（被管侧）                       平台（nightjar）
+─────────────────────                     ─────────────────────────────────────────
+应用日志 /var/log/app/*.log
+      │
+      ▼
+filebeat（平台用 Ansible 幂等部署：已装则复用、配置内容变化才重启）
+      │  output.kafka（JSON 编码）
+      ▼
+                                  ┌──────────────────────────────────────┐
+       Kafka EXTERNAL :9092 ─────▶│ kafka 容器（KRaft 单节点）            │
+      （KAFKA_ADVERTISED_HOST）   │  INTERNAL :29092 ← 平台内部消费       │
+                                  │  topic: mwops-logs                   │
+                                  └───────────────┬──────────────────────┘
+                                                  │ consumer group: mwops-log-ingest
+                                                  ▼
+                                  internal/logpipe（解析 Filebeat 事件）
+                                                  ▼
+                                  service/logpipeline.go（消费编排 + 链路状态/探测）
+                                                  ▼
+                                  service/logalert.go Ingest（错误指纹 /
+                                  匹配 log_alert_rules：窗口去重 + 冷却抑制）
+                                                  ▼
+                                  log_alert_events（analysis_state=pending）
+                                                  ▼
+                                  定时任务（log_alert.worker_interval_seconds）
+                                                  ▼
+                                  service/logalert_worker.go 后处理：
+                                  ① 外发通知渠道（写 notified_at）
+                                  ② internal/repo 拉代码（首次 clone，之后更新）
+                                  ③ service/codeanalysis.go AI 三点式结论
+```
+
+要点：
+
+- 平台只提供 **Kafka 端口 + 消费链路**，采集在被管侧自洽运行，平台重启不影响采集（位点在 Filebeat 注册表）；
+- 消费位点**只在 Ingest 成功后提交**；解析失败的消息计入 `dropped` 并照常提交，避免一条脏消息堵住分区；
+- 平台自检 `POST /api/integrations/:id/selfcheck` 对日志类型返回三段环节：
+  平台 → Kafka / 被管机接入地址（Kafka EXTERNAL）/ 日志是否真的进来了；
+- 回退通路只有一条：`POST /api/hooks/logs`（应用直推，零侵入兜底），字段与 Filebeat 路径统一映射。
+
+## 一之二、日志事件的数据流（规则 → 窗口/冷却 → 后处理）
+
+落库之后的那一段值得单独记住：**"这条告警为什么没通知我"全靠这条链上的字段解释**。
+
+```text
+日志事件 ──▶ ① 规则匹配（service/logalertrule.go）
+                 按「服务 + 错误指纹 + 级别」匹配 log_alert_rules：
+                 priority 数字小者优先、同优先级按 id 升序，取第一条 enabled 的规则；
+                 没命中 → 用 log_alert.default_* 构造的虚拟规则（零配置也能跑通）
+             ──▶ ② 窗口去重（命中规则的 dedup_window，分钟）
+                 窗口内同指纹【合并计数】、不新增事件（error_count 累加、last_seen_at 刷新）
+             ──▶ ③ 冷却抑制（命中规则的 cooldown，分钟）
+                 冷却内不重复通知、不重复触发 AI，但【事件照常记录】
+                 （suppressed=true + cooldown_until；冷却过后再次合并才重新通知，且不重跑 AI）
+             ──▶ ④ 后处理（service/logalert_worker.go）
+                 定时任务扫 analysis_state=pending：
+                 通知渠道（写 notified_at）→ 拉代码（internal/repo）→ AI 三点式结论
+                 （定位文件行 / 根因 / 应急处置 / 修复建议），
+                 失败或跳过原因写 analysis_error（disabled=规则关了 AI 或没配仓库映射）
+```
+
+三个结构性保证：
+
+- **状态在数据库**（`analysis_state` / `notified_at` / `cooldown_until`）：进程重启不丢，页面能解释每条事件的下场；
+- **多副本安全**：`ClaimForAnalysis` 用带条件的 UPDATE（`pending → running`）抢占，一条事件只被处理一次；
+- **缓存不是工作区**：`internal/repo` 只保证"本地有一份与远端一致的代码"（首次 clone、之后更新），
+  强制重置到远端，避免脏缓存给出错误行号（详见 [`COLLECTOR.md`](COLLECTOR.md) 6.6）。
 
 ## 二、设计文档条目映射
 
@@ -40,7 +119,7 @@ model / db（实体与迁移，pgvector 适配）
 | 4.5 知识库质量闭环 | `service/knowledge.go`、`service/diagnose.go: sinkKnowledge` | 诊断沉淀 `status=draft`；采纳率参与检索加权 |
 | 4.6 操作分级与执行 | `service/fix.go`、`service/approval.go` | L0/L1/L2 判定；L2 转工单；结果回填复核 |
 | 4.7 审计（只追加 + 哈希链） | `repository/audit.go`、`service/audit.go` | 仓储无 Update/Delete；`hash_self = SHA256(hash_prev\|内容)` |
-| 4.8 日志告警与代码分析 | `service/logalert.go`、`service/codeanalysis.go`、`cmd/agent` | 错误指纹归并；三点式模板；出网白名单 + 脱敏 |
+| 4.8 日志告警与代码分析 | `service/logalert.go`、`service/logalertrule.go`、`service/logalert_worker.go`、`internal/repo`、`service/codeanalysis.go`、`internal/logpipe`、`service/logpipeline.go` | 错误指纹归并；日志告警规则（`log_alert_rules`：去重窗口/冷却期/优先级/通知渠道/AI 开关）由 `logalertrule.go` 匹配与读写；落库后的通知 + 拉代码 + AI 三点式分析由 `logalert_worker.go` 定时编排；`internal/repo` 维护服务代码的本地缓存（首次 clone、之后更新到远端）；三点式模板；出网白名单 + 脱敏；日志集成由 `logpipe` 消费 Kafka 并把 Filebeat 事件映射成日志事件 |
 | 5.1 不做自主循环 Agent | `service/diagnose.go` | 单轮采集 + 一次 LLM 调用；护栏②为二期 Agent 预留 |
 | 5.2 上下文预算 | `engine/guardrail/budget.go` | 截断维度透出；`SummarizeSeries` 做降采样摘要 |
 | 5.3 防死循环 | `engine/guardrail/loop_guard.go` | 步数/指纹/白名单/决策卡；工具失败不重试 |
@@ -77,4 +156,4 @@ model / db（实体与迁移，pgvector 适配）
 | 因果收敛（4.4 二期） | 告警指纹与聚类结果 | 服务拓扑数据模型与依赖推断 |
 | 自研三层代码索引（4.8.3 二期） | `CodeAnalysisService.locateCode` | AST 解析、知识图谱、向量检索 + Rerank |
 | 多租户与微服务拆分（3.3） | 服务容器与仓储接口 | 租户维度注入、按域拆进程与独立部署 |
-| Kafka / VictoriaMetrics / MinIO（2.3 可选组件） | `pkg/cache` 的接口抽象方式 | 对应的队列与存储适配器 |
+| VictoriaMetrics / MinIO（2.3 可选组件） | `pkg/cache` 的接口抽象方式 | 对应的队列与存储适配器 |

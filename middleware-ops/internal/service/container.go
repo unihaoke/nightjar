@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -13,9 +14,18 @@ import (
 	"middleware-ops/internal/engine/guardrail"
 	"middleware-ops/internal/monitor"
 	"middleware-ops/internal/pkg/cache"
+	"middleware-ops/internal/repo"
 	"middleware-ops/internal/repository"
 	"middleware-ops/internal/utils"
 )
+
+// cacheDirOrDefault 归一化代码仓库缓存目录（留空时用 ./data/repos，容器里落在 backend-data 卷内）。
+func cacheDirOrDefault(dir string) string {
+	if trimmed := strings.TrimSpace(dir); trimmed != "" {
+		return trimmed
+	}
+	return "./data/repos"
+}
 
 // ContainerOptions 是服务容器构造参数。
 type ContainerOptions struct {
@@ -70,6 +80,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Servers = repository.NewServerRepository(opt.DB)
 	deps.CodeRepos = repository.NewCodeRepoRepository(opt.DB)
 	deps.LogEvents = repository.NewLogEventRepository(opt.DB)
+	deps.LogAlertRules = repository.NewLogAlertRuleRepository(opt.DB)
 	deps.CodeAnalyses = repository.NewCodeAnalysisRepository(opt.DB)
 	deps.Notifies = repository.NewNotificationLogRepository(opt.DB)
 
@@ -146,10 +157,17 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.KnowledgeSvc = NewKnowledgeService(deps.Knowledge, deps.Diagnoses, deps.Audit, opt.Log)
 	deps.Approval = NewApprovalService(deps.Approvals, deps.Notifier, deps.Audit, opt.Log)
 	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, deps.AlertSvc, opt.Log)
-	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos, deps.Audit, opt.Log)
+	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos,
+		deps.LogAlertRules, cfg, opt.Cache, deps.Audit, opt.Log)
+	// 日志集成的接收链路（Filebeat → 平台 Kafka → 日志事件）。
+	// 只装配不启动：启动时机由 main 决定（跟随进程生命周期），未配置 Kafka 时它是空转的安全对象。
+	deps.LogPipeline = NewLogPipeline(cfg, deps.LogAlert, opt.Log)
 	// 集成中心：把 Exporter 暴露 + Prometheus 抓取 + 实例纳管 + 告警规则串成一次点击。
 	deps.Integration = NewIntegrationService(cfg, deps.Instances, deps.Servers, opt.Cipher,
 		deps.AlertSvc, deps.Audit, deps.Approval, opt.Monitor, opt.Log)
+	// 日志集成的自检需要问日志链路两个问题（Kafka 通不通、链路状态），
+	// 用接口注入而不是构造参数：两条链路互不依赖，谁先装配都不影响。
+	deps.Integration.SetLogPipeline(deps.LogPipeline)
 	// 启动时对齐 file_sd：清理已删除集成残留的目标，并保证文件存在
 	// （Prometheus 的 file_sd_configs 指向它，文件缺失只会在日志里刷错误）。
 	if cfg.Integration.Enabled {
@@ -160,6 +178,19 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	redactor := NewRedactor(&cfg.Security)
 	deps.CodeAnalysis = NewCodeAnalysisService(cfg, deps.Engine, deps.LogEvents, deps.CodeRepos,
 		deps.CodeAnalyses, redactor, deps.Audit, deps.Cost, opt.Log)
+	// 日志告警的后处理：把"已落库但还没通知/还没分析"的事件推进到结论。
+	// 代码仓库缓存用**进程级** Options 构造（缓存根目录、git 路径、超时都属于平台配置），
+	// 每次请求只描述"要哪个服务的哪条分支"。
+	repoFetcher := NewRepoFetcher(repo.NewFetcher(repo.Options{
+		RootDir:      cacheDirOrDefault(cfg.CodeRepo.CacheDir),
+		CloneTimeout: cfg.CodeRepo.CloneTimeout,
+		PullTimeout:  cfg.CodeRepo.PullTimeout,
+		Log:          opt.Log,
+	}))
+	deps.LogAlertWorker = NewLogAlertWorker(LogAlertWorkerDeps{
+		Config: cfg, Events: deps.LogEvents, Rules: deps.LogAlertRules, CodeRepos: deps.CodeRepos,
+		Notifier: deps.Notifier, Analysis: deps.CodeAnalysis, Fetcher: repoFetcher, Log: opt.Log,
+	})
 
 	deps.Dashboard = NewDashboardService(DashboardDeps{
 		Instances: deps.Instances, Alerts: deps.Alerts, Diagnoses: deps.Diagnoses,

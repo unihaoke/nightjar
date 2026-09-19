@@ -4,39 +4,77 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
 	"middleware-ops/internal/apperr"
+	"middleware-ops/internal/config"
 	"middleware-ops/internal/model"
+	"middleware-ops/internal/pkg/cache"
 	"middleware-ops/internal/repository"
 	"middleware-ops/internal/utils"
 )
 
 // LogAlertService 实现日志告警域（4.8.1 / 4.8.2）。
 //
-// 采集入口：HTTP Hook（应用主动上报，零侵入）与 Agent 上报共用同一接口；
-// 去重聚合：错误指纹 + 窗口去重 + 冷却期静默。
+// 完整链路（与 docs/LOG_INTEGRATION.md 一致）：
+//
+//	采集（Filebeat）→ Kafka → 本服务 Ingest：按规则做**窗口去重**与**冷却抑制** → 落库
+//	  → 后处理（LogAlertWorker）：外发通知渠道 + AI 代码分析（拉取仓库并定位代码）
+//
+// 为什么要按"规则"而不是写死参数：去重窗口与冷却期决定了"多久打扰人一次"，
+// 它随服务重要性而变（核心交易服务要立刻通知、批处理服务可以攒一攒），
+// 因此必须由页面配置（log_alert_rules），代码只提供回调默认值。
 type LogAlertService struct {
 	servers *repository.ServerRepository
 	events  *repository.LogEventRepository
 	repos   *repository.CodeRepoRepository
+	rules   *repository.LogAlertRuleRepository
+	cfg     *config.Config
 	audit   *AuditService
 	log     *zap.Logger
-	// window 为窗口去重时长（默认 5 分钟，见 4.8.2）。
+	// window 为**兜底**去重窗口（分钟）。真实窗口来自命中的规则；
+	// 保留它是因为 EnsureWindow 是既有对外接口（定时任务会按配置刷新）。
 	window time.Duration
+	// cooldown 用 Redis 记录"最近一次外发时间"，实现冷却期（与指标告警同一套实现）。
+	cooldown cooldownTracker
+	// 规则缓存：Ingest 是**每条日志**都会走的路径，如果每次都查一次规则表，
+	// 一次日志风暴就会把 DB 打成瓶颈（同一条 SQL 每秒重复上千次）。
+	// 规则是人工维护、极少变动的，因此按 TTL 缓存；规则增删改时立即失效（见 invalidateRuleCache）。
+	ruleCacheMu sync.RWMutex
+	ruleCache   []model.LogAlertRule
+	ruleCacheAt time.Time
 }
+
+// ruleCacheTTL 是规则缓存的存活时间。
+//
+// 取 10 秒的权衡：并发实例（多副本）下，别人改的规则最多 10 秒后在本副本生效；
+// 而本副本上的改动会立即失效缓存，所以"我改完立刻生效"。多副本之间的这点延迟
+// 换来的是采集路径上不再有重复查询，值得。
+const ruleCacheTTL = 10 * time.Second
 
 // NewLogAlertService 构造日志告警服务。
 func NewLogAlertService(
 	servers *repository.ServerRepository,
 	events *repository.LogEventRepository,
 	repos *repository.CodeRepoRepository,
+	rules *repository.LogAlertRuleRepository,
+	cfg *config.Config,
+	store cache.Store,
 	audit *AuditService,
 	log *zap.Logger,
 ) *LogAlertService {
-	return &LogAlertService{servers: servers, events: events, repos: repos, audit: audit, log: log, window: 5 * time.Minute}
+	svc := &LogAlertService{
+		servers: servers, events: events, repos: repos, rules: rules, cfg: cfg,
+		audit: audit, log: log, window: 5 * time.Minute,
+		cooldown: newCooldownTracker(store, "logalert:cd:"),
+	}
+	if cfg != nil && cfg.LogAlert.DefaultDedupWindow > 0 {
+		svc.window = time.Duration(cfg.LogAlert.DefaultDedupWindow) * time.Minute
+	}
+	return svc
 }
 
 // LogReport 是应用/Agent 上报的日志条目。
@@ -54,6 +92,9 @@ type LogReport struct {
 	Stacktrace string `json:"stacktrace"`
 	// ContextLines 为错误前后 N 行上下文（Agent 采集时提供）。
 	ContextLines string `json:"context_lines"`
+	// LogPath 为日志文件路径（日志集成：Filebeat 的 log.file.path）。
+	// 排查时"哪个文件在报错"往往比"报了什么"更快定位到服务与模块。
+	LogPath string `json:"log_path"`
 	// Timestamp 为日志产生时间（缺省取当前时间）。
 	Timestamp *time.Time `json:"timestamp"`
 	// Count 为批量上报的重复次数。
@@ -110,22 +151,31 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 		count = 1
 	}
 	alertType := defaultString(in.AlertType, detectAlertType(in))
+	level := defaultString(in.Level, "ERROR")
 
-	// 窗口去重：同服务 + 同指纹合并计数。
-	existing, err := s.events.FindBySignature(ctx, in.Service, signature, time.Now().UTC().Add(-s.window))
-	if err == nil && existing != nil {
-		if mergeErr := s.events.MergeCount(ctx, existing.ID, count, now); mergeErr != nil {
-			return nil, apperr.Wrap(apperr.CodeInternal, mergeErr)
+	// ① 选规则：命中规则优先，否则用平台默认值（保证"零配置也能跑通"）。
+	rule := s.effectiveRuleFor(ctx, in.Service, signature, level)
+
+	// ② 冷却判定：冷却期内**不重复通知、不重复触发 AI**，但事件照记录（抑制 ≠ 丢弃）。
+	cooling, coolErr := s.cooldown.inCooldown(ctx, cooldownKey(in.Service, signature), rule.Cooldown, now)
+	if coolErr != nil {
+		// 读失败按"不冷却"处理：宁可多打扰一次，也不能因为 Redis 抖动把告警静默掉。
+		s.log.Warn("日志告警冷却判定失败（本次按不冷却处理）", zap.Error(coolErr))
+	}
+
+	// ③ 窗口去重：窗口内同指纹合并到既有事件。
+	if rule.DedupWindow > 0 {
+		windowStart := now.Add(-time.Duration(rule.DedupWindow) * time.Minute)
+		existing, err := s.events.FindBySignature(ctx, in.Service, signature, windowStart)
+		if err == nil && existing != nil {
+			return s.mergeInto(ctx, existing, in, count, now, rule, cooling, signature)
 		}
-		return &IngestResult{
-			EventID: existing.EventID, Signature: signature, Merged: true,
-			Count: existing.ErrorCount + count, Status: existing.Status, Suppressed: existing.Suppressed,
-		}, nil
-	}
-	if err != nil && !repository.EnsureNotFound(err) {
-		return nil, apperr.Wrap(apperr.CodeInternal, err)
+		if err != nil && !repository.EnsureNotFound(err) {
+			return nil, apperr.Wrap(apperr.CodeInternal, err)
+		}
 	}
 
+	// ④ 新事件：入队等待后处理（通知 + AI 分析），并把冷却起点写下来。
 	event := &model.LogAlertEvent{
 		EventID:        "LE" + utils.Fingerprint(in.Service, signature, now.Format(time.RFC3339Nano))[:14],
 		ServerID:       serverID,
@@ -134,23 +184,119 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 		ErrorSignature: signature,
 		RawStacktrace:  in.Stacktrace,
 		ContextLines:   in.ContextLines,
+		LogPath:        in.LogPath,
 		ErrorCount:     count,
-		Severity:       severityOf(in.Level),
+		Severity:       severityOf(level),
 		Status:         model.LogEventPending,
 		FirstSeenAt:    now,
 		LastSeenAt:     now,
+		RuleID:         rule.ID,
+		DedupWindow:    rule.DedupWindow,
+		AnalysisState:  model.LogAnalysisPending,
+	}
+	if rule.Cooldown > 0 {
+		until := now.Add(time.Duration(rule.Cooldown) * time.Minute)
+		event.CooldownUntil = &until
+	}
+	if cooling {
+		event.Suppressed = true
+		event.AnalysisState = model.LogAnalysisDisabled
+		event.AnalysisError = suppressReason(event.CooldownUntil)
 	}
 	if err := s.events.Create(ctx, event); err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
-	// 错误指纹统计观测（便于识别高频指纹）。
+	if !cooling && rule.Cooldown > 0 {
+		// 冷却起点在"入队时"就打：后处理是异步的，若等通知成功再打点，
+		// 队列积压期间同指纹的后续事件会继续入队，等于冷却期失效（告警风暴）。
+		if err := s.cooldown.markSent(ctx, cooldownKey(in.Service, signature), now, rule.Cooldown); err != nil {
+			s.log.Warn("记录日志告警冷却起点失败（下次可能重复通知）", zap.Error(err))
+		}
+	}
+
 	s.log.Info("收到日志告警事件",
 		zap.String("event_id", event.EventID), zap.String("service", event.ServiceName),
-		zap.String("signature", signature), zap.String("level", in.Level))
+		zap.String("signature", signature), zap.String("level", level),
+		zap.Int64("rule_id", rule.ID), zap.Bool("suppressed", cooling))
+
 	return &IngestResult{
 		EventID: event.EventID, Signature: signature, Merged: false,
-		Count: count, Status: event.Status,
+		Count: count, Status: event.Status, Suppressed: cooling,
 	}, nil
+}
+
+// mergeInto 把重复日志合并进既有事件，并给出"这次要不要再提醒"的结论。
+//
+// 语义（与指标告警一致，页面文案也照此写）：
+//   - 冷却期内 → 只累加计数并标记抑制，绝不重复打扰；
+//   - 冷却已过 → 重新入队（worker 会再发一次通知），但**不重跑 AI**：
+//     同一条事件已经有结论了，重复分析只会白烧 token（worker 会跳过 Analyzed 的事件）。
+func (s *LogAlertService) mergeInto(
+	ctx context.Context, existing *model.LogAlertEvent, in LogReport, count int,
+	now time.Time, rule model.LogAlertRule, cooling bool, signature string,
+) (*IngestResult, error) {
+	if err := s.events.MergeCount(ctx, existing.ID, count, now); err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, err)
+	}
+
+	if cooling {
+		if !existing.Suppressed {
+			if err := s.events.SetSuppressed(ctx, existing.ID, true); err != nil {
+				s.log.Warn("标记日志事件为抑制失败", zap.Error(err))
+			}
+		}
+		if existing.CooldownUntil != nil {
+			if err := s.events.SetAnalysisState(ctx, existing.ID, model.LogAnalysisDisabled,
+				suppressReason(existing.CooldownUntil)); err != nil {
+				s.log.Warn("写入抑制原因失败", zap.Error(err))
+			}
+		}
+		return &IngestResult{
+			EventID: existing.EventID, Signature: signature, Merged: true,
+			Count: existing.ErrorCount + count, Status: existing.Status, Suppressed: true,
+		}, nil
+	}
+
+	// 冷却已过：重新入队通知（AI 由 worker 按 Analyzed 判断是否要跑）。
+	until := now.Add(time.Duration(rule.Cooldown) * time.Minute)
+	if rule.Cooldown > 0 {
+		if err := s.cooldown.markSent(ctx, cooldownKey(in.Service, signature), now, rule.Cooldown); err != nil {
+			s.log.Warn("记录日志告警冷却起点失败", zap.Error(err))
+		}
+	}
+	if err := s.events.SetCooldown(ctx, existing.ID, until); err != nil {
+		s.log.Warn("更新日志事件冷却时间失败", zap.Error(err))
+	}
+	if err := s.events.SetSuppressed(ctx, existing.ID, false); err != nil {
+		s.log.Warn("解除日志事件抑制标记失败", zap.Error(err))
+	}
+	if !existing.Analyzed {
+		if err := s.events.SetAnalysisState(ctx, existing.ID, model.LogAnalysisPending, ""); err != nil {
+			s.log.Warn("重新入队日志事件分析失败", zap.Error(err))
+		}
+	}
+	s.log.Info("日志告警在窗口内合并（冷却已过，将再次提醒）",
+		zap.String("event_id", existing.EventID), zap.String("service", in.Service),
+		zap.String("signature", signature), zap.Int("total", existing.ErrorCount+count))
+
+	return &IngestResult{
+		EventID: existing.EventID, Signature: signature, Merged: true,
+		Count: existing.ErrorCount + count, Status: existing.Status, Suppressed: false,
+	}, nil
+}
+
+// cooldownKey 是冷却记录键：服务 + 指纹（同一服务的同类错误才算"同一条告警"）。
+func cooldownKey(service, signature string) string {
+	return service + "|" + signature
+}
+
+// suppressReason 生成"为什么被抑制"的说明（页面直接展示，省得使用者猜）。
+func suppressReason(until *time.Time) string {
+	if until == nil {
+		return "冷却期内抑制（事件仍已记录；如需立即分析可点「重新分析」）"
+	}
+	return "冷却期内抑制至 " + until.Local().Format("2006-01-02 15:04") +
+		"（事件仍已记录；如需立即分析可点「重新分析」）"
 }
 
 // List 分页检索日志事件。
@@ -202,6 +348,34 @@ func (s *LogAlertService) UpdateStatus(ctx context.Context, id int64, status str
 func (s *LogAlertService) MarkAnalyzed(ctx context.Context, id int64) error {
 	if err := s.events.MarkAnalyzed(ctx, id); err != nil {
 		return apperr.Wrap(apperr.CodeInternal, err)
+	}
+	return nil
+}
+
+// RequeueAnalysis 把事件重新放回后处理队列（页面「重新分析」）。
+//
+// 除了改状态，还必须**清掉冷却记录**：否则事件虽然重新入队，后处理仍会认为"冷却中"而跳过通知，
+// 使用者的观感是"点了重新分析什么都没发生"。清冷却正是"人工动作可以打破自动抑制"的体现。
+func (s *LogAlertService) RequeueAnalysis(ctx context.Context, id int64, operator Operator) error {
+	event, err := s.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.events.RequeueAnalysis(ctx, id); err != nil {
+		return apperr.Wrap(apperr.CodeInternal, err)
+	}
+	if err := s.events.SetSuppressed(ctx, id, false); err != nil {
+		s.log.Warn("解除事件抑制标记失败", zap.Error(err))
+	}
+	if err := s.cooldown.clear(ctx, cooldownKey(event.ServiceName, event.ErrorSignature)); err != nil {
+		s.log.Warn("清除冷却记录失败（重新分析可能仍被判定为冷却中）", zap.Error(err))
+	}
+	if s.audit != nil {
+		s.audit.RecordAsync(ctx, AuditEntry{
+			UserID: operator.UserID, Username: operator.Username, ActionType: "log_event_reanalyze",
+			Level: LevelLow, IPAddress: operator.IP, UserAgent: operator.Agent,
+			Detail: map[string]any{"event_id": event.EventID, "service": event.ServiceName},
+		})
 	}
 	return nil
 }

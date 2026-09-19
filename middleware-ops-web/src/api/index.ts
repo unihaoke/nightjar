@@ -30,9 +30,12 @@ import type {
   IntegrationView,
   IntegrationSelfCheck,
   KnowledgeEntry,
-  LogCollectInput,
-  LogCollectPlan,
+  LogAlertRule,
+  LogAlertRuleDefaults,
+  LogAlertRuleInput,
   LogEvent,
+  LogPipelineProbeResult,
+  LogPipelineStatus,
   Metric,
   MetricSample,
   MetricSnapshot,
@@ -44,6 +47,7 @@ import type {
   NotifyTestResult,
   Overview,
   Profile,
+  ReanalyzeResult,
   Role,
   ServerInstance,
   Session,
@@ -154,9 +158,6 @@ export const integrationApi = {
   dropAccount: (id: number, payload: AccountSecurePayload & { admin_username: string; admin_password: string }) =>
     postSlow<IntegrationView>(`/api/integrations/${id}/account/drop`, payload),
   remove: (id: number) => del<{ message: string }>(`/api/integrations/${id}`),
-  /** 日志接入：读取被管容器的 docker 配置反查日志位置（读不到会报错，不猜路径）。 */
-  previewLog: (payload: LogCollectInput) => post<LogCollectPlan>('/api/integrations/logs/preview', payload),
-  createLog: (payload: LogCollectInput) => post<LogCollectPlan>('/api/integrations/logs', payload),
 }
 
 /** AI 诊断（4.3）。 */
@@ -397,6 +398,24 @@ export const logAlertApi = {
     get<PageResult<CodeRepo>>('/api/log-alerts/code-repos', params, withSignal(signal)),
   saveCodeRepo: (id: number | undefined, payload: Partial<CodeRepo>) =>
     post<CodeRepo>(`/api/log-alerts/code-repos${id ? `?id=${id}` : ''}`, payload),
+  /** 平台自带 Kafka 的采集链路现状（Filebeat 推送到平台 Kafka 后由消费者入库）。 */
+  pipeline: () => get<LogPipelineStatus>('/api/log-alerts/pipeline'),
+  /** 测试 Kafka 连接：失败也返回 ok=false 与原因，不抛错。 */
+  probePipeline: () => post<LogPipelineProbeResult>('/api/log-alerts/pipeline/probe'),
+  /**
+   * 日志告警规则（4.8.2）：按服务/指纹/级别匹配，决定去重窗口、冷却期、通知渠道与是否 AI 分析。
+   *
+   * 与指标告警规则（alertApi.rules）刻意同名同语义，使用者在两个页面看到的是一套心智模型。
+   */
+  rules: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<LogAlertRule>>('/api/log-alerts/rules', params, withSignal(signal)),
+  /** 平台默认处理参数：没命中任何规则时按它执行（页面必须能展示，否则无法解释"为什么没通知"）。 */
+  ruleDefaults: () => get<LogAlertRuleDefaults>('/api/log-alerts/rules/defaults'),
+  createRule: (payload: LogAlertRuleInput) => post<LogAlertRule>('/api/log-alerts/rules', payload),
+  updateRule: (id: number, payload: LogAlertRuleInput) => put<LogAlertRule>(`/api/log-alerts/rules/${id}`, payload),
+  removeRule: (id: number) => del<{ message: string }>(`/api/log-alerts/rules/${id}`),
+  /** 重新分析：对同一条事件重新入队 AI 代码分析（失败原因由后端 message 原样返回）。 */
+  reanalyze: (eventId: number) => post<ReanalyzeResult>(`/api/log-alerts/events/${eventId}/reanalyze`),
 }
 
 /** 系统与大盘（8.2）。 */

@@ -1,0 +1,951 @@
+package integration
+
+import (
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+// 本文件锁定「日志集成」两份产物的契约。
+//
+// 为什么值得逐条固化：
+//   - filebeat.yml 是**在目标机上执行的文件**：键写错不会报错，只会安静地采不到日志
+//     （`fields_under_root`、`not.contains`、`output.kafka` 的键名都属于这类）；
+//   - 安装 playbook 是**在别的机器上执行命令**的能力，必须幂等（"已存在则不需要部署"）、
+//     不得出现裸 {{ }}（INC-005/INC-006），并且探测 → 决策 → 下发 → 校验的链路完整。
+
+// logTestInput 构造一份最小可用的日志集成输入（各用例只覆盖自己要验的字段）。
+func logTestInput() LogInput {
+	return LogInput{
+		Name: "order-service", Host: "10.0.0.21", Service: "order-service", Environment: "prod",
+		Paths:      []string{"/var/log/app/*.log"},
+		Level:      LogLevelError,
+		Multiline:  true,
+		KafkaHosts: []string{"10.0.0.5:9092"},
+		Topic:      "mwops-logs", FilebeatVersion: "8.16.0", InstallMode: LogInstallAuto,
+	}
+}
+
+// logTestOptions 构造一份最小可用的远程安装参数。
+func logTestOptions() RemoteOptions {
+	return RemoteOptions{
+		Host: "10.0.0.21", SSHUser: "ops", SSHPort: 22, SSHPassword: "ssh-secret", Become: true,
+	}
+}
+
+// mustRenderFilebeatConfig 渲染配置并在失败时直接结束用例。
+func mustRenderFilebeatConfig(t *testing.T, in LogInput) string {
+	t.Helper()
+	content, err := RenderFilebeatConfig(in)
+	if err != nil {
+		t.Fatalf("渲染 filebeat.yml 失败：%v", err)
+	}
+	return content
+}
+
+// mustRenderFilebeatInstall 渲染安装产物并在失败时直接结束用例。
+func mustRenderFilebeatInstall(t *testing.T, in LogInput, opts RemoteOptions) RemoteArtifacts {
+	t.Helper()
+	art, err := RenderFilebeatInstall(in, opts)
+	if err != nil {
+		t.Fatalf("渲染 Filebeat 安装产物失败：%v", err)
+	}
+	return art
+}
+
+// yamlAt 按路径取 YAML 节点（路径形如 "output.kafka.topic"）。
+//
+// 注意：`filebeat.inputs` 这类键名**本身含点**，因此查找时先按"整段是一个键"匹配，
+// 匹配不到才按点拆开递归（顺序反了会把 filebeat.inputs 拆成 filebeat → inputs 而找不到）。
+//
+// 用真实解析器而不是字符串包含：这份配置是目标机上真的要跑的文件，
+// "能解析出这个键、值是这些"才是契约，字符串包含只能证明"模板里打过这个字"。
+func yamlAt(t *testing.T, root *yaml.Node, path string) *yaml.Node {
+	t.Helper()
+	node := lookupYAMLNode(valueNode(root), strings.Split(path, "."))
+	if node == nil {
+		t.Fatalf("filebeat.yml 里找不到 %q（键名或层级不符）:\n%s", path, dumpYAML(root))
+	}
+	return node
+}
+
+// valueNode 跳过文档节点，取真正的根节点。
+func valueNode(node *yaml.Node) *yaml.Node {
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return node.Content[0]
+	}
+	return node
+}
+
+// lookupYAMLNode 在映射里逐段查找；每段先当整体键名，再按点拆分。
+func lookupYAMLNode(node *yaml.Node, segments []string) *yaml.Node {
+	if node == nil || len(segments) == 0 {
+		return node
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	if len(segments) == 1 {
+		if child := mappingChild(node, segments[0]); child != nil {
+			return child
+		}
+		// 末段本身含点但没匹配到：再拆分一次（如 filebeat.inputs）。
+		parts := strings.Split(segments[0], ".")
+		if len(parts) > 1 {
+			return lookupYAMLNode(node, parts)
+		}
+		return nil
+	}
+	if child := mappingChild(node, segments[0]); child != nil {
+		return lookupYAMLNode(child, segments[1:])
+	}
+	// 当前段可能是"含点的键"的前缀：把剩余段合并回来再试。
+	for cut := len(segments) - 1; cut >= 1; cut-- {
+		joined := strings.Join(segments[:cut+1], ".")
+		if child := mappingChild(node, joined); child != nil {
+			return lookupYAMLNode(child, segments[cut+1:])
+		}
+	}
+	return nil
+}
+
+// mappingChild 返回映射中指定键的值节点。
+func mappingChild(node *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// dumpYAML 在失败信息里附带原文（重新渲染一次，便于直接看到键序与缩进）。
+func dumpYAML(root *yaml.Node) string {
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return "<无法序列化>"
+	}
+	return string(out)
+}
+
+// parseYAML 把渲染结果解析成 YAML 文档节点（失败即用例失败）。
+func parseYAML(t *testing.T, label, content string) *yaml.Node {
+	t.Helper()
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+		t.Fatalf("%s 不是合法 YAML：%v\n%s", label, err, content)
+	}
+	return &doc
+}
+
+// yamlStrings 把序列节点读成字符串切片（同时兼作"它确实是序列"的断言）。
+func yamlStrings(t *testing.T, node *yaml.Node, path string) []string {
+	t.Helper()
+	if node.Kind != yaml.SequenceNode {
+		t.Fatalf("%s 应为 YAML 序列，实际 kind=%d", path, node.Kind)
+	}
+	out := make([]string, 0, len(node.Content))
+	for _, item := range node.Content {
+		out = append(out, item.Value)
+	}
+	return out
+}
+
+// TestRenderFilebeatConfigIsParsableYAML 锁定"渲染出来的就一定得是合法 YAML"。
+//
+// 这是最廉价也最值钱的一条：配置非法时 Filebeat 以
+// `Exiting: error loading config file` 秒退，而平台侧只能看到"目标机没有日志"。
+func TestRenderFilebeatConfigIsParsableYAML(t *testing.T) {
+	content := mustRenderFilebeatConfig(t, logTestInput())
+	// 顶部三行注释是目标机上的"说明书"：手改会被覆盖 + 不写 codec 段的原因。
+	for _, want := range []string{
+		"本文件由平台「集成中心」渲染",
+		"请勿手工修改",
+		"output.kafka 默认就是 JSON 编码",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("文件头注释应包含 %q（目标机上唯一的说明来源）：\n%s", want, content)
+		}
+	}
+	parseYAML(t, "filebeat.yml", content)
+}
+
+// TestRenderFilebeatConfigPaths 锁定 paths 多值（含多行/逗号分隔的粘贴形式）。
+func TestRenderFilebeatConfigPaths(t *testing.T) {
+	cases := []struct {
+		name  string
+		paths []string
+		want  []string
+	}{
+		{
+			name:  "多个路径各自成行",
+			paths: []string{"/var/log/app/*.log", "/data/logs/**/*.log"},
+			want:  []string{"/var/log/app/*.log", "/data/logs/**/*.log"},
+		},
+		{
+			name:  "多行粘贴（前端 textarea 的常见形态）",
+			paths: []string{"/var/log/a/*.log\n/var/log/b/*.log\n"},
+			want:  []string{"/var/log/a/*.log", "/var/log/b/*.log"},
+		},
+		{
+			name:  "逗号分隔并去重",
+			paths: []string{"/var/log/a.log, /var/log/b.log", "/var/log/a.log"},
+			want:  []string{"/var/log/a.log", "/var/log/b.log"},
+		},
+	}
+	for _, tc := range cases {
+		in := logTestInput()
+		in.Paths = tc.paths
+		content := mustRenderFilebeatConfig(t, in)
+		doc := parseYAML(t, "filebeat.yml", content)
+		inputs := yamlAt(t, doc, "filebeat.inputs")
+		if inputs.Kind != yaml.SequenceNode || len(inputs.Content) == 0 {
+			t.Fatalf("%s：filebeat.inputs 应至少有一条输入：\n%s", tc.name, content)
+		}
+		got := yamlStrings(t, yamlAt(t, inputs.Content[0], "paths"), "filebeat.inputs[0].paths")
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Fatalf("%s：paths 应为 %v，实际 %v\n%s", tc.name, tc.want, got, content)
+		}
+		if yamlAt(t, inputs.Content[0], "type").Value != "filestream" {
+			t.Fatalf("%s：输入类型应为 filestream（deprecated 的 log 输入没有断点续传）：\n%s", tc.name, content)
+		}
+	}
+}
+
+// TestRenderFilebeatConfigLevels 锁定级别过滤的三档行为。
+//
+// 这一条最容易写反：drop_event 的 when 是"命中则丢弃"，
+// 因此"保留 ERROR"必须写成 `when.not.contains` —— 漏掉 not 会把唯一的错误日志全丢掉，
+// 现象却是"平台一条日志都收不到"，很难往回追到这一行。
+func TestRenderFilebeatConfigLevels(t *testing.T) {
+	cases := []struct {
+		level string
+		// wantTerms 是应当出现在过滤条件里的关键字（空表示"完全不过滤"）。
+		wantTerms []string
+		noFilter  bool
+	}{
+		{level: LogLevelError, wantTerms: []string{"ERROR"}},
+		{level: LogLevelWarn, wantTerms: []string{"ERROR", "WARN"}},
+		{level: LogLevelInfo, noFilter: true},
+		{level: "info", noFilter: true}, // 大小写不敏感（表单可能传小写）
+	}
+	for _, tc := range cases {
+		in := logTestInput()
+		in.Level = tc.level
+		content := mustRenderFilebeatConfig(t, in)
+		if tc.noFilter {
+			if strings.Contains(content, "drop_event") {
+				t.Fatalf("INFO 表示不过滤，不得生成 drop_event（否则会把日志丢掉）：\n%s", content)
+			}
+			continue
+		}
+		if !strings.Contains(content, "drop_event") || !strings.Contains(content, "not:") {
+			t.Fatalf("%s 档必须用 drop_event + not（命中才保留），否则错误日志会被丢光：\n%s", tc.level, content)
+		}
+		for _, term := range tc.wantTerms {
+			if !strings.Contains(content, "message: "+term) {
+				t.Fatalf("%s 档应匹配 %q：\n%s", tc.level, term, content)
+			}
+		}
+		// WARN 档不得出现别的级别关键字（多一个就意味着少收一类日志）。
+		if tc.level == LogLevelWarn && strings.Contains(content, "message: INFO") {
+			t.Fatalf("WARN 档不应匹配 INFO：\n%s", content)
+		}
+		parseYAML(t, tc.level+" 档 filebeat.yml", content)
+	}
+}
+
+// TestRenderFilebeatConfigMultiline 锁定多行合并的开与关。
+func TestRenderFilebeatConfigMultiline(t *testing.T) {
+	in := logTestInput()
+	in.Multiline = true
+	content := mustRenderFilebeatConfig(t, in)
+	doc := parseYAML(t, "filebeat.yml", content)
+	inputs := yamlAt(t, doc, "filebeat.inputs")
+	parsers := yamlAt(t, inputs.Content[0], "parsers")
+	if parsers.Kind != yaml.SequenceNode || len(parsers.Content) == 0 {
+		t.Fatalf("开启多行合并时应生成 parsers：\n%s", content)
+	}
+	// parsers 首项是 "- multiline: {...}"，即一个单键映射，取它的值才是 multiline 参数表。
+	parser := parsers.Content[0]
+	multiline := yamlAt(t, parser, "multiline")
+	for path, want := range map[string]string{
+		// negate=true + match=after 表示"pattern 描述的是首行特征"；反过来会让所有堆栈
+		// 被拆成一行一条（现象是平台上一堆没有上下文的碎片日志）。
+		"negate": "true",
+		"match":  "after",
+	} {
+		if got := yamlAt(t, multiline, path).Value; got != want {
+			t.Fatalf("multiline.%s 应为 %q，实际 %q（拆错堆栈方向）:\n%s", path, want, got, content)
+		}
+	}
+	pattern := yamlAt(t, multiline, "pattern").Value
+	if pattern == "" || !strings.Contains(pattern, "[0-9]{4}") {
+		t.Fatalf("pattern 留空时应回落 Java 默认（行首时间戳）:%q\n%s", pattern, content)
+	}
+	if got := yamlAt(t, multiline, "max_lines").Value; got == "" {
+		t.Fatalf("max_lines 必须设置：否则日志尾部会无限攒在内存里:\n%s", content)
+	}
+
+	// 自定义 pattern 原文落进配置（Python 场景就是靠这个字段切换）。
+	in.MultilinePattern = `^Traceback \(most recent call last\):`
+	custom := mustRenderFilebeatConfig(t, in)
+	if !strings.Contains(custom, `^Traceback \(most recent call last\):`) {
+		t.Fatalf("自定义多行正则应原样写入（不得被二次转义）:\n%s", custom)
+	}
+	parseYAML(t, "自定义多行的 filebeat.yml", custom)
+
+	// 关闭时不再生成 multiline（但仍保留 parsers 段，便于 diff）。
+	in.Multiline = false
+	off := mustRenderFilebeatConfig(t, in)
+	if strings.Contains(off, "multiline:") {
+		t.Fatalf("关闭多行合并时不应生成 multiline:\n%s", off)
+	}
+	parseYAML(t, "关闭多行的 filebeat.yml", off)
+}
+
+// TestRenderFilebeatConfigKafkaOutput 锁定 output.kafka 的关键字段。
+func TestRenderFilebeatConfigKafkaOutput(t *testing.T) {
+	in := logTestInput()
+	in.KafkaHosts = []string{"10.0.0.5:9092", "10.0.0.6:9092"}
+	content := mustRenderFilebeatConfig(t, in)
+	doc := parseYAML(t, "filebeat.yml", content)
+
+	hosts := yamlStrings(t, yamlAt(t, doc, "output.kafka.hosts"), "output.kafka.hosts")
+	if strings.Join(hosts, "|") != "10.0.0.5:9092|10.0.0.6:9092" {
+		t.Fatalf("Kafka hosts 应为多值列表，实际 %v\n%s", hosts, content)
+	}
+	if got := yamlAt(t, doc, "output.kafka.topic").Value; got != "mwops-logs" {
+		t.Fatalf("topic 应为 mwops-logs，实际 %q", got)
+	}
+	// reachable_only 必须显式为 false：true 时分区 leader 暂时不可达就直接丢事件。
+	if got := yamlAt(t, doc, "output.kafka.partition.round_robin.reachable_only").Value; got != "false" {
+		t.Fatalf("partition.round_robin.reachable_only 应为 false（否则分区不可达即丢日志），实际 %q", got)
+	}
+	if got := yamlAt(t, doc, "output.kafka.required_acks").Value; got != "1" {
+		t.Fatalf("required_acks 应为 1，实际 %q", got)
+	}
+	if got := yamlAt(t, doc, "output.kafka.compression").Value; got != "gzip" {
+		t.Fatalf("compression 应为 gzip，实际 %q", got)
+	}
+	// max_message_bytes 必须 ≤ broker 的 message.max.bytes（默认 1048576）。
+	if got := yamlAt(t, doc, "output.kafka.max_message_bytes").Value; got != "1000000" {
+		t.Fatalf("max_message_bytes 应为 1000000（超过 broker 上限会被拒收），实际 %q", got)
+	}
+	if got := yamlAt(t, doc, "output.kafka.client_id").Value; got == "" {
+		t.Fatalf("client_id 必须写出来（否则目标机侧看不出是谁在推日志）：\n%s", content)
+	}
+	// 刻意不写 codec：JSON 是 output.kafka 的默认编码，平台消费者按 JSON 解析。
+	// 按**解析后的键**判定（文件头与注释里会提到 codec 这个词，不能按全文匹配）。
+	kafka := yamlAt(t, doc, "output.kafka")
+	for i := 0; i+1 < len(kafka.Content); i += 2 {
+		if kafka.Content[i].Value == "codec" {
+			t.Fatalf("不得写 codec 段（改成 text 会让平台字段映射全部落空）：\n%s", content)
+		}
+	}
+}
+
+// TestRenderFilebeatConfigFieldsUnderRoot 锁定 fields 与 fields_under_root 的取值。
+//
+// fields_under_root 必须是 **false**：true 会把 service/environment/server 提升到事件顶层，
+// 压掉 Filebeat 自带的同名元数据；平台消费者统一按 `fields.*` 读取（LOG_INTEGRATION.md §五）。
+//
+// server 与 integration 的分工也在这里锁住：server = **目标机地址**（平台按它登记
+// server_instances，填集成名会让每条日志都新注册一台"服务器"），integration = 集成名。
+func TestRenderFilebeatConfigFieldsUnderRoot(t *testing.T) {
+	in := logTestInput()
+	in.Name = "order-service"
+	in.Service = "order-api"
+	in.Environment = "prod"
+	in.Host = "10.0.0.21"
+	content := mustRenderFilebeatConfig(t, in)
+	doc := parseYAML(t, "filebeat.yml", content)
+	input := yamlAt(t, doc, "filebeat.inputs").Content[0]
+	if got := yamlAt(t, input, "fields_under_root").Value; got != "false" {
+		t.Fatalf("fields_under_root 应为 false（平台按 fields.* 读取），实际 %q", got)
+	}
+	for key, want := range map[string]string{
+		"fields.service":     "order-api",
+		"fields.environment": "prod",
+		"fields.server":      "10.0.0.21",
+		"fields.integration": "order-service",
+	} {
+		if got := yamlAt(t, input, key).Value; got != want {
+			t.Fatalf("%s 应为 %q，实际 %q", key, want, got)
+		}
+	}
+	// server 绝不能是集成名：那会让平台按日志去登记一台并不存在的服务器。
+	if got := yamlAt(t, input, "fields.server").Value; got == in.Name {
+		t.Fatalf("fields.server 必须是目标机地址（%q），不能是集成名（否则平台会重复登记服务器）：\n%s",
+			in.Host, content)
+	}
+
+	// 服务名留空时回落集成名：空 service 会让日志页把所有服务混在一起。
+	in.Service = ""
+	fallback := mustRenderFilebeatConfig(t, in)
+	if !strings.Contains(fallback, "service: "+in.Name) {
+		t.Fatalf("服务名留空时应回落集成名 %q：\n%s", in.Name, fallback)
+	}
+	// 服务名回落不得带偏 server：它仍然必须是目标机地址。
+	if !strings.Contains(fallback, "server: "+in.Host) {
+		t.Fatalf("服务名回落时 fields.server 仍应是目标机地址 %q：\n%s", in.Host, fallback)
+	}
+}
+
+// TestRenderFilebeatConfigValidation 锁定校验失败路径。
+//
+// 这些输入都必须**明确报错**：渲染出一份"缺 paths / 缺 hosts / 缺 topic"的配置，
+// 在目标机上只会表现为 Filebeat 起不来或永远没有日志，使用者无从下手。
+func TestRenderFilebeatConfigValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*LogInput)
+		wantMsg string
+	}{
+		{name: "日志路径为空", mutate: func(in *LogInput) { in.Paths = nil }, wantMsg: "日志路径不能为空"},
+		{name: "日志路径只有空白", mutate: func(in *LogInput) { in.Paths = []string{" ", "\n", ","} }, wantMsg: "日志路径不能为空"},
+		{name: "Kafka 地址为空", mutate: func(in *LogInput) { in.KafkaHosts = nil }, wantMsg: "Kafka 地址不能为空"},
+		{name: "Kafka 地址只有逗号", mutate: func(in *LogInput) { in.KafkaHosts = []string{" , "} }, wantMsg: "Kafka 地址不能为空"},
+		{name: "topic 为空", mutate: func(in *LogInput) { in.Topic = "  " }, wantMsg: "Kafka topic 不能为空"},
+		{name: "级别非法", mutate: func(in *LogInput) { in.Level = "TRACE" }, wantMsg: "不合法"},
+		{name: "集成名非法", mutate: func(in *LogInput) { in.Name = "Order_Service" }, wantMsg: "不合法"},
+		{name: "集成名为空", mutate: func(in *LogInput) { in.Name = "" }, wantMsg: "集成名称不能为空"},
+	}
+	for _, tc := range cases {
+		in := logTestInput()
+		tc.mutate(&in)
+		if _, err := RenderFilebeatConfig(in); err == nil {
+			t.Fatalf("%s：应报错（否则会下发一份目标机跑不起来的配置）", tc.name)
+		} else if !strings.Contains(err.Error(), tc.wantMsg) {
+			t.Fatalf("%s：错误信息应包含 %q（便于使用者知道改哪里），实际：%v", tc.name, tc.wantMsg, err)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallKafkaProbe 锁定「目标机 → 平台 Kafka」的 TCP 连通性探测。
+//
+// 这一步的价值：Kafka advertised 地址配错时，平台侧一切正常、目标机却在报
+// `dial tcp 127.0.0.1:9092: connect: connection refused`。只有从目标机真的连一次，
+// 现场才有证据区分"网络不通"与"地址配错"。因此它必须：
+//   - 探测真实配置里的那个地址（与 filebeat.yml 的 hosts[0] 一致，否则结论无意义）；
+//   - 失败不阻断（failed_when: false + 输出结论），因为采集不一定立刻可用；
+//   - 结论里给出可照抄的排查命令与 KAFKA_ADVERTISED_HOST 这个具体原因。
+func TestRenderFilebeatInstallKafkaProbe(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		in.KafkaHosts = []string{"10.0.0.5:9092", "10.0.0.6:9092"}
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		// 探测目标必须是配置里写的第一个地址（与真实采集用同一个值）。
+		if !strings.Contains(art.Playbook, "/dev/tcp/10.0.0.5/9092") {
+			t.Fatalf("%s 模式应在目标机上探测 Kafka 地址 10.0.0.5:9092：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.Playbook, "nc -z -w 5 10.0.0.5 9092") {
+			t.Fatalf("%s 模式应在没有 bash 时回退 nc：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.Playbook, "KAFKA_ADVERTISED_HOST") {
+			t.Fatalf("%s 模式的探测结论应点明 KAFKA_ADVERTISED_HOST（这才是根因所在）：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.Playbook, "nc -vz 10.0.0.5 9092") {
+			t.Fatalf("%s 模式应给出可照抄的人工复核命令：\n%s", mode, art.Playbook)
+		}
+		// 结论要能被自检/部署备注读到，但**不得**让安装整体失败。
+		probeAt := strings.Index(art.Playbook, "探测目标机到平台 Kafka 的 TCP 连通性")
+		if probeAt < 0 {
+			t.Fatalf("%s 模式缺少 Kafka 连通性探测任务：\n%s", mode, art.Playbook)
+		}
+		task := art.Playbook[probeAt:]
+		if !strings.Contains(task, "failed_when: false") {
+			t.Fatalf("%s 模式的连通性探测失败不得中断安装（采集不一定立刻可用）：\n%s", mode, task)
+		}
+		if !strings.Contains(task, "filebeat_kafka_probe") || !strings.Contains(task, "ansible.builtin.debug") {
+			t.Fatalf("%s 模式的探测结论应注册为变量并打印出来：\n%s", mode, task)
+		}
+	}
+}
+
+// TestSplitHostPort 锁定探测地址的拆解（含 IPv6 与缺端口两种边界）。
+func TestSplitHostPort(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantPort string
+	}{
+		{"10.0.0.5:9092", "10.0.0.5", "9092"},
+		{"kafka.internal:19092", "kafka.internal", "19092"},
+		{"10.0.0.5", "10.0.0.5", "9092"}, // 缺端口时按 Kafka 默认值
+		{"[::1]:9092", "::1", "9092"},    // IPv6 要去掉方括号，否则 nc 解析不了
+	}
+	for _, tc := range cases {
+		host, port := splitHostPort(tc.in)
+		if host != tc.wantHost || port != tc.wantPort {
+			t.Fatalf("splitHostPort(%q) = (%q, %q)，期望 (%q, %q)", tc.in, host, port, tc.wantHost, tc.wantPort)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallArtifacts 锁定三种安装方式共有的产物契约。
+func TestRenderFilebeatInstallArtifacts(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		// 1) 先探测再决策（用户明确要求"如果存在则不需要部署"）。
+		for _, want := range []string{"command -v filebeat", "systemctl is-active filebeat.service", "command -v docker"} {
+			if !strings.Contains(art.Playbook, want) {
+				t.Fatalf("%s 模式应先探测目标机状态（%q），否则会重复安装/覆盖已有 Filebeat：\n%s",
+					mode, want, art.Playbook)
+			}
+		}
+		// 2) 配置下发必须 copy + notify，重启只能由 handler 承担。
+		if !strings.Contains(art.Playbook, "ansible.builtin.copy") {
+			t.Fatalf("%s 模式应通过 copy 下发配置：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.Playbook, "notify: 重启 Filebeat") {
+			t.Fatalf("%s 模式的下发任务必须 notify 重启 handler：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.Playbook, "handlers:") || !strings.Contains(art.Playbook, "重启 Filebeat") {
+			t.Fatalf("%s 模式缺少 restart handler：\n%s", mode, art.Playbook)
+		}
+		// 3) 配置内容走变量文件：内联进 playbook 会被 Ansible 当 Jinja 渲染（INC-005/INC-006 同类坑）。
+		if !strings.Contains(art.Playbook, "content: \"{{ filebeat_config_content }}\"") {
+			t.Fatalf("%s 模式的内联配置应取自变量文件：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.VarsFile, "filebeat_config_content: |") {
+			t.Fatalf("%s 模式的 vars 文件应含块标量形式的 filebeat.yml：\n%s", mode, art.VarsFile)
+		}
+
+		// 4) 末尾的两条尽力而为校验（失败不阻断，但输出要打到日志）。
+		for _, want := range []string{"filebeat test config", "filebeat test output"} {
+			if !strings.Contains(art.VarsFile, want) {
+				t.Fatalf("%s 模式应包含自检 %q（用于抓 advertised 地址配错这类问题）：\n%s", mode, want, art.VarsFile)
+			}
+		}
+		verifyAt := strings.Index(art.Playbook, "校验 filebeat.yml 配置")
+		if verifyAt < 0 {
+			t.Fatalf("%s 模式缺少自检任务：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.Playbook[verifyAt:], "failed_when: false") {
+			t.Fatalf("%s 模式的自检失败不得让整个 playbook 失败（安装已经成功，自检是信息）：\n%s",
+				mode, art.Playbook[verifyAt:])
+		}
+
+		// 5) 产物元数据：日志集成没有 Exporter 端口。
+		if art.Target != "10.0.0.21" {
+			t.Fatalf("%s 模式：日志集成的 Target 应是主机本身，实际 %q", mode, art.Target)
+		}
+		if art.UnitName != FilebeatUnitName {
+			t.Fatalf("%s 模式：UnitName 应为 %s，实际 %q", mode, FilebeatUnitName, art.UnitName)
+		}
+		if art.ContainerName != "mwops-filebeat" {
+			t.Fatalf("%s 模式：ContainerName 应为 mwops-filebeat，实际 %q", mode, art.ContainerName)
+		}
+
+		// 6) 安全约定：playbook 不含 SSH 口令，展示用 inventory 用占位符。
+		if strings.Contains(art.Playbook, "ssh-secret") {
+			t.Fatalf("%s 模式：playbook 不得包含 SSH 口令：\n%s", mode, art.Playbook)
+		}
+		if !strings.Contains(art.MaskedInventory, "${SSH_PASSWORD}") {
+			t.Fatalf("%s 模式：展示用 inventory 应使用占位符：\n%s", mode, art.MaskedInventory)
+		}
+		if !strings.Contains(art.Inventory, "ansible_password=ssh-secret") {
+			t.Fatalf("%s 模式：真实 inventory 应含 SSH 口令（0600、用完即删）", mode)
+		}
+		if strings.Contains(art.RunCommand, "ssh-secret") {
+			t.Fatalf("%s 模式：执行命令不得包含凭据：%s", mode, art.RunCommand)
+		}
+
+		// 7) 渲染器自校验必须通过（与既有 Exporter 产物同一道防线）。
+		if err := validatePlaybookYAML("日志集成", art.Playbook); err != nil {
+			t.Fatalf("%s 模式：playbook 未通过平台自校验：%v", mode, err)
+		}
+		if err := ensureFilebeatVarsParsable("日志集成", art.VarsFile); err != nil {
+			t.Fatalf("%s 模式：vars 文件未通过平台自校验：%v", mode, err)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallHasNoUnquotedJinja 锁定产物里不得出现裸 {{ }}。
+//
+// 真实故障 INC-005/INC-006：playbook 里以 {{ 开头的值会被 YAML 当 flow mapping
+// （ansible 报 unhashable type），行中的 Go 模板语法会被当 Jinja 表达式
+// （unexpected '.'）。日志集成新增了 docker run 多行命令与自检命令，两处都容易踩。
+func TestRenderFilebeatInstallHasNoUnquotedJinja(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		// 复用既有测试的扫描逻辑：冒号后的值若以 {{ 开头必须带引号。
+		assertJinjaValuesQuoted(t, "日志集成/"+mode, art.Playbook)
+		for i, line := range strings.Split(art.Playbook, "\n") {
+			if strings.Contains(line, "{{.") || strings.Contains(line, "{{ .") {
+				t.Fatalf("日志集成/%s 第 %d 行含 Go 模板语法（会被 Ansible 当 Jinja 渲染而报错）：%s",
+					mode, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
+// TestRenderFilebeatInstallModes 锁定三种安装方式各自的分支特征。
+//
+// auto 必须同时包含 package 与 docker 两条分支：它要能在"目标机已有 docker"和
+// "目标机只有发行版包管理器"两类机器上用同一份产物跑通（用 when 条件二选一）。
+func TestRenderFilebeatInstallModes(t *testing.T) {
+	cases := []struct {
+		mode      string
+		wantAny   []string
+		wantNone  []string
+		checkAuto bool
+	}{
+		{
+			mode: LogInstallPackage,
+			wantAny: []string{
+				"/etc/debian_version",                           // 发行版判定不依赖 gather_facts
+				"artifacts.elastic.co",                          // deb/rpm 来源
+				"ansible.builtin.apt",                           // debian
+				"dnf install",                                   // redhat
+				"ansible.builtin.systemd",                       // 启用 systemd 单元
+				"https://artifacts.elastic.co/packages/8.x/apt", // 仓库兜底
+			},
+			// 明确选了 package 就不该出现"真的去跑容器"的命令（vars 里留一个镜像变量不算：
+			// 产物里保留它是为了让同一份渲染器三种模式的变量表一致）。
+			wantNone: []string{"docker pull", "docker run -d"},
+		},
+		{
+			mode: LogInstallDocker,
+			wantAny: []string{
+				"docker.elastic.co/beats/filebeat:8.16.0",
+				"docker run -d",
+				"--restart=always",
+				"/etc/filebeat/filebeat.yml:ro",
+			},
+			wantNone: []string{"ansible.builtin.apt", "dnf install"},
+		},
+		{
+			mode:      LogInstallAuto,
+			wantAny:   []string{"docker run -d", "dnf install", "docker.elastic.co/beats/filebeat:8.16.0", "artifacts.elastic.co"},
+			checkAuto: true,
+		},
+	}
+	for _, tc := range cases {
+		in := logTestInput()
+		in.InstallMode = tc.mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		for _, want := range tc.wantAny {
+			if !strings.Contains(art.Playbook, want) {
+				t.Fatalf("%s 模式应包含 %q：\n%s", tc.mode, want, art.Playbook)
+			}
+		}
+		// 只在**任务区**里做"不应出现"的判定：handler 里同时保留了 systemd 与 docker
+		// 两条重启路径（filebeat_mode 决定走哪条），那是刻意为之，不算"跑错安装路径"。
+		tasks := art.Playbook
+		if idx := strings.Index(tasks, "  handlers:\n"); idx >= 0 {
+			tasks = tasks[:idx]
+		}
+		for _, none := range tc.wantNone {
+			if strings.Contains(tasks, none) {
+				t.Fatalf("%s 模式的任务区不应包含 %q（安装路径必须明确，不能让使用者以为选了 A 实际跑了 B）：\n%s",
+					tc.mode, none, tasks)
+			}
+		}
+		// 三种模式的 handler 都必须同时覆盖 systemd 与 docker 两条重启路径：
+		// 用前面 set_fact 算出的实际方式（filebeat_tested_mode）二选一，
+		// 避免"配置变了却没重启"（那会让平台安静地收不到日志）。
+		handlers := art.Playbook
+		if idx := strings.Index(handlers, "  handlers:\n"); idx >= 0 {
+			handlers = handlers[idx:]
+		}
+		for _, want := range []string{"systemctl restart", "docker rm -f", "filebeat_tested_mode"} {
+			if !strings.Contains(handlers, want) {
+				t.Fatalf("%s 模式的 handler 应覆盖 %q（重启路径必须与安装路径匹配）：\n%s", tc.mode, want, handlers)
+			}
+		}
+		if !tc.checkAuto {
+			continue
+		}
+		// auto 的决策顺序：已安装 → docker → package，三条分支都必须写在产物里。
+		for _, want := range []string{
+			"filebeat_present | bool",          // 复用已安装
+			"filebeat_has_docker | bool",       // 其次容器
+			"not (filebeat_has_docker | bool)", // 最后包安装
+		} {
+			if !strings.Contains(art.Playbook, want) {
+				t.Fatalf("auto 模式应包含分支条件 %q（已装 → docker → package）：\n%s", want, art.Playbook)
+			}
+		}
+	}
+}
+
+// TestRenderFilebeatInstallRestartsOnlyThroughHandler 锁定"重启只由 handler 触发"。
+//
+// 这一条是幂等的关键：ansible.builtin.copy 默认按 checksum 比对，
+// 配置内容不变时任务报 ok、**不会**通知 handler，因此重复重放 playbook 不会重启 Filebeat、
+// 采集不抖动；一旦把 restart 写进普通任务（而不是 handler），每次重放都会重启一次。
+func TestRenderFilebeatInstallRestartsOnlyThroughHandler(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		split := strings.SplitN(art.Playbook, "  handlers:\n", 2)
+		if len(split) != 2 {
+			t.Fatalf("%s 模式应包含 handlers 段：\n%s", mode, art.Playbook)
+		}
+		tasks, handlers := split[0], split[1]
+		// 任务区里出现 state: restarted / docker restart 都意味着"每次重放都重启"。
+		for _, forbidden := range []string{"state: restarted", "docker restart"} {
+			if strings.Contains(tasks, forbidden) {
+				t.Fatalf("%s 模式的任务区不应出现 %q（重启必须交给 handler，由 copy 的 checksum 决定是否触发）：\n%s",
+					mode, forbidden, tasks)
+			}
+		}
+		// handler 里必须有真正的重启动作（否则"配置变了"这件事不会生效）。
+		if !strings.Contains(handlers, "restart") {
+			t.Fatalf("%s 模式的 handler 应重启 Filebeat：\n%s", mode, handlers)
+		}
+		// 配置变更 -> 重启 这条链路的说明必须留在产物里（下一个接手的人才知道为什么这么写）。
+		if !strings.Contains(art.Playbook, "内容不变时不重启采集") {
+			t.Fatalf("%s 模式的配置下发任务应说明 checksum 语义：\n%s", mode, art.Playbook)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallConfigMountsLogDirs 锁定 docker 模式下的日志目录挂载。
+//
+// 容器只能看见挂载进来的路径：少挂一个目录 = 那批日志永远采不到，
+// 而 Filebeat 只会安静地"没有匹配到文件"（docker logs 里连报错都没有）。
+func TestRenderFilebeatInstallConfigMountsLogDirs(t *testing.T) {
+	in := logTestInput()
+	in.InstallMode = LogInstallDocker
+	in.Paths = []string{"/var/log/app/*.log", "/data/logs/**/*.log"}
+	art := mustRenderFilebeatInstall(t, in, logTestOptions())
+	for _, want := range []string{
+		"-v /var/log/app:/var/log/app:ro",
+		"-v /data/logs:/data/logs:ro",
+		"-v \"{{ filebeat_config_path }}:/etc/filebeat/filebeat.yml:ro\"",
+	} {
+		if !strings.Contains(art.Playbook, want) {
+			t.Fatalf("docker 模式应挂载 %q：\n%s", want, art.Playbook)
+		}
+	}
+	// 顶层目录（/var、/data）绝不整体挂进容器。
+	for _, forbidden := range []string{"-v /var:/var", "-v /data:/data", "-v /:/"} {
+		if strings.Contains(art.Playbook, forbidden) {
+			t.Fatalf("docker 模式不得整体挂载 %q（会把宿主其它内容暴露给容器）：\n%s", forbidden, art.Playbook)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallValidation 锁定安装产物的失败路径。
+func TestRenderFilebeatInstallValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*LogInput, *RemoteOptions)
+		wantMsg string
+	}{
+		{
+			name:    "日志路径为空",
+			mutate:  func(in *LogInput, _ *RemoteOptions) { in.Paths = nil },
+			wantMsg: "日志路径不能为空",
+		},
+		{
+			name:    "Kafka 地址为空",
+			mutate:  func(in *LogInput, _ *RemoteOptions) { in.KafkaHosts = nil },
+			wantMsg: "Kafka 地址不能为空",
+		},
+		{
+			name:    "topic 为空",
+			mutate:  func(in *LogInput, _ *RemoteOptions) { in.Topic = "" },
+			wantMsg: "Kafka topic 不能为空",
+		},
+		{
+			name:    "安装方式非法",
+			mutate:  func(in *LogInput, _ *RemoteOptions) { in.InstallMode = "helm" },
+			wantMsg: "不合法",
+		},
+		{
+			name:    "目标机地址为空",
+			mutate:  func(_ *LogInput, opts *RemoteOptions) { opts.Host = " " },
+			wantMsg: "目标服务器地址",
+		},
+		{
+			name:    "SSH 用户名为空",
+			mutate:  func(_ *LogInput, opts *RemoteOptions) { opts.SSHUser = "" },
+			wantMsg: "SSH 用户名",
+		},
+	}
+	for _, tc := range cases {
+		in := logTestInput()
+		opts := logTestOptions()
+		tc.mutate(&in, &opts)
+		if _, err := RenderFilebeatInstall(in, opts); err == nil {
+			t.Fatalf("%s：应报错（否则会产出一份跑不通/装错东西的 playbook）", tc.name)
+		} else if !strings.Contains(err.Error(), tc.wantMsg) {
+			t.Fatalf("%s：错误信息应包含 %q，实际：%v", tc.name, tc.wantMsg, err)
+		}
+	}
+}
+
+// TestLogTemplateRegistration 锁定日志模板的注册信息与"不带 Exporter 语义"。
+func TestLogTemplateRegistration(t *testing.T) {
+	tpl, ok := TemplateOf(TypeLog)
+	if !ok {
+		t.Fatal("日志集成（log）模板应存在——否则前端新建集成时选不到 Filebeat")
+	}
+	if tpl.Component != "filebeat" || tpl.Name == "" || tpl.Description == "" {
+		t.Fatalf("日志模板的基础信息不完整：%+v", tpl)
+	}
+	if tpl.Phase != 1 {
+		t.Fatalf("日志集成应为 Phase 1（纳管 + 采集），实际 %d", tpl.Phase)
+	}
+	if tpl.CategoryOf() != CategoryLog || tpl.Category != CategoryLog {
+		t.Fatalf("日志模板的分类应为 %s：%+v", CategoryLog, tpl)
+	}
+	if tpl.NeedsAuth {
+		t.Fatal("日志集成不需要账号口令（Filebeat 只往 Kafka 推数据，凭据由平台侧 KAFKA_* 决定）")
+	}
+	// Exporter 语义的字段必须全部留空：填任何值都会让前端渲染出一个并不存在的 Exporter。
+	if tpl.Image != "" || tpl.ExporterPort != 0 || tpl.MetricsPath != "" || tpl.Release != nil {
+		t.Fatalf("日志集成不得带 Exporter 相关字段（Image/ExporterPort/MetricsPath/Release）：%+v", tpl)
+	}
+	if len(tpl.Alerts) != 0 {
+		t.Fatalf("日志集成不产生 Prometheus 告警规则：%+v", tpl.Alerts)
+	}
+	if tpl.Dashboard.ID != "" || tpl.Dashboard.Title != "" {
+		t.Fatalf("日志集成没有 Grafana 大盘：%+v", tpl.Dashboard)
+	}
+	if tpl.AddressLabel == "" || tpl.AddressHint == "" {
+		t.Fatal("日志集成需要地址栏文案（本机也填 127.0.0.1，统一走 SSH 安装）")
+	}
+
+	// 日志模板必须放行"端口为 0"：它的地址是**服务器地址**，没有服务端口概念
+	// （端口属于 SSH，由凭据字段承担），服务层传的就是 Address.Port = 0。
+	// 这里锁住的是"使用者不会看到一个自己也填不出来的必填项"。
+	if err := tpl.Validate(Instance{
+		Name: "app-log-01", MWType: TypeLog, Environment: "prod",
+		Address: Address{Host: "10.0.0.21", Port: 0},
+	}); err != nil {
+		t.Fatalf("日志集成的地址没有服务端口，Port=0 必须被放行，实际被拒：%v", err)
+	}
+	// 但"地址为空"仍然要拦（否则产出的 playbook 连目标机都不知道在哪）。
+	if err := tpl.Validate(Instance{
+		Name: "app-log-01", MWType: TypeLog, Environment: "prod",
+		Address: Address{Host: "", Port: 0},
+	}); err == nil {
+		t.Fatal("日志集成的地址不能为空（需填目标服务器地址）")
+	}
+	// 名称与标签校验对日志集成同样生效（不能因为分类不同就放松）。
+	if err := tpl.Validate(Instance{
+		Name: "App_Log", MWType: TypeLog, Address: Address{Host: "10.0.0.21", Port: 0},
+	}); err == nil {
+		t.Fatal("日志集成仍需遵守集成名规范")
+	}
+	if err := tpl.Validate(Instance{
+		Name: "app-log-01", MWType: TypeLog,
+		Address: Address{Host: "10.0.0.21", Port: 0},
+		Labels:  map[string]string{"instance": "x"},
+	}); err == nil {
+		t.Fatal("日志集成仍需拒绝覆盖平台保留标签")
+	}
+	// 反过来：指标监控模板的端口校验不能被这次改动放松（0 仍然非法）。
+	redisTpl, _ := TemplateOf(TypeRedis)
+	if err := redisTpl.Validate(Instance{
+		Name: "redis-01", MWType: TypeRedis, Address: Address{Host: "10.0.0.11", Port: 0},
+	}); err == nil {
+		t.Fatal("指标监控模板的端口必须仍在 1-65535 之间（日志模板的例外不得外溢）")
+	}
+
+	// Options 必须覆盖渲染器实际读取的每一个字段（缺一个就意味着使用者没地方填）。
+	wantOptions := map[string]string{
+		"MWOPS_LOG_PATHS":             "string",
+		"MWOPS_LOG_SERVICE":           "string",
+		"MWOPS_LOG_ENVIRONMENT":       "string",
+		"MWOPS_LOG_LEVEL":             "string",
+		"MWOPS_LOG_MULTILINE":         "bool",
+		"MWOPS_LOG_MULTILINE_PATTERN": "string",
+		"MWOPS_LOG_INSTALL_MODE":      "string",
+		"MWOPS_LOG_FILEBEAT_VERSION":  "string",
+	}
+	got := make(map[string]Option, len(tpl.Options))
+	for _, opt := range tpl.Options {
+		got[opt.Key] = opt
+		if opt.Target != TargetEnv {
+			t.Fatalf("参数 %s 应通过环境变量落地（TargetEnv），实际 %s", opt.Key, opt.Target)
+		}
+		if opt.Label == "" {
+			t.Fatalf("参数 %s 缺少中文标签（前端表单要显示）", opt.Key)
+		}
+	}
+	for key, kind := range wantOptions {
+		opt, ok := got[key]
+		if !ok {
+			t.Fatalf("日志模板缺少参数 %s（渲染器读了它，使用者却没地方填）", key)
+		}
+		if opt.Kind != kind {
+			t.Fatalf("参数 %s 的 Kind 应为 %s，实际 %s（决定前端控件）", key, kind, opt.Kind)
+		}
+	}
+	// 默认值必须与渲染器的兜底一致，否则"表单显示的值"和"实际落地的值"会对不上。
+	for key, want := range map[string]string{
+		"MWOPS_LOG_ENVIRONMENT":      "dev",
+		"MWOPS_LOG_LEVEL":            LogLevelError,
+		"MWOPS_LOG_MULTILINE":        "true",
+		"MWOPS_LOG_INSTALL_MODE":     LogInstallAuto,
+		"MWOPS_LOG_FILEBEAT_VERSION": "8.16.0",
+	} {
+		if got[key].Default != want {
+			t.Fatalf("参数 %s 的默认值应为 %q，实际 %q", key, want, got[key].Default)
+		}
+	}
+
+	// Notes 必须写清三个最容易踩的坑（这三条都是"平台看起来正常但收不到日志"的典型）。
+	notes := strings.Join(tpl.Notes, "\n")
+	for _, want := range []string{
+		"advertised",       // ① Kafka 对外地址配错：连上后立刻断开
+		"127.0.0.1:9092",   //    典型报错原文
+		"InvalidTimestamp", // ② 目标机时钟偏移（NTP）被 Kafka 拒收
+		"幂等",               // ③ 已安装的不重复安装
+	} {
+		if !strings.Contains(notes, want) {
+			t.Fatalf("模板 Notes 应说明 %q 这个坑：\n%s", want, notes)
+		}
+	}
+}
+
+// TestTemplatesExposeCategory 锁定分类字段的对外行为。
+//
+// 既有 8 个模板必须兜底成 monitor（它们的字段值一个字都不能改），
+// 日志模板必须是 log —— 前端据此决定展示哪组表单与哪条落地链路。
+func TestTemplatesExposeCategory(t *testing.T) {
+	seenLog := false
+	for _, tpl := range Templates() {
+		if tpl.Category == "" {
+			t.Fatalf("Templates() 返回的 %s 缺少 category（前端只能自己猜）", tpl.Type)
+		}
+		switch tpl.Type {
+		case TypeLog:
+			seenLog = true
+			if tpl.Category != CategoryLog {
+				t.Fatalf("日志模板应为 %s，实际 %s", CategoryLog, tpl.Category)
+			}
+		default:
+			if tpl.Category != CategoryMonitor {
+				t.Fatalf("%s 应兜底为 %s（既有模板不得因新增分类而改变语义），实际 %s",
+					tpl.Type, CategoryMonitor, tpl.Category)
+			}
+		}
+	}
+	if !seenLog {
+		t.Fatal("模板列表里应有日志集成（log）")
+	}
+	// 自定义/未知类型也走兜底：分类只由 Type 决定，不依赖调用方填字段。
+	if got := (Template{Type: TypeRedis}).CategoryOf(); got != CategoryMonitor {
+		t.Fatalf("Redis 应归入 %s，实际 %s", CategoryMonitor, got)
+	}
+	if got := (Template{Type: TypeLog}).CategoryOf(); got != CategoryLog {
+		t.Fatalf("log 应归入 %s，实际 %s", CategoryLog, got)
+	}
+}
