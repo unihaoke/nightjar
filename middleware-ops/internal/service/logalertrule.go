@@ -16,7 +16,7 @@ import (
 // 本文件实现「日志告警规则」：把"谁能触发、合并多久、冷却多久、要不要通知/分析"从代码里
 // 搬到页面可配置（用户明确要求："规则也是需要设置对应的去重窗口，冷却期等"）。
 //
-// 判定输入与指标告警规则不同：指标比数值，日志比**服务 + 错误指纹 + 级别**。
+// 判定输入与指标告警规则不同：指标比数值，日志比**服务 + 日志消息 + 级别**。
 // 因此单独一张 log_alert_rules 表；但"去重窗口 / 冷却期 / 通知渠道 / AI 开关"四个概念
 // 与指标规则同名同语义，使用者在两个页面看到的是同一套心智模型。
 
@@ -29,7 +29,7 @@ type LogAlertRuleInput struct {
 	Description string `json:"description"`
 	// ServiceName 为空表示匹配任意服务。
 	ServiceName string `json:"service_name"`
-	// SignaturePattern 为空表示匹配任意指纹；`/re/` 形式按正则，其余按子串。
+	// SignaturePattern 按**日志消息原文**匹配（与屏蔽项同一套语义）；`/re/` 形式按正则，其余按子串；为空表示任意。
 	SignaturePattern string `json:"signature_pattern"`
 	// MinSeverity 为空表示不限级别（INFO/WARN/ERROR/FATAL）。
 	MinSeverity string `json:"min_severity"`
@@ -70,13 +70,18 @@ func severityRank(level string) int {
 	}
 }
 
-// signatureMatches 判断指纹是否匹配规则里的 pattern。
+// messageMatches 判断日志消息是否匹配规则里的 pattern。
 //
 //	""        → 任意
 //	"/re/"    → 正则（大小写不敏感；编译失败按子串处理，绝不 panic——
 //	            规则写错不该让整条日志链路挂掉）
-//	其它      → 子串（大小写不敏感：使用者很难记住指纹的确切大小写）
-func signatureMatches(pattern, signature string) bool {
+//	其它      → 子串（大小写不敏感：使用者很难记住日志里的确切大小写）
+//
+// 匹配的是**上报的 message 原文**，不是错误指纹：指纹是归一化后的哈希
+// （见 ErrorSignature），使用者写不出"我想匹配的那句话"对应的哈希，只能写出日志里的文本——
+// 拿哈希去比 pattern，配什么都不会命中，且从外面看不出是配错了还是没配。
+// 与屏蔽项（log_alert_exclusions.pattern）刻意用同一套写法，两个页面填的东西一样。
+func messageMatches(pattern, message string) bool {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return true
@@ -84,20 +89,22 @@ func signatureMatches(pattern, signature string) bool {
 	if len(pattern) >= 2 && strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
 		expr := pattern[1 : len(pattern)-1]
 		if re, err := regexp.Compile("(?i)" + expr); err == nil {
-			return re.MatchString(signature)
+			return re.MatchString(message)
 		}
 		// 正则非法：退化为子串匹配（并保留斜杠外的原文），比"规则失效"更符合直觉。
 		pattern = strings.Trim(pattern, "/")
 	}
-	return strings.Contains(strings.ToLower(signature), strings.ToLower(pattern))
+	return strings.Contains(strings.ToLower(message), strings.ToLower(pattern))
 }
 
 // MatchLogAlertRule 取第一条命中的启用规则。
 //
+// message 是这次上报的日志消息原文（规则按它匹配，不是按指纹）。
+//
 // 优先级的语义：priority 数字**小**的优先；同优先级按 id 升序（先建的先匹配）。
 // 调用方传入的 rules 通常已按此顺序排好（仓储层保证了顺序），这里再排一次，
 // 使这个函数不依赖调用顺序——它是纯函数，单测里可以随便给乱序切片。
-func MatchLogAlertRule(rules []model.LogAlertRule, service, signature, level string) (model.LogAlertRule, bool) {
+func MatchLogAlertRule(rules []model.LogAlertRule, service, message, level string) (model.LogAlertRule, bool) {
 	ordered := make([]model.LogAlertRule, 0, len(rules))
 	for _, rule := range rules {
 		if rule.Enabled {
@@ -120,7 +127,7 @@ func MatchLogAlertRule(rules []model.LogAlertRule, service, signature, level str
 		if rule.MinSeverity != "" && want < severityRank(rule.MinSeverity) {
 			continue
 		}
-		if !signatureMatches(rule.SignaturePattern, signature) {
+		if !messageMatches(rule.SignaturePattern, message) {
 			continue
 		}
 		return rule, true
@@ -334,10 +341,11 @@ func (s *LogAlertService) invalidateRuleCache() {
 // 否则一个从没配过的服务也会持续产出通知，而没人说得清它依据什么在告警。
 // 规则读取失败时同样按未命中处理并记 warn——读不到规则时的"静默告警"
 // 和"凭空告警"一样都是不可接受的静默失效，至少要在日志里留下痕迹。
-func (s *LogAlertService) matchRule(ctx context.Context, service, signature, level string) (model.LogAlertRule, bool) {
+// message 是日志消息原文：规则按它匹配（不是按指纹，理由见 messageMatches）。
+func (s *LogAlertService) matchRule(ctx context.Context, service, message, level string) (model.LogAlertRule, bool) {
 	rules, err := s.enabledRules(ctx)
 	if err != nil {
 		s.log.Warn("读取日志告警规则失败，本次按未命中处理", zap.Error(err))
 	}
-	return MatchLogAlertRule(rules, service, signature, level)
+	return MatchLogAlertRule(rules, service, message, level)
 }

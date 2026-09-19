@@ -108,6 +108,18 @@ func probePath(dir string) (bool, bool, error) {
 	return true, statErr == nil, nil
 }
 
+// dirIsEmpty 判断目录里是否一个条目都没有（不含 .git 之外的隐藏文件判断，
+// 隐藏条目同样会被计入——clone 中断留下的空壳里可能有半拉的 .git 之外的东西）。
+//
+// 用途：区分「可以安全删除的空目录」与「有内容、必须保护、不能覆盖的目录」。
+func dirIsEmpty(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
+}
+
 // isGitDir 判断目录是否是 git 仓库（.git 可能是目录，也可能是 worktree 的文件）。
 func isGitDir(dir string) bool {
 	_, isRepo, err := probePath(dir)

@@ -37,6 +37,15 @@ type CodeAnalysisService struct {
 	audit    *AuditService
 	cost     engineGuard
 	log      *zap.Logger
+	// fetcher 可选：装配后，分析前会确保本地有一份代码（没有就 clone）。
+	// 用 SetRepoFetcher 注入而不是构造参数，是因为装配顺序上 fetcher 要在 worker 之前建好，
+	// 而 worker 又依赖本服务——拆成两步避免构造顺序上的循环。
+	fetcher RepoFetcher
+}
+
+// SetRepoFetcher 装配代码仓库缓存（见字段注释里的装配顺序说明）。
+func (s *CodeAnalysisService) SetRepoFetcher(f RepoFetcher) {
+	s.fetcher = f
 }
 
 // engineGuard 抽象成本记账，避免代码分析服务直接依赖护栏实现细节。
@@ -146,6 +155,9 @@ func (s *CodeAnalysisService) Analyze(ctx context.Context, in CodeAnalysisReques
 	redactedMessage := s.redactor.Redact(message)
 
 	// ③ 本地检索：堆栈定位文件行 → 上下文切片（合规兜底）。
+	// 检索前先确保本地真的有代码：目录不存在时 WalkDir 只会静默跳过，
+	// 分析照常出结论、却没有任何代码依据——使用者完全看不出少了什么。
+	s.ensureCode(ctx, repo)
 	snippet, locatedFile, locatedLine, snippetTruncated := s.locateCode(repo, stack)
 	if snippetTruncated {
 		warnings = append(warnings, fmt.Sprintf("代码片段超过 %d 行上限，已截断", s.redactor.MaxLines()))
@@ -264,6 +276,47 @@ func (s *CodeAnalysisService) GetByEvent(ctx context.Context, eventID int64) (*m
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
 	return item, nil
+}
+
+// ensureCode 保证分析时本地有一份代码：**没有就 clone，有就直接用**（不重复 pull）。
+//
+// 为什么两处都要兜（这里是分析入口，worker 里还有一次）：
+//   - 手工分析（页面直接提交堆栈）与事件重试都可能不走 worker 的拉取步骤；
+//   - 容器重建后缓存目录可能整块消失，此时"本地没有代码"是常态而不是异常。
+//
+// 有代码时**刻意不拉远端**：一次手工分析不应触发一次 pull（既慢又可能被代码托管限流），
+// 拉到最新是 worker/启动预热的事；这里只保证"分析时手上有代码"。
+func (s *CodeAnalysisService) ensureCode(ctx context.Context, repo *model.CodeRepo) {
+	if s == nil || s.fetcher == nil || repo == nil {
+		return
+	}
+	if strings.TrimSpace(repo.RepoURL) == "" {
+		return
+	}
+	allowOutbound := true
+	if s.cfg != nil {
+		allowOutbound = s.cfg.CodeRepo.AllowOutbound
+	}
+	req := RepoFetchRequest{
+		Service: repo.ServiceName, RepoURL: repo.RepoURL, Branch: repo.Branch,
+		LocalPath: repo.LocalPath, AllowOutbound: allowOutbound,
+	}
+	if s.fetcher.HasCode(ctx, req) {
+		return
+	}
+	res, err := s.fetcher.Ensure(ctx, req)
+	if err != nil {
+		// 拉取失败不阻断分析：本地检索拿不到代码片段时，LLM 仍可基于堆栈给出建议，
+		// 只是结论里没有代码上下文——把原因记进日志，界面上由 warning 反映。
+		s.log.Warn("分析前拉取代��失败（本次分析没有代码上下文）",
+			zap.String("service", repo.ServiceName), zap.Error(err))
+		return
+	}
+	if res.LocalPath != "" {
+		repo.LocalPath = res.LocalPath
+	}
+	s.log.Info("分析前已克隆代码",
+		zap.String("service", repo.ServiceName), zap.String("revision", res.Revision))
 }
 
 // locateCode 依据堆栈定位本地代码文件并切片。

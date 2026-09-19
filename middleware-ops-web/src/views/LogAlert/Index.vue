@@ -561,6 +561,11 @@ async function copyHookExample(): Promise<void> {
           </el-tooltip>
         </div>
 
+        <!-- 错误消息原文：指纹是哈希，排查时真正要看的是这一句 -->
+        <div v-if="current.error_message" class="field">
+          <span class="field-label">错误消息</span>
+          <span>{{ current.error_message }}</span>
+        </div>
         <div class="field">
           <span class="field-label">错误指纹</span>
           <code>{{ current.error_signature }}</code>

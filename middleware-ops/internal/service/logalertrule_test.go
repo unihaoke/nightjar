@@ -31,12 +31,12 @@ func TestMatchLogAlertRule(t *testing.T) {
 			ServiceName: "pay-api", SignaturePattern: "/timeout|refused/"},
 	}
 	cases := []struct {
-		name      string
-		service   string
-		signature string
-		level     string
-		wantID    int64
-		wantHit   bool
+		name    string
+		service string
+		message string
+		level   string
+		wantID  int64
+		wantHit bool
 	}{
 		{"具体服务优先于通用（priority 小者胜）", "order-api", "boom", "ERROR", 2, true},
 		{"正则命中的服务规则", "pay-api", "connection timeout after 3s", "ERROR", 4, true},
@@ -48,7 +48,7 @@ func TestMatchLogAlertRule(t *testing.T) {
 		{"停用的规则永不命中", "pay-api", "timeout", "FATAL", 4, true},
 	}
 	for _, c := range cases {
-		got, hit := MatchLogAlertRule(rules, c.service, c.signature, c.level)
+		got, hit := MatchLogAlertRule(rules, c.service, c.message, c.level)
 		if hit != c.wantHit {
 			t.Fatalf("%s: 命中=%v，期望 %v", c.name, hit, c.wantHit)
 		}
@@ -71,12 +71,12 @@ func TestMatchLogAlertRuleUsesDefaultLevelRank(t *testing.T) {
 	}
 }
 
-// TestSignatureMatches 校验指纹匹配的三种写法与容错。
-func TestSignatureMatches(t *testing.T) {
+// TestMessageMatches 校验消息匹配的三种写法与容错。
+func TestMessageMatches(t *testing.T) {
 	cases := []struct {
-		pattern   string
-		signature string
-		want      bool
+		pattern string
+		message string
+		want    bool
 	}{
 		{"", "anything", true},
 		{"timeout", "connection timeout after 3s", true},
@@ -88,9 +88,30 @@ func TestSignatureMatches(t *testing.T) {
 		{"/[unclosed/", "boom [unclosed bracket", true},
 	}
 	for _, c := range cases {
-		if got := signatureMatches(c.pattern, c.signature); got != c.want {
-			t.Fatalf("signatureMatches(%q, %q)=%v，期望 %v", c.pattern, c.signature, got, c.want)
+		if got := messageMatches(c.pattern, c.message); got != c.want {
+			t.Fatalf("messageMatches(%q, %q)=%v，期望 %v", c.pattern, c.message, got, c.want)
 		}
+	}
+}
+
+// TestMatchLogAlertRuleMatchesRawMessageNotFingerprint 钉住"规则按日志原文匹配"这件事。
+//
+// 为什么要专门钉一条：signature 是归一化后的哈希，若拿哈希去比 pattern，
+// 使用者照着日志里那句话配出来的规则永远不命中，而页面上看不出任何异常——
+// 只会表现为"日志进来了但没有告警"，是最难查的一类静默失效。
+func TestMatchLogAlertRuleMatchesRawMessageNotFingerprint(t *testing.T) {
+	rules := []model.LogAlertRule{
+		{Base: model.Base{ID: 1}, Name: "框架噪音", Enabled: true,
+			SignaturePattern: "Request method 'GET' is not supported"},
+	}
+	message := "Resolved [org.springframework.web.HttpRequestMethodNotSupportedException: Request method 'GET' is not supported]"
+	fingerprint := ErrorSignature(message, "")
+
+	if _, hit := MatchLogAlertRule(rules, "jd-logs", message, "ERROR"); !hit {
+		t.Fatal("按日志原文应命中规则")
+	}
+	if _, hit := MatchLogAlertRule(rules, "jd-logs", fingerprint, "ERROR"); hit {
+		t.Fatalf("拿指纹（%s）去匹配不应命中——那说明又退回成按哈希比了", fingerprint)
 	}
 }
 

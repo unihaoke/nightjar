@@ -692,7 +692,13 @@ export interface LogEvent {
   server_id: number
   service_name: string
   alert_type: string
+  /** 错误指纹：同类错误的哈希摘要，用于聚合与去重，不可读。 */
   error_signature: string
+  /**
+   * 错误消息原文（首条上报的 message，截断留存）。
+   * 展示与通知都用它——指纹是哈希，人看不懂。
+   */
+  error_message: string
   raw_stacktrace: string
   context_lines: string
   error_count: number
@@ -728,7 +734,10 @@ export interface LogAlertRule {
   description: string
   /** 只对某服务生效；为空表示任意服务。 */
   service_name: string
-  /** 匹配错误指纹：普通文本按子串匹配，`/re/` 形式按正则匹配；为空表示任意。 */
+  /**
+   * 日志消息匹配：填日志里的原文片段（子串），`/re/` 形式按正则；为空表示任意。
+   * 匹配的是 message 原文而不是错误指纹（指纹是哈希，使用者写不出来）。
+   */
   signature_pattern: string
   /** 最低级别 INFO/WARN/ERROR/FATAL；为空表示不限级别。 */
   min_severity: string

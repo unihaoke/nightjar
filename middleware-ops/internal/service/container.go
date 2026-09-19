@@ -203,6 +203,8 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 		PullTimeout:  cfg.CodeRepo.PullTimeout,
 		Log:          opt.Log,
 	}))
+	// 分析入口也能自己补代码（本地没有就 clone）：手工分析与事件重试不一定经过 worker。
+	deps.CodeAnalysis.SetRepoFetcher(repoFetcher)
 	deps.LogAlertWorker = NewLogAlertWorker(LogAlertWorkerDeps{
 		Config: cfg, Events: deps.LogEvents, Rules: deps.LogAlertRules, CodeRepos: deps.CodeRepos,
 		Notifier: deps.Notifier, Analysis: deps.CodeAnalysis, Fetcher: repoFetcher, Log: opt.Log,

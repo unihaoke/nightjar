@@ -247,6 +247,12 @@ type AlertNotification struct {
 	AlertID   int64               `json:"alert_id"`
 	DetailURL string              `json:"detail_url"`
 	Fields    []NotificationField `json:"fields,omitempty"`
+	// Sections 是正文之后逐段追加的长文本块（错误上下文、堆栈等）。
+	//
+	// 为什么不拼进 Content：飞书卡片里一个 div 塞多行文本会被压成一坨，
+	// 拆成多个 div 才能分段渲染；而企微/钉钉/邮件没有卡片，renderText 会把它们
+	// 顺序拼回正文——同一个字段在两类渠道上都能保持可读。
+	Sections []string `json:"sections,omitempty"`
 	// Diagnosis 非空表示这条消息携带 AI 诊断结论（告警触发的自动诊断产出）。
 	Diagnosis *DiagnosisBrief `json:"diagnosis,omitempty"`
 }
@@ -335,12 +341,19 @@ func (s *NotifierService) sendSync(ctx context.Context, n AlertNotification) err
 
 // NotifyLogEvent 发送一条日志告警通知（日志告警后处理专用）。
 //
+// rule 是这条事件命中的规则：必须把「是哪条规则命中的」写进消息——
+// 同一个服务可能配了多条规则（支付超时和 GC 各一条），值班同学不知道命中条件，
+// 就只能凭消息正文猜"这条为什么打扰我"，进而把规则关掉（正确做法是改规则，不是关告警）。
+//
 // channels 为空时用通知配置里**已启用的渠道**（与指标告警的选择逻辑一致）。
 // brief 非空时把 AI 代码结论一起发出去——收消息的人据此判断要不要立刻处理，
 // 不必再回平台点一次；结论来自规则引擎降级时会显式标注，避免被当成确定结论。
 // 返回 nil 表示"至少有一个渠道发出去了"：部分成功也算通知成功——
 // 否则一次渠道抖动会让同一条告警在冷却结束后反复重发，变成新的噪音源。
-func (s *NotifierService) NotifyLogEvent(ctx context.Context, event model.LogAlertEvent, channels []string, brief *LogAnalysisBrief) error {
+func (s *NotifierService) NotifyLogEvent(
+	ctx context.Context, event model.LogAlertEvent, rule model.LogAlertRule,
+	channels []string, brief *LogAnalysisBrief,
+) error {
 	cfg := s.current()
 	if !cfg.Enabled {
 		return fmt.Errorf("通知总开关未启用：日志告警不会外发（请到「通知渠道」启用）")
@@ -359,11 +372,18 @@ func (s *NotifierService) NotifyLogEvent(ctx context.Context, event model.LogAle
 		return fmt.Errorf("没有任何可用通知渠道：请在「通知渠道」启用至少一个渠道，或在规则里指定")
 	}
 
-	title := fmt.Sprintf("【日志告警·%s】%s", strings.ToUpper(defaultString(event.Severity, "error")), event.ServiceName)
+	// 标题带规则名：飞书群里消息是按标题扫的，"服务 + 规则"才能一眼分出轻重。
+	title := fmt.Sprintf("【日志告警·%s】%s｜%s",
+		strings.ToUpper(defaultString(event.Severity, "error")), event.ServiceName, logRuleName(rule))
+	// 正文放"到底报了什么错"：指纹是哈希、不可读，真正要看的是消息原文。
+	content, sections := logErrorBlocks(event)
 	fields := []NotificationField{
+		// 整行显示：规则名 + 命中条件 + 规则 ID，收消息的人据此判断"要不要改规则"。
+		{Key: "命中规则", Value: logRuleValue(rule)},
 		{Key: "服务", Value: event.ServiceName, Short: true},
 		{Key: "级别", Value: defaultString(event.Severity, "error"), Short: true},
 		{Key: "次数", Value: fmt.Sprintf("%d（%d 分钟窗口内合并）", event.ErrorCount, event.DedupWindow), Short: true},
+		{Key: "最近发生", Value: event.LastSeenAt.Local().Format("2006-01-02 15:04:05"), Short: true},
 	}
 	if event.LogPath != "" {
 		fields = append(fields, NotificationField{Key: "日志文件", Value: event.LogPath})
@@ -399,9 +419,9 @@ func (s *NotifierService) NotifyLogEvent(ctx context.Context, event model.LogAle
 	detailURL := fmt.Sprintf("%s/log-alerts?event_id=%d", s.appURL, event.ID)
 	for _, channel := range targets {
 		err := s.sendSync(ctx, AlertNotification{
-			Channel: channel, Title: title, Content: event.ErrorSignature,
+			Channel: channel, Title: title, Content: content,
 			Level: defaultString(event.Severity, "error"), AlertID: event.ID,
-			DetailURL: detailURL, Fields: fields,
+			DetailURL: detailURL, Fields: fields, Sections: sections,
 		})
 		if err != nil {
 			failed = append(failed, channel+"："+err.Error())
@@ -416,6 +436,89 @@ func (s *NotifierService) NotifyLogEvent(ctx context.Context, event model.LogAle
 		s.log.Warn("日志告警部分渠道发送失败", zap.Strings("failed", failed))
 	}
 	return nil
+}
+
+// logErrorBlocks 把一条日志事件渲染成「通知正文 + 追加段落」。
+//
+// 为什么正文不能直接用 ErrorSignature：那是同一类错误的哈希摘要（聚合与去重靠它），
+// 不是人能读的文本。只发指纹的话，值班同学在 IM 里看到的是一串十六进制，
+// 除了"出事了"什么信息都拿不到——等于逼每个人回平台点一次详情。
+func logErrorBlocks(event model.LogAlertEvent) (string, []string) {
+	content := "**错误信息**：" + logErrorMessage(event)
+	var sections []string
+	if block := trimLogBlock(event.ContextLines, 6, 400); block != "" {
+		sections = append(sections, "**上下文**：\n"+block)
+	}
+	if block := trimLogBlock(event.RawStacktrace, 8, 600); block != "" {
+		sections = append(sections, "**堆栈**：\n"+block)
+	}
+	return content, sections
+}
+
+// logErrorMessage 取可读的错误消息；上报没带原文时退回指纹短标签（至少能回平台搜到这条）。
+func logErrorMessage(event model.LogAlertEvent) string {
+	if msg := strings.TrimSpace(event.ErrorMessage); msg != "" {
+		return truncateRunes(msg, 300)
+	}
+	if sig := strings.TrimSpace(event.ErrorSignature); sig != "" {
+		return "（上报未带消息原文）错误指纹 " + SignatureLabel(sig)
+	}
+	return "（上报未带消息原文）"
+}
+
+// trimLogBlock 把多行文本裁成「前 maxLines 行、总长不超过 maxRunes」。
+//
+// 堆栈动辄上百行，整段塞进 IM 卡片会把它撑到需要滚动，反而没人看；
+// 完整内容留在平台，卡片只给"够定位"的前几行。
+func trimLogBlock(text string, maxLines, maxRunes int) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) > maxLines {
+		lines = append(lines[:maxLines], "…（已截断，完整内容见平台）")
+	}
+	return truncateRunes(strings.Join(lines, "\n"), maxRunes)
+}
+
+// logRuleName 取规则名（标题用，短）。
+func logRuleName(rule model.LogAlertRule) string {
+	if name := strings.TrimSpace(rule.Name); name != "" {
+		return truncateRunes(name, 20)
+	}
+	return "规则未记录"
+}
+
+// logRuleValue 拼「命中规则」这一整行：规则名 + 它按什么条件命中 + 规则 ID。
+//
+// 带上命中条件而不是只给名字：同名不同条件的规则（如"支付服务-超时"与"支付服务-异常"）
+// 在 IM 里必须能被区分，否则讨论时只能说"那条告警"，对不上是哪条规则。
+func logRuleValue(rule model.LogAlertRule) string {
+	name := strings.TrimSpace(rule.Name)
+	if name == "" {
+		// 没有 rule_id 只可能是规则化之前的历史数据（worker 会把它标成「历史事件」）。
+		name = "未关联规则（历史事件）"
+	}
+	conds := []string{"全部服务"}
+	if s := strings.TrimSpace(rule.ServiceName); s != "" {
+		conds[0] = "服务=" + s
+	}
+	// 规则按消息原文匹配（与屏蔽项一致），这里也照"消息"说，避免把人误导去查指纹哈希。
+	if p := strings.TrimSpace(rule.SignaturePattern); p != "" {
+		if len(p) >= 2 && strings.HasPrefix(p, "/") && strings.HasSuffix(p, "/") {
+			conds = append(conds, "消息正则 "+p)
+		} else {
+			conds = append(conds, "消息包含 "+p)
+		}
+	}
+	if s := strings.TrimSpace(rule.MinSeverity); s != "" {
+		conds = append(conds, "级别≥"+s)
+	}
+	if rule.ID > 0 {
+		conds = append(conds, fmt.Sprintf("规则ID=%d", rule.ID))
+	}
+	return name + "（" + strings.Join(conds, " · ") + "）"
 }
 
 // recordLog 记录通知结果。
@@ -479,6 +582,15 @@ func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) e
 
 	elements := []map[string]any{
 		{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": n.Content}},
+	}
+	// 附加段落各自一个 div：飞书把一个 div 里的多行压成一坨，分段才能逐块渲染。
+	for _, section := range n.Sections {
+		if strings.TrimSpace(section) == "" {
+			continue
+		}
+		elements = append(elements, map[string]any{
+			"tag": "div", "text": map[string]any{"tag": "lark_md", "content": section},
+		})
 	}
 	elements = append(elements, buildFeishuFields(n.Fields)...)
 	if n.Diagnosis != nil {
@@ -714,6 +826,12 @@ func (s *NotifierService) sendEmail(n AlertNotification) error {
 func (n AlertNotification) renderText() string {
 	var b strings.Builder
 	b.WriteString(n.Content)
+	for _, section := range n.Sections {
+		if strings.TrimSpace(section) == "" {
+			continue
+		}
+		b.WriteString("\n\n" + section)
+	}
 	if len(n.Fields) > 0 {
 		b.WriteString("\n")
 		for _, f := range n.Fields {

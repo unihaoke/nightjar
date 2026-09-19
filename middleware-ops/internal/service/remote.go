@@ -372,7 +372,11 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	     并重建容器——配置始终按渲染内容同步，不受该开关影响。同时修掉"显式安装方式被自动判定成
 //	     复用"的缺陷（INC-029：显式 docker + 宿主有包版 filebeat 时，handler 去重启 systemd
 //	     而不是重建容器，容器静默使用旧配置）。
-const CodeRevision = "r15"
+//	r16：代码缓存遵循「没有就 clone、有就 pull」：新增启动预热（平台重建后补齐缓存，
+//	     异步、失败不阻断启动）、分析入口自兜（手工分析/重试也会先补代码），
+//	     「最小拉取间隔」只在本地确实有代码时生效，且空的/残缺的 .git 会被判定为
+//	     没有代码并重新 clone。
+const CodeRevision = "r16"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

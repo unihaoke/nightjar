@@ -39,3 +39,11 @@ func (a repoFetcherAdapter) Ensure(ctx context.Context, req RepoFetchRequest) (R
 		Revision: result.Revision, Branch: result.Branch,
 	}, err
 }
+
+// HasCode 报告本地是否已有可用代码（见 RepoFetcher 接口的说明）。
+func (a repoFetcherAdapter) HasCode(ctx context.Context, req RepoFetchRequest) bool {
+	return a.fetcher.HasCode(ctx, repo.Request{
+		Service: req.Service, RepoURL: req.RepoURL, Branch: req.Branch,
+		LocalPath: req.LocalPath, AllowOutbound: req.AllowOutbound,
+	})
+}

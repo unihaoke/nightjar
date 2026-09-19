@@ -50,9 +50,9 @@ func MatchLogAlertExclusion(items []model.LogAlertExclusion, service, message st
 			!strings.EqualFold(svc, strings.TrimSpace(service)) {
 			continue
 		}
-		// 复用规则的匹配语法（子串 / `/re/` 正则 / 非法正则退化为子串），
+		// 与规则共用消息匹配语法（子串 / `/re/` 正则 / 非法正则退化为子串），
 		// 使用者只需要记住一套写法：在规则里怎么配，在屏蔽里就怎么配。
-		if !signatureMatches(item.Pattern, message) {
+		if !messageMatches(item.Pattern, message) {
 			continue
 		}
 		return item, true

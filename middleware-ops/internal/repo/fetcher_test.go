@@ -358,6 +358,74 @@ func TestEnsureOutboundDeniedRunsNoGit(t *testing.T) {
 	}
 }
 
+// TestEnsureEmptyDirIsRecloned 钉住「目录存在但为空 → 当作没有代码，重新 clone」。
+//
+// 场景来自真实运维：clone 进行中服务被重建/进程被杀，目标目录已经建出来了却没拉到代码。
+// 若按"已存在但不是仓库"硬失败，这个服务就**永远**拿不到代码，且报错看起来像是配置问题。
+func TestEnsureEmptyDirIsRecloned(t *testing.T) {
+	remote := newTestRemote(t)
+	root := t.TempDir()
+	local := filepath.Join(root, "svc")
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatalf("建空目录失败: %v", err)
+	}
+	f := NewFetcher(Options{RootDir: root})
+	req := Request{Service: "svc", RepoURL: remote.url, Branch: "main", AllowOutbound: true}
+
+	if f.HasCode(context.Background(), req) {
+		t.Fatal("空目录不应算作「已有代码」")
+	}
+	res, err := f.Ensure(context.Background(), req)
+	if err != nil {
+		t.Fatalf("空目录应触发 clone，实际失败: %v", err)
+	}
+	if res.Action != ActionCloned {
+		t.Fatalf("Action = %q，期望 %q", res.Action, ActionCloned)
+	}
+	if !isGitDir(local) {
+		t.Fatalf("%s 应被重新克隆成 git 仓库", local)
+	}
+	if !f.HasCode(context.Background(), req) {
+		t.Fatal("clone 后应算作「已有代码」")
+	}
+}
+
+// TestEnsureBrokenGitDirIsRecloned 钉住「.git 存在但仓库不可用 → 重新 clone」。
+//
+// 同样是中断留下的半成品：这类目录能骗过"是不是 git 仓库"的检查，却在 fetch/pull 时失败，
+// 表现为每次分析都失败且原因看着像网络问题。
+func TestEnsureBrokenGitDirIsRecloned(t *testing.T) {
+	remote := newTestRemote(t)
+	root := t.TempDir()
+	f := NewFetcher(Options{RootDir: root})
+	req := Request{Service: "svc", RepoURL: remote.url, Branch: "main", AllowOutbound: true}
+
+	if _, err := f.Ensure(context.Background(), req); err != nil {
+		t.Fatalf("首次 clone 失败: %v", err)
+	}
+	// 把 .git 换成空目录：模拟 clone 写到一半被中断。
+	if err := os.RemoveAll(filepath.Join(root, "svc", ".git")); err != nil {
+		t.Fatalf("删除 .git 失败: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "svc", ".git"), 0o755); err != nil {
+		t.Fatalf("重建空 .git 失败: %v", err)
+	}
+	if f.HasCode(context.Background(), req) {
+		t.Fatal("损坏的仓库不应算作「已有代码」")
+	}
+
+	res, err := f.Ensure(context.Background(), req)
+	if err != nil {
+		t.Fatalf("损坏仓库应触发重新 clone，实际失败: %v", err)
+	}
+	if res.Action != ActionCloned {
+		t.Fatalf("Action = %q，期望 %q", res.Action, ActionCloned)
+	}
+	if got := readFile(t, filepath.Join(root, "svc", "app", "main.go")); !strings.Contains(got, "func main()") {
+		t.Fatalf("重新 clone 后文件内容不符: %q", got)
+	}
+}
+
 // TestEnsureCloneTimeout 超时要能被识别为超时。
 func TestEnsureCloneTimeout(t *testing.T) {
 	runner := &blockingRunner{}

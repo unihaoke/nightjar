@@ -243,6 +243,27 @@ func (f *Fetcher) Ensure(ctx context.Context, req Request) (*Result, error) {
 	return res, nil
 }
 
+// HasCode 报告本地缓存里是否已经有一份**可用**的代码：目录存在、是 git 仓库、且仓库没坏。
+//
+// 为什么需要它：调用方要用它把「刷新间隔内可以复用本地副本」和「本地其实根本没有代码」
+// 区分开——后者必须立刻 clone，不能因为"刚刚拉过"就跳过（见服务层 ensureRepo）。
+// 判定"可用"而不是"存在"是刻意的：一个残缺的 .git 目录（clone 被中断留下的）
+// 同样算"没有代码"，照它去定位代码只会得到空结果。
+func (f *Fetcher) HasCode(ctx context.Context, req Request) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	local, err := f.resolveLocalPath(req)
+	if err != nil {
+		return false
+	}
+	exists, isRepo, err := probePath(local)
+	if err != nil || !exists || !isRepo {
+		return false
+	}
+	return f.repoHealthy(ctx, local)
+}
+
 // LocalPathFor 只做本地目录解析与越界校验，不执行任何 git 操作、不检查 AllowOutbound。
 //
 // 用途：降级场景——Ensure 失败但本地还留着旧副本时，调用方需要知道该用哪个目录；
@@ -361,21 +382,64 @@ func (f *Fetcher) resolveLocalPath(req Request) (string, error) {
 }
 
 // ensureLocal 是串行化之后的实际操作：判定 clone 还是更新，并保证错误可操作。
+//
+// 「没有代码」的三种形态都必须落到 clone，否则该服务会永久拿不到代码：
+//  1. 目录不存在（首次，或被重建的容器丢掉了缓存卷）——最常见；
+//  2. 目录存在但为空——上次 clone 被中断（进程被 kill、容器重建）留下的空壳，
+//     里面没有任何需要保护的内容，留着只会让后续每次都卡在"已存在但不是仓库"；
+//  3. 目录有 .git 但 git 认为它不是一个可用仓库——同样是中断留下的半成品。
+//
+// 只有"目录里有内容且不是 git 仓库"才按硬性要求 2 拒绝覆盖：那可能是别人的目录，
+// 删掉是不可逆的数据损失。
 func (f *Fetcher) ensureLocal(ctx context.Context, req Request, local string) (*Result, error) {
 	exists, isRepo, err := probePath(local)
 	if err != nil {
 		return nil, err
 	}
-	if exists && !isRepo {
-		// 硬性要求 2：绝不覆盖已有目录——它可能是其它服务的缓存、也可能是人工放置的数据。
-		return nil, fmt.Errorf("%w：目录 %s 已存在但没有 .git，拒绝覆盖；"+
-			"请修改 RootDir/Service（改用其它目录）或确认该目录可以清理后手工删除再重试",
-			ErrNotGitRepo, local)
-	}
-	if !isRepo {
+	if !exists {
 		return f.clone(ctx, req, local)
 	}
-	return f.update(ctx, req, local)
+	if !isRepo {
+		empty, err := dirIsEmpty(local)
+		if err != nil {
+			return nil, fmt.Errorf("repo: 检查目录 %s 内容失败: %w", local, err)
+		}
+		if !empty {
+			// 硬性要求 2：绝不覆盖已有内容——它可能是其它服务的缓存、也可能是人工放置的数据。
+			return nil, fmt.Errorf("%w：目录 %s 已存在但没有 .git，拒绝覆盖；"+
+				"请修改 RootDir/Service（改用其它目录）或确认该目录可以清理后手工删除再重试",
+				ErrNotGitRepo, local)
+		}
+		// 空目录：clone 被中断留下的空壳，删掉重来是安全的（里面没有内容可丢）。
+		f.log.Warn("缓存目录为空且不是 git 仓库，按「上次克隆被中断」处理并重新克隆",
+			zap.String("local_path", local))
+		if err := os.RemoveAll(local); err != nil {
+			return nil, fmt.Errorf("repo: 清理空的残留目录 %s 失败: %w", local, err)
+		}
+		return f.clone(ctx, req, local)
+	}
+	if f.repoHealthy(ctx, local) {
+		return f.update(ctx, req, local)
+	}
+	// .git 在但仓库不可用：半成品，留着只会让每次更新都失败。删掉重新 clone。
+	f.log.Warn("缓存目录的 git 仓库不可用，按「上次克隆被中断」处理并重新克隆",
+		zap.String("local_path", local))
+	if err := os.RemoveAll(local); err != nil {
+		return nil, fmt.Errorf("repo: 清理损坏的缓存目录 %s 失败: %w", local, err)
+	}
+	return f.clone(ctx, req, local)
+}
+
+// repoHealthy 判断目录里的 git 仓库能不能正常工作。
+//
+// 用 rev-parse --git-dir（只查询、不改动工作区）：clone 被打断留下的半成品 .git
+// 会在这里失败，而它对 update 来说也确实不可用。
+func (f *Fetcher) repoHealthy(ctx context.Context, local string) bool {
+	if _, err := f.runGit(ctx, local, "rev-parse --git-dir", f.opts.PullTimeout, "",
+		"-C", local, "rev-parse", "--git-dir"); err != nil {
+		return false
+	}
+	return true
 }
 
 // clone 首次克隆（硬性要求 2）。

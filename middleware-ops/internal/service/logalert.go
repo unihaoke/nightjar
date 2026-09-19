@@ -182,7 +182,7 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 	//
 	// 平台不再有任何"默认规则/默认值"兜底：告警必须由使用者在页面上新增的规则触发，
 	// 否则一条没配过的服务也会源源不断产生通知，而没人说得清它从哪来。
-	rule, matched := s.matchRule(ctx, in.Service, signature, level)
+	rule, matched := s.matchRule(ctx, in.Service, in.Message, level)
 	if !matched {
 		s.log.Debug("日志未命中任何日志告警规则，已忽略",
 			zap.String("service", in.Service), zap.String("signature", signature))
@@ -218,17 +218,19 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 		ServiceName:    in.Service,
 		AlertType:      alertType,
 		ErrorSignature: signature,
-		RawStacktrace:  in.Stacktrace,
-		ContextLines:   in.ContextLines,
-		LogPath:        in.LogPath,
-		ErrorCount:     count,
-		Severity:       severityOf(level),
-		Status:         model.LogEventPending,
-		FirstSeenAt:    now,
-		LastSeenAt:     now,
-		RuleID:         rule.ID,
-		DedupWindow:    rule.DedupWindow,
-		AnalysisState:  model.LogAnalysisPending,
+		// 指纹只用于聚合，通知里要展示的是人能读的原文（见 model.LogAlertEvent.ErrorMessage）。
+		ErrorMessage:  truncateRunes(in.Message, 1000),
+		RawStacktrace: in.Stacktrace,
+		ContextLines:  in.ContextLines,
+		LogPath:       in.LogPath,
+		ErrorCount:    count,
+		Severity:      severityOf(level),
+		Status:        model.LogEventPending,
+		FirstSeenAt:   now,
+		LastSeenAt:    now,
+		RuleID:        rule.ID,
+		DedupWindow:   rule.DedupWindow,
+		AnalysisState: model.LogAnalysisPending,
 	}
 	if rule.Cooldown > 0 {
 		until := now.Add(time.Duration(rule.Cooldown) * time.Minute)

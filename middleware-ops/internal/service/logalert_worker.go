@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,10 @@ type LogAlertWorker struct {
 // 换成别的实现（比如本地镜像、对象存储解包）时不需要动这里。
 type RepoFetcher interface {
 	Ensure(ctx context.Context, req RepoFetchRequest) (RepoFetchResult, error)
+	// HasCode 报告本地是否已经有可用代码：调用方靠它区分"刷新间隔内可复用本地副本"
+	// 与"本地没有代码、必须 clone"。没有它，"刚刚拉过"这个记忆会让代码缺失的服务
+	// 一直拿不到代码（容器重建丢缓存卷后最典型）。
+	HasCode(ctx context.Context, req RepoFetchRequest) bool
 }
 
 // RepoFetchRequest / RepoFetchResult 是跨层的数据形状（与 internal/repo 的 Request/Result 对应）。
@@ -272,7 +277,7 @@ func (w *LogAlertWorker) notify(ctx context.Context, event model.LogAlertEvent, 
 		return fmt.Errorf("冷却期内抑制")
 	}
 	channels := []string(rule.NotifyChannels)
-	if err := w.notifier.NotifyLogEvent(ctx, event, channels, brief); err != nil {
+	if err := w.notifier.NotifyLogEvent(ctx, event, rule, channels, brief); err != nil {
 		w.log.Warn("日志告警通知失败", zap.Int64("event_id", event.ID), zap.Error(err))
 		return err
 	}
@@ -282,26 +287,40 @@ func (w *LogAlertWorker) notify(ctx context.Context, event model.LogAlertEvent, 
 	return nil
 }
 
-// ensureRepo 保证本地有一份与远端一致的代码，并把路径写回 CodeRepo（页面可见）。
-func (w *LogAlertWorker) ensureRepo(ctx context.Context, repo model.CodeRepo) (RepoFetchResult, error) {
-	interval := 300
-	if w.cfg != nil && w.cfg.CodeRepo.RefreshInterval > 0 {
-		interval = w.cfg.CodeRepo.RefreshInterval
+// canReuseLocalCache 判断本次能否跳过远端、直接复用本地副本。
+//
+// 两个条件缺一不可：
+//   - 本地确实有代码：**没有代码时必须去 clone**，"刚刚拉过"这种记忆不能替代代码本身；
+//     容器重建丢了缓存卷之后，正是这条决定了服务能不能重新拿到代码；
+//   - 距上次拉取还在最小间隔内：避免故障风暴里每条事件都去 pull 一次远端。
+//
+// interval <= 0 表示不设间隔（每次都向远端确认），last 为零值表示本次进程还没拉过。
+func canReuseLocalCache(hasCode bool, last, now time.Time, interval time.Duration) bool {
+	if !hasCode || last.IsZero() || interval <= 0 {
+		return false
 	}
-	if last, ok := w.repoRefreshedAt.Load(repo.ServiceName); ok {
-		if at, ok := last.(time.Time); ok && time.Since(at) < time.Duration(interval)*time.Second {
-			// 距离上次拉取还没到最小间隔：直接用本地副本（它刚刚被刷新过）。
-			return RepoFetchResult{LocalPath: repo.LocalPath, Action: "cached"}, nil
-		}
-	}
+	return now.Sub(last) < interval
+}
+
+// fetchRequest 把一条仓库映射转成拉取请求（进程级配置在这里补齐）。
+func (w *LogAlertWorker) fetchRequest(repo model.CodeRepo) RepoFetchRequest {
 	allowOutbound := true
 	if w.cfg != nil {
 		allowOutbound = w.cfg.CodeRepo.AllowOutbound
 	}
-	result, err := w.fetcher.Ensure(ctx, RepoFetchRequest{
+	return RepoFetchRequest{
 		Service: repo.ServiceName, RepoURL: repo.RepoURL, Branch: repo.Branch,
 		LocalPath: repo.LocalPath, AllowOutbound: allowOutbound,
-	})
+	}
+}
+
+// ensureRepo 保证本地有一份与远端一致的代码，并把路径写回 CodeRepo（页面可见）。
+//
+// 关键约束：只有**本地确实有代码**时，"最小拉取间隔"才允许跳过远端。
+// 否则会出现「刚拉过 → 走缓存 → 但代码其实不在了（卷被重建/目录被清）」，
+// 分析阶段拿着不存在的目录去定位代码，静默返回空结论——这是最难查的一类失败。
+func (w *LogAlertWorker) ensureRepo(ctx context.Context, repo model.CodeRepo) (RepoFetchResult, error) {
+	result, err := w.syncRepo(ctx, repo)
 	if err != nil {
 		return result, err
 	}
@@ -316,6 +335,97 @@ func (w *LogAlertWorker) ensureRepo(ctx context.Context, repo model.CodeRepo) (R
 		w.log.Warn("更新代码仓库拉取时间失败", zap.String("service", repo.ServiceName), zap.Error(err))
 	}
 	return result, nil
+}
+
+// syncRepo 是 ensureRepo 里"只管把代码拉到位"的那一段（记忆刷新时间与落库留给外层，
+// 这样这段判定可以在没有数据库的单测里被钉住——它是最容易退化的一条规则）。
+func (w *LogAlertWorker) syncRepo(ctx context.Context, repo model.CodeRepo) (RepoFetchResult, error) {
+	req := w.fetchRequest(repo)
+	interval := 300
+	if w.cfg != nil && w.cfg.CodeRepo.RefreshInterval > 0 {
+		interval = w.cfg.CodeRepo.RefreshInterval
+	}
+	var last time.Time
+	if at, ok := w.repoRefreshedAt.Load(repo.ServiceName); ok {
+		if t, ok := at.(time.Time); ok {
+			last = t
+		}
+	}
+	if canReuseLocalCache(w.fetcher.HasCode(ctx, req), last, time.Now(), time.Duration(interval)*time.Second) {
+		// 距离上次拉取还没到最小间隔：直接用本地副本（它刚刚被刷新过）。
+		return RepoFetchResult{LocalPath: repo.LocalPath, Action: "cached"}, nil
+	}
+	return w.fetcher.Ensure(ctx, req)
+}
+
+// repoWarmLimit 是启动预热最多处理的仓库数（防御性上限：映射表不该有成千上万条，
+// 真有也不该在启动阶段把代码托管打满）。
+const repoWarmLimit = 200
+
+// WarmRepos 在进程启动后把所有已配置的代码仓库补齐：本地没有代码 → clone，已有 → pull。
+//
+// 为什么必须有这一步（对应"服务重新构建"的场景）：平台容器重建后缓存目录常常是空的
+// （数据卷没挂、被清理、或换成了新卷）。若等到第一条告警事件才去 clone，
+// 那一次分析必然拿不到代码——AI 定位不到行，只能给出没有代码依据的结论；
+// 而大仓库 clone 动辄几分钟，还会把事件处理堵住。预热把这笔时间花在没有事件压力的时候。
+//
+// 刻意异步、失败只记日志：预热是"让第一条告警更快更准"，它不该阻断启动，
+// 也不该因为某个仓库的凭据过期就让平台起不来。失败的仓库会在事件处理里按正常逻辑重试。
+func (w *LogAlertWorker) WarmRepos(ctx context.Context) (ok, failed int) {
+	if w == nil || w.codeRepos == nil || w.fetcher == nil {
+		return 0, 0
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	allowOutbound := true
+	if w.cfg != nil {
+		allowOutbound = w.cfg.CodeRepo.AllowOutbound
+	}
+	if !allowOutbound {
+		w.log.Info("出网许可未开启，跳过启动预热（本次不会执行任何 git 命令）")
+		return 0, 0
+	}
+	items, _, err := w.codeRepos.List(ctx, "", repoWarmLimit, 0)
+	if err != nil {
+		w.log.Warn("读取代码仓库映射失败，跳过启动预热", zap.Error(err))
+		return 0, 0
+	}
+	for i := range items {
+		if ctx.Err() != nil {
+			return ok, failed
+		}
+		item := items[i]
+		if strings.TrimSpace(item.RepoURL) == "" {
+			// 没有仓库地址就没法 clone：这是配置问题，说清楚比默默跳过好。
+			w.log.Warn("跳过预热：服务未配置仓库地址",
+				zap.String("service", item.ServiceName))
+			failed++
+			continue
+		}
+		res, err := w.fetcher.Ensure(ctx, w.fetchRequest(item))
+		if err != nil {
+			failed++
+			w.log.Warn("启动预热失败（下次分析会重试）",
+				zap.String("service", item.ServiceName), zap.Error(err))
+			continue
+		}
+		ok++
+		// 成功才记刷新时间：失败的仓库不该被"最小拉取间隔"挡住重试。
+		w.repoRefreshedAt.Store(item.ServiceName, time.Now())
+		if res.LocalPath != "" && res.LocalPath != item.LocalPath {
+			item.LocalPath = res.LocalPath
+		}
+		now := time.Now().UTC()
+		item.LastPullAt = &now
+		if err := w.codeRepos.Update(ctx, &item); err != nil {
+			w.log.Warn("更新代码仓库拉取时间失败", zap.String("service", item.ServiceName), zap.Error(err))
+		}
+		w.log.Info("代码缓存预热完成",
+			zap.String("service", item.ServiceName), zap.String("action", res.Action),
+			zap.String("revision", res.Revision), zap.String("local_path", res.LocalPath))
+	}
+	return ok, failed
 }
 
 // analysisDecision 决定"这条事件在 AI 分析这一步该怎么收场"，并给出给使用者看的原因。

@@ -339,8 +339,14 @@ type LogAlertEvent struct {
 	ServiceName    string `gorm:"size:128;index" json:"service_name"`
 	AlertType      string `gorm:"size:32;index" json:"alert_type"`
 	ErrorSignature string `gorm:"size:255;index" json:"error_signature"`
-	RawStacktrace  string `gorm:"type:text" json:"raw_stacktrace"`
-	ContextLines   string `gorm:"type:text" json:"context_lines"`
+	// ErrorMessage 为这条日志**原始的**错误消息（通知与页面展示用）。
+	//
+	// 为什么指纹之外还要存一份原文：ErrorSignature 是同一类错误的哈希摘要（聚合与去重靠它），
+	// 不是人能读的文本——通知里只发指纹，值班同学看到的就是一串十六进制。
+	// 这里保留首条真实消息（截断留存），让"到底报了什么错"在 IM 里一眼可见。
+	ErrorMessage  string `gorm:"size:1024" json:"error_message"`
+	RawStacktrace string `gorm:"type:text" json:"raw_stacktrace"`
+	ContextLines  string `gorm:"type:text" json:"context_lines"`
 	// LogPath 为这条日志来自哪个文件（日志集成：Filebeat 的 log.file.path）。
 	// 排查时"哪个文件在报错"往往比"报了什么"更快定位到服务与模块。
 	LogPath string `gorm:"size:512" json:"log_path"`
@@ -400,7 +406,12 @@ type LogAlertRule struct {
 	Description string `gorm:"size:255" json:"description"`
 	// ServiceName 为空表示匹配任意服务。
 	ServiceName string `gorm:"size:128;index" json:"service_name"`
-	// SignaturePattern 匹配错误指纹：普通文本按子串匹配，`/re/` 形式按正则匹配；为空表示任意。
+	// SignaturePattern 按**日志消息原文**（上报的 message）匹配：普通文本按子串，`/re/` 形式按正则；为空表示任意。
+	//
+	// 匹配原文而不是错误指纹：指纹是归一化后的哈希（见 ErrorSignature），
+	// 使用者写不出"我想匹配的那句话"对应的哈希，只能写出日志里的文本。
+	// 与屏蔽项（log_alert_exclusions.pattern）刻意同一套写法，两个页面填的东西一样。
+	// 列名沿用 signature_pattern 只为不动存量配置（改列名会让 AutoMigrate 新开一列、旧配置全失效）。
 	SignaturePattern string `gorm:"size:255" json:"signature_pattern"`
 	// MinSeverity 为最低级别（INFO/WARN/ERROR/FATAL）；为空表示不限级别。
 	MinSeverity string `gorm:"size:16" json:"min_severity"`

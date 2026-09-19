@@ -3,8 +3,9 @@
  * 日志告警规则（4.8.2）：列表 + 新建/编辑弹窗 + 启停 + 字段校验。
  *
  * 与指标告警规则（Alert/Rules.vue）形态刻意对齐：两个页面一套心智模型。
- * 差别在"判定输入"——指标规则比数值（metric > threshold），日志规则比**错误指纹与级别**
- * （哪个服务的哪类错误），因此字段是 service_name / signature_pattern / min_severity。
+ * 差别在"判定输入"——指标规则比数值（metric > threshold），日志规则比**服务 + 日志消息 + 级别**，
+ * 因此字段是 service_name / signature_pattern / min_severity。
+ * 注意 signature_pattern 匹配的是 message 原文（与屏蔽项同一套写法），不是错误指纹。
  *
  * 平台**没有任何默认规则**：日志必须命中这里新增的某条规则才会产生告警，
  * 否则不入库、不通知、不分析——页面顶部必须把这条说清，否则使用者会以为平台漏收了日志。
@@ -483,7 +484,7 @@ async function toggle(rule: LogAlertRule): Promise<void> {
           </el-tag>
         </div>
         <p class="rule-cond mono">
-          {{ row.service_name || '任意服务' }} · {{ row.signature_pattern || '任意指纹' }}
+          {{ row.service_name || '任意服务' }} · {{ row.signature_pattern || '任意消息' }}
         </p>
         <div class="rule-meta muted">
           <span>级别 {{ row.min_severity || '不限' }}</span>
@@ -513,7 +514,7 @@ async function toggle(rule: LogAlertRule): Promise<void> {
                 <span v-else class="muted">任意服务</span>
               </template>
             </el-table-column>
-            <el-table-column label="指纹匹配" min-width="170">
+            <el-table-column label="消息匹配" min-width="170">
               <template #default="{ row }">
                 <span v-if="row.signature_pattern" class="mono">{{ row.signature_pattern }}</span>
                 <span v-else class="muted">任意</span>
@@ -592,12 +593,13 @@ async function toggle(rule: LogAlertRule): Promise<void> {
           </el-col>
 
           <el-col :span="24">
-            <el-form-item label="错误指纹匹配" prop="signature_pattern">
-              <el-input v-model="form.signature_pattern" placeholder="留空表示任意指纹" />
+            <el-form-item label="日志消息匹配" prop="signature_pattern">
+              <el-input v-model="form.signature_pattern" placeholder="留空表示任意消息" />
               <p class="field-hint">
+                匹配的是<b>日志里的原文</b>（上报的 message），不是错误指纹——指纹是哈希，照着日志填文本即可。
                 填普通文本=子串匹配，例如 <span class="mono">NullPointerException</span>；填
                 <span class="mono">/正则/</span>=按正则匹配，例如
-                <span class="mono">/timeout|refused/i</span>；留空表示任意指纹。
+                <span class="mono">/timeout|refused/</span>；留空表示任意消息。
               </p>
             </el-form-item>
           </el-col>

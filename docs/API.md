@@ -424,7 +424,7 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 
 **规则驱动的窗口与冷却（语义必须按此理解）**
 
-去重窗口与冷却期不写死在代码里，而由 `log_alert_rules` 逐条配置：匹配按「服务 + 错误指纹 + 级别」，
+去重窗口与冷却期不写死在代码里，而由 `log_alert_rules` 逐条配置：匹配按「服务 + 日志消息原文 + 级别」，
 **priority 数字小者优先、同优先级按 id 升序取第一条命中的启用规则**；**没有命中任何规则时**
 **不产生告警**（不入库、不通知、不分析）——平台没有内置默认规则，告警只能来自页面上新增过的规则。
 
@@ -463,7 +463,7 @@ data: {"code":5002,"message":"AI 引擎不可用"}
   "name": "订单服务空指针立即告警",
   "description": "核心服务：窗口短、通知快，且要 AI 代码结论",
   "service_name": "order-api",
-  "signature_pattern": "a1b2c3",
+  "signature_pattern": "NullPointerException",
   "min_severity": "ERROR",
   "dedup_window": 2,
   "cooldown": 5,
@@ -474,10 +474,10 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 }
 ```
 
-- `service_name` 留空 = 匹配任意服务；`signature_pattern` 留空 = 匹配任意指纹。
-  **注意匹配对象是「错误指纹」而不是原始错误消息**（指纹是异常类名 + 消息模板 + 首个业务栈帧算出的短串），
-  所以 `signature_pattern` 通常填指纹里的**一段子串**（从事件详情页的 `error_signature` 复制，或先留空跑一条看实际取值）；
-  写成 `/正则/` 时按正则匹配（大小写不敏感），例如 `/^a1b2/`；
+- `service_name` 留空 = 匹配任意服务；`signature_pattern` 留空 = 匹配任意消息。
+  **匹配对象是上报的 `message` 原文，不是错误指纹**（指纹是归一化后的哈希，写不出来），
+  所以 `signature_pattern` 直接填日志里那句话的一段，例如 `NullPointerException`、`Request method 'GET' is not supported`；
+  写成 `/正则/` 时按正则匹配（大小写不敏感），例如 `/timeout|refused/`；
 - `min_severity` 取 `INFO/WARN/ERROR/FATAL`（留空 = 不限级别）；
 - `notify_channels` 取 `feishu/wecom/dingtalk/email`（留空 = 用平台「通知渠道」里已启用的渠道）；
 - `dedup_window` / `cooldown` 单位是分钟，显式传 `0` 表示「不合并 / 不冷却」，

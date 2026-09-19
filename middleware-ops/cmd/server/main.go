@@ -205,6 +205,20 @@ func run(configPath string) error {
 	}
 	defer scheduler.Stop()
 
+	// 代码缓存预热：平台（重新）构建后缓存目录可能是空的（数据卷没挂/被清理），
+	// 这里按已配置的仓库映射补齐——本地没有就 clone，有就 pull 到最新。
+	//
+	// 异步、失败只记日志：预热是"让第一条告警更快更准"，不该拖住启动，
+	// 也不该因某个仓库的凭据过期就让平台起不来（失败的仓库会在事件处理里重试）。
+	go func() {
+		warmCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
+		ok, failed := deps.LogAlertWorker.WarmRepos(warmCtx)
+		if ok+failed > 0 {
+			log.Info("代码缓存预热结束", zap.Int("ok", ok), zap.Int("failed", failed))
+		}
+	}()
+
 	// 日志集成接收链路：Filebeat → 平台 Kafka → 日志事件。
 	// 与 HTTP 服务同生命周期：进程退出时停止消费（未提交的位点下次会重新消费，日志事件层按指纹去重）。
 	// 未配置 Kafka 时它只写一条说明日志，不阻断启动。

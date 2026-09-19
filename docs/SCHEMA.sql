@@ -340,6 +340,8 @@ CREATE TABLE IF NOT EXISTS log_alert_events (
     service_name     VARCHAR(128),
     alert_type       VARCHAR(32),
     error_signature  VARCHAR(255),
+    -- 错误消息原文（首条上报的 message）：指纹是哈希、不可读，通知与页面展示用它
+    error_message    VARCHAR(1024),
     raw_stacktrace   TEXT,
     context_lines    TEXT,
     log_path         VARCHAR(512),
@@ -369,7 +371,7 @@ CREATE INDEX IF NOT EXISTS idx_log_alert_events_status ON log_alert_events(statu
 -- 日志告警规则（日志集成的日志 → 去重窗口 / 冷却期 / 通知 / AI 分析）
 --
 -- 与指标告警规则（alert_rules）刻意分表：两者的判定输入不同——
--- 指标规则比数值（metric > threshold），日志规则比**错误指纹与级别**。
+-- 指标规则比数值（metric > threshold），日志规则比**服务 + 日志消息原文 + 级别**。
 -- 但"去重窗口 / 冷却期 / 通知渠道 / AI 开关"四个概念同名同语义，使用者的心智模型一致。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS log_alert_rules (
@@ -379,7 +381,7 @@ CREATE TABLE IF NOT EXISTS log_alert_rules (
     name              VARCHAR(128) NOT NULL,
     description       VARCHAR(255),
     service_name      VARCHAR(128),           -- 空 = 任意服务
-    signature_pattern VARCHAR(255),           -- 普通文本=子串；/re/=正则；空 = 任意
+    signature_pattern VARCHAR(255),           -- 匹配上报的 message 原文：普通文本=子串；/re/=正则；空 = 任意
     min_severity      VARCHAR(16),            -- 空 = 不限级别
     dedup_window      INTEGER DEFAULT 5,      -- 去重窗口（分钟）：窗口内同指纹只合并计数
     cooldown          INTEGER DEFAULT 10,     -- 冷却期（分钟）：冷却内不通知、不触发 AI
