@@ -362,7 +362,12 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	r13：日志告警补齐完整链路：可配置规则（去重窗口/冷却期/通知渠道/AI 开关，log_alert_rules）、
 //	     冷却抑制与窗口合并语义、后处理编排（通知 + AI 代码分析，DB 队列 + 定时任务）、
 //	     代码仓库本地缓存（首次 clone、之后更新到远端）；新增「重新分析」打破冷却。
-const CodeRevision = "r13"
+//	r14：日志集成在现场连续暴露的缺陷集中修复：日志集成不再进入「纳管中间件」域（列表/统计/探测
+//	     都按类型白名单过滤，INC-023）；playbook 先删旧容器再写配置、容器内配置路径改为官方镜像
+//	     真实路径、数据目录独立且归属 uid1000（INC-024/026）；断言改用实时 stat、结论任务不用正则
+//	     与 Jinja 会吃掉的字符（INC-027）；**远程目标机 + 回环/容器内 Kafka 地址在配置阶段直接拒绝**
+//	     （INC-028）。
+const CodeRevision = "r14"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

@@ -174,6 +174,21 @@ else
   warn '未发现 mwops-kafka 容器：日志集成不可用（docker compose up -d kafka 后重启后端）'
   hint 'Kafka 是「日志集成」的日志总线，见 docs/LOG_INTEGRATION.md；平台其余功能不受影响'
 fi
+# advertised 地址的"对方视角"体检（INC-028）：这个地址会被渲染进**目标机**的 filebeat.yml，
+# 所以对远程目标机而言，回环地址/容器内服务名是**必然失败**的（Filebeat 会去连它自己）。
+# 本机目标用回环地址是对的，因此这里只提示、不判失败，并把判断依据写清楚。
+advertised=$(env_get "$NJ_ENV" KAFKA_ADVERTISED_HOST)
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mwops-kafka$'; then
+  case "${advertised:-127.0.0.1}" in
+    127.0.0.1|localhost|::1|0.0.0.0|kafka)
+      warn "KAFKA_ADVERTISED_HOST=${advertised:-127.0.0.1} 是回环/容器内地址：只适用于「日志集成填平台自己」的场景"
+      hint '若日志集成的目标是**别的机器**，它上面的 Filebeat 会去连那台机器自己的 9092 → 日志一条都到不了平台'
+      hint '改法：.env 里设 KAFKA_ADVERTISED_HOST=<被管机可达的平台 IP 或域名> → docker compose up -d kafka backend → 重新应用该日志集成'
+      hint '平台会在预览/部署/重新应用时直接拒绝这种组合（INC-028），不用等部署完再去目标机排查'
+      ;;
+    *) ok "KAFKA_ADVERTISED_HOST=$advertised（远程目标机可据此回连平台）" ;;
+  esac
+fi
 # 兼容旧版本残留：若发现旧方案的采集容器，说明平台镜像/集成记录还是重构前的，提醒清理。
 legacy_collectors=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mwops-logcollect|^mwops-.*-logs$' || true)
 if [ -n "$legacy_collectors" ]; then

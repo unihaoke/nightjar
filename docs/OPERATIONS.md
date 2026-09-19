@@ -478,6 +478,14 @@ docker exec mwops-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-serv
   集成中心对该日志集成点**自检**，第 2 段「被管机接入地址（Kafka EXTERNAL）」就是查这个地址。
   只有平台与被管机在同一台机器时，`localhost` 才成立。
 
+- **平台现在会在执行前就拒绝这个必然失败的组合**（INC-028）：目标是**远程**被管机、而 EXTERNAL 地址仍是
+  回环（`127.0.0.1` / `localhost` / `::1`）或容器内服务名（`kafka`）时，**预览 / 部署 / 重新应用**
+  会在渲染 `filebeat.yml` 之前直接失败并提示改 `KAFKA_ADVERTISED_HOST` 后
+  `docker compose up -d kafka backend`。
+  这样做的理由是：这类配置**必然**失败，但失败点在对方机器的 Filebeat 上（报错在 `dial tcp 127.0.0.1`
+  这种极具误导性的形态），让它在平台侧当场拒绝比事后到目标机排障便宜得多。
+  **本机目标不需要也不应该改成公网地址**——此时回环地址是正确配置（EXTERNAL 端口已发布到宿主）。
+
 **磁盘占用与清理**
 
 - Kafka 只做**削峰与解耦**，不承担长期留存：日志的长期留存由平台的事件表

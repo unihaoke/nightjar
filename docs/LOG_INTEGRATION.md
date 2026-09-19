@@ -65,6 +65,12 @@
 
 - `.env` 里显式提供 `KAFKA_ADVERTISED_HOST`（默认 `127.0.0.1`，仅单机自测可用）；
 - `scripts/onboard.sh` 会尝试自动探测宿主 IP 并写入；
+- **平台会主动拒绝"必然失败"的组合**（INC-028）：日志集成的目标是**远程**机器、而 Kafka 对外地址
+  还是回环（`127.0.0.1`/`localhost`/`::1`）或容器内服务名（`kafka`）时，**预览、部署、重新应用
+  三条会渲染 `filebeat.yml` 的路径**都会在写出产物之前直接失败（保存表单本身不渲染，
+  因此不会因为平台配置不全而存不下集成点），错误信息给出改哪个配置项与重建哪两个容器；
+  自检第 2 段也会把这一环判红而不是笼统地"不通"。
+  本机目标（集成就填平台自己）用回环地址是**正确**的：EXTERNAL 端口已发布到宿主。
 - 日志集成的**自检**会把"平台侧能否连上 Kafka"与"被管机接入地址是否可用"分开判定（见 §六），
   而"目标机视角能否连上"由部署时的 playbook 在目标机上探测（那里才有 SSH，见 §六末段）。
 
@@ -227,7 +233,9 @@ AI 要回答"这条日志对应哪一行代码"，就必须先有代码。`inter
 1. **平台侧 Kafka 可达**：用平台配置的 `brokers` 列 topic，确认 `mwops-logs` 存在；
 2. **被管机接入地址（advertised）**：把 `KAFKA_ADVERTISED_HOST:KAFKA_PORT` 摆出来并从平台侧探一次，
    同时明确标注"被管机视角仍需在目标机执行 `nc -vz <host> <port>` 验证"——
-   这一步专门用来抓 §三 里那个"advertised 地址配成 localhost"的经典问题；
+   这一步专门用来抓 §三 里那个"advertised 地址配成 localhost"的经典问题。
+   **这一环会区分"地址本身就不可能对"与"地址对但端口不通"**：目标是远程机器、而地址是回环或容器内服务名时
+   直接判红并指出改哪个配置项（INC-028），不再笼统报"不通"——否则现场会去查一个并不存在的网络问题；
 3. **数据面**：按 `server_instances.last_seen_at` 给出"最近一条日志是多久以前"，
    超过 30 分钟判为警告，并给出目标机上的三条自查动作（`systemctl status filebeat` /
    `filebeat test output` / 路径 glob 是否匹配）。
@@ -299,5 +307,8 @@ echo '2024-01-01 ERROR demo: boom' >> /var/log/app/demo.log
 > **未在本仓库环境中验证的部分**（如实说明）：本次交付只做了产物级验证——
 > 渲染出的 `filebeat.yml` 与 playbook 通过 Go（yaml.v3）与 Python（pyyaml）**两种解析器**复核、
 > 后端全量 `go build/vet/test` 通过、前端 `vue-tsc` 与 `vite build` 通过。
+> INC-028 的地址校验（远程目标 + 回环/容器名 → 拒绝；本机目标 + 回环 → 放行）由
+> `TestKafkaAddressUsableForTarget` / `TestLogInputOfRejectsMissingPieces` 覆盖，
+> 但**"改成正确 advertised 地址后目标机是否真的能推上日志"仍未在真实链路上跑通**。
 > playbook **没有在真实目标机（真实 Debian/RHEL + Filebeat 8.16 + Kafka）上执行过**：
 > `/dev/tcp` 探测、`nc -z` 回退、RPM 依赖解析、docker 挂载与 handler 重启都只有静态断言。

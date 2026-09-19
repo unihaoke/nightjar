@@ -132,4 +132,73 @@ func TestLogInputOfRejectsMissingPieces(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "KAFKA_BROKERS") {
 		t.Fatalf("报错要指明改哪个配置，实际 %v", err)
 	}
+
+	// INC-028：远程目标机 + 平台默认的回环 Kafka 地址 = 必然失败，必须在配置阶段就拒绝。
+	// 放过去的话现象是"部署成功、日志页空白"，使用者要在两个系统之间来回猜。
+	loopback := &config.Config{}
+	loopback.Kafka.Enabled = true
+	loopback.Kafka.Brokers = []string{"kafka:29092"}
+	loopback.Kafka.ExternalHost = "127.0.0.1"
+	loopback.Kafka.ExternalPort = 9092
+	remote := integration.Instance{
+		Name: "jd-logs", MWType: tpl.Type, Address: integration.Address{Host: "203.195.191.75"},
+		Options: map[string]string{optLogPaths: "/var/log/app/*.log"},
+	}
+	remoteItem := &model.MiddlewareInstance{Name: "jd-logs", MWType: tpl.Type}
+	if _, err := (&IntegrationService{cfg: loopback}).logInputOf(remoteItem, tpl, remote, IntegrationMeta{}); err == nil {
+		t.Fatal("远程目标机 + 回环 Kafka 地址必须被拒绝（否则 Filebeat 会去连它自己）")
+	} else if !strings.Contains(err.Error(), "KAFKA_ADVERTISED_HOST") {
+		t.Fatalf("拒绝时必须给出改哪个配置，实际 %v", err)
+	}
+	// 同一份回环地址对**本机**目标是合法的（EXTERNAL 端口已发布到宿主），不能误拦。
+	local := remote
+	local.Address = integration.Address{Host: "127.0.0.1"}
+	if _, err := (&IntegrationService{cfg: loopback}).logInputOf(remoteItem, tpl, local, IntegrationMeta{}); err != nil {
+		t.Fatalf("本机目标用回环地址是合法的，不该被拦：%v", err)
+	}
+}
+
+// TestKafkaAddressUsableForTarget 锁定"必然失败的组合要在执行前拒绝"（INC-028）。
+//
+// 真实故障：平台的 Kafka 对外地址是默认值 127.0.0.1，而日志集成的目标是远程服务器；
+// 平台把 127.0.0.1:9092 渲染进了那台机器的 filebeat.yml —— 它只会连自己，
+// 日志一条都到不了平台，而现象是"部署成功、日志页空白"。
+func TestKafkaAddressUsableForTarget(t *testing.T) {
+	brokers := []string{"kafka:29092"}
+	cases := []struct {
+		name       string
+		external   string
+		port       int
+		target     string
+		wantErr    bool
+		wantSubstr string
+	}{
+		{"远程 + 回环地址 → 拒绝", "127.0.0.1", 9092, "203.195.191.75", true, "回环地址"},
+		{"远程 + localhost → 拒绝", "localhost", 9092, "203.195.191.75", true, "回环地址"},
+		{"远程 + ::1 → 拒绝", "::1", 9092, "10.0.0.9", true, "回环地址"},
+		{"远程 + 127.0.0.2（同段回环）→ 拒绝", "127.0.0.2", 9092, "10.0.0.9", true, "回环地址"},
+		{"远程 + 容器内服务名 → 拒绝", "kafka", 29092, "203.195.191.75", true, "容器网络内"},
+		{"远程 + 平台公网地址 → 允许", "203.195.191.75", 9092, "10.0.0.9", false, ""},
+		{"远程 + 平台域名 → 允许", "nightjar.example.com", 9092, "10.0.0.9", false, ""},
+		// 本机目标：回环地址是**对的**（EXTERNAL 端口已发布到宿主），不能误拦。
+		{"本机目标 + 回环地址 → 允许", "127.0.0.1", 9092, "127.0.0.1", false, ""},
+		{"本机目标 + localhost → 允许", "localhost", 9092, "localhost", false, ""},
+		{"未配置对外地址 → 拒绝", "", 9092, "10.0.0.9", true, "未配置"},
+	}
+	for _, c := range cases {
+		err := kafkaAddressUsableForTarget(c.external, c.port, c.target, brokers)
+		if c.wantErr && err == nil {
+			t.Fatalf("%s：必须拒绝（%s → %s）", c.name, c.external, c.target)
+		}
+		if !c.wantErr && err != nil {
+			t.Fatalf("%s：不该拒绝，实际 %v", c.name, err)
+		}
+		if c.wantErr && !strings.Contains(err.Error(), c.wantSubstr) {
+			t.Fatalf("%s：错误里应说明「%s」，实际 %v", c.name, c.wantSubstr, err)
+		}
+		// 错误必须给出可照抄的修法：只告诉他"不行"而不说改哪里，等于把问题丢回给使用者。
+		if c.wantErr && !strings.Contains(err.Error(), "KAFKA_ADVERTISED_HOST") {
+			t.Fatalf("%s：错误里应给出改哪个配置项，实际 %v", c.name, err)
+		}
+	}
 }

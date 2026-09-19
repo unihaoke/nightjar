@@ -25,10 +25,17 @@ import (
 // 打自己的公网 IP 要走 hairpin NAT 并穿过安全组，云上常被拦；回环则永远可用。
 
 // isLoopbackHost 判断是否回环地址（含 localhost）。
+//
+// 除常见写法外，用 net.ParseIP().IsLoopback() 兜底：127.0.0.0/8 整段与 IPv6 的 ::1
+// 都是回环，"只有 127.0.0.1 才算"会漏掉 127.0.0.2 这类同样打不到对端的写法。
 func isLoopbackHost(host string) bool {
-	switch strings.ToLower(strings.TrimSpace(host)) {
+	trimmed := strings.ToLower(strings.TrimSpace(host))
+	switch trimmed {
 	case "127.0.0.1", "localhost", "::1", "[::1]":
 		return true
+	}
+	if ip := net.ParseIP(strings.Trim(trimmed, "[]")); ip != nil {
+		return ip.IsLoopback()
 	}
 	return false
 }

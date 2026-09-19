@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +38,64 @@ const (
 	optLogInstallMode = "MWOPS_LOG_INSTALL_MODE"
 	optLogBeatVersion = "MWOPS_LOG_FILEBEAT_VERSION"
 )
+
+// kafkaAddressUsableForTarget 判断"平台准备给这台目标机的 Kafka 地址"能不能真的被它用上。
+//
+// 背景（真实故障 INC-028）：平台把 Kafka 的对外地址渲染进目标机的 filebeat.yml，
+// 而它的默认值是回环地址 127.0.0.1。远程目标机拿到 127.0.0.1:9092 只会连它**自己**，
+// 采集必然一条都到不了平台——现象却是"部署成功、日志页空白"，属于最难排查的一类。
+//
+// 按 INC-010 的原则：**必然失败的配置要在执行前明确拒绝**，并给出可照抄的修法。
+// 反过来说，本机目标（集成就填平台自己的地址）用回环地址是**正确**的：
+// Kafka 的 EXTERNAL 端口已经发布到宿主，127.0.0.1:9092 在宿主机上就是通的。
+func kafkaAddressUsableForTarget(externalHost string, externalPort int, targetHost string, internalBrokers []string) error {
+	host := strings.TrimSpace(externalHost)
+	if host == "" {
+		return fmt.Errorf("平台未配置 Kafka 对外地址（kafka.external_host / .env 的 KAFKA_ADVERTISED_HOST）：" +
+			"被管机上的 Filebeat 不知道该把日志推到哪里")
+	}
+	target := strings.TrimSpace(targetHost)
+	if target == "" || isLoopbackHost(target) {
+		return nil // 本机目标：回环地址正是对的
+	}
+	port := externalPort
+	if port <= 0 {
+		port = 9092
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	switch {
+	case isLoopbackHost(host):
+		return fmt.Errorf("平台的 Kafka 对外地址是回环地址 %s，而被管机是远程的 %s："+
+			"那台机器上的 Filebeat 会去连它自己的 %d 端口，日志一条都到不了平台。"+
+			"请在平台 .env 里把 KAFKA_ADVERTISED_HOST 改成**被管机可达的平台 IP 或域名**，"+
+			"再执行 docker compose up -d kafka backend"+
+			"（Kafka 的 advertised 监听器与平台渲染进 filebeat.yml 的 hosts 用的是同一个值，必须一起重建才生效）",
+			address, target, port)
+	case hostIsKafkaInternal(host, internalBrokers):
+		return fmt.Errorf("平台的 Kafka 对外地址写成了容器网络内的地址 %s，被管机解析不到："+
+			"请把 .env 的 KAFKA_ADVERTISED_HOST 改成被管机可达的平台 IP 或域名（不要写容器名/服务名），"+
+			"再执行 docker compose up -d kafka backend", address)
+	}
+	return nil
+}
+
+// isLoopbackHost 复用 integration_address.go 里的实现（那里同时服务 Exporter 的地址视角），
+// 不再重复声明——同名函数两份实现早晚会在"什么算回环"上分叉。
+
+// hostIsKafkaInternal 判断主机名是不是"只有平台容器网络里才解析得到"的地址
+// （例如 compose 里的服务名 kafka）——被管机拿到它同样连不上。
+func hostIsKafkaInternal(host string, internalBrokers []string) bool {
+	for _, broker := range internalBrokers {
+		brokerHost, _, err := net.SplitHostPort(strings.TrimSpace(broker))
+		if err != nil {
+			brokerHost = strings.TrimSpace(broker)
+		}
+		if brokerHost != "" && strings.EqualFold(brokerHost, strings.TrimSpace(host)) {
+			return true
+		}
+	}
+	return false
+}
 
 // LogPipelineProbe 是日志集成自检需要的最小依赖面。
 //
@@ -125,9 +185,17 @@ func (s *IntegrationService) logInputOf(item *model.MiddlewareInstance, tpl inte
 		version = s.cfg.Kafka.FilebeatVersion
 	}
 
+	// 目标机坐标：优先用远程部署填的 TargetHost（集群维度），否则用集成的地址字段。
+	targetHost := firstNonEmptyString(meta.TargetHost, instance.Address.Host)
+	// 必然失败的组合在**执行前**就拒绝：远程目标机 + 回环/容器内的 Kafka 地址（INC-028）。
+	// 放过去的话现象是"部署成功、日志页空白"，使用者要在两个系统之间来回猜。
+	if err := kafkaAddressUsableForTarget(s.cfg.Kafka.ExternalHost, s.cfg.Kafka.ExternalPort,
+		targetHost, s.cfg.Kafka.NonEmptyBrokers()); err != nil {
+		return integration.LogInput{}, apperr.New(apperr.CodeInvalidParam, err.Error())
+	}
+
 	return integration.LogInput{
-		// 目标机地址：优先用远程部署填的 TargetHost（集群维度），否则用集成的地址字段。
-		Host:             firstNonEmptyString(meta.TargetHost, instance.Address.Host),
+		Host:             targetHost,
 		Name:             item.Name,
 		Service:          firstNonEmptyString(options[optLogService], item.Name),
 		Environment:      firstNonEmptyString(options[optLogEnvironment], item.Environment, s.defaultEnvironment()),
@@ -455,6 +523,20 @@ func (s *IntegrationService) selfCheckLog(ctx context.Context, item *model.Middl
 		status := s.logPipe.Status()
 		address := status.ExternalAddress
 		externalStage.Detail = "被管机上的 Filebeat 会连 " + address + "（topic " + status.Topic + "）"
+		// 先判"这个地址对这台目标机是否根本不可能用"：远程机 + 回环地址 = 必然失败，
+		// 这种情况直接判红并给出修法，而不是靠平台侧探测的运气（平台探测 127.0.0.1 大概率也不通，
+		// 但"不通"和"必然不通"给使用者的信息量完全不同）。
+		targetHost := firstNonEmptyString(meta.TargetHost, item.Host)
+		if err := kafkaAddressUsableForTarget(s.cfg.Kafka.ExternalHost, s.cfg.Kafka.ExternalPort,
+			targetHost, s.cfg.Kafka.NonEmptyBrokers()); err != nil {
+			externalStage.Status = stageFail
+			externalStage.Detail += "；这个地址**不可能**被 " + targetHost + " 用上"
+			externalStage.Advice = err.Error()
+			out.Stages = append(out.Stages, externalStage)
+			out.OK = false
+			out.Summary = "在「" + externalStage.Title + "」这一环断了：" + externalStage.Advice
+			return out
+		}
 		if err := probeHostPort(ctx, splitHost(address), splitPort(address)); err != nil {
 			externalStage.Status = stageWarn
 			externalStage.Advice = "平台自己都连不上这个地址，被管机大概率也连不上：" +

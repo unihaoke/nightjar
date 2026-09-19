@@ -1030,6 +1030,53 @@ func dockerRunCommand(t *testing.T, playbook string) string {
 	return strings.Join(parts, " ")
 }
 
+// TestRenderFilebeatInstallKafkaProbeOutputIsRobust 锁定"Kafka 探测结论的产出方式"。
+//
+// 真实故障 INC-027：探测任务本身 ok，但紧接着那条**只负责打印结论**的 debug 任务抛异常
+// （`AttributeError: 'NoneType' object has no attribute 'group'`），把整个部署判成失败。
+// 两个原因都是"写法花哨换来的坑"：
+//  1. 结论标记用了 `{#MWOPS#}`：`{#` 在 Ansible 模板化 module 参数时被当成 **Jinja 注释**整段剥掉，
+//     脚本实际只输出 reachable，标记永远不存在；
+//  2. 解析用 `regex_search(...) | first | default(...)`：匹配不到时 regex_search 返回 None，
+//     再链 `| first` 就抛异常——一条打印任务把部署搞挂了。
+//
+// 因此这里锁死"朴素写法"：标记必须是纯字母数字、产物里不得出现 `{#`、解析不得用正则，
+// 且三种情形（可达/不通/无输出）都要能区分。
+func TestRenderFilebeatInstallKafkaProbeOutputIsRobust(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		// ① 禁止 Jinja 注释标记：它会在模板化阶段被吃掉。
+		if strings.Contains(art.Playbook, "{#") {
+			t.Fatalf("%s 模式：产物不得出现 Jinja 注释起始标记 `{#`（会被整段剥掉，标记打不出来）", mode)
+		}
+		// ② 结论标记必须是纯字母数字。
+		for _, marker := range []string{"MWOPS_KAFKA_REACHABLE", "MWOPS_KAFKA_UNREACHABLE"} {
+			if !strings.Contains(art.Playbook, marker) {
+				t.Fatalf("%s 模式：探测脚本应输出标记 %s", mode, marker)
+			}
+		}
+		// ③ 解析不得用正则（regex_search 匹配不到会返回 None，链式过滤会抛异常）。
+		if strings.Contains(art.Playbook, "regex_search") {
+			t.Fatalf("%s 模式：结论解析不得使用 regex_search（匹配失败会让打印任务抛异常）", mode)
+		}
+		// ④ 三种情形都要能区分：可达 / 明确不通 / 探测没有输出。
+		block := playbookTaskBlock(t, art.Playbook, "输出 Kafka 连通性结论")
+		for _, want := range []string{"MWOPS_KAFKA_REACHABLE", "MWOPS_KAFKA_UNREACHABLE", "unknown"} {
+			if !strings.Contains(block, want) {
+				t.Fatalf("%s 模式：结论任务应能区分 %q 的情形：\n%s", mode, want, block)
+			}
+		}
+		// ⑤ 后面的任务失败时也要执行已 notify 的重启 handler：
+		// 否则会留下"配置已落盘、服务还用旧配置"的半应用状态（INC-027 的连带后果）。
+		if !strings.Contains(art.Playbook, "force_handlers: true") {
+			t.Fatalf("%s 模式：play 必须带 force_handlers: true（失败时也要应用已下发的配置）", mode)
+		}
+	}
+}
+
 // TestRenderFilebeatInstallDockerRunCommand 逐字锁定 docker run 命令。
 //
 // 这条命令是"日志集成到底跑成什么样"的最终事实来源，任何一处改动（挂载路径、用户、

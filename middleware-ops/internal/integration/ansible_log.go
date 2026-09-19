@@ -342,6 +342,14 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 	// gather_facts: false —— playbook 里刻意不依赖任何 fact（ansible_os_family 等在此模式下
 	// 是未定义变量，直接引用会报 undefined）。发行版判定改为读 /etc/debian_version。
 	b.WriteString("  gather_facts: false\n")
+	// force_handlers: true —— 后面的任务失败时也要执行已 notify 的 handler（重启 Filebeat）。
+	//
+	// 为什么：写配置的 copy 会 notify「重启 Filebeat」，而 Ansible 默认在任务失败时**跳过 handler**。
+	// 于是"配置已落盘、服务还在用旧配置"这种半应用状态就会留下来——真实故障 INC-027 正是如此：
+	// 一条只负责打印探测结论的 debug 任务抛异常，把整个部署判失败，新配置明明写好了却没生效，
+	// 使用者看到的是"部署失败 + 收不到日志"两件事一起发生。
+	// 反过来也安全：handler 只在 copy 真的改动了配置时才会被 notify，安装阶段失败不会触发它。
+	b.WriteString("  force_handlers: true\n")
 	b.WriteString("  vars:\n")
 	b.WriteString("    filebeat_version: " + yamlScalar(in.Version) + "\n")
 	b.WriteString("    filebeat_mode: " + yamlScalar(in.Mode) + "\n")
@@ -925,16 +933,24 @@ func writeFilebeatKafkaProbeTask(b *strings.Builder, in filebeatPlaybookInput) {
 	host, port := splitHostPort(in.KafkaProbe)
 	logTask(b, "探测目标机到平台 Kafka 的 TCP 连通性（advertised 地址配错的现场证据）")
 	// 用 bash /dev/tcp 与 nc 两种手段：目标机上不一定装了 nc，而 /dev/tcp 是 bash 内建，
-	// 覆盖面最广。刻意用自定义的 Jinja 注释标记（{# #}）而不是 shell 的 #：
-	// 后者会被 Jinja 当注释吃掉，分界的 echo 就再也打不出来了。
+	// 覆盖面最广。
+	//
+	// 两个刻意的取舍（都来自真实故障 INC-027）：
+	//  1. 结论标记只用**字母数字**（MWOPS_KAFKA_REACHABLE / MWOPS_KAFKA_UNREACHABLE）。
+	//     不能拿 shell 的 `#` 当初的分界：`{#` 在 Ansible **模板化 module 参数**时会被当成
+	//     Jinja 注释而整段剥掉，那条 echo 根本打不出标记（脚本实际只输出 reachable）；
+	//  2. 解析**不用正则**：`regex_search` 匹配不到会返回 None，再链 `| first` 直接抛异常
+	//     （现场报 `AttributeError: 'NoneType' object has no attribute 'group'`，
+	//     而且这是一个**只负责打印**的任务把整个部署判成了失败）。
+	//     判"stdout 里有没有这个子串"最简单，失败模式最少。
 	b.WriteString("      ansible.builtin.shell: |\n")
 	b.WriteString("        set -u\n")
 	b.WriteString("        if timeout 5 bash -c 'echo > /dev/tcp/" + host + "/" + port + "' 2>/dev/null; then\n")
-	b.WriteString("          echo '{#MWOPS#}reachable'\n")
+	b.WriteString("          echo MWOPS_KAFKA_REACHABLE\n")
 	b.WriteString("        elif command -v nc >/dev/null 2>&1 && nc -z -w 5 " + host + " " + port + " >/dev/null 2>&1; then\n")
-	b.WriteString("          echo '{#MWOPS#}reachable'\n")
+	b.WriteString("          echo MWOPS_KAFKA_REACHABLE\n")
 	b.WriteString("        else\n")
-	b.WriteString("          echo '{#MWOPS#}unreachable'\n")
+	b.WriteString("          echo MWOPS_KAFKA_UNREACHABLE\n")
 	b.WriteString("        fi\n")
 	b.WriteString("      register: filebeat_kafka_probe\n")
 	b.WriteString("      failed_when: false\n")
@@ -942,10 +958,10 @@ func writeFilebeatKafkaProbeTask(b *strings.Builder, in filebeatPlaybookInput) {
 	logTask(b, "输出 Kafka 连通性结论（不通时给出可照抄的排查命令）")
 	b.WriteString("      ansible.builtin.debug:\n")
 	b.WriteString("        msg: >-\n")
-	// 解析探测结论：regex_search 返回捕获组组成的列表，用 `| first` 取标量
-	// （列表直接插进字符串会渲染成 ['reachable'] 这种带括号引号的形态，不适合给人看）。
-	b.WriteString("          Kafka " + host + ":" + port + " 连通性：{{ filebeat_kafka_probe.stdout | default('') " +
-		"| regex_search('MWOPS#}(reachable|unreachable)', '\\\\1') | first | default('unknown') }}。" +
+	// 三种情形分开说：可达 / 明确不通 / 探测没有输出（进不去目标机或脚本没跑到）。
+	// 把"没输出"混进 unreachable 会让人去查一个并不存在的网络问题。
+	b.WriteString("          Kafka " + host + ":" + port + " 连通性：{{ 'reachable' if 'MWOPS_KAFKA_REACHABLE' in (filebeat_kafka_probe.stdout | default('')) " +
+		"else ('unreachable' if 'MWOPS_KAFKA_UNREACHABLE' in (filebeat_kafka_probe.stdout | default('')) else 'unknown（探测未产出结论，请查看上面的任务输出）') }}。" +
 		"若为 unreachable，请在目标机执行 nc -vz " + host + " " + port + " 复核，" +
 		"并检查平台 .env 的 KAFKA_ADVERTISED_HOST 是否为被管机可达的地址（写 localhost/127.0.0.1 或容器名都会导致" +
 		"Filebeat 连上后立刻断开）。\n")
