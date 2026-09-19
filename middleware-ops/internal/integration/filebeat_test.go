@@ -570,10 +570,12 @@ func TestRenderFilebeatInstallHealsPollutedPath(t *testing.T) {
 		art := mustRenderFilebeatInstall(t, in, logTestOptions())
 
 		// 自愈任务：探测 → 注册变量 → 条件删除 → 说明原因。
+		// 注意这里用的是**早期**快照 filebeat_config_stat（语义："写配置之前的状态"）；
+		// 起容器前的闸门用的是另一份快照 filebeat_config_final，两者不得串（见 INC-016）。
 		statBlock := playbookTaskBlock(t, art.Playbook, "检查 filebeat.yml 是否被占用成目录")
 		for _, want := range []string{
 			"ansible.builtin.stat:",          // 先探测
-			"register: filebeat_config_stat", // 结果注册成变量（后面 copy 前的闸门也用）
+			"register: filebeat_config_stat", // 结果注册成变量（只服务自愈的 when）
 		} {
 			if !strings.Contains(statBlock, want) {
 				t.Fatalf("%s 模式的探测任务应包含 %q：\n%s", mode, want, statBlock)
@@ -600,23 +602,128 @@ func TestRenderFilebeatInstallHealsPollutedPath(t *testing.T) {
 				t.Fatalf("%s 模式的说明任务应包含 %q（使用者要能一眼看懂发生了什么）：\n%s", mode, want, debugBlock)
 			}
 		}
-		// 启动容器前必须有「必须是普通文件」的闸门：宁可报错，也不要让 Docker 再制造一个目录。
+		// 启动容器前必须有闸门：宁可报错，也不要让 Docker 再制造一个目录。
 		// package 模式不碰容器，因此这条只对 auto / docker 断言。
 		if mode == LogInstallPackage {
 			continue
 		}
-		guard := playbookTaskBlock(t, art.Playbook, "启动容器前确认 filebeat.yml 已是普通文件")
+		existsGuard := playbookTaskBlock(t, art.Playbook, "闸门①：filebeat.yml 必须已存在")
 		for _, want := range []string{
 			"ansible.builtin.assert:",
-			"filebeat_config_stat.stat.isreg",
-			"拒绝启动容器",
+			"filebeat_config_final.stat.exists", // 基于**新鲜**快照
+			"磁盘空间",                              // 情形 A 的排查方向
 		} {
-			if !strings.Contains(guard, want) {
-				t.Fatalf("%s 模式的启动前闸门应包含 %q：\n%s", mode, want, guard)
+			if !strings.Contains(existsGuard, want) {
+				t.Fatalf("%s 模式的闸门①应包含 %q：\n%s", mode, want, existsGuard)
 			}
 		}
-		if !strings.Contains(guard, "when:") {
-			t.Fatalf("%s 模式的启动前闸门必须带 when（只在需要起容器时才校验）：\n%s", mode, guard)
+		isregGuard := playbookTaskBlock(t, art.Playbook, "闸门②：filebeat.yml 必须是普通文件")
+		for _, want := range []string{
+			"ansible.builtin.assert:",
+			"filebeat_config_final.stat.isreg", // 基于**新鲜**快照
+			"拒绝启动容器",
+			"rm -rf", // 情形 B 的修法
+		} {
+			if !strings.Contains(isregGuard, want) {
+				t.Fatalf("%s 模式的闸门②应包含 %q：\n%s", mode, want, isregGuard)
+			}
+		}
+		for label, guard := range map[string]string{"闸门①": existsGuard, "闸门②": isregGuard} {
+			if !strings.Contains(guard, "when:") {
+				t.Fatalf("%s 模式的%s必须带 when（只在需要起容器时才校验）：\n%s", mode, label, guard)
+			}
+			// 绝不能退回"写配置之前"的陈旧快照（INC-016 的现场误报就是这么来的）。
+			if strings.Contains(guard, "filebeat_config_stat") {
+				t.Fatalf("%s 模式的%s不得引用陈旧的 filebeat_config_stat（那是写配置之前的状态）：\n%s",
+					mode, label, guard)
+			}
+		}
+	}
+}
+
+// TestRenderFilebeatInstallGuardUsesFreshStat 锁定"闸门必须基于新鲜状态"（INC-016）。
+//
+// 线上真实报错：
+//
+//	TASK [启动容器前确认 filebeat.yml 已是普通文件（防止 Docker 再制造目录）]
+//	fatal: => {"assertion": "filebeat_config_stat.stat.exists", "evaluated_to": false, ...}
+//
+// 根因是**注册变量是快照**：早期那次 stat（line 68）的语义是"写配置**之前**的状态"，
+// 只服务自愈任务的 when。而现场的顺序是：
+//
+//	文件当时不存在 → 自愈 when 为假（正确地跳过）→ copy 把文件建好
+//	→ assert 复用旧快照说"不存在" → 拒绝启动容器
+//
+// 于是"文件不存在"这条**正确**的路径必然误报。修法是 assert 之前重新 stat，并用新变量；
+// 本条用例把这条结构性保证钉死：重新 stat 必须紧邻闸门之前，且闸门只能引用新变量。
+func TestRenderFilebeatInstallGuardUsesFreshStat(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		names := playbookTaskNames(t, art.Playbook)
+
+		copyAt := taskIndex(t, names, "下发 filebeat.yml")
+		finalStatAt := taskIndex(t, names, "启动容器前重新确认 filebeat.yml 的状态")
+		guard1At := taskIndex(t, names, "闸门①：filebeat.yml 必须已存在")
+		guard2At := taskIndex(t, names, "闸门②：filebeat.yml 必须是普通文件")
+
+		// ① copy < stat(final) < assert，且 stat(final) 紧邻 assert 之前（下标相差 1）：
+		//    "基于新鲜状态"最直接的结构性保证。
+		if copyAt >= finalStatAt {
+			t.Fatalf("%s 模式：重新 stat 必须排在 copy 之后（copy=%d, stat=%d）：\n%s",
+				mode, copyAt, finalStatAt, strings.Join(names, "\n"))
+		}
+		if guard1At-finalStatAt != 1 {
+			t.Fatalf("%s 模式：重新 stat 必须紧邻闸门之前（stat=%d, 闸门①=%d，相差应为 1）：\n%s",
+				mode, finalStatAt, guard1At, strings.Join(names, "\n"))
+		}
+		if guard2At != guard1At+1 {
+			t.Fatalf("%s 模式：两条闸门应紧邻（闸门①=%d, 闸门②=%d）：\n%s",
+				mode, guard1At, guard2At, strings.Join(names, "\n"))
+		}
+
+		// ② 重新 stat 注册到新变量；闸门只引用它。
+		finalStatBlock := playbookTaskBlock(t, art.Playbook, "启动容器前重新确认 filebeat.yml 的状态")
+		for _, want := range []string{
+			"ansible.builtin.stat:",
+			"register: filebeat_config_final",
+			"path: \"{{ filebeat_config_path }}\"",
+		} {
+			if !strings.Contains(finalStatBlock, want) {
+				t.Fatalf("%s 模式的重新 stat 任务应包含 %q：\n%s", mode, want, finalStatBlock)
+			}
+		}
+		for _, label := range []string{"闸门①：filebeat.yml 必须已存在", "闸门②：filebeat.yml 必须是普通文件"} {
+			block := playbookTaskBlock(t, art.Playbook, label)
+			if !strings.Contains(block, "filebeat_config_final") {
+				t.Fatalf("%s 模式的%s必须引用 filebeat_config_final：\n%s", mode, label, block)
+			}
+			if strings.Contains(block, "filebeat_config_stat") {
+				t.Fatalf("%s 模式的%s不得引用陈旧的 filebeat_config_stat（写配置之前的快照）：\n%s",
+					mode, label, block)
+			}
+		}
+
+		// ③ 自愈链仍用**早期**快照：两种用途不能串（合并就会退回 INC-016）。
+		healStatBlock := playbookTaskBlock(t, art.Playbook, "检查 filebeat.yml 是否被占用成目录")
+		if !strings.Contains(healStatBlock, "register: filebeat_config_stat") {
+			t.Fatalf("%s 模式的自愈探测必须仍注册 filebeat_config_stat：\n%s", mode, healStatBlock)
+		}
+		removeBlock := playbookTaskBlock(t, art.Playbook, "清理非普通文件的 filebeat.yml")
+		if !strings.Contains(removeBlock, "filebeat_config_stat.stat.exists and not filebeat_config_stat.stat.isreg") {
+			t.Fatalf("%s 模式的自愈删除条件必须引用早期快照 filebeat_config_stat：\n%s", mode, removeBlock)
+		}
+
+		// ④ 两种失败情形要给出**不同**的、能照做的提示。
+		existsMsg := playbookTaskBlock(t, art.Playbook, "闸门①：filebeat.yml 必须已存在")
+		if !strings.Contains(existsMsg, "磁盘空间") || strings.Contains(existsMsg, "rm -rf") {
+			t.Fatalf("%s 模式的闸门①（文件不存在）不应提示 rm -rf，而应指向 copy 失败/权限/磁盘：\n%s",
+				mode, existsMsg)
+		}
+		isregMsg := playbookTaskBlock(t, art.Playbook, "闸门②：filebeat.yml 必须是普通文件")
+		if !strings.Contains(isregMsg, "rm -rf") {
+			t.Fatalf("%s 模式的闸门②（存在但非普通文件）应给出 rm -rf 的修法：\n%s", mode, isregMsg)
 		}
 	}
 }
@@ -882,14 +989,16 @@ func TestRenderFilebeatInstallContainerConfigPath(t *testing.T) {
 		if !strings.Contains(art.Playbook, "容器内配置路径固定为 "+wantContainerPath) {
 			t.Fatalf("%s 模式：playbook 顶部应说明容器内配置路径的约定：\n%s", mode, art.Playbook)
 		}
-		// 顺序：assert（配置已是普通文件）必须紧跟在 copy 之后、docker run 之前。
+		// 顺序：重新 stat → assert → docker run，且 copy 必须在最前
+		//（"闸门必须基于新鲜状态"见 TestRenderFilebeatInstallGuardUsesFreshStat）。
 		names := playbookTaskNames(t, art.Playbook)
 		copyAt := taskIndex(t, names, "下发 filebeat.yml")
-		guardAt := taskIndex(t, names, "启动容器前确认 filebeat.yml 已是普通文件")
+		finalStatAt := taskIndex(t, names, "启动容器前重新确认 filebeat.yml 的状态")
+		guardAt := taskIndex(t, names, "闸门①：filebeat.yml 必须已存在")
 		runAt := taskIndex(t, names, "创建 Filebeat 容器")
-		if !(copyAt < guardAt && guardAt < runAt) {
-			t.Fatalf("%s 模式：顺序应为 copy(%d) < 普通文件闸门(%d) < docker run(%d)：\n%s",
-				mode, copyAt, guardAt, runAt, strings.Join(names, "\n"))
+		if !(copyAt < finalStatAt && finalStatAt < guardAt && guardAt < runAt) {
+			t.Fatalf("%s 模式：顺序应为 copy(%d) < 重新 stat(%d) < 闸门(%d) < docker run(%d)：\n%s",
+				mode, copyAt, finalStatAt, guardAt, runAt, strings.Join(names, "\n"))
 		}
 	}
 }
@@ -1402,10 +1511,14 @@ func TestLogTemplateRegistration(t *testing.T) {
 	}
 	// 默认值必须与渲染器的兜底一致，否则"表单显示的值"和"实际落地的值"会对不上。
 	for key, want := range map[string]string{
-		"MWOPS_LOG_ENVIRONMENT":      "dev",
-		"MWOPS_LOG_LEVEL":            LogLevelError,
-		"MWOPS_LOG_MULTILINE":        "true",
-		"MWOPS_LOG_INSTALL_MODE":     LogInstallAuto,
+		"MWOPS_LOG_ENVIRONMENT": "dev",
+		"MWOPS_LOG_LEVEL":       LogLevelError,
+		"MWOPS_LOG_MULTILINE":   "true",
+		// 默认安装方式刻意是 package（不是 auto）：auto 在目标机有 Docker 时会走容器模式，
+		// 而容器模式的坑最多（容器运行用户 / 宿主数据目录属主 / 镜像约定的配置路径 /
+		// Docker 把缺失的绑定源创建成目录），真实环境里连着暴露了四轮（INC-024 / INC-026）。
+		// 需要容器化采集时由使用者显式选 auto/docker。
+		"MWOPS_LOG_INSTALL_MODE":     "package",
 		"MWOPS_LOG_FILEBEAT_VERSION": "8.16.0",
 	} {
 		if got[key].Default != want {

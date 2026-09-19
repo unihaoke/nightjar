@@ -511,8 +511,9 @@ var templates = map[string]Template{
 				Help: "开启后 Java / Python 的异常堆栈会被合并成一条事件；关闭则一行一条（堆栈会被拆散，不建议）"},
 			{Key: "MWOPS_LOG_MULTILINE_PATTERN", Label: "多行匹配正则", Target: TargetEnv, Kind: "string",
 				Help: "留空按 Java 日志默认（行首时间戳起新事件）；Python 等其它格式见 docs/LOG_INTEGRATION.md"},
-			{Key: "MWOPS_LOG_INSTALL_MODE", Label: "安装方式", Target: TargetEnv, Kind: "string", Default: "auto",
-				Help: "auto（已装则复用 → docker → 包安装）/ package（deb/rpm + systemd）/ docker（官方镜像容器）"},
+			{Key: "MWOPS_LOG_INSTALL_MODE", Label: "安装方式", Target: TargetEnv, Kind: "string", Default: "package",
+				Help: "package（deb/rpm + systemd，默认，活动部件最少）/ auto（已装则复用 → docker → 包安装）/ " +
+					"docker（官方镜像容器；需要目标机有 Docker，且要注意数据目录与挂载路径由平台托管）"},
 			{Key: "MWOPS_LOG_FILEBEAT_VERSION", Label: "Filebeat 版本", Target: TargetEnv, Kind: "string",
 				Default: "8.16.0",
 				Help:    "默认 8.16.0；必须 ≥ 7.15（filestream 输入从此版本起可用）"},

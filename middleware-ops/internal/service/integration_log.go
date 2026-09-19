@@ -111,8 +111,14 @@ func (s *IntegrationService) logInputOf(item *model.MiddlewareInstance, tpl inte
 
 	installMode := strings.TrimSpace(options[optLogInstallMode])
 	if installMode == "" {
-		// 默认 auto：目标机上已有 Filebeat 就复用，有 docker 就用容器，否则走包安装。
-		installMode = "auto"
+		// 默认 package（deb/rpm + systemd），**刻意不是 auto**：
+		// auto 在目标机有 Docker 时会走容器模式，而容器模式涉及的坑最多
+		// （容器运行用户与宿主数据目录属主、配置必须挂到镜像约定的
+		// /usr/share/filebeat/filebeat.yml、Docker 会把缺失的绑定源创建成目录）——
+		// 这几条在真实环境里连着暴露了四轮（INC-024 / INC-026）。
+		// package 由系统包管理器安装，配置路径与数据目录都由 deb/rpm 按正确属主落好，
+		// 活动部件最少。需要容器化采集时，使用者显式选 auto/docker 即可。
+		installMode = "package"
 	}
 	version := strings.TrimSpace(options[optLogBeatVersion])
 	if version == "" {

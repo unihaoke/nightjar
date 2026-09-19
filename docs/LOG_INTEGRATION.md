@@ -94,21 +94,36 @@ Topic：`mwops-logs`（可配），`KAFKA_AUTO_CREATE_TOPICS_ENABLE=true`，平�
 | 服务名 / 环境 | 写入事件字段（`service` / `environment`），用于日志页归集与筛选 |
 | 最低级别 | ERROR / WARN / INFO（写入 Filebeat 处理器，降低噪音） |
 | 多行合并 | 是否把 Java/Python 堆栈合并成一条事件（默认开，pattern 按语言给默认值） |
-| 安装方式 | `auto`（默认，见下）/ `package`（deb/rpm + systemd）/ `docker`（容器） |
+| 安装方式 | `package`（**默认**，deb/rpm + systemd）/ `auto`（已装则复用 → docker → 包安装）/ `docker`（官方镜像容器） |
 | Filebeat 版本 | 默认 `8.16.0` |
 | Kafka Topic | 默认取平台配置，只读展示，便于对齐排障 |
 
 ### 幂等部署规则（用户要求："已存在则不需要部署"）
 
+**默认是 `package`（deb/rpm + systemd），不是 `auto`**——这是刻意的取舍：
+`auto` 在"目标机有 Docker"时会走容器模式，而容器模式的活动部件最多，
+真实环境里连着暴露了四轮问题（INC-024 / INC-026）：容器的运行用户与宿主数据目录属主、
+配置必须挂到镜像约定的 `/usr/share/filebeat/filebeat.yml`、Docker 会把缺失的绑定源创建成目录。
+`package` 由系统包管理器安装，配置路径与数据目录都由 deb/rpm 按正确属主落好，最不容易出错。
+需要容器化采集（例如不准在宿主装包）时，显式改成 `auto`/`docker` 即可。
+
 `auto` 模式的判定顺序（全部用 Ansible 完成，结果写回集成备注）：
 
 1. 目标机已有 `filebeat` 且 `systemctl is-active filebeat` → **复用**，只下发/校验配置；
-2. 目标机有 `docker` → 用官方 `docker.elastic.co/beats/filebeat:8.16.0` 容器（挂载配置与日志目录，`--restart=always`）；
+2. 目标机有 `docker` → 用官方 `docker.elastic.co/beats/filebeat:8.16.0` 容器
+   （`--user=root`、配置挂到容器内 `/usr/share/filebeat/filebeat.yml`、数据目录用平台专属的
+   `/var/lib/mwops-filebeat`（0775 / uid 1000）——与系统 filebeat 的 `/var/lib/filebeat` 刻意分开）；
 3. 都没有 → 用官方仓库安装 deb/rpm 并启用 systemd 单元。
 
 配置的"是否变更"用**渲染后的 filebeat.yml 内容哈希**判定（Ansible `copy` 的 `checksum` 语义）：
 内容一致 → 不重启（避免每次重放都抖动采集）；内容变化 → `systemctl restart filebeat` 或容器重建。
 检测与安装都只在"需要"时执行，**重复点击集成不会重复安装**。
+
+容器模式还有三道用现场故障换来的自愈与闸门（顺序固定，改动前先看 INC-024 / INC-026）：
+`stat 配置路径` → 非普通文件则 `absent`（清掉历史 docker 挂载留下的目录）→ **`docker rm -f` 旧容器**
+（打断"Docker 每次重启重建绑定源目录"的循环）→ 下发配置 → **重新 `stat` 之后**用两条闸门断言
+（存在 / 是普通文件；两条的失败提示分别指向"目录权限与磁盘"和"目录需删除"）→ `docker run`。
+最后那次 stat 必须重新探测：Ansible 的注册变量是**快照**，拿写配置之前的状态做断言必然误报。
 
 ### 目标机出网问题
 

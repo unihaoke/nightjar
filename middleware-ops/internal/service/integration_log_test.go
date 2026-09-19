@@ -89,8 +89,11 @@ func TestLogInputOfBuildsFromOptionsAndPlatformKafka(t *testing.T) {
 	if input.Multiline {
 		t.Fatal("表单显式填 false 时应关闭多行合并")
 	}
-	if input.InstallMode != "auto" {
-		t.Fatalf("安装方式留空应默认 auto（已存在则不重复部署），实际 %q", input.InstallMode)
+	// 默认 package（而不是 auto）：auto 会在有 Docker 的目标机上走容器模式，
+	// 而容器模式的活动部件最多（容器用户/数据目录属主/镜像约定的配置路径/
+	// Docker 创建绑定源目录），真实环境里连着暴露了四轮问题（INC-024 / INC-026）。
+	if input.InstallMode != "package" {
+		t.Fatalf("安装方式留空应默认 package（活动部件最少的那条路径），实际 %q", input.InstallMode)
 	}
 	if input.FilebeatVersion != "8.16.0" {
 		t.Fatalf("版本应回落到平台配置，实际 %q", input.FilebeatVersion)

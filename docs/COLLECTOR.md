@@ -364,7 +364,7 @@ Filebeat 把日志推到**平台自带的 Kafka**（`docker compose` 的 `kafka`
    | 服务名 / 环境 | `order-api` / `prod` | 写入事件字段 `service` / `environment`，用于日志页归集与筛选；服务名留空时回落为集成名，环境留空为 `dev` |
    | 最低级别 | `ERROR` | ERROR 只收错误行，WARN 收 ERROR+WARN，INFO 不过滤；过滤在目标机完成，能显著降低负载 |
    | 合并多行堆栈 | 开（默认） | Java / Python 堆栈合并成一条事件 |
-   | 安装方式 | `auto`（默认） | 已装 Filebeat 且 `systemctl is-active` → 复用；有 docker → 官方镜像容器；都没有 → deb/rpm + systemd |
+   | 安装方式 | `package`（默认） | `package` = deb/rpm + systemd（默认，活动部件最少）；`auto` = 已装且 `systemctl is-active` → 复用，有 docker → 官方镜像容器，都没有 → deb/rpm；`docker` = 显式用容器。容器模式要额外注意容器运行用户、宿主数据目录属主与镜像约定的配置路径（见 LOG_INTEGRATION.md 与 POSTMORTEM INC-024/026） |
    | Filebeat 版本 | `8.16.0` | 与 `.env` 的 `FILEBEAT_VERSION` 一致 |
 
 2. 保存后点该集成的 **自检**，三段环节要全绿：

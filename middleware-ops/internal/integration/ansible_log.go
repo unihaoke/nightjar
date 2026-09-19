@@ -755,6 +755,13 @@ func writeFilebeatDockerTasksWhen(b *strings.Builder, in filebeatPlaybookInput, 
 	writeFilebeatContainerTasks(b, in, v, cond)
 }
 
+// filebeatFinalStatVar 是"写配置之后、起容器之前"那次 stat 的注册变量名。
+//
+// 与自愈用的 filebeat_config_stat 是**两个不同时刻的快照**，刻意不合并（INC-016）：
+// 前者回答"写之前要不要清理"，后者回答"写之后是不是一个正常的文件"。混用会导致
+// assert 读到过期状态而误报（详见 writeFilebeatContainerTasks 里的注释）。
+const filebeatFinalStatVar = "filebeat_config_final"
+
 // writeFilebeatContainerTasks 渲染容器（重建）任务。
 //
 // 刻意把"重建"与"配置下发"分开：
@@ -774,15 +781,40 @@ func writeFilebeatContainerTasks(b *strings.Builder, in filebeatPlaybookInput, v
 	b.WriteString("      failed_when: false\n")
 	b.WriteString("      changed_when: false\n")
 	b.WriteString("      when: " + yamlScalar(cond) + "\n")
-	// 起容器之前的最后一道闸：配置文件必须是**普通文件**。
+	// 起容器之前的最后一道闸：配置文件必须**是刚写好的那个普通文件**。
 	// 只要它不是普通文件（最典型的是上一次 docker 单文件挂载留下的目录），Docker 会再把它
 	// 当成"缺失路径"创建成目录，把问题滚雪球；这里明确失败并说清怎么修（宁可报错也不要制造目录）。
-	logTask(b, "启动容器前确认 filebeat.yml 已是普通文件（防止 Docker 再制造目录）")
+	//
+	// ⚠️ 必须**重新 stat**（线上真实故障 INC-016）：Ansible 的注册变量是**那一刻的快照**，
+	// 不会自动刷新。早期那次 stat（filebeat_config_stat）的语义是"写配置**之前**的状态"，
+	// 只服务于自愈任务的 when。如果 assert 复用它，就会出现这种必然误报：
+	//
+	//	文件当时不存在 → 自愈 when 为假（正确地跳过）→ copy 把文件建好
+	//	→ assert 读旧快照说"不存在" → 拒绝启动容器
+	//
+	// 用户现场正是如此（他按我们的建议手工删过那个目录，所以这一轮 stat 时文件不存在）。
+	// 因此这里重新探测一次（语义："写配置**之后**、起容器**之前**的状态"），
+	// 两个变量各司其职，不要合并。
+	logTask(b, "启动容器前重新确认 filebeat.yml 的状态（注册变量是快照，必须重新探测）")
+	b.WriteString("      ansible.builtin.stat:\n")
+	b.WriteString("        path: \"{{ " + v.config + " }}\"\n")
+	b.WriteString("      register: " + filebeatFinalStatVar + "\n")
+	b.WriteString("      when: " + yamlScalar(cond) + "\n")
+	// 分两条 assert，是为了让失败信息能对症下药（现场那条"请 rm -rf"的提示会误导人：
+	// 文件其实只是没被写出来，删了也没用）。两条都基于**刚探测的新变量**。
+	logTask(b, "闸门①：filebeat.yml 必须已存在（copy 失败时给出权限/磁盘的排查方向）")
 	b.WriteString("      ansible.builtin.assert:\n")
 	b.WriteString("        that:\n")
-	b.WriteString("          - filebeat_config_stat.stat.exists\n")
-	b.WriteString("          - filebeat_config_stat.stat.isreg\n")
-	b.WriteString("        fail_msg: \"{{ " + v.config + " }} 不是普通文件（可能是目录或软链），" +
+	b.WriteString("          - " + filebeatFinalStatVar + ".stat.exists\n")
+	b.WriteString("        fail_msg: \"{{ " + v.config + " }} 在配置下发之后仍然不存在：" +
+		"复制配置这一步没落成文件（该路径当前的 copy 任务报 ok/changed 才是正常）。" +
+		"请检查 {{ " + v.parent + " }} 的目录权限、目标机磁盘空间，以及 copy 任务的输出。\"\n")
+	b.WriteString("      when: " + yamlScalar(cond) + "\n")
+	logTask(b, "闸门②：filebeat.yml 必须是普通文件（目录/软链时给出删除修法）")
+	b.WriteString("      ansible.builtin.assert:\n")
+	b.WriteString("        that:\n")
+	b.WriteString("          - " + filebeatFinalStatVar + ".stat.isreg\n")
+	b.WriteString("        fail_msg: \"{{ " + v.config + " }} 存在但不是普通文件（可能是目录或软链），" +
 		"拒绝启动容器：Docker 会把缺失的宿主路径创建成目录，容器拿到的就不是配置文件。" +
 		"请先手工删除该路径（rm -rf {{ " + v.config + " }}）后重试。\"\n")
 	b.WriteString("      when: " + yamlScalar(cond) + "\n")
