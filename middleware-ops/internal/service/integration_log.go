@@ -37,6 +37,8 @@ const (
 	optLogPattern     = "MWOPS_LOG_MULTILINE_PATTERN"
 	optLogInstallMode = "MWOPS_LOG_INSTALL_MODE"
 	optLogBeatVersion = "MWOPS_LOG_FILEBEAT_VERSION"
+	// optLogOverwrite 是「覆盖 Filebeat」开关（见 LogInput.Overwrite 的语义说明）。
+	optLogOverwrite = "MWOPS_LOG_OVERWRITE"
 )
 
 // kafkaAddressUsableForTarget 判断"平台准备给这台目标机的 Kafka 地址"能不能真的被它用上。
@@ -207,7 +209,28 @@ func (s *IntegrationService) logInputOf(item *model.MiddlewareInstance, tpl inte
 		Topic:            s.cfg.Kafka.LogTopic,
 		FilebeatVersion:  version,
 		InstallMode:      installMode,
+		Overwrite:        isTrue(options[optLogOverwrite]),
 	}, nil
+}
+
+// filebeatInstallPlanLabel 用一句话说明"这次会怎么处理目标机上已有的 Filebeat"。
+//
+// 为什么要把这句话生成在服务层（而不是前端拼）：它同时出现在**预览步骤**里与**部署完成备注**里，
+// 两处口径必须一致；分散在两处早晚会出现"预览说会重装、实际备注说复用了"这种自相矛盾。
+func filebeatInstallPlanLabel(input integration.LogInput) string {
+	mode := strings.TrimSpace(input.InstallMode)
+	switch mode {
+	case integration.LogInstallPackage:
+		mode = "包安装（deb/rpm + systemd）"
+	case integration.LogInstallDocker:
+		mode = "Docker 容器"
+	default:
+		mode = "自动选择（docker → 包安装）"
+	}
+	if input.Overwrite {
+		return "已勾选「覆盖 Filebeat」：" + mode + "，忽略已安装的版本，重新拉取安装包/镜像并覆盖安装"
+	}
+	return mode + "，探测是否已安装 Filebeat（已存在则不重新拉取、不重装，仅按平台内容同步配置）"
 }
 
 // validateLogInstance 校验日志集成的入参。
@@ -268,7 +291,7 @@ func (s *IntegrationService) previewLogIntegration(in IntegrationInput) (*integr
 	}
 	steps := []string{
 		"渲染 filebeat.yml（输入：" + strings.Join(input.Paths, "、") + "；级别 ≥ " + input.Level + "）",
-		"Ansible 连接目标机 " + input.Host + "，探测是否已安装 Filebeat（已存在则跳过安装）",
+		"Ansible 连接目标机 " + input.Host + "：" + filebeatInstallPlanLabel(input),
 		"下发 /etc/filebeat/filebeat.yml（内容未变化则不重启，避免采集抖动）",
 		"确保 filebeat 服务运行：" + "systemctl status filebeat",
 		"Filebeat 推送到 Kafka " + strings.Join(input.KafkaHosts, ",") + "（topic " + input.Topic + "）",
@@ -312,6 +335,8 @@ func (s *IntegrationService) deployLogIntegration(
 			ActionDetail: map[string]any{
 				"name": item.Name, "target_host": input.Host, "paths": input.Paths,
 				"install_mode": input.InstallMode, "kafka": input.KafkaHosts, "topic": input.Topic,
+				// overwrite 也进工单：审批人要知道这次是"新增采集"还是"覆盖目标机上已有的 Filebeat"。
+				"overwrite_filebeat": input.Overwrite,
 			},
 			Reason: "生产环境由平台在远程服务器安装 Filebeat 采集日志（L2）",
 		}, operator)
@@ -401,8 +426,14 @@ func (s *IntegrationService) deployLogIntegration(
 
 	// 部署成功只代表"Filebeat 已就位"；日志是否真的流到平台由自检第 3 步判定。
 	// 这里把 ansible 的关键结论写进备注，省得使用者为了看一行结论去翻平台日志。
-	note := fmt.Sprintf("Filebeat 已就位（目标机 %s，安装方式 %s）：%s", input.Host, input.InstallMode,
-		lastMeaningfulLine(safe))
+	// 备注里必须带上"这次有没有覆盖安装"：它决定了目标机上跑的是不是刚下发的那个版本，
+	// 使用者排障时第一件事就是确认这一点（而 ansible 输出里的 changed/ok 计数并不直观）。
+	installVerb := "复用/未重装"
+	if input.Overwrite {
+		installVerb = "已覆盖安装"
+	}
+	note := fmt.Sprintf("Filebeat 已就位（目标机 %s，安装方式 %s，%s）：%s", input.Host, input.InstallMode,
+		installVerb, lastMeaningfulLine(safe))
 	s.setDeployNote(ctx, item.ID, note)
 	s.log.Info("日志集成：Filebeat 部署完成",
 		zap.String("integration", item.Name), zap.String("host", input.Host),
@@ -618,6 +649,19 @@ func splitLogPaths(raw string) []string {
 func isFalse(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "false", "0", "no", "off", "n":
+		return true
+	default:
+		return false
+	}
+}
+
+// isTrue 判断"显式打开"的取值；未填写时返回 false（保持默认关闭）。
+//
+// 为什么不像 isFalse 那样"缺省即真"：这是**破坏性**开关（会重新下载并覆盖目标机上已有的
+// Filebeat）。缺省必须是"不动它"——把开关做成"默认开"等于让每次部署都去重装别人机器上的软件。
+func isTrue(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true", "1", "yes", "on", "y":
 		return true
 	default:
 		return false

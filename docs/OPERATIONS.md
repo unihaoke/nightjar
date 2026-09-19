@@ -206,6 +206,12 @@ GO_BUILD_TAGS=pgvector docker compose build backend && docker compose up -d back
 
 - **重复点集成不会重复安装**：`auto` 模式先探测已装的 Filebeat 并复用，只在渲染后的
   `filebeat.yml` 内容变化时才重启（`systemctl restart filebeat` / 容器重建）。
+- **「覆盖 Filebeat」开关（默认关闭）**：关闭时目标机上已装的 Filebeat 一律不动（不重新下载安装包、
+  本地已有镜像也不重新 `docker pull`），只有缺失时才安装；打开后会重新拉取安装包/镜像并**强制覆盖安装**
+  （`apt-get --reinstall` / `dnf reinstall` / 重新 `docker pull` + 重建容器），用于升级版本或修复装坏的 Filebeat。
+  注意两点：① 配置文件与这个开关**无关**，始终按平台渲染内容同步（内容没变连重启都不会发生），
+  所以改日志路径或 Kafka 地址不必打开它；② 显式选了 `package` / `docker` 时以选定方式为准，"复用"只在
+  `auto` 模式下才可能出现（INC-029）。
 
 `POST /api/hooks/logs`（应用 HTTP 直推）作为零侵入兜底保留，字段与 Filebeat 路径统一映射：
 `service` / `level` / `message` 必填，`log_path` 记录日志来自哪个文件。

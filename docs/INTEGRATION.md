@@ -478,7 +478,13 @@ Filebeat 把日志推到**平台自带的 Kafka**。
 - **目标机出网与接入地址**：被管机必须能访问 `.env` 里的 `KAFKA_ADVERTISED_HOST:KAFKA_PORT`。
   这个值写 `localhost`/`127.0.0.1` 时，Filebeat 会**握手成功、随后立刻断开**并报
   `dial tcp 127.0.0.1:9092: connect: connection refused`——它被 broker 元数据引导去了自己那台机器。
-  集成自检第 2 段「被管机接入地址」专门检测这个地址。
+  集成自检第 2 段「被管机接入地址」专门检测这个地址（远程目标 + 回环/容器内地址会被直接判红）。
+- **安装是幂等的，并提供一个「覆盖 Filebeat」开关**：默认（关闭）时目标机上已装的 Filebeat 一律不动
+  ——不重新下载 deb/rpm、本地已有该 tag 的镜像也不重新 `docker pull`，只有缺失时才安装；
+  打开后则重新拉取安装包/镜像并**强制覆盖安装**（`apt-get --reinstall` / `dnf reinstall` /
+  重新 `docker pull` + 重建容器），用于升级版本或修复装坏的 Filebeat。
+  `filebeat.yml` **不受这个开关控制**：它由平台配置推导，始终按渲染内容同步（内容没变不重启），
+  所以改日志路径或 Kafka 地址不必打开它。显式选定的 `package`/`docker` 优先于"复用"（INC-029）。
 - **不需要 `docker.sock`**：日志集成走 SSH + Ansible 到目标机，采集在被管侧自洽运行；
   平台侧即使关掉 Docker 通道（`INTEGRATION_DOCKER_ENABLED=false`）它依然可用。
 - **平台重启不影响采集**：Filebeat 有本地缓冲与断点续传（注册表），

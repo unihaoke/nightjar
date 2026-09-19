@@ -367,7 +367,12 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	     真实路径、数据目录独立且归属 uid1000（INC-024/026）；断言改用实时 stat、结论任务不用正则
 //	     与 Jinja 会吃掉的字符（INC-027）；**远程目标机 + 回环/容器内 Kafka 地址在配置阶段直接拒绝**
 //	     （INC-028）。
-const CodeRevision = "r14"
+//	r15：日志集成新增「覆盖 Filebeat」开关（MWOPS_LOG_OVERWRITE）：关闭时已装就复用、镜像已在本地
+//	     也不重新拉取；打开时重新下载安装包（apt --reinstall / dnf reinstall）或重新 docker pull
+//	     并重建容器——配置始终按渲染内容同步，不受该开关影响。同时修掉"显式安装方式被自动判定成
+//	     复用"的缺陷（INC-029：显式 docker + 宿主有包版 filebeat 时，handler 去重启 systemd
+//	     而不是重建容器，容器静默使用旧配置）。
+const CodeRevision = "r15"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

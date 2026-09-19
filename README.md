@@ -21,7 +21,9 @@
 可选挂载 `docker.sock` 由平台一键拉起 Exporter 容器。详见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)。
 
 **日志集成（M3 增强）**：集成中心另有**日志类型集成**（模板 `type: "log"`、`category: "log"`）——平台用 **Ansible 在目标服务器幂等部署 Filebeat**
-（已安装则跳过安装、只在配置内容变化时重启），Filebeat 把日志推到**平台自带的 Kafka**（compose 里的 `kafka` 服务，KRaft 单节点），
+（默认幂等：已安装则跳过安装、镜像已在本地也不重新拉取；需要升级/修复时打开表单里的**「覆盖 Filebeat」**开关，
+平台会重新下载安装包或重新 `docker pull` 并覆盖安装。配置始终按渲染内容同步，内容变化才重启），
+Filebeat 把日志推到**平台自带的 Kafka**（compose 里的 `kafka` 服务，KRaft 单节点），
 后端按消费组 `mwops-log-ingest` 消费 topic `mwops-logs`，复用既有日志事件链路（错误指纹 / 通知 / AI 代码分析入口）。
 它不装 Exporter、不经过 Prometheus、也不需要 `docker.sock`。详见 [`docs/LOG_INTEGRATION.md`](docs/LOG_INTEGRATION.md)。
 

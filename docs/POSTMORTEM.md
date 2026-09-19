@@ -5,6 +5,76 @@
 
 ---
 
+## INC-029 · 显式选了 Docker，却被判定成"复用"：handler 去重启 systemd，容器悄悄用着旧配置
+
+**背景**：这一条不是现场报障，而是在实现「覆盖 Filebeat」开关（用户要求："是否覆盖 Filebeat，
+如果选择则可以覆盖 Filebeat 重新获取 docker，否则如果没有才进行拉取"）时**读产物读出来的**。
+
+**缺陷**
+
+安装方式的决策是这样写的（改动前）：
+
+```jinja
+filebeat_tested_mode: >-
+  {%- if filebeat_present %}reuse
+  {%- elif filebeat_has_docker %}docker
+  {%- else %}package{% endif %}
+```
+
+它**完全没看使用者显式选的安装方式**（`filebeat_mode`）。于是下面这条路径走错：
+
+1. 使用者在表单里显式选 `docker`（例如目标机不允许装系统包）；
+2. 目标机上**恰好也有**包版 Filebeat（历史遗留、或别的系统装过）→ `filebeat_present = true`；
+3. 决策算出 `reuse`；
+4. 配置内容变化时 handler 按 `reuse` 走 `systemctl restart filebeat` —— **重启的是宿主上的包版
+   Filebeat，不是我们托管的容器**。容器里的 Filebeat 仍然挂着那份只读配置运行，
+   直到下次容器被重建才会读到新配置。
+
+**为什么难发现**：整份 playbook `failed=0`、配置也确实落盘了（`/etc/filebeat/filebeat.yml`），
+"重启"也真的执行了。失效的只是"容器有没有重新读配置"这一环，而它**没有任何输出**——
+与 INC-016 / INC-025 是同一类：错误的链路在界面与日志上都表现为成功。
+
+**修复**
+
+1. 决策改为**显式模式优先**，其次才是"复用"：
+
+   ```jinja
+   {%- if filebeat_mode == 'docker' %}docker
+   {%- elif filebeat_mode == 'package' %}package
+   {%- elif not (filebeat_install_needed | bool) %}reuse
+   {%- elif filebeat_has_docker | bool %}docker
+   {%- else %}package{% endif %}
+   ```
+
+2. 顺手把"是否需要安装"独立成 `filebeat_install_needed`（= 未安装 **或** 勾选覆盖），
+   让"目标机事实"（present/has_docker）与"平台意图"（overwrite）不再混在一个变量里——
+   这次要接入「覆盖」开关时，正好暴露了原来那套揉在一起的判定没法表达"忽略已存在"。
+
+**同时交付的「覆盖 Filebeat」开关**（本轮需求）：
+
+- 关闭（默认）：已安装 → 复用（不重新下载安装包）；docker 模式本地已有该 tag 的镜像 → 不 `pull`；
+- 打开：`package` 重新下载并 `apt-get --reinstall` / `dnf reinstall`（兜底 `rpm -Uvh --replacepkgs`）、
+  `docker` 无条件 `docker pull` 并重建容器、`auto` 跳过复用按"有 docker 用容器否则用包"重装；
+- 配置 `filebeat.yml` **不**受这个开关控制：它由平台配置推导，始终按内容同步
+  （内容没变连重启都不会发生）——否则会出现"平台改了 Kafka 地址、目标机还在用旧配置"的静默失效。
+
+**防复发**
+
+1. `TestRenderFilebeatInstallExplicitModeBeatsReuse`：显式 `package`/`docker` 的分支必须存在，
+   且**必须排在 `reuse` 之前**（顺序反了就等于复用优先）；
+2. `TestRenderFilebeatInstallOverwriteIsDeclared`：开关必须是 play 变量（产物一眼可见）、
+   强制重装与普通安装必须是互斥分支（`when` 带 `not`）、下载任务要跟随开关 `force`；
+3. `TestRenderFilebeatInstallImagePullFollowsOverwrite`：拉取任务的 `when` 必须同时含
+   "覆盖分支"与"本地镜像探测分支"（只写一个都会丢掉一半语义）；
+4. `TestLogInputOfOverwriteOption`：缺省/false 一律解析为关闭（破坏性开关缺省必须"不动它"），
+   并且预览与部署备注的文案必须随开关变化；
+5. 独立复核：用 Python/PyYAML 校验产物结构，并用一个极小的 Jinja 求值器把决策模板在
+   "三种模式 × 开关 × 目标机四种状态"下逐一代入，确认算出的方式与预期一致
+   （不拿渲染器自己证明自己）。
+6. 经验提炼补一条（第 29 条）：**"用户显式选择"必须优先于"系统自动判定"**。
+
+---
+
 ## INC-028 · 平台把 Kafka 回环地址发给了远程被管机：Filebeat 永远连不上，且报错极具误导性
 
 **首次暴露**：2026-09-19，package 模式部署"成功"后在目标机上核对配置，发现 Filebeat 写的是
@@ -1650,3 +1720,14 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
     （`dial tcp 127.0.0.1:9092: connection refused` 看上去像对方网络坏了）。
     校验时还要注意反向错误：**本机目标用回环地址是对的**，一刀切拒绝会把正确配置也拦掉——
     判定条件必须同时包含"目标是谁"和"地址是什么"两个维度。
+29. **「用户显式选择」必须优先于「系统自动判定」**：安装方式的自动判定（已装就复用）本意是省事，
+    但它盖住了使用者明确选的 `docker`/`package`，于是 handler 按错误的方式去"重启"
+    （重启宿主 systemd 而不是重建容器），配置落盘了、任务全绿，容器却还用着旧配置（INC-029）。
+    规则：把"用户意图"与"环境探测"分成两个变量，**自动判定只填用户没指定的部分**；
+    两者混在一个表达式里时，任何新增选项都会挤不进去。
+30. **破坏性开关的缺省必须是"不动它"**：`MWOPS_LOG_OVERWRITE` 会重新下载并覆盖目标机上已有的
+    Filebeat，因此"没填"必须等价于关闭，只有显式的 `true/1/yes/on` 才算打开；
+    反过来 `MWOPS_LOG_MULTILINE` 这种"默认开更好"的开关才适合"缺省即真"。
+    同一个表单里的布尔项，缺省语义要**逐个按后果**决定，不能统一成一种写法。
+    另外要把"开关管什么、不管什么"写清楚：这个开关只管程序本体（安装包/镜像），
+    配置始终按内容同步——否则使用者会以为"不勾选就不会覆盖我的配置"。

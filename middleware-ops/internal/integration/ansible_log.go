@@ -24,6 +24,13 @@ import (
 //  3. docker 模式只在容器不存在或镜像/配置变化时重建；
 //  4. auto 模式按 已安装 → docker → package 的顺序兜底；
 //  5. 配置内容不变 → copy 的 checksum 判定为 ok → **不触发** restart handler。
+//
+// 在此基础上新增「覆盖 Filebeat」开关（LogInput.Overwrite / 模板参数 MWOPS_LOG_OVERWRITE）：
+//   - 关闭（默认）：上面 1~5 全部成立——已安装就复用、镜像已在本地就不重新拉取；
+//   - 打开：跳过"复用"，按配置的安装方式**重新拉取安装包/镜像并覆盖安装**
+//     （package → 重新下载 deb/rpm 并强制重装；docker → 重新 docker pull 并重建容器）；
+//   - 无论开关如何，**配置文件始终按渲染内容同步**（内容没变不重启）：
+//     它由平台配置推导（Kafka 地址、日志路径），必须跟着平台走，见 filebeat.go 的 LogInput.Overwrite 说明。
 
 // 日志集成在目标机上的固定对象名。
 const (
@@ -105,6 +112,7 @@ func RenderFilebeatInstall(in LogInput, opts RemoteOptions) (RemoteArtifacts, er
 
 	playbook := renderFilebeatPlaybook(filebeatPlaybookInput{
 		Name: in.Name, Version: version, Mode: mode, Become: opts.Become,
+		Overwrite: in.Overwrite,
 		ConfigDir: configDir,
 		// 远程绝对路径与容器内路径在**本平台**恰好相同（都指向 /etc/filebeat/filebeat.yml）：
 		// docker 模式把宿主上的这份文件只读挂进容器，容器内 Filebeat 用默认路径即可，
@@ -304,10 +312,12 @@ func literalDirPrefix(pattern string) string {
 
 // filebeatPlaybookInput 是日志安装 playbook 的渲染入参。
 type filebeatPlaybookInput struct {
-	Name       string
-	Version    string
-	Mode       string
-	Become     bool
+	Name    string
+	Version string
+	Mode    string
+	Become  bool
+	// Overwrite 见 LogInput.Overwrite：true = 忽略"已存在"，重新拉取安装包/镜像并覆盖安装。
+	Overwrite  bool
 	ConfigDir  string
 	ConfigPath string
 	// MirrorPath 是配置目录里的副本（保留目标机上"人可读"的一份，便于排障时对比）。
@@ -353,6 +363,9 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 	b.WriteString("  vars:\n")
 	b.WriteString("    filebeat_version: " + yamlScalar(in.Version) + "\n")
 	b.WriteString("    filebeat_mode: " + yamlScalar(in.Mode) + "\n")
+	// 覆盖开关走 play 变量（而不是变量文件）：它决定整份 playbook 走"复用/安装/重装"哪条路，
+	// 写在产物开头一眼可见——排障时"这份 playbook 到底会不会重装 Filebeat"不该靠推理。
+	b.WriteString("    filebeat_overwrite: " + boolLiteral(in.Overwrite) + "\n")
 	b.WriteString("    filebeat_container: " + yamlScalar(in.Container) + "\n")
 	b.WriteString("    filebeat_unit: " + yamlScalar(FilebeatUnitName) + "\n")
 	b.WriteString("    filebeat_config_path: " + yamlScalar(in.ConfigPath) + "\n")
@@ -435,6 +448,18 @@ func writeFilebeatHandlers(b *strings.Builder, in filebeatPlaybookInput) {
 	b.WriteString("      else\n")
 	b.WriteString("        systemctl restart {{ " + v.unit + " }}\n")
 	b.WriteString("      fi\n")
+}
+
+// boolLiteral 把布尔值渲染成 YAML 布尔字面量（true/false，不加引号）。
+//
+// 不用 yamlScalar：那会产出字符串 "true"，而 `| bool` 虽然能吃下字符串，
+// 产物里 `filebeat_overwrite: true` 与 `filebeat_overwrite: "true"` 对读产物的人含义不同
+// （前者明确是布尔，后者看起来像被误写成字符串的开关）。
+func boolLiteral(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
 }
 
 // writeFilebeatDetectTasks 先探测再决策（用户明确要求："如果存在则不需要部署"）。
@@ -537,7 +562,8 @@ func writeFilebeatContainerRemoveTask(b *strings.Builder, v filebeatVars, mode s
 	}
 	cond := "filebeat_has_docker | bool"
 	if mode == LogInstallAuto {
-		cond = "not (filebeat_present | bool) and (filebeat_has_docker | bool)"
+		// auto 模式下"要不要动容器"= 本次是否需要安装（未勾选覆盖且已装 → 不动容器）。
+		cond = "(filebeat_install_needed | bool) and (filebeat_has_docker | bool)"
 	}
 	b.WriteString("    # ---- 清理旧容器：打断 Docker 反复重建\"绑定源目录\"的循环（必须在写配置之前） ----\n")
 	logTask(b, "删除平台托管的旧 Filebeat 容器（存在才删，打断 Docker 重建绑定源目录的循环）")
@@ -558,13 +584,26 @@ func writeFilebeatResolveTasks(b *strings.Builder, v filebeatVars) {
 	b.WriteString("        filebeat_active: " + yamlScalar("{{ filebeat_service.stdout | default('') | trim == 'active' }}") + "\n")
 	b.WriteString("        filebeat_has_docker: " + yamlScalar("{{ filebeat_docker_bin.rc == 0 }}") + "\n")
 	b.WriteString("        filebeat_is_debian: " + yamlScalar("{{ filebeat_debian.stat.exists }}") + "\n")
-	logTask(b, "选择实际执行的安装方式（auto → package / docker / 复用）")
+	// 「覆盖 Filebeat」的**唯一判据**：勾了就一律重装，没勾就只在缺失时安装。
+	// 单独一条 set_fact（而不是把它塞进上一条）：上一条是"目标机事实"，这条是"平台意图"，
+	// 混在一起会让"为什么这台机器重装了"没法从产物里一眼看出来。
+	logTask(b, "判定本次是否需要安装/覆盖 Filebeat（未勾选覆盖且已安装 → 不安装）")
 	b.WriteString("      ansible.builtin.set_fact:\n")
-	// 优先级：已安装（复用）→ docker → package。
-	// 这个顺序对应"对现有环境影响最小"：能不动就不动，能用容器就不用装包。
+	b.WriteString("        filebeat_install_needed: " +
+		yamlScalar("{{ (filebeat_overwrite | bool) or not (filebeat_present | bool) }}") + "\n")
+	logTask(b, "选择实际执行的安装方式（显式模式优先；auto → 复用 / docker / package）")
+	b.WriteString("      ansible.builtin.set_fact:\n")
+	// 决策顺序（改动前请先读完）：
+	//   ① 显式的 package / docker **优先于一切**——使用者明确选了哪种方式，就按哪种方式办；
+	//      早期版本漏了这一步，于是"显式 docker + 目标机正好装了包版 filebeat"会算出 reuse，
+	//      handler 便去 `systemctl restart filebeat` 而不是重建容器：容器读不到新配置、采集静默变旧。
+	//   ② 未勾选覆盖且已安装 → reuse（用户要求的"已存在则不部署"）；
+	//   ③ 需要安装时：有 docker 用容器，否则用包（对现有环境影响最小）。
 	b.WriteString("        " + v.mode + ": >-\n")
-	b.WriteString("          {%- if filebeat_present %}reuse\n")
-	b.WriteString("          {%- elif filebeat_has_docker %}docker\n")
+	b.WriteString("          {%- if filebeat_mode == 'docker' %}docker\n")
+	b.WriteString("          {%- elif filebeat_mode == 'package' %}package\n")
+	b.WriteString("          {%- elif not (filebeat_install_needed | bool) %}reuse\n")
+	b.WriteString("          {%- elif filebeat_has_docker | bool %}docker\n")
 	b.WriteString("          {%- else %}package{% endif %}\n")
 }
 
@@ -580,13 +619,20 @@ func writeFilebeatAutoTasks(b *strings.Builder, in filebeatPlaybookInput, v file
 	// 曾经把这条提示写在两个分支之后，于是日志里会先看到一堆安装/拉镜像任务、
 	// 最后才出现"检测到已安装…跳过安装"，读起来与结论相反（就是上面那个 INC 的同款问题：
 	// 任务顺序必须与真实决策顺序一致，否则排障时会被日志误导）。
-	logTask(b, "复用目标机已安装的 Filebeat（已存在则不部署）")
+	logTask(b, "复用目标机已安装的 Filebeat（未勾选覆盖且已存在，则不部署）")
 	b.WriteString("      ansible.builtin.debug:\n")
 	b.WriteString("        msg: \"检测到已安装的 Filebeat（{{ filebeat_bin.stdout | default('') | trim }}），" +
-		"跳过安装，仅下发配置\"\n")
-	b.WriteString("      when: filebeat_present | bool\n")
-	writeFilebeatDockerTasksWhen(b, in, v, "not (filebeat_present | bool) and (filebeat_has_docker | bool)")
-	writeFilebeatPackageTasksWhen(b, in, v, "not (filebeat_present | bool) and not (filebeat_has_docker | bool)")
+		"未勾选「覆盖 Filebeat」→ 跳过安装，仅按平台内容同步配置\"\n")
+	b.WriteString("      when: " + yamlScalar("not (filebeat_install_needed | bool)") + "\n")
+	// 勾了覆盖就必须**明确说出来**：这一步会重新拉取并覆盖目标机上已有的 Filebeat，
+	// 现场看到"部署又跑了下载/重装"时才不会以为平台在乱动。
+	logTask(b, "说明：已勾选「覆盖 Filebeat」，将重新拉取并覆盖安装")
+	b.WriteString("      ansible.builtin.debug:\n")
+	b.WriteString("        msg: \"已勾选「覆盖 Filebeat」：忽略目标机上已安装的 " +
+		"{{ filebeat_bin.stdout | default('（未安装）') | trim }}，本次重新拉取安装包/镜像并覆盖安装\"\n")
+	b.WriteString("      when: filebeat_overwrite | bool\n")
+	writeFilebeatDockerTasksWhen(b, in, v, "(filebeat_install_needed | bool) and (filebeat_has_docker | bool)")
+	writeFilebeatPackageTasksWhen(b, in, v, "(filebeat_install_needed | bool) and not (filebeat_has_docker | bool)")
 }
 
 // writeFilebeatPackageTasks 渲染 package 安装（无条件版本，供显式 package 模式使用）。
@@ -594,13 +640,16 @@ func writeFilebeatPackageTasks(b *strings.Builder, in filebeatPlaybookInput, v f
 	writeFilebeatPackageTasksWhen(b, in, v, "")
 }
 
-// writeFilebeatPackageTasksWhen 渲染"未安装才安装"的包安装分支。
+// writeFilebeatPackageTasksWhen 渲染"需要安装时"的包安装分支。
+//
+// 条件从"未安装"改为"本次需要安装"（filebeat_install_needed = 未安装 **或** 勾选了覆盖）：
+// 勾选覆盖时，即使目标机已装 Filebeat 也要重新下载并强制重装（升级/修复装坏的版本）。
 func writeFilebeatPackageTasksWhen(b *strings.Builder, in filebeatPlaybookInput, v filebeatVars, when string) {
-	cond := "not (filebeat_present | bool)"
+	cond := "filebeat_install_needed | bool"
 	if when != "" {
 		cond = when
 	}
-	b.WriteString("    # ---- package 分支：deb/rpm + systemd（仅在未安装时执行） ----\n")
+	b.WriteString("    # ---- package 分支：deb/rpm + systemd（未安装时安装；勾选覆盖时强制重装） ----\n")
 	logTask(b, "校验目标机到 artifacts.elastic.co 的出网（失败时给出离线部署提示）")
 	// 只做**提示不阻断**：内网机器连不上官方制品是常见情况，但目标机可能已经装好了
 	// filebeat（此时根本不需要下载），因此这一步用 debug 给出结论而不是 fail。
@@ -630,16 +679,28 @@ func writeFilebeatPackageTasksWhen(b *strings.Builder, in filebeatPlaybookInput,
 // writeFilebeatDebTasks 渲染 Debian/Ubuntu 的 deb 安装（下载 + apt，仓库方式作为兜底）。
 func writeFilebeatDebTasks(b *strings.Builder, in filebeatPlaybookInput, cond string) {
 	b.WriteString("    # ---- Debian/Ubuntu：get_url 下载 deb + apt 安装（本机文件，不依赖 apt 源出网） ----\n")
-	logTask(b, "下载 Filebeat deb 包")
+	logTask(b, "下载 Filebeat deb 包（勾选「覆盖」时强制重新下载）")
 	b.WriteString("      ansible.builtin.get_url:\n")
 	b.WriteString("        url: " + yamlScalar(strings.ReplaceAll(filebeatDebURLTemplate, "{version}", in.Version)) + "\n")
 	b.WriteString("        dest: " + yamlScalar("/tmp/filebeat-"+in.Version+"-amd64.deb") + "\n")
 	b.WriteString("        mode: '0644'\n")
+	// force 跟随覆盖开关：默认（不覆盖）时 /tmp 里已有同名包就不再下载（省流量、内网也少一次出网），
+	// 勾选覆盖时**必须重新下载**——否则"覆盖安装"会拿上一次可能损坏/被替换过的包去重装。
+	b.WriteString("        force: " + yamlScalar("{{ filebeat_overwrite | bool }}") + "\n")
 	b.WriteString("      register: filebeat_deb\n")
 	b.WriteString("      retries: 3\n")
 	b.WriteString("      delay: 5\n")
 	b.WriteString("      until: filebeat_deb is succeeded\n")
 	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_is_debian | bool)") + "\n")
+	// 覆盖安装：apt-get --reinstall 是"把已安装的同名包按这个 deb 重新装一遍"的标准做法
+	//（apt 模块对"已是最新版本"的包可能直接报 ok，不会真的覆盖文件，因此覆盖必须走这条）。
+	logTask(b, "覆盖安装 Filebeat（已勾选「覆盖」：apt-get --reinstall 强制重装本地 deb）")
+	b.WriteString("      ansible.builtin.shell: |\n")
+	b.WriteString("        set -eu\n")
+	b.WriteString("        apt-get install -y --reinstall " + shellArg("/tmp/filebeat-"+in.Version+"-amd64.deb") + "\n")
+	b.WriteString("      register: filebeat_deb_reinstall\n")
+	b.WriteString("      failed_when: false\n")
+	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_is_debian | bool) and (filebeat_overwrite | bool)") + "\n")
 	logTask(b, "安装 Filebeat（apt 解析本地 deb 的依赖）")
 	b.WriteString("      ansible.builtin.apt:\n")
 	b.WriteString("        deb: " + yamlScalar("/tmp/filebeat-"+in.Version+"-amd64.deb") + "\n")
@@ -648,43 +709,59 @@ func writeFilebeatDebTasks(b *strings.Builder, in filebeatPlaybookInput, cond st
 	// 仓库里的版本通常比平台默认版本旧，但对"能装上并能采日志"而言足够。
 	b.WriteString("      register: filebeat_deb_install\n")
 	b.WriteString("      failed_when: false\n")
-	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_is_debian | bool)") + "\n")
+	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_is_debian | bool) and not (filebeat_overwrite | bool)") + "\n")
 	logTask(b, "兜底：deb 安装失败时改用发行版仓库安装")
 	// 官方仓库要先加 GPG key 与源，这里用 Elastic 官方的 apt 源脚本，一步到位且可重复执行。
 	b.WriteString("      ansible.builtin.shell: |\n")
 	b.WriteString("        set -eu\n")
 	b.WriteString("        curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg\n")
 	b.WriteString("        echo 'deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main' > /etc/apt/sources.list.d/elastic-8.x.list\n")
-	b.WriteString("        apt-get update -y && apt-get install -y filebeat\n")
+	b.WriteString("        apt-get update -y && apt-get install -y {{ '--reinstall ' if filebeat_overwrite | bool else '' }}filebeat\n")
 	b.WriteString("      register: filebeat_apt_repo\n")
 	b.WriteString("      failed_when: false\n")
-	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_is_debian | bool) and (filebeat_deb_install is failed)") + "\n")
+	// 两条安装路径（直接装 deb / 覆盖重装）任一失败才兜底；`is defined` 是必需的：
+	// 覆盖关闭时 filebeat_deb_reinstall 那条任务被 when 跳过，未定义变量会让 when 直接报错。
+	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_is_debian | bool) and "+
+		"((filebeat_deb_install is defined and filebeat_deb_install is failed) or "+
+		"(filebeat_deb_reinstall is defined and filebeat_deb_reinstall is failed))") + "\n")
 }
 
 // writeFilebeatRPMTasks 渲染 RHEL/CentOS/Rocky 的 rpm 安装（rpm/dnf，仓库方式作为兜底）。
 func writeFilebeatRPMTasks(b *strings.Builder, in filebeatPlaybookInput, cond string) {
 	b.WriteString("    # ---- RHEL/CentOS/Rocky：get_url 下载 rpm + dnf 本地安装 ----\n")
-	logTask(b, "下载 Filebeat rpm 包")
+	logTask(b, "下载 Filebeat rpm 包（勾选「覆盖」时强制重新下载）")
 	b.WriteString("      ansible.builtin.get_url:\n")
 	b.WriteString("        url: " + yamlScalar(strings.ReplaceAll(filebeatRPMURLTemplate, "{version}", in.Version)) + "\n")
 	b.WriteString("        dest: " + yamlScalar("/tmp/filebeat-"+in.Version+"-x86_64.rpm") + "\n")
 	b.WriteString("        mode: '0644'\n")
+	// 与 deb 同理：不勾选覆盖时已有同名包就不再下载，勾选时必须重新下载。
+	b.WriteString("        force: " + yamlScalar("{{ filebeat_overwrite | bool }}") + "\n")
 	b.WriteString("      register: filebeat_rpm\n")
 	b.WriteString("      retries: 3\n")
 	b.WriteString("      delay: 5\n")
 	b.WriteString("      until: filebeat_rpm is succeeded\n")
 	b.WriteString("      when: " + yamlScalar(cond+" and not (filebeat_is_debian | bool)") + "\n")
+	// 覆盖安装：dnf 的 install 对"同版本已安装"只会报 already installed（不覆盖文件），
+	// 因此覆盖必须用 reinstall。
+	logTask(b, "覆盖安装 Filebeat（已勾选「覆盖」：dnf reinstall 强制重装本地 rpm）")
+	b.WriteString("      ansible.builtin.command: dnf reinstall -y " + yamlScalar("/tmp/filebeat-"+in.Version+"-x86_64.rpm") + "\n")
+	b.WriteString("      register: filebeat_rpm_reinstall\n")
+	b.WriteString("      failed_when: false\n")
+	b.WriteString("      when: " + yamlScalar(cond+" and not (filebeat_is_debian | bool) and (filebeat_overwrite | bool)") + "\n")
 	logTask(b, "安装 Filebeat（dnf 本地 rpm，自动解析依赖）")
 	// disablerepo 与 localinstall 组合：避免目标机没有配 Elastic 源时 dnf 找不到包。
 	b.WriteString("      ansible.builtin.command: dnf install -y " + yamlScalar("/tmp/filebeat-"+in.Version+"-x86_64.rpm") + "\n")
 	b.WriteString("      register: filebeat_rpm_install\n")
 	b.WriteString("      failed_when: false\n")
-	b.WriteString("      when: " + yamlScalar(cond+" and not (filebeat_is_debian | bool)") + "\n")
-	logTask(b, "兜底：rpm 安装失败时改用 rpm 直接安装")
+	b.WriteString("      when: " + yamlScalar(cond+" and not (filebeat_is_debian | bool) and not (filebeat_overwrite | bool)") + "\n")
+	logTask(b, "兜底：dnf 失败时改用 rpm 直接装（--replacepkgs 即覆盖安装）")
 	b.WriteString("      ansible.builtin.command: rpm -Uvh --replacepkgs " + yamlScalar("/tmp/filebeat-"+in.Version+"-x86_64.rpm") + "\n")
 	b.WriteString("      register: filebeat_rpm_fallback\n")
 	b.WriteString("      failed_when: false\n")
-	b.WriteString("      when: " + yamlScalar(cond+" and not (filebeat_is_debian | bool) and (filebeat_rpm_install is failed)") + "\n")
+	// 与 deb 侧同理：两路任一失败才兜底，`is defined` 防止跳过的那条注册变量未定义。
+	b.WriteString("      when: " + yamlScalar(cond+" and not (filebeat_is_debian | bool) and "+
+		"((filebeat_rpm_install is defined and filebeat_rpm_install is failed) or "+
+		"(filebeat_rpm_reinstall is defined and filebeat_rpm_reinstall is failed))") + "\n")
 	logTask(b, "确认安装结果（command -v filebeat）")
 	b.WriteString("      ansible.builtin.shell: command -v filebeat\n")
 	b.WriteString("      register: filebeat_install_check\n")
@@ -728,14 +805,29 @@ func writeFilebeatDockerTasksWhen(b *strings.Builder, in filebeatPlaybookInput, 
 		cond = when
 	}
 	b.WriteString("    # ---- docker 分支：官方镜像 + --restart=always（挂载配置与日志目录） ----\n")
-	logTask(b, "拉取 Filebeat 官方镜像")
+	// 先探测本地有没有这个镜像，再决定要不要联网拉取（用户要求："否则如果没有才进行拉取"）。
+	// 用 `docker image inspect` 的退出码判定，不做任何字符串解析（INC-027：产物里的字符串
+	// 会被多层解析器处理，能不解析就不解析）。
+	logTask(b, "探测本地是否已有 Filebeat 镜像（未勾选覆盖时，已有则不重新拉取）")
+	b.WriteString("      ansible.builtin.command: docker image inspect \"{{ " + v.image + " }}\"\n")
+	b.WriteString("      register: filebeat_image_inspect\n")
+	b.WriteString("      failed_when: false\n")
+	b.WriteString("      changed_when: false\n")
+	b.WriteString("      when: " + yamlScalar(cond) + "\n")
+	logTask(b, "拉取 Filebeat 官方镜像（勾选覆盖时强制重新拉取，否则仅在本地缺失时拉取）")
 	b.WriteString("      ansible.builtin.command: docker pull \"{{ " + v.image + " }}\"\n")
 	b.WriteString("      register: filebeat_pull\n")
 	b.WriteString("      retries: 3\n")
 	b.WriteString("      delay: 10\n")
 	b.WriteString("      until: filebeat_pull is succeeded\n")
 	b.WriteString("      changed_when: false\n")
-	b.WriteString("      when: " + yamlScalar(cond) + "\n")
+	// 两个条件的含义：
+	//   - 勾选「覆盖 Filebeat」→ 无论本地有没有都重新拉取（这正是"重新获取镜像"的诉求：
+	//     镜像 tag 可能被上游重推、或本地那份被改坏）；
+	//   - 未勾选 → 只有本地没有该 tag 时才拉取（内网/离线环境不必每次都出网，也不会因为
+	//     上游重推同一个 tag 而"悄悄换了版本"）。
+	b.WriteString("      when: " + yamlScalar(cond+" and ((filebeat_overwrite | bool) or "+
+		"(filebeat_image_inspect.rc | default(1) | int) != 0)") + "\n")
 	logTask(b, "创建 Filebeat 数据目录（注册表/位点，容器重建后断点续传不失效）")
 	b.WriteString("      ansible.builtin.file:\n")
 	b.WriteString("        path: \"{{ filebeat_data_dir }}\"\n")
@@ -827,6 +919,9 @@ func writeFilebeatContainerTasks(b *strings.Builder, in filebeatPlaybookInput, v
 		"请先手工删除该路径（rm -rf {{ " + v.config + " }}）后重试。\"\n")
 	b.WriteString("      when: " + yamlScalar(cond) + "\n")
 	logTask(b, "创建 Filebeat 容器（已存在则跳过，避免无故重启采集）")
+	// 走到这里时容器必然不存在：前面「删除平台托管的旧 Filebeat 容器」已经在本分支的条件下
+	// 把旧容器删掉了（这也是"重新拉取的镜像能真正生效"的前提——容器不重建就还用旧镜像）。
+	// 因此这里的 inspect 判定是二次保险，而不是唯一依据。
 	b.WriteString("      ansible.builtin.shell: |\n")
 	b.WriteString("        set -eu\n")
 	b.WriteString("        " + dockerRunLineForFilebeat(in, v) + "\n")

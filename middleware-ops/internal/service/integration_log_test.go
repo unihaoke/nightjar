@@ -32,7 +32,7 @@ func TestLogOptionKeysAreDeclaredInTemplate(t *testing.T) {
 	}
 	used := []string{
 		optLogPaths, optLogService, optLogEnvironment, optLogLevel,
-		optLogMultiline, optLogPattern, optLogInstallMode, optLogBeatVersion,
+		optLogMultiline, optLogPattern, optLogInstallMode, optLogBeatVersion, optLogOverwrite,
 	}
 	for _, key := range used {
 		if !declared[key] {
@@ -155,6 +155,67 @@ func TestLogInputOfRejectsMissingPieces(t *testing.T) {
 	local.Address = integration.Address{Host: "127.0.0.1"}
 	if _, err := (&IntegrationService{cfg: loopback}).logInputOf(remoteItem, tpl, local, IntegrationMeta{}); err != nil {
 		t.Fatalf("本机目标用回环地址是合法的，不该被拦：%v", err)
+	}
+}
+
+// TestLogInputOfOverwriteOption 锁定「覆盖 Filebeat」开关的解析与文案。
+//
+// 开关的语义（用户要求："如果选择则可以覆盖 Filebeat 重新获取 docker，否则如果没有才进行拉取"）：
+//   - 表单没填 / 填 false → **不动**目标机上已有的 Filebeat（默认必须是"不动"，因为这是破坏性操作）；
+//   - 填 true → Overwrite=true，产物走重新拉取 + 强制重装那条路。
+//
+// 同时锁定文案：预览步骤与部署备注都必须能读出"这次到底会不会覆盖安装"。
+// 文案错位的代价是真实的——之前 deployAttemptLabel 就出现过"日志集成显示成创建只读账号"的问题。
+func TestLogInputOfOverwriteOption(t *testing.T) {
+	tpl, _ := integration.TemplateOf(integration.TypeLog)
+	cfg := &config.Config{}
+	cfg.Kafka.Enabled = true
+	cfg.Kafka.Brokers = []string{"kafka:29092"}
+	cfg.Kafka.LogTopic = "mwops-logs"
+	cfg.Kafka.ExternalHost = "10.0.0.5"
+	cfg.Kafka.ExternalPort = 9092
+	svc := &IntegrationService{cfg: cfg}
+	item := &model.MiddlewareInstance{Name: "order-log", MWType: tpl.Type, Environment: model.EnvProd}
+
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{"", false},      // 未填：默认关闭
+		{"false", false}, // 显式关闭
+		{"0", false},     // 兼容 0/1 写法
+		{"no", false},    // 兼容 no/yes
+		{"true", true},   // 打开
+		{"1", true},      //
+		{" yes ", true},  // 带空白的取值必须照样识别（表单/接口都可能带空白）
+		{"TRUE", true},   // 大小写不敏感
+	}
+	for _, tc := range cases {
+		instance := integration.Instance{
+			Name: "order-log", MWType: tpl.Type, Address: integration.Address{Host: "10.0.0.9"},
+			Environment: model.EnvProd,
+			Options: map[string]string{
+				optLogPaths:       "/var/log/app/*.log",
+				optLogOverwrite:   tc.raw,
+				optLogInstallMode: "package",
+			},
+		}
+		input, err := svc.logInputOf(item, tpl, instance, IntegrationMeta{Options: instance.Options, TargetHost: "10.0.0.9"})
+		if err != nil {
+			t.Fatalf("覆盖=%q：组装渲染输入失败：%v", tc.raw, err)
+		}
+		if input.Overwrite != tc.want {
+			t.Fatalf("覆盖=%q：Overwrite 应为 %v，实际 %v", tc.raw, tc.want, input.Overwrite)
+		}
+		// 文案必须与开关一致：勾选时说"覆盖安装"，未勾选时说"已存在则不重装"。
+		label := filebeatInstallPlanLabel(input)
+		if tc.want {
+			if !strings.Contains(label, "覆盖安装") {
+				t.Fatalf("覆盖=%q：文案应说明本次会覆盖安装，实际 %q", tc.raw, label)
+			}
+		} else if !strings.Contains(label, "不重新拉取") {
+			t.Fatalf("覆盖=%q：文案应说明已存在则不重新拉取/不重装，实际 %q", tc.raw, label)
+		}
 	}
 }
 

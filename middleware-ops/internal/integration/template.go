@@ -514,6 +514,12 @@ var templates = map[string]Template{
 			{Key: "MWOPS_LOG_INSTALL_MODE", Label: "安装方式", Target: TargetEnv, Kind: "string", Default: "package",
 				Help: "package（deb/rpm + systemd，默认，活动部件最少）/ auto（已装则复用 → docker → 包安装）/ " +
 					"docker（官方镜像容器；需要目标机有 Docker，且要注意数据目录与挂载路径由平台托管）"},
+			{Key: "MWOPS_LOG_OVERWRITE", Label: "覆盖 Filebeat", Target: TargetEnv, Kind: "bool", Default: "false",
+				Help: "关闭（默认，幂等）：目标机上已装 Filebeat 就复用——不重新下载安装包、本地已有镜像也不重新拉取，" +
+					"只有缺失时才安装。打开（覆盖）：忽略\"已存在\"，重新下载 deb/rpm 并强制重装，" +
+					"或重新 docker pull 镜像并重建容器；用于升级版本或修复被改坏/装了一半的 Filebeat。" +
+					"注意：filebeat.yml 在两种情况下都按平台渲染内容同步（内容没变不重启），" +
+					"因此只是改了 Kafka 地址 / 日志路径时**不需要**打开这个开关"},
 			{Key: "MWOPS_LOG_FILEBEAT_VERSION", Label: "Filebeat 版本", Target: TargetEnv, Kind: "string",
 				Default: "8.16.0",
 				Help:    "默认 8.16.0；必须 ≥ 7.15（filestream 输入从此版本起可用）"},

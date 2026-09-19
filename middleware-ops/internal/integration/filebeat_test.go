@@ -1130,6 +1130,123 @@ func playbookTaskBlock(t *testing.T, playbook, prefix string) string {
 	return strings.Join(lines[start:end], "\n")
 }
 
+// TestRenderFilebeatInstallOverwriteIsDeclared 锁定「覆盖 Filebeat」开关的产物契约。
+//
+// 背景（用户要求）："是否覆盖 Filebeat——选择则可以覆盖 Filebeat 重新获取 docker，
+// 否则如果没有才进行拉取"。语义落在**安装/拉取**这一层：
+//
+//	关闭（默认）：已安装就复用，不重新下载 deb/rpm、本地已有镜像也不重新拉取；
+//	打开：忽略"已存在"，重新下载并强制重装（--reinstall / dnf reinstall 或 rpm --replacepkgs），
+//	      docker 模式则重新 pull 镜像并重建容器。
+//
+// 这里逐条锁住"开关真的接进了产物"：
+//  1. 开关必须是 play 变量（产物里一眼可见 true/false），而不是埋在变量文件里；
+//  2. 决策需要独立成 filebeat_install_needed，避免把"目标机事实"与"平台意图"混成一个变量；
+//  3. 强制重装与普通安装必须是**互斥**的两个分支（when 里带 not），
+//     否则未勾选覆盖时也会重装，等于开关没接上；
+//  4. 下载任务在勾选覆盖时必须重新下载（get_url force 跟随开关）。
+func TestRenderFilebeatInstallOverwriteIsDeclared(t *testing.T) {
+	wantFlag := map[bool]string{false: "filebeat_overwrite: false", true: "filebeat_overwrite: true"}
+	for _, overwrite := range []bool{false, true} {
+		in := logTestInput()
+		in.InstallMode = LogInstallPackage
+		in.Overwrite = overwrite
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		if !strings.Contains(art.Playbook, wantFlag[overwrite]) {
+			t.Fatalf("覆盖=%v：play 变量里应声明 %q（开关必须能从产物一眼看出）：\n%s",
+				overwrite, wantFlag[overwrite], art.Playbook)
+		}
+		// 决策变量：只在「未安装或勾选覆盖」时才安装。
+		if !strings.Contains(art.Playbook, "filebeat_install_needed:") {
+			t.Fatalf("覆盖=%v：应把「是否需要安装」独立成 filebeat_install_needed 事实：\n%s",
+				overwrite, art.Playbook)
+		}
+		// 两条互斥的安装分支。
+		reinstall := playbookTaskBlock(t, art.Playbook, "覆盖安装 Filebeat（已勾选「覆盖」")
+		if !strings.Contains(reinstall, "(filebeat_overwrite | bool)") {
+			t.Fatalf("覆盖=%v：强制重装任务必须以 filebeat_overwrite 为前提：\n%s", overwrite, reinstall)
+		}
+		plain := playbookTaskBlock(t, art.Playbook, "安装 Filebeat（apt 解析本地 deb 的依赖）")
+		if !strings.Contains(plain, "not (filebeat_overwrite | bool)") {
+			t.Fatalf("覆盖=%v：普通安装任务必须带 not (filebeat_overwrite | bool)（否则未勾选覆盖也会重装）：\n%s",
+				overwrite, plain)
+		}
+		// 勾选覆盖时必须重新下载安装包（否则会拿 /tmp 里的旧包去"覆盖安装"）。
+		download := playbookTaskBlock(t, art.Playbook, "下载 Filebeat deb 包")
+		if !strings.Contains(download, "force:") {
+			t.Fatalf("覆盖=%v：下载任务应带 force（跟随覆盖开关）：\n%s", overwrite, download)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallImagePullFollowsOverwrite 锁定镜像拉取策略。
+//
+// 用户的原始表述就是这一条："勾选覆盖 → 重新获取 docker 镜像；否则**如果没有才拉取**"。
+// 因此拉取任务的 when 必须同时满足两件事：
+//   - 有 filebeat_overwrite 分支（勾选时无条件拉取）；
+//   - 有本地镜像探测分支（未勾选时只在缺失时拉取）。
+//
+// 只写"总是拉取"会丢掉"没勾选就不出网"的省事路径；只写"缺失才拉取"会让覆盖开关对 docker 失效。
+func TestRenderFilebeatInstallImagePullFollowsOverwrite(t *testing.T) {
+	for _, overwrite := range []bool{false, true} {
+		in := logTestInput()
+		in.InstallMode = LogInstallDocker
+		in.Overwrite = overwrite
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		// 先探测本地镜像（不做字符串解析：用 docker image inspect 的退出码）。
+		probe := playbookTaskBlock(t, art.Playbook, "探测本地是否已有 Filebeat 镜像")
+		if !strings.Contains(probe, "docker image inspect") {
+			t.Fatalf("overwrite=%v：拉取前必须先探测本地镜像：\n%s", overwrite, probe)
+		}
+		pull := playbookTaskBlock(t, art.Playbook, "拉取 Filebeat 官方镜像")
+		for _, want := range []string{"filebeat_overwrite | bool", "filebeat_image_inspect.rc"} {
+			if !strings.Contains(pull, want) {
+				t.Fatalf("overwrite=%v：拉取任务的 when 应包含 %q（勾选覆盖即无条件拉取，否则仅本地缺失时拉取）：\n%s",
+					overwrite, want, pull)
+			}
+		}
+		// 拉到的镜像要真正生效，容器必须重建：旧容器由"删除平台托管的旧容器"这一步清掉。
+		remove := playbookTaskBlock(t, art.Playbook, "删除平台托管的旧 Filebeat 容器")
+		if !strings.Contains(remove, "docker rm -f") {
+			t.Fatalf("覆盖=%v：必须保留「先删旧容器」这一步（否则重新拉取的镜像不会生效）：\n%s",
+				overwrite, remove)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallExplicitModeBeatsReuse 锁定"显式安装方式优先于复用"。
+//
+// 真实缺陷（实现本开关时发现）：早期版本的决策是 `已安装 → reuse / docker / package`，
+// **完全不看**使用者显式选的安装方式。于是"显式选 docker + 目标机恰好也装了包版 filebeat"
+// 会算出 reuse，handler 便去 `systemctl restart filebeat` 而不是重建容器——
+// 容器里的 Filebeat 读不到新配置，采集静默地停留在旧配置上。
+//
+// 因此决策的第一优先级必须是显式模式，其次才是"复用"。
+func TestRenderFilebeatInstallExplicitModeBeatsReuse(t *testing.T) {
+	for _, mode := range []string{LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		decision := playbookTaskBlock(t, art.Playbook, "选择实际执行的安装方式")
+		explicit := "filebeat_mode == '" + mode + "'"
+		if !strings.Contains(decision, explicit) {
+			t.Fatalf("%s 模式：决策里必须有显式模式分支（%q），否则会被判成 reuse：\n%s",
+				mode, explicit, decision)
+		}
+		// 显式模式分支必须排在 reuse 分支之前——顺序反了就等于复用优先。
+		if strings.Index(decision, explicit) > strings.Index(decision, "reuse") {
+			t.Fatalf("%s 模式：显式模式分支必须写在 reuse 之前：\n%s", mode, decision)
+		}
+		// 覆盖开关与复用互斥：勾选覆盖后不再有 reuse 的可能。
+		if !strings.Contains(decision, "filebeat_install_needed | bool") {
+			t.Fatalf("%s 模式：决策必须引用 filebeat_install_needed（勾选覆盖时不再复用）：\n%s", mode, decision)
+		}
+	}
+}
+
 // TestSplitHostPort 锁定探测地址的拆解（含 IPv6 与缺端口两种边界）。
 func TestSplitHostPort(t *testing.T) {
 	cases := []struct {
@@ -1535,6 +1652,7 @@ func TestLogTemplateRegistration(t *testing.T) {
 		"MWOPS_LOG_MULTILINE":         "bool",
 		"MWOPS_LOG_MULTILINE_PATTERN": "string",
 		"MWOPS_LOG_INSTALL_MODE":      "string",
+		"MWOPS_LOG_OVERWRITE":         "bool",
 		"MWOPS_LOG_FILEBEAT_VERSION":  "string",
 	}
 	got := make(map[string]Option, len(tpl.Options))
@@ -1567,6 +1685,9 @@ func TestLogTemplateRegistration(t *testing.T) {
 		// 需要容器化采集时由使用者显式选 auto/docker。
 		"MWOPS_LOG_INSTALL_MODE":     "package",
 		"MWOPS_LOG_FILEBEAT_VERSION": "8.16.0",
+		// 覆盖 Filebeat 是**破坏性**开关（会重新下载并覆盖目标机上已有的 Filebeat），
+		// 因此默认必须是 false：把缺省写成"打开"等于让每次部署都去重装别人机器上的软件。
+		"MWOPS_LOG_OVERWRITE": "false",
 	} {
 		if got[key].Default != want {
 			t.Fatalf("参数 %s 的默认值应为 %q，实际 %q", key, want, got[key].Default)

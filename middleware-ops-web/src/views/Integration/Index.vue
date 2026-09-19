@@ -247,6 +247,17 @@ const applyTarget = ref<IntegrationView | null>(null)
 const applySsh = reactive({ user: '', method: 'password' as 'password' | 'key', password: '', key: '', port: 22 })
 /** 「重新应用」的对象是否为日志集成：决定弹窗文案（Filebeat 还是 Exporter）。 */
 const applyIsLog = computed(() => (applyTarget.value ? isLogItem(applyTarget.value) : false))
+/**
+ * 待重新应用的日志集成是否勾选了「覆盖 Filebeat」。
+ *
+ * 弹窗里必须说清"这次会不会重装"：重新应用是使用者**唯一**能改这件事的入口，
+ * 而"勾了覆盖"与"没勾覆盖"在目标机上做的事情差别很大（前者会重新下载并覆盖安装）。
+ */
+const applyOverwrite = computed(() =>
+  isTruthyValue(String(applyTarget.value?.options?.MWOPS_LOG_OVERWRITE ?? '')),
+)
+/** 表单里是否勾选了「覆盖 Filebeat」（决定采集参数区的告警提示与提交后的文案）。 */
+const logOverwriteOn = computed(() => isTruthyValue(String(form.options.MWOPS_LOG_OVERWRITE ?? '')))
 /** 正在"重新核验"的集成 ID。 */
 const verifyingId = ref<number | null>(null)
 const probingId = ref<number | null>(null)
@@ -648,7 +659,9 @@ async function handleSubmit(): Promise<void> {
       ElMessage({
         type: 'success',
         message: editing.value
-          ? '日志集成已更新：平台将重放一次 Filebeat 部署（已安装则只校验配置）'
+          ? (logOverwriteOn.value
+            ? '日志集成已更新：平台将重放一次 Filebeat 部署，并重新拉取、覆盖安装 Filebeat'
+            : '日志集成已更新：平台将重放一次 Filebeat 部署（已安装则跳过安装，只校验并同步配置）')
           : '日志集成已创建：平台将用 Ansible 在目标机安装 Filebeat 并把日志推送到平台 Kafka',
       })
     } else {
@@ -692,7 +705,12 @@ async function runApply(item: IntegrationView, payload: AccountSecurePayload): P
     if (saved.last_error) {
       ElMessage({ type: 'warning', message: saved.last_error })
     } else if (isLogItem(item)) {
-      ElMessage({ type: 'success', message: '已开始重新应用：后台用 Ansible 安装/校验 Filebeat（已装则跳过），完成后此处显示结果（可点刷新）' })
+      ElMessage({
+        type: 'success',
+        message: isTruthyValue(String(item.options?.MWOPS_LOG_OVERWRITE ?? ''))
+          ? '已开始重新应用：后台用 Ansible 重新拉取并覆盖安装 Filebeat，完成后此处显示结果（可点刷新）'
+          : '已开始重新应用：后台用 Ansible 安装/校验 Filebeat（已装则跳过安装），完成后此处显示结果（可点刷新）',
+      })
     } else {
       ElMessage({ type: 'success', message: '已开始重新应用：后台重建/重装 Exporter，完成后此处显示结果（可点刷新）' })
     }
@@ -815,11 +833,17 @@ function isLogItem(item: IntegrationView): boolean {
  *
  * 平台不持有目标机的进程视图（Ansible 装完就结束），所以这里只回答
  * "装在哪台机器、什么时候装的/核验的"，运行状态由自检与日志页数据回答。
+ *
+ * 「覆盖 Filebeat」按**当前配置**描述（刚改过开关、还没重新应用时，实际发生的可能是上一次的取值）：
+ * 因此文案用"当前配置：…"限定，不用完成时态去断言上一次部署到底做了什么。
  */
 function logDeployTooltip(item: IntegrationView): string {
   const host = item.target_host || item.address || '目标机'
   const stamp = item.remote_installed_at ? `，最近一次安装/核验：${formatTime(item.remote_installed_at)}` : ''
-  return `目标机 ${host}：由平台经 Ansible 安装并校验 Filebeat（已装则跳过）${stamp}。采集是否在跑请看自检结论或日志页数据。`
+  const plan = isTruthyValue(String(item.options?.MWOPS_LOG_OVERWRITE ?? ''))
+    ? '当前配置：勾选了「覆盖 Filebeat」，每次部署都会重新拉取安装包/镜像并覆盖安装'
+    : '当前配置：未勾选「覆盖 Filebeat」，已安装则跳过安装、只有缺失时才拉取'
+  return `目标机 ${host}：由平台经 Ansible 安装并校验 Filebeat（${plan}）${stamp}。采集是否在跑请看自检结论或日志页数据。`
 }
 
 /** 打开编辑弹窗。 */
@@ -1206,7 +1230,7 @@ onMounted(load)
             :closable="false"
             show-icon
             class="mb"
-            title="平台会用 Ansible 在目标机安装 Filebeat（已安装则跳过），Filebeat 将日志推送到平台 Kafka"
+            title="平台会用 Ansible 在目标机安装 Filebeat（未勾选「覆盖 Filebeat」时已安装则跳过），Filebeat 将日志推送到平台 Kafka"
           >
             <p class="field-hint">
               采集在目标机上由 Filebeat 完成：日志先落到平台 Kafka，再由平台消费进既有的日志事件链路
@@ -1215,6 +1239,8 @@ onMounted(load)
             </p>
             <p class="field-hint">
               平台按<b>渲染后的配置内容</b>判断是否需要重启：内容没变就不动它，重复保存不会反复重启采集。
+              这条判断与「覆盖 Filebeat」无关——配置文件始终跟着平台走，只有 Filebeat <b>程序本体</b>
+              （安装包 / 容器镜像）才由那个开关决定要不要重新拉取。
             </p>
           </el-alert>
           <div v-for="option in activeTemplate?.options || []" :key="option.key" class="option-row">
@@ -1262,6 +1288,25 @@ onMounted(load)
             </el-select>
             <el-input v-else v-model="form.options[option.key]" class="option-input" :placeholder="option.default" />
           </div>
+          <!-- 勾选覆盖时把后果说清楚：这是唯一一个会"重新拉取并覆盖目标机上已有 Filebeat"的开关，
+               使用者点下去之前应该知道会发生什么（含重启采集）。 -->
+          <el-alert
+            v-if="logOverwriteOn"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="mb"
+            title="已勾选「覆盖 Filebeat」：保存并部署时会重新拉取安装包 / 容器镜像，并覆盖目标机上已有的 Filebeat"
+          >
+            <p class="field-hint">
+              package 安装方式 → 重新下载 deb/rpm 并强制重装（apt --reinstall / dnf reinstall）；
+              docker 安装方式 → 重新 <span class="mono">docker pull</span> 镜像并重建容器。
+              目标机上正在采集的 Filebeat 会被重启，采集会短暂中断（几秒到几十秒）。
+            </p>
+            <p class="field-hint">
+              只是想改日志路径 / Kafka 地址？<b>不需要</b>这个开关——配置文件始终按平台内容同步，内容变了才会重启。
+            </p>
+          </el-alert>
           <p class="field-hint">平台只透传模板声明的参数，不接受任意自定义配置。</p>
         </template>
 
@@ -1817,10 +1862,15 @@ onMounted(load)
     >
       <el-alert type="info" :closable="false" show-icon
         :title="applyIsLog
-          ? '将用 Ansible 在目标机安装/校验 Filebeat（已安装则跳过）'
+          ? (applyOverwrite
+            ? '将用 Ansible 在目标机重新拉取并覆盖安装 Filebeat（已勾选「覆盖 Filebeat」）'
+            : '将用 Ansible 在目标机安装/校验 Filebeat（未勾选「覆盖 Filebeat」：已安装则跳过）')
           : '将重写抓取配置并在目标机上重建/重装 Exporter'">
         <p class="field-hint">
           平台会{{ applyIsLog ? '重放一次 Filebeat 部署并下发最新配置' : '重写 Prometheus 抓取目标并重新安装 Exporter' }}。
+          <template v-if="applyIsLog && applyOverwrite">
+            本次会<b>重新下载安装包 / 重新 docker pull 镜像并覆盖安装</b>，正在采集的 Filebeat 会被重启。
+          </template>
           SSH 凭据仅本次使用、不落库、不回显；用<b>私钥</b>认证时不需要平台安装 sshpass。
         </p>
       </el-alert>

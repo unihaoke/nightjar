@@ -101,8 +101,29 @@ Topic：`mwops-logs`（可配），`KAFKA_AUTO_CREATE_TOPICS_ENABLE=true`，平�
 | 最低级别 | ERROR / WARN / INFO（写入 Filebeat 处理器，降低噪音） |
 | 多行合并 | 是否把 Java/Python 堆栈合并成一条事件（默认开，pattern 按语言给默认值） |
 | 安装方式 | `package`（**默认**，deb/rpm + systemd）/ `auto`（已装则复用 → docker → 包安装）/ `docker`（官方镜像容器） |
+| 覆盖 Filebeat | **默认关闭**（幂等：已装就复用、镜像已在本地就不重新拉取；缺失才安装）。打开则忽略"已存在"，重新下载 deb/rpm 并强制重装，或重新 `docker pull` 镜像并重建容器 |
 | Filebeat 版本 | 默认 `8.16.0` |
 | Kafka Topic | 默认取平台配置，只读展示，便于对齐排障 |
+
+### 「覆盖 Filebeat」开关：管的是**程序本体**，不是配置
+
+这个开关只影响"要不要动目标机上那个 Filebeat"：
+
+| 安装方式 | 关闭（默认） | 打开（覆盖） |
+|---|---|---|
+| `package` | 已安装 → 不重装；缺失 → 下载 deb/rpm 安装 | 强制重新下载（`get_url force`）→ `apt-get --reinstall` / `dnf reinstall`（兜底 `rpm -Uvh --replacepkgs`） |
+| `docker` | 本地已有该 tag 的镜像 → 不 `pull`；容器按既有逻辑重建 | 无条件 `docker pull`（重新获取镜像）→ 重建容器 |
+| `auto` | 已安装 → 复用；否则 docker → package | 跳过"复用"，按 **有 docker → docker，否则 package** 重装 |
+
+**故意不覆盖配置文件**：`filebeat.yml` 是平台自己的产物，内容由平台配置推导（Kafka 对外地址、
+日志路径、级别）。若"不勾选就不覆盖配置"，就会出现"平台上改了地址、界面一切正常、目标机还在用旧配置"
+——正是 INC-016 / INC-028 反复出现的那类"看起来成功了但链路是断的"。
+因此配置**始终按内容同步**（Ansible `copy` 的 checksum 语义：内容没变连重启都不会发生），
+只有"程序本体"（安装包 / 镜像）由这个开关决定是否重新拉取。**改日志路径或 Kafka 地址不需要打开它。**
+
+判定顺序里还有一条实现时修掉的缺陷（INC-029）：显式的 `package` / `docker` **优先于"复用"**。
+早期版本一律"已安装 → reuse"，于是"显式选 docker + 目标机恰好也装了包版 Filebeat"会算出 reuse，
+配置变化时 handler 去 `systemctl restart filebeat` 而不是重建容器，容器静默地用着旧配置。
 
 ### 幂等部署规则（用户要求："已存在则不需要部署"）
 
@@ -120,6 +141,10 @@ Topic：`mwops-logs`（可配），`KAFKA_AUTO_CREATE_TOPICS_ENABLE=true`，平�
    （`--user=root`、配置挂到容器内 `/usr/share/filebeat/filebeat.yml`、数据目录用平台专属的
    `/var/lib/mwops-filebeat`（0775 / uid 1000）——与系统 filebeat 的 `/var/lib/filebeat` 刻意分开）；
 3. 都没有 → 用官方仓库安装 deb/rpm 并启用 systemd 单元。
+
+显式选了 `package` / `docker` 时**不走上面这套**：使用者选定的方式优先，
+"复用"只在 `auto` 模式下才可能出现（见上面 INC-029）。
+勾选「覆盖 Filebeat」时第 1 步被跳过：需要安装 → 按"有 docker 用容器、否则用包"重装。
 
 配置的"是否变更"用**渲染后的 filebeat.yml 内容哈希**判定（Ansible `copy` 的 `checksum` 语义）：
 内容一致 → 不重启（避免每次重放都抖动采集）；内容变化 → `systemctl restart filebeat` 或容器重建。
@@ -281,6 +306,21 @@ kafka:
 `.env` 侧对应 `KAFKA_ADVERTISED_HOST` / `KAFKA_PORT`，两者必须一致（compose 用它渲染
 `KAFKA_ADVERTISED_LISTENERS`，后端用它渲染 Filebeat 的 `hosts` 并把地址交给自检）。
 
+**集成表单参数**（`MWOPS_LOG_*`，存在 `middleware_instances.options` 里，逐集成独立）：
+
+| 键 | 取值 | 说明 |
+|---|---|---|
+| `MWOPS_LOG_PATHS` | 多行 glob | 目标机上的日志路径（必填） |
+| `MWOPS_LOG_SERVICE` / `MWOPS_LOG_ENVIRONMENT` | 字符串 | 写入事件的 `service` / `environment` |
+| `MWOPS_LOG_LEVEL` | ERROR / WARN / INFO | 目标机侧过滤 |
+| `MWOPS_LOG_MULTILINE` / `MWOPS_LOG_MULTILINE_PATTERN` | bool / 正则 | 多行堆栈合并 |
+| `MWOPS_LOG_INSTALL_MODE` | `package`（默认）/ `auto` / `docker` | 安装方式 |
+| `MWOPS_LOG_OVERWRITE` | `true` / `false`（默认） | 覆盖 Filebeat：重新拉取安装包/镜像并强制重装 |
+| `MWOPS_LOG_FILEBEAT_VERSION` | 版本号 | 默认 `8.16.0`（≥ 7.15） |
+
+> `MWOPS_LOG_OVERWRITE` 的"缺省即关闭"是刻意的：它是唯一会**重新下载并覆盖目标机上已有软件**的开关，
+> 默认必须是"不动它"。因此对"没填/填 false"一律按关闭处理，只有显式的 `true`/`1`/`yes`/`on` 才算打开。
+
 ---
 
 ## 九、验证清单（交付时逐条走）
@@ -295,6 +335,10 @@ nc -vz <KAFKA_ADVERTISED_HOST> 9092
 
 # 3. 端到端：目标机手工塞一条日志，平台日志页应在数秒内出现事件
 echo '2024-01-01 ERROR demo: boom' >> /var/log/app/demo.log
+
+# 4. 「覆盖 Filebeat」开关（可选）：仅在需要升级/修复目标机上已有的 Filebeat 时打开
+#    未勾选时重放 playbook 不应出现下载/重装动作；勾选后应看到重新下载与 --reinstall/reinstall
+#    产物里可直接核对：vars 段的 filebeat_overwrite 与各安装任务的 when 条件
 ```
 
 > 端口别混：**29092 只在平台容器网络内**（后端消费用 `kafka:29092`），
@@ -310,5 +354,11 @@ echo '2024-01-01 ERROR demo: boom' >> /var/log/app/demo.log
 > INC-028 的地址校验（远程目标 + 回环/容器名 → 拒绝；本机目标 + 回环 → 放行）由
 > `TestKafkaAddressUsableForTarget` / `TestLogInputOfRejectsMissingPieces` 覆盖，
 > 但**"改成正确 advertised 地址后目标机是否真的能推上日志"仍未在真实链路上跑通**。
+> 「覆盖 Filebeat」开关同理：产物里的分支、条件与决策语义由
+> `TestRenderFilebeatInstallOverwriteIsDeclared` / `TestRenderFilebeatInstallImagePullFollowsOverwrite` /
+> `TestRenderFilebeatInstallExplicitModeBeatsReuse` / `TestLogInputOfOverwriteOption` 覆盖，
+> 并用独立的 Python/PyYAML 与一个极小的 Jinja 求值器复核（六种模式×覆盖组合、四种目标机状态），
+> 但**`apt-get --reinstall` / `dnf reinstall` / `docker pull` 在真实目标机上的行为没有实跑过**
+> （尤其 `dnf reinstall` 对本地 rpm 的可用性、以及内网机器重新下载是否会失败）。
 > playbook **没有在真实目标机（真实 Debian/RHEL + Filebeat 8.16 + Kafka）上执行过**：
 > `/dev/tcp` 探测、`nc -z` 回退、RPM 依赖解析、docker 挂载与 handler 重启都只有静态断言。
