@@ -42,6 +42,12 @@ type SettingService struct {
 	audit   *AuditService
 	log     *zap.Logger
 
+	// onAIApplied 在 AI 设置生效后被调用：让「AI 代码分析」的客户端按新配置重建。
+	//
+	// 用回调而不是直接依赖 CodeAnalysisService，是因为装配顺序上设置服务先于它创建
+	//（启动时要先把平台设置对齐到内存，领域服务才装配），直接引用会形成顺序耦合。
+	onAIApplied func()
+
 	// saveMu 串行化保存动作。
 	//
 	// 保存不是一次纯内存操作：它要「读旧值 → 合并 → 加密落库 → 覆盖内存配置 → 重建引擎」。
@@ -74,6 +80,14 @@ func NewSettingService(d SettingDeps) *SettingService {
 		engine: d.Engine, factory: d.Factory, cost: d.Cost, notify: d.Notifier,
 		audit: d.Audit, log: d.Log,
 	}
+}
+
+// SetAIAppliedHook 注册"AI 设置生效"回调（由容器在 CodeAnalysisService 装配后调用）。
+func (s *SettingService) SetAIAppliedHook(fn func()) {
+	if s == nil {
+		return
+	}
+	s.onAIApplied = fn
 }
 
 // 设置项标识（platform_settings.name）。
@@ -124,11 +138,36 @@ type aiProviderPayload struct {
 	PricePerKToken float64 `json:"price_per_k_token"`
 }
 
+// aiAnalysisPayload 是「AI 代码分析」外部服务的持久化形态（含明文密钥）。
+//
+// 它就是日志告警那条链路的对接参数：平台把问题提交给它、它回调/被轮询回结论，
+// 详见 internal/service/ai_analysis_client.go。放在 AI 设置里统一管理，
+// 是为了让"密钥与地址"只有平台这一个来源（与提供方设置同样的三条约定）。
+//
+// 时长字段用字符串（如 "30m"）而不是纳秒数字：它要被界面编辑、也要被人读，
+// 写 1800000000000 这种数字谁都看不出是多久。解析失败时保留原值。
+type aiAnalysisPayload struct {
+	Enabled         bool   `json:"enabled"`
+	BaseURL         string `json:"base_url"`
+	APIKey          string `json:"api_key"`
+	SubmitPath      string `json:"submit_path"`
+	QueryPath       string `json:"query_path"`
+	CallbackURL     string `json:"callback_url"`
+	CallbackToken   string `json:"callback_token"`
+	Timeout         string `json:"timeout"`
+	TaskTimeout     string `json:"task_timeout"`
+	PollInterval    string `json:"poll_interval"`
+	PollBatch       int    `json:"poll_batch"`
+	SyncMode        bool   `json:"sync_mode"`
+	NotifyOnSubmit  bool   `json:"notify_on_submit"`
+}
+
 // aiSettingsPayload 是 AI 设置的完整持久化形态。
 type aiSettingsPayload struct {
 	Strategy        string            `json:"strategy"`
 	ThirdParty      aiProviderPayload `json:"third_party"`
 	SelfHosted      aiProviderPayload `json:"self_hosted"`
+	CodeAnalysis    aiAnalysisPayload `json:"code_analysis"`
 	DailyTokenQuota int64             `json:"daily_token_quota"`
 	PerUserQuota    int64             `json:"per_user_daily_quota"`
 }
@@ -179,11 +218,34 @@ type ProviderSettingsView struct {
 	PricePerKToken float64 `json:"price_per_k_token"`
 }
 
+// AIAnalysisView 是「AI 代码分析」的展示形态：两把密钥只以「是否已配置 + 掩码」出现。
+type AIAnalysisView struct {
+	Enabled             bool   `json:"enabled"`
+	BaseURL             string `json:"base_url"`
+	APIKeySet           bool   `json:"api_key_set"`
+	APIKeyMasked        string `json:"api_key_masked"`
+	SubmitPath          string `json:"submit_path"`
+	QueryPath           string `json:"query_path"`
+	CallbackURL         string `json:"callback_url"`
+	CallbackTokenSet    bool   `json:"callback_token_set"`
+	CallbackTokenMasked string `json:"callback_token_masked"`
+	Timeout             string `json:"timeout"`
+	TaskTimeout         string `json:"task_timeout"`
+	PollInterval        string `json:"poll_interval"`
+	PollBatch           int    `json:"poll_batch"`
+	SyncMode            bool   `json:"sync_mode"`
+	NotifyOnSubmit      bool   `json:"notify_on_submit"`
+	// Configured 表示"现在真的能调用"（开关已开且地址非空）。
+	// 页面据此提示"填了但没生效"，避免管理员以为配好了却在日志页看到"未装配"。
+	Configured bool `json:"configured"`
+}
+
 // AISettingsView 是 GET/PUT /api/settings/ai 的响应体。
 type AISettingsView struct {
 	Strategy          string               `json:"strategy"`
 	ThirdParty        ProviderSettingsView `json:"third_party"`
 	SelfHosted        ProviderSettingsView `json:"self_hosted"`
+	CodeAnalysis      AIAnalysisView       `json:"code_analysis"`
 	DailyTokenQuota   int64                `json:"daily_token_quota"`
 	PerUserDailyQuota int64                `json:"per_user_daily_quota"`
 	UpdatedBy         string               `json:"updated_by"`
@@ -245,11 +307,31 @@ type ProviderSettingsInput struct {
 	PricePerKToken float64 `json:"price_per_k_token"`
 }
 
+// AIAnalysisInput 是「AI 代码分析」的入参：两把密钥走三态语义（空=不变，clear=清空）。
+type AIAnalysisInput struct {
+	Enabled            bool   `json:"enabled"`
+	BaseURL            string `json:"base_url"`
+	APIKey             string `json:"api_key"`
+	ClearAPIKey        bool   `json:"clear_api_key"`
+	SubmitPath         string `json:"submit_path"`
+	QueryPath          string `json:"query_path"`
+	CallbackURL        string `json:"callback_url"`
+	CallbackToken      string `json:"callback_token"`
+	ClearCallbackToken bool   `json:"clear_callback_token"`
+	Timeout            string `json:"timeout"`
+	TaskTimeout        string `json:"task_timeout"`
+	PollInterval       string `json:"poll_interval"`
+	PollBatch          int    `json:"poll_batch"`
+	SyncMode           bool   `json:"sync_mode"`
+	NotifyOnSubmit     bool   `json:"notify_on_submit"`
+}
+
 // AISettingsInput 是 PUT /api/settings/ai 的请求体。
 type AISettingsInput struct {
 	Strategy          string                `json:"strategy"`
 	ThirdParty        ProviderSettingsInput `json:"third_party"`
 	SelfHosted        ProviderSettingsInput `json:"self_hosted"`
+	CodeAnalysis      AIAnalysisInput       `json:"code_analysis"`
 	DailyTokenQuota   int64                 `json:"daily_token_quota"`
 	PerUserDailyQuota int64                 `json:"per_user_daily_quota"`
 }
@@ -582,9 +664,33 @@ func defaultAISettingsPayload() aiSettingsPayload {
 		Strategy:   "hybrid",
 		ThirdParty: aiProviderPayload{Enabled: false, Kind: "openai", MaxTokens: 2048},
 		SelfHosted: aiProviderPayload{Enabled: false, Kind: "ollama", MaxTokens: 2048},
+		// AI 代码分析默认关闭：没配外部服务地址就不该假装能分析
+		//（否则日志事件会停在"排队中"，而使用者看到的原因却是"AI 分析中"）。
+		CodeAnalysis: aiAnalysisPayload{
+			Enabled: false, SubmitPath: defaultSubmitPath, QueryPath: defaultQueryPath,
+			Timeout: "15s", TaskTimeout: "30m", PollInterval: "60s", PollBatch: defaultPollBatch,
+		},
 		DailyTokenQuota: 0,
 		PerUserQuota:    0,
 	}
+}
+
+// AI 代码分析的默认对接形状（与 config 里的历史默认值一致，界面首次打开就有可用值）。
+const (
+	defaultSubmitPath = "/v1/analyses"
+	defaultQueryPath  = "/v1/analyses/{task_id}"
+	defaultPollBatch  = 20
+)
+
+// parseDurationOr 解析 "30m" 这类时长；空值或非法时**保留原值**而不是静默改成 0。
+//
+// 静默归零的后果是超时立刻触发（0 超时 = 每次都超时），比"沿用旧值"危险得多。
+func parseDurationOr(raw string, fallback time.Duration) time.Duration {
+	v, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
 
 // applyTo 把 payload 写进 AI 引擎配置（不含护栏配额，配额由 applyQuotas 单独处理）。
@@ -608,6 +714,28 @@ func (p aiSettingsPayload) applyTo(cfg *config.AIEngineConfig) {
 	}
 }
 
+// applyCodeAnalysisTo 把「AI 代码分析」落到根配置上（它不在 AIEngine 之下，是独立的一段）。
+func (p aiSettingsPayload) applyCodeAnalysisTo(cfg *config.Config) {
+	cfg.AIAnalysis = config.AIAnalysisConfig{
+		Enabled:        p.CodeAnalysis.Enabled,
+		BaseURL:        p.CodeAnalysis.BaseURL,
+		APIKey:         p.CodeAnalysis.APIKey,
+		SubmitPath:     defaultString(p.CodeAnalysis.SubmitPath, defaultSubmitPath),
+		QueryPath:      defaultString(p.CodeAnalysis.QueryPath, defaultQueryPath),
+		CallbackURL:    p.CodeAnalysis.CallbackURL,
+		CallbackToken:  p.CodeAnalysis.CallbackToken,
+		Timeout:        parseDurationOr(p.CodeAnalysis.Timeout, cfg.AIAnalysis.Timeout),
+		TaskTimeout:    parseDurationOr(p.CodeAnalysis.TaskTimeout, cfg.AIAnalysis.TaskTimeout),
+		PollInterval:   parseDurationOr(p.CodeAnalysis.PollInterval, cfg.AIAnalysis.PollInterval),
+		PollBatch:      p.CodeAnalysis.PollBatch,
+		SyncMode:       p.CodeAnalysis.SyncMode,
+		NotifyOnSubmit: p.CodeAnalysis.NotifyOnSubmit,
+	}
+	if cfg.AIAnalysis.PollBatch <= 0 {
+		cfg.AIAnalysis.PollBatch = defaultPollBatch
+	}
+}
+
 // view 生成对外展示形态。
 func (p aiProviderPayload) view() ProviderSettingsView {
 	return ProviderSettingsView{
@@ -615,6 +743,72 @@ func (p aiProviderPayload) view() ProviderSettingsView {
 		APIKeySet: strings.TrimSpace(p.APIKey) != "", APIKeyMasked: maskSecret(p.APIKey),
 		Model: p.Model, MaxTokens: p.MaxTokens, PricePerKToken: p.PricePerKToken,
 	}
+}
+
+// view 生成 AI 代码分析的展示形态（两把密钥只给掩码）。
+func (p aiAnalysisPayload) view() AIAnalysisView {
+	return AIAnalysisView{
+		Enabled:             p.Enabled,
+		BaseURL:             p.BaseURL,
+		APIKeySet:           strings.TrimSpace(p.APIKey) != "",
+		APIKeyMasked:        maskSecret(p.APIKey),
+		SubmitPath:          p.SubmitPath,
+		QueryPath:           p.QueryPath,
+		CallbackURL:         p.CallbackURL,
+		CallbackTokenSet:    strings.TrimSpace(p.CallbackToken) != "",
+		CallbackTokenMasked: maskSecret(p.CallbackToken),
+		Timeout:             p.Timeout,
+		TaskTimeout:         p.TaskTimeout,
+		PollInterval:        p.PollInterval,
+		PollBatch:           p.PollBatch,
+		SyncMode:            p.SyncMode,
+		NotifyOnSubmit:      p.NotifyOnSubmit,
+		Configured:          p.Enabled && strings.TrimSpace(p.BaseURL) != "",
+	}
+}
+
+// mergeAIAnalysis 合并 AI 代码分析入参：非密钥字段按"非空即覆盖"，密钥走三态语义。
+//
+// 路径与时长按"非空即覆盖"而不是整体覆盖：这几项界面上经常只改其中一个，
+// 整体覆盖会把没填的字段清空（SubmitPath 空了等于客户端拼不出地址）。
+func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayload {
+	out := old
+	out.Enabled = in.Enabled
+	out.BaseURL = strings.TrimSpace(in.BaseURL)
+	out.CallbackURL = strings.TrimSpace(in.CallbackURL)
+	if v := strings.TrimSpace(in.SubmitPath); v != "" {
+		out.SubmitPath = v
+	}
+	if v := strings.TrimSpace(in.QueryPath); v != "" {
+		out.QueryPath = v
+	}
+	if v := strings.TrimSpace(in.Timeout); v != "" {
+		out.Timeout = v
+	}
+	if v := strings.TrimSpace(in.TaskTimeout); v != "" {
+		out.TaskTimeout = v
+	}
+	if v := strings.TrimSpace(in.PollInterval); v != "" {
+		out.PollInterval = v
+	}
+	if in.PollBatch > 0 {
+		out.PollBatch = in.PollBatch
+	}
+	out.SyncMode = in.SyncMode
+	out.NotifyOnSubmit = in.NotifyOnSubmit
+	out.APIKey = mergeSecret(old.APIKey, in.APIKey, in.ClearAPIKey)
+	out.CallbackToken = mergeSecret(old.CallbackToken, in.CallbackToken, in.ClearCallbackToken)
+	// 兜底：老记录里没有这两个路径时补默认值，避免客户端拼出空路径。
+	if strings.TrimSpace(out.SubmitPath) == "" {
+		out.SubmitPath = defaultSubmitPath
+	}
+	if strings.TrimSpace(out.QueryPath) == "" {
+		out.QueryPath = defaultQueryPath
+	}
+	if out.PollBatch <= 0 {
+		out.PollBatch = defaultPollBatch
+	}
+	return out
 }
 
 // providersActive 计算「真正会参与的提供方」标签。
@@ -644,6 +838,7 @@ func (s *SettingService) AISettings(ctx context.Context) (*AISettingsView, error
 		Strategy:          payload.Strategy,
 		ThirdParty:        payload.ThirdParty.view(),
 		SelfHosted:        payload.SelfHosted.view(),
+		CodeAnalysis:      payload.CodeAnalysis.view(),
 		DailyTokenQuota:   payload.DailyTokenQuota,
 		PerUserDailyQuota: payload.PerUserQuota,
 		UpdatedBy:         updatedBy,
@@ -682,6 +877,7 @@ func (s *SettingService) SaveAISettings(ctx context.Context, in AISettingsInput,
 	}
 	next.ThirdParty = mergeAIProvider(existing.ThirdParty, in.ThirdParty)
 	next.SelfHosted = mergeAIProvider(existing.SelfHosted, in.SelfHosted)
+	next.CodeAnalysis = mergeAIAnalysis(existing.CodeAnalysis, in.CodeAnalysis)
 	next.DailyTokenQuota = in.DailyTokenQuota
 	next.PerUserQuota = in.PerUserDailyQuota
 
@@ -707,6 +903,13 @@ func (s *SettingService) SaveAISettings(ctx context.Context, in AISettingsInput,
 		"daily_token_quota":       next.DailyTokenQuota,
 		"per_user_daily_quota":    next.PerUserQuota,
 		"providers_active":        next.providersActive(),
+		// AI 代码分析：只记开关、地址（脱敏）与"密钥是否被改过"，不记任何密钥。
+		"code_analysis_enabled":        next.CodeAnalysis.Enabled,
+		"code_analysis_base_url":       redactCredentials(next.CodeAnalysis.BaseURL),
+		"code_analysis_key_changed":    analysisSecretChanged(existing.CodeAnalysis, in.CodeAnalysis),
+		"code_analysis_sync_mode":      next.CodeAnalysis.SyncMode,
+		"code_analysis_task_timeout":   next.CodeAnalysis.TaskTimeout,
+		"code_analysis_notify_submit":  next.CodeAnalysis.NotifyOnSubmit,
 	})
 
 	return s.AISettings(ctx)
@@ -750,11 +953,29 @@ func validateAIStrategy(strategy string) error {
 	}
 }
 
+// analysisSecretChanged 汇报 AI 代码分析的两把密钥是否被改动（只记布尔）。
+func analysisSecretChanged(old aiAnalysisPayload, in AIAnalysisInput) map[string]any {
+	keyChanged, keyCleared := secretChange(old.APIKey, in.APIKey, in.ClearAPIKey)
+	tokenChanged, tokenCleared := secretChange(old.CallbackToken, in.CallbackToken, in.ClearCallbackToken)
+	return map[string]any{
+		"api_key_changed":    keyChanged,
+		"api_key_cleared":    keyCleared,
+		"callback_token_changed": tokenChanged,
+		"callback_token_cleared": tokenCleared,
+	}
+}
+
 // applyAIPayload 把 payload 落到内存配置并让引擎 / 护栏立即生效。
 func (s *SettingService) applyAIPayload(payload aiSettingsPayload) {
 	payload.applyTo(&s.cfg.AIEngine)
 	s.cfg.Guardrail.DailyTokenQuota = payload.DailyTokenQuota
 	s.cfg.Guardrail.PerUserQuota = payload.PerUserQuota
+	// AI 代码分析的客户端必须跟着换：它内部持有 base_url 与密钥，
+	// 不重建的话"界面保存成功"而实际还在用旧地址调用（或仍在用已清空的密钥）。
+	payload.applyCodeAnalysisTo(s.cfg)
+	if s.onAIApplied != nil {
+		s.onAIApplied()
+	}
 	// 引擎按新配置重建：Factory 自身是 Engine 门面，各 service 持有的指针自动看到新引擎。
 	if s.factory != nil {
 		s.factory.Reload()

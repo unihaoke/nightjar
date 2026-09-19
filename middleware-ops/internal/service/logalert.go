@@ -429,93 +429,10 @@ func (s *LogAlertService) Stats(ctx context.Context, since time.Time) (map[strin
 	return map[string]any{"total": total, "by_status": counts}, nil
 }
 
-// 服务器管理 ---------------------------------------------------------------
-
-// ServerInput 是服务器入参。
-type ServerInput struct {
-	Name        string   `json:"name" binding:"required"`
-	IP          string   `json:"ip"`
-	Hostname    string   `json:"hostname"`
-	Environment string   `json:"environment"`
-	GroupName   string   `json:"group_name"`
-	Tags        []string `json:"tags"`
-}
-
-// ListServers 分页查询服务器。
-func (s *LogAlertService) ListServers(ctx context.Context, keyword, environment string, limit, offset int) ([]model.ServerInstance, int64, error) {
-	items, total, err := s.servers.List(ctx, keyword, environment, limit, offset)
-	if err != nil {
-		return nil, 0, apperr.Wrap(apperr.CodeInternal, err)
-	}
-	return items, total, nil
-}
-
-// CreateServer 新增服务器。
-func (s *LogAlertService) CreateServer(ctx context.Context, in ServerInput, operator Operator) (*model.ServerInstance, error) {
-	if strings.TrimSpace(in.Name) == "" {
-		return nil, apperr.New(apperr.CodeInvalidParam, "服务器名称不能为空")
-	}
-	item := &model.ServerInstance{
-		Name: in.Name, IP: in.IP, Hostname: in.Hostname,
-		Environment: defaultString(in.Environment, model.EnvDev),
-		GroupName:   in.GroupName, Tags: model.JSONStringSlice(in.Tags), Status: 1,
-	}
-	if err := s.servers.Create(ctx, item); err != nil {
-		return nil, apperr.Wrap(apperr.CodeInternal, err)
-	}
-	if s.audit != nil {
-		s.audit.RecordAsync(ctx, AuditEntry{
-			UserID: operator.UserID, Username: operator.Username, ActionType: "server_create",
-			Level: LevelLow, IPAddress: operator.IP, UserAgent: operator.Agent,
-			Detail: map[string]any{"server_id": item.ID, "name": item.Name, "ip": item.IP},
-		})
-	}
-	return item, nil
-}
-
-// UpdateServer 更新服务器。
-func (s *LogAlertService) UpdateServer(ctx context.Context, id int64, in ServerInput, operator Operator) (*model.ServerInstance, error) {
-	item, err := s.servers.Get(ctx, id)
-	if err != nil {
-		if repository.EnsureNotFound(err) {
-			return nil, apperr.New(apperr.CodeNotFound, "服务器不存在")
-		}
-		return nil, apperr.Wrap(apperr.CodeInternal, err)
-	}
-	item.Name = defaultString(in.Name, item.Name)
-	item.IP = in.IP
-	item.Hostname = in.Hostname
-	if in.Environment != "" {
-		item.Environment = in.Environment
-	}
-	item.GroupName = in.GroupName
-	item.Tags = model.JSONStringSlice(in.Tags)
-	if err := s.servers.Update(ctx, item); err != nil {
-		return nil, apperr.Wrap(apperr.CodeInternal, err)
-	}
-	return item, nil
-}
-
-// DeleteServer 删除服务器。
-func (s *LogAlertService) DeleteServer(ctx context.Context, id int64, operator Operator) error {
-	if _, err := s.servers.Get(ctx, id); err != nil {
-		if repository.EnsureNotFound(err) {
-			return apperr.New(apperr.CodeNotFound, "服务器不存在")
-		}
-		return apperr.Wrap(apperr.CodeInternal, err)
-	}
-	if err := s.servers.Delete(ctx, id); err != nil {
-		return apperr.Wrap(apperr.CodeInternal, err)
-	}
-	if s.audit != nil {
-		s.audit.RecordAsync(ctx, AuditEntry{
-			UserID: operator.UserID, Username: operator.Username, ActionType: "server_delete",
-			Level: LevelLow, IPAddress: operator.IP, UserAgent: operator.Agent,
-			Detail: map[string]any{"server_id": id},
-		})
-	}
-	return nil
-}
+// 服务器管理已移除：日志菜单不再提供服务器与代码仓库的维护入口。
+//
+// 数据模型（server_instances）仍然保留：日志上报会按 IP 归集到已登记的服务器，
+// 集成中心纳管实例时也依赖它——删掉的是"手工维护入口"，不是服务器的存在。
 
 // ErrorSignature 生成错误指纹：异常类名 + 错误消息模板（去变量）。
 //

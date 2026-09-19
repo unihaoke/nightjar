@@ -134,7 +134,7 @@ func TestPermissionCatalogCoversConstants(t *testing.T) {
 		PermAlertRead, PermAlertWrite, PermKnowledgeRead, PermKnowledgeWrite,
 		PermFixPreview, PermFixExecute, PermAuditRead, PermAuditSnapshot,
 		PermUserManage, PermApprovalRead, PermApprovalDecide,
-		PermLogAlertRead, PermLogAlertWrite, PermCodeAnalyze, PermServerManage,
+		PermLogAlertRead, PermLogAlertWrite, PermCodeAnalyze,
 		PermSystemOverview, PermSQLRead, PermSystemConfigRead, PermSystemConfigWrite,
 	}
 	for _, perm := range all {

@@ -12,7 +12,7 @@ router（路由表：权限点 + 操作级别的显式声明）
 middleware（追踪/恢复/限流/认证/数据权限）
    │
 service（业务编排：resource / ai / control 三域）
-   ├── resource：纳管、监控、告警、日志告警（规则 + 后处理编排）、服务器与仓库
+   ├── resource：纳管、监控、告警、日志告警（规则 + 后处理编排 + Kafka 采集链路）
    ├── ai      ：诊断编排、知识库、代码分析、上下文与 Prompt
    └── control ：认证授权、修复执行、审批、审计、通知
    │

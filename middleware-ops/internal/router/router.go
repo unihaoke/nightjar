@@ -211,10 +211,6 @@ func New(opt Options) *gin.Engine {
 		logAlerts.GET("/events", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListLogEvents)
 		logAlerts.GET("/events/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.GetLogEvent)
 		logAlerts.PUT("/events/:id/status", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.UpdateLogEventStatus)
-		logAlerts.GET("/servers", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListServers)
-		logAlerts.POST("/servers", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.CreateServer)
-		logAlerts.PUT("/servers/:id", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.UpdateServer)
-		logAlerts.DELETE("/servers/:id", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.DeleteServer)
 		// 日志集成接收链路（Kafka）：状态用于页面卡片，probe 用于「测试 Kafka 连接」按钮。
 		logAlerts.GET("/pipeline", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.LogPipelineStatus)
 		logAlerts.POST("/pipeline/probe", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.ProbeLogPipeline)

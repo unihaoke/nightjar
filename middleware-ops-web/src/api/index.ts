@@ -49,7 +49,6 @@ import type {
   Profile,
   ReanalyzeResult,
   Role,
-  ServerInstance,
   Session,
   SystemInfo,
   TestResult,
@@ -389,11 +388,6 @@ export const logAlertApi = {
     get<PageResult<LogEvent>>('/api/log-alerts/events', params, withSignal(signal)),
   event: (id: number) => get<{ event: LogEvent; analysis: CodeAnalysis | null }>(`/api/log-alerts/events/${id}`),
   updateStatus: (id: number, status: string) => put<{ message: string }>(`/api/log-alerts/events/${id}/status`, { status }),
-  servers: (params: PageQuery, signal?: AbortSignal) =>
-    get<PageResult<ServerInstance>>('/api/log-alerts/servers', params, withSignal(signal)),
-  createServer: (payload: Partial<ServerInstance>) => post<ServerInstance>('/api/log-alerts/servers', payload),
-  updateServer: (id: number, payload: Partial<ServerInstance>) => put<ServerInstance>(`/api/log-alerts/servers/${id}`, payload),
-  removeServer: (id: number) => del<{ message: string }>(`/api/log-alerts/servers/${id}`),
   /** 平台自带 Kafka 的采集链路现状（Filebeat 推送到平台 Kafka 后由消费者入库）。 */
   pipeline: () => get<LogPipelineStatus>('/api/log-alerts/pipeline'),
   /** 测试 Kafka 连接：失败也返回 ok=false 与原因，不抛错。 */

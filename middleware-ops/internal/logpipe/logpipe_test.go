@@ -141,7 +141,7 @@ func TestParseTimestamp(t *testing.T) {
 
 // TestNewDisabled 校验"没配 broker 就不启动消费者"：平台必须能在没有 Kafka 的环境下启动。
 func TestNewDisabled(t *testing.T) {
-	ingest := func(context.Context, Record) error { return nil }
+	ingest := func(context.Context, Record) (IngestOutcome, error) { return IngestOutcome{}, nil }
 	if c := New(Options{Ingest: ingest}); c != nil {
 		t.Fatal("brokers 为空时应返回 nil（未启用日志接入）")
 	}
@@ -166,7 +166,7 @@ func TestConsumerStartAndClose(t *testing.T) {
 	consumer := New(Options{
 		Brokers: []string{"127.0.0.1:1"}, // 必然连不上，且失败很快
 		Topic:   "mwops-logs", GroupID: "test-group", ClientID: "test",
-		Ingest: func(context.Context, Record) error { return nil },
+		Ingest: func(context.Context, Record) (IngestOutcome, error) { return IngestOutcome{}, nil },
 		Log:    zap.NewNop(),
 	})
 	if consumer == nil {

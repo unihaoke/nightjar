@@ -36,7 +36,6 @@ const (
 	PermLogAlertRead      = "logalert:read"
 	PermLogAlertWrite     = "logalert:write"
 	PermCodeAnalyze       = "code:analyze"
-	PermServerManage      = "server:manage"
 	PermSystemOverview    = "system:overview"
 	PermSQLRead           = "sql:read"
 	PermSystemConfigRead  = "system:config"
@@ -58,7 +57,7 @@ var rolePermissions = map[string][]string{
 		PermAlertRead, PermAlertWrite, PermKnowledgeRead, PermKnowledgeWrite,
 		PermFixPreview, PermFixExecute, PermAuditRead, PermAuditSnapshot,
 		PermUserManage, PermApprovalRead, PermApprovalDecide,
-		PermLogAlertRead, PermLogAlertWrite, PermCodeAnalyze, PermServerManage,
+		PermLogAlertRead, PermLogAlertWrite, PermCodeAnalyze,
 		PermSystemOverview, PermSQLRead, PermSystemConfigRead, PermSystemConfigWrite,
 	},
 	RoleOps: {
@@ -66,7 +65,7 @@ var rolePermissions = map[string][]string{
 		PermAlertRead, PermAlertWrite, PermKnowledgeRead, PermKnowledgeWrite,
 		PermFixPreview, PermFixExecute, PermAuditRead,
 		PermApprovalRead, PermLogAlertRead, PermLogAlertWrite, PermCodeAnalyze,
-		PermServerManage, PermSystemOverview, PermSQLRead, PermSystemConfigRead,
+		PermSystemOverview, PermSQLRead, PermSystemConfigRead,
 	},
 	RoleDev: {
 		PermMiddlewareRead, PermMonitorRead, PermAIUse,
@@ -408,7 +407,7 @@ func AllPermissionCatalog() []map[string]any {
 			{PermAuditRead, "查看审计日志"}, {PermAuditSnapshot, "生成/校验审计快照"},
 		}},
 		{"系统", []struct{ code, name string }{
-			{PermUserManage, "用户与角色管理"}, {PermServerManage, "服务器管理"},
+			{PermUserManage, "用户与角色管理"},
 			{PermSystemOverview, "查看全局大盘"}, {PermSystemConfigRead, "查看系统配置"},
 			{PermSystemConfigWrite, "修改系统配置"},
 		}},

@@ -439,9 +439,25 @@ export interface LogPipelineStatus {
   group_id: string
   /** 消费者是否正在运行。 */
   running: boolean
+  /**
+   * 本次进程启动以来的计数（重启归零）。
+   *
+   * 口径：consumed = ingested + ignored；dropped（脏消息）与 failed（入库失败重试中）
+   * 不计入 consumed——它们没有真正进入平台，混在一起就会让"已消费"永远对不上。
+   */
   consumed: number
   dropped: number
   failed: number
+  /** 真正入库（新增或合并进既有事件）的条数。 */
+  ingested: number
+  /** 平台按配置有意不入库的条数（命中屏蔽项 / 未命中任何告警规则）。 */
+  ignored: number
+  /** 含历史累计的总量：跨重启、跨副本累加（persistent=false 时等于本次计数）。 */
+  consumed_total: number
+  dropped_total: number
+  failed_total: number
+  /** 累计值是否已落库；false 表示页面上的"累计"其实只有本次启动以来。 */
+  persistent: boolean
   /** 最近一条成功入库的消息时间；空串表示还没有数据。 */
   last_message_at: string
   last_error: string
@@ -832,19 +848,6 @@ export interface CodeAnalysis {
   created_at: string
 }
 
-/** 服务器实例。 */
-export interface ServerInstance {
-  id: number
-  name: string
-  ip: string
-  hostname: string
-  environment: string
-  group_name: string
-  status: number
-  tags: string[] | null
-  last_seen_at?: string
-}
-
 /** 大盘总览。 */
 export interface Overview {
   instances: { online: number; offline: number; total: number; by_type: Record<string, number> }
@@ -950,12 +953,59 @@ export interface AIProviderSetting {
   price_per_k_token: number
 }
 
+/**
+ * AI 代码分析（日志告警用的外部服务）视图。
+ *
+ * 两把密钥（api_key / callback_token）都只有 *_set 与掩码，明文永不回显。
+ */
+export interface AIAnalysisSetting {
+  enabled: boolean
+  base_url: string
+  api_key_set: boolean
+  api_key_masked: string
+  submit_path: string
+  query_path: string
+  callback_url: string
+  callback_token_set: boolean
+  callback_token_masked: string
+  /** 形如 "15s"，空串沿用原值。 */
+  timeout: string
+  task_timeout: string
+  poll_interval: string
+  poll_batch: number
+  sync_mode: boolean
+  notify_on_submit: boolean
+  /** 是否真的具备调用条件（开关已开且地址非空）。 */
+  configured: boolean
+}
+
+/** AI 代码分析入参：密钥三态（不填 = 不变，clear_* = 清空）。 */
+export interface AIAnalysisInput {
+  enabled: boolean
+  base_url: string
+  api_key?: string
+  clear_api_key?: boolean
+  submit_path: string
+  query_path: string
+  callback_url: string
+  callback_token?: string
+  clear_callback_token?: boolean
+  timeout: string
+  task_timeout: string
+  poll_interval: string
+  poll_batch: number
+  sync_mode: boolean
+  notify_on_submit: boolean
+}
+
 /** AI 设置视图（GET /api/settings/ai）。 */
 export interface AISettingsView {
   /** third_party | self_hosted | hybrid */
   strategy: string
   third_party: AIProviderSetting
   self_hosted: AIProviderSetting
+  /** AI 代码分析：由平台托管（加密落库，保存即生效）。 */
+  code_analysis: AIAnalysisSetting
   daily_token_quota: number
   per_user_daily_quota: number
   updated_by: string
@@ -983,6 +1033,7 @@ export interface AISettingsInput {
   strategy: string
   third_party: AIProviderInput
   self_hosted: AIProviderInput
+  code_analysis: AIAnalysisInput
   daily_token_quota: number
   per_user_daily_quota: number
 }

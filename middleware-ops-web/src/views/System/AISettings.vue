@@ -170,6 +170,28 @@ async function load(): Promise<void> {
       apiKeyDraft[item.key] = ''
       apiKeyClear[item.key] = false
     }
+    const ca = data.code_analysis
+    if (ca) {
+      Object.assign(codeAnalysis, {
+        enabled: ca.enabled ?? false,
+        base_url: ca.base_url || '',
+        submit_path: ca.submit_path || '/v1/analyses',
+        query_path: ca.query_path || '/v1/analyses/{task_id}',
+        callback_url: ca.callback_url || '',
+        timeout: ca.timeout || '15s',
+        task_timeout: ca.task_timeout || '30m',
+        poll_interval: ca.poll_interval || '60s',
+        poll_batch: ca.poll_batch ?? 20,
+        sync_mode: ca.sync_mode ?? false,
+        notify_on_submit: ca.notify_on_submit ?? false,
+      })
+      analysisKeyMasked.api_key = ca.api_key_masked || ''
+      analysisKeyMasked.callback_token = ca.callback_token_masked || ''
+    }
+    analysisKeyDraft.api_key = ''
+    analysisKeyDraft.callback_token = ''
+    analysisKeyClear.api_key = false
+    analysisKeyClear.callback_token = false
   } catch (error) {
     toastError(error)
   } finally {
@@ -185,6 +207,77 @@ async function loadUsage(): Promise<void> {
     usage.value = null
     toastError(error)
   }
+}
+
+/**
+ * AI 代码分析（日志告警用的外部服务）表单。
+ *
+ * 与两个提供方同页管理：地址与密钥只有平台这一个来源，保存后立刻重建客户端生效。
+ */
+const codeAnalysis = reactive({
+  enabled: false,
+  base_url: '',
+  submit_path: '/v1/analyses',
+  query_path: '/v1/analyses/{task_id}',
+  callback_url: '',
+  timeout: '15s',
+  task_timeout: '30m',
+  poll_interval: '60s',
+  poll_batch: 20,
+  sync_mode: false,
+  notify_on_submit: false,
+})
+
+/** 两把密钥的草稿（明文永不回显，只用于"这次要不要改"）。 */
+const analysisKeyDraft = reactive({ api_key: '', callback_token: '' })
+/** 清除标记：点了「清除」才会在保存时下发 clear_*。 */
+const analysisKeyClear = reactive({ api_key: false, callback_token: false })
+/** 后端返回的掩码，仅用于 placeholder。 */
+const analysisKeyMasked = reactive({ api_key: '', callback_token: '' })
+
+/** 填入新密钥即撤销「清除」标记（新值优先）。 */
+function onAnalysisKeyInput(field: 'api_key' | 'callback_token'): void {
+  if (analysisKeyDraft[field]) {
+    analysisKeyClear[field] = false
+  }
+}
+
+/** 切换清除标记。 */
+function toggleAnalysisClear(field: 'api_key' | 'callback_token'): void {
+  analysisKeyClear[field] = !analysisKeyClear[field]
+  if (analysisKeyClear[field]) {
+    analysisKeyDraft[field] = ''
+  }
+}
+
+/** 组装 AI 代码分析入参：空密钥不下发，避免把占位符写进后端。 */
+function buildCodeAnalysis(): AISettingsInput['code_analysis'] {
+  const payload: AISettingsInput['code_analysis'] = {
+    enabled: codeAnalysis.enabled,
+    base_url: codeAnalysis.base_url,
+    submit_path: codeAnalysis.submit_path,
+    query_path: codeAnalysis.query_path,
+    callback_url: codeAnalysis.callback_url,
+    timeout: codeAnalysis.timeout,
+    task_timeout: codeAnalysis.task_timeout,
+    poll_interval: codeAnalysis.poll_interval,
+    poll_batch: Number(codeAnalysis.poll_batch) || 20,
+    sync_mode: codeAnalysis.sync_mode,
+    notify_on_submit: codeAnalysis.notify_on_submit,
+  }
+  if (analysisKeyDraft.api_key.trim()) {
+    payload.api_key = analysisKeyDraft.api_key.trim()
+  }
+  if (analysisKeyClear.api_key) {
+    payload.clear_api_key = true
+  }
+  if (analysisKeyDraft.callback_token.trim()) {
+    payload.callback_token = analysisKeyDraft.callback_token.trim()
+  }
+  if (analysisKeyClear.callback_token) {
+    payload.clear_callback_token = true
+  }
+  return payload
 }
 
 /** 新填了密钥就不再请求清空（新值优先）。 */
@@ -242,6 +335,7 @@ async function save(): Promise<void> {
       strategy: form.strategy,
       third_party: buildProvider('third_party'),
       self_hosted: buildProvider('self_hosted'),
+      code_analysis: buildCodeAnalysis(),
       daily_token_quota: Number(form.daily_token_quota) || 0,
       per_user_daily_quota: Number(form.per_user_daily_quota) || 0,
     }
@@ -536,6 +630,160 @@ onMounted(async () => {
       <div v-if="canWrite" class="row actions">
         <el-button type="primary" :loading="saving" :icon="'Check'" @click="save">保存 AI 设置</el-button>
       </div>
+    </div>
+
+    <!-- AI 代码分析：日志告警把问题提交给外部服务，结论由回调/轮询带回 -->
+    <div class="card">
+      <h3 class="card-title">
+        <span>AI 代码分析</span>
+        <span class="muted head-note">日志告警用；平台是唯一来源，保存即生效</span>
+      </h3>
+      <p class="field-hint">
+        日志告警把「问题」（脱敏后的错误信息 + 堆栈）提交给这个服务，由它完成代码分析；
+        结论通过回调 <span class="mono">/api/ai/analysis/callback</span> 或平台轮询取回，再送进通知。
+      </p>
+      <el-alert
+        v-if="!codeAnalysis.enabled || !codeAnalysis.base_url"
+        class="mb-top"
+        type="info"
+        :closable="false"
+        show-icon
+        title="当前不会做 AI 分析"
+      >
+        <p class="field-hint">
+          开关未开或服务地址为空时，日志事件的分析状态会明确标为「未启用」并写明原因，不会假装排队。
+        </p>
+      </el-alert>
+
+      <el-form label-position="top" :disabled="!canWrite">
+        <el-row :gutter="12">
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="服务地址 Base URL">
+              <el-input v-model="codeAnalysis.base_url" class="mono" placeholder="如 http://ai.internal:8000" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="启用与生效状态">
+              <div class="row">
+                <el-switch v-model="codeAnalysis.enabled" active-text="启用" />
+                <el-tag size="small" :type="view?.code_analysis?.configured ? 'success' : 'info'" effect="light">
+                  {{ view?.code_analysis?.configured ? '已生效' : '未生效' }}
+                </el-tag>
+              </div>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="API Key（调用凭据）">
+              <div class="row key-row">
+                <el-input
+                  v-model="analysisKeyDraft.api_key"
+                  type="password"
+                  show-password
+                  autocomplete="new-password"
+                  class="key-input"
+                  :placeholder="analysisKeyMasked.api_key ? `已保存：${analysisKeyMasked.api_key}，留空表示不修改` : '尚未配置，填写后保存'"
+                  @input="onAnalysisKeyInput('api_key')"
+                />
+                <el-button
+                  :type="analysisKeyClear.api_key ? 'danger' : 'default'"
+                  :plain="analysisKeyClear.api_key"
+                  :icon="'Delete'"
+                  @click="toggleAnalysisClear('api_key')"
+                >
+                  {{ analysisKeyClear.api_key ? '取消清除' : '清除' }}
+                </el-button>
+              </div>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="回调令牌（AI 服务回传结论时校验）">
+              <div class="row key-row">
+                <el-input
+                  v-model="analysisKeyDraft.callback_token"
+                  type="password"
+                  show-password
+                  autocomplete="new-password"
+                  class="key-input"
+                  :placeholder="analysisKeyMasked.callback_token ? `已保存：${analysisKeyMasked.callback_token}，留空表示不修改` : '未配置则拒收所有回调（改由轮询兜底）'"
+                  @input="onAnalysisKeyInput('callback_token')"
+                />
+                <el-button
+                  :type="analysisKeyClear.callback_token ? 'danger' : 'default'"
+                  :plain="analysisKeyClear.callback_token"
+                  :icon="'Delete'"
+                  @click="toggleAnalysisClear('callback_token')"
+                >
+                  {{ analysisKeyClear.callback_token ? '取消清除' : '清除' }}
+                </el-button>
+              </div>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="提交路径">
+              <el-input v-model="codeAnalysis.submit_path" class="mono" placeholder="/v1/analyses" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="查询路径">
+              <el-input v-model="codeAnalysis.query_path" class="mono" placeholder="/v1/analyses/{task_id}" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="24">
+            <el-form-item label="回调地址（平台对外地址）">
+              <el-input
+                v-model="codeAnalysis.callback_url"
+                class="mono"
+                placeholder="如 http://platform.example.com；反向代理后填对外域名"
+              />
+              <p class="field-hint">
+                AI 服务要能访问到这个地址；留空则不带 callback_url，结论只由轮询兜底。
+              </p>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :sm="6">
+            <el-form-item label="单次请求超时">
+              <el-input v-model="codeAnalysis.timeout" class="mono" placeholder="15s" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :sm="6">
+            <el-form-item label="任务超时">
+              <el-input v-model="codeAnalysis.task_timeout" class="mono" placeholder="30m" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :sm="6">
+            <el-form-item label="轮询间隔">
+              <el-input v-model="codeAnalysis.poll_interval" class="mono" placeholder="60s" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :sm="6">
+            <el-form-item label="每轮轮询条数">
+              <el-input-number
+                v-model="codeAnalysis.poll_batch"
+                :min="1"
+                :max="200"
+                controls-position="right"
+                class="mobile-block"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="同步返回结论">
+              <div class="row">
+                <el-switch v-model="codeAnalysis.sync_mode" />
+                <span class="muted">AI 服务在提交时就给出结论（不进等待队列）</span>
+              </div>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="提交即通知">
+              <div class="row">
+                <el-switch v-model="codeAnalysis.notify_on_submit" />
+                <span class="muted">先发一条告警，结论到达后再发一条（一条告警变两条消息）</span>
+              </div>
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
     </div>
 
     <!-- 额度与消费 -->

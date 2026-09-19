@@ -65,7 +65,6 @@ const groups: NavGroup[] = [
       { name: 'log-alerts', title: '日志告警', icon: 'Document', permission: 'logalert:read' },
       // 分组内顺序与「治理」一致：先事件列表，再规则（规则解释事件为什么被合并/静默）。
       { name: 'log-alert-rules', title: '日志告警规则', icon: 'Filter', permission: 'logalert:read' },
-      { name: 'servers', title: '服务器与仓库', icon: 'Monitor', permission: 'logalert:read' },
     ],
   },
   {

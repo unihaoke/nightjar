@@ -350,7 +350,7 @@ func analysisDecision(rule model.LogAlertRule, service string, analysisReady boo
 	}
 	if !analysisReady {
 		return model.LogAnalysisDisabled,
-			"平台未装配 AI 分析能力（请配置 ai_analysis.base_url 并打开 ai_analysis.enabled）"
+			"平台未装配 AI 分析能力（请在「AI 设置 → AI 代码分析」中启用并填写服务地址）"
 	}
 	_ = service
 	return "", ""

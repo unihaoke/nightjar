@@ -338,6 +338,22 @@ CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_service_name ON ai_analysis_tas
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_status ON ai_analysis_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_deadline_at ON ai_analysis_tasks(deadline_at);
 
+-- 日志消费链路的累计计数（按 topic + 消费组一行）：跨重启、跨副本累加。
+CREATE TABLE IF NOT EXISTS kafka_consume_stats (
+    id           BIGSERIAL PRIMARY KEY,
+    created_at   TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ,
+    topic        VARCHAR(128),
+    group_id     VARCHAR(128),
+    consumed     BIGINT DEFAULT 0,
+    ingested     BIGINT DEFAULT 0,
+    ignored      BIGINT DEFAULT 0,
+    dropped      BIGINT DEFAULT 0,
+    failed       BIGINT DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_kafka_consume_stats_topic ON kafka_consume_stats(topic);
+CREATE INDEX IF NOT EXISTS idx_kafka_consume_stats_group_id ON kafka_consume_stats(group_id);
+
 CREATE TABLE IF NOT EXISTS log_alert_events (
     id               BIGSERIAL PRIMARY KEY,
     created_at       TIMESTAMPTZ,

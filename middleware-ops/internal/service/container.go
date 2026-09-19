@@ -69,6 +69,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Fixes = repository.NewFixRepository(opt.DB)
 	deps.Servers = repository.NewServerRepository(opt.DB)
 	deps.AIAnalysisTasks = repository.NewAIAnalysisTaskRepository(opt.DB)
+	deps.KafkaStats = repository.NewKafkaConsumeStatRepository(opt.DB)
 	deps.LogEvents = repository.NewLogEventRepository(opt.DB)
 	deps.LogAlertRules = repository.NewLogAlertRuleRepository(opt.DB)
 	deps.LogAlertExclusions = repository.NewLogAlertExclusionRepository(opt.DB)
@@ -152,7 +153,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 		deps.LogAlertRules, deps.LogAlertExclusions, cfg, opt.Cache, deps.Audit, opt.Log)
 	// 日志集成的接收链路（Filebeat → 平台 Kafka → 日志事件）。
 	// 只装配不启动：启动时机由 main 决定（跟随进程生命周期），未配置 Kafka 时它是空转的安全对象。
-	deps.LogPipeline = NewLogPipeline(cfg, deps.LogAlert, opt.Log)
+	deps.LogPipeline = NewLogPipeline(cfg, deps.LogAlert, deps.KafkaStats, opt.Log)
 	// 集成中心：把 Exporter 暴露 + Prometheus 抓取 + 实例纳管 + 告警规则串成一次点击。
 	deps.Integration = NewIntegrationService(cfg, deps.Instances, deps.Servers, opt.Cipher,
 		deps.AlertSvc, deps.Audit, deps.Approval, opt.Monitor, opt.Log)
@@ -169,6 +170,8 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	redactor := NewRedactor(&cfg.Security)
 	deps.CodeAnalysis = NewCodeAnalysisService(cfg, deps.LogEvents, deps.CodeAnalyses,
 		deps.AIAnalysisTasks, redactor, deps.Audit, deps.Cost, opt.Log)
+	// 「AI 设置」里保存 AI 代码分析后，客户端必须按新配置重建（地址/密钥都在它内部）。
+	deps.Settings.SetAIAppliedHook(deps.CodeAnalysis.Reload)
 	// 日志告警的后处理：把"已落库但还没通知/还没分析"的事件推进到结论。
 	// AI 分析走异步：worker 只负责"提交任务"与"收到结论后收尾"，慢分析不再占用 worker。
 	deps.LogAlertWorker = NewLogAlertWorker(LogAlertWorkerDeps{

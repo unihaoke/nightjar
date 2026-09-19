@@ -555,6 +555,24 @@ type PlatformSetting struct {
 // TableName 显式指定表名，避免 GORM 复数化差异。
 func (PlatformSetting) TableName() string { return "platform_settings" }
 
+// KafkaConsumeStat 是日志消费链路的**累计**计数（按 topic + 消费组一行）。
+//
+// 为什么要有它：消费者的 consumed 原本只是进程内的原子计数，容器重建后归零，
+// 而 Kafka 位点已经提交、消息不会重投——页面上的"已消费条数"因此永远小于
+// 真正消费过的总量。落库后页面给出的是可跨重启、跨副本累加的累计值。
+type KafkaConsumeStat struct {
+	Base
+	Topic    string `gorm:"size:128;index" json:"topic"`
+	GroupID  string `gorm:"size:128;index" json:"group_id"`
+	Consumed int64  `json:"consumed"`
+	// Ingested 为真正入库（新增或合并进既有事件）的条数。
+	Ingested int64 `json:"ingested"`
+	// Ignored 为平台有意不入库的条数（命中屏蔽项 / 未命中规则）。
+	Ignored int64 `json:"ignored"`
+	Dropped int64 `json:"dropped"`
+	Failed  int64 `json:"failed"`
+}
+
 // MigrationList 返回 AutoMigrate 所需的实体顺序（外键语义上先主后从）。
 func MigrationList() []any {
 	return []any{
@@ -566,6 +584,7 @@ func MigrationList() []any {
 		&AuditLog{}, &AuditSnapshot{},
 		&Approval{}, &FixRecord{},
 		&ServerInstance{}, &LogAlertEvent{}, &LogAlertRule{}, &LogAlertExclusion{}, &AICodeAnalysis{}, &AIAnalysisTask{},
+		&KafkaConsumeStat{},
 		&NotificationLog{},
 		&PlatformSetting{},
 	}

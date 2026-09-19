@@ -50,6 +50,8 @@ type Deps struct {
 	LogEvents     *repository.LogEventRepository
 	// AIAnalysisTasks 为异步 AI 分析任务仓储（提交—回调—超时）。
 	AIAnalysisTasks *repository.AIAnalysisTaskRepository
+	// KafkaStats 为日志消费链路的累计计数仓储（跨重启、跨副本累加）。
+	KafkaStats *repository.KafkaConsumeStatRepository
 	LogAlertRules *repository.LogAlertRuleRepository
 	// LogAlertExclusions 为日志告警屏蔽项仓储（"这类错误不告警"）。
 	LogAlertExclusions *repository.LogAlertExclusionRepository

@@ -190,7 +190,10 @@ kafka:
   # 单条日志消息上限：堆栈可能很长，与 Filebeat 的 max_message_bytes 同量级。
   max_bytes: 10485760
   session_timeout: 30s
-  commit_interval: 1s
+  # commit_interval **已废弃且被忽略**：位点只由业务侧在处理成功（或确认丢弃）后手动提交。
+  # 自动提交会把"落库失败、正等着重试"的消息位点也推过去——那条日志就此丢失，
+  # 而 Kafka 侧认为它已消费，这正是"消费条数对不上"里最难查的一部分差值。
+  commit_interval: 0s
   # earliest：首次消费从头开始（宁可重复，不漏）；latest：只消费新消息。
   start_offset: earliest
 
@@ -212,30 +215,14 @@ log_alert:
   analyze_timeout: 2m
 
 # ---------------------------------------------------------------------------
-# 外部 AI 分析服务（日志告警用）：提交问题 → 回调/轮询 → 结论
+# AI 代码分析（日志告警用的外部服务）**不在本文件里配置**
 #
-# 为什么不再 clone 代码：代码分析交给专门的 AI 服务（它自己有代码与上下文），
-# 平台只负责把问题（脱敏后的错误信息与堆栈）问出去、把答案收回来并送进通知。
-# 平台因此不再持有任何代码副本，也不再有「把代码片段外发」这个合规面。
+# 它由「AI 设置 → AI 代码分析」界面管理：密钥 AES-256-GCM 加密落库、保存即生效，
+# 平台库是唯一来源（本文件与 .env 都不再提供 ai_analysis.*，写了也不会生效）。
+#
+# 链路：平台把问题（脱敏后的错误信息 + 堆栈）提交给该服务 → 它做代码分析 →
+# 回调 /api/ai/analysis/callback 或由平台轮询取回结论 → 写进通知。
 # ---------------------------------------------------------------------------
-ai_analysis:
-  enabled: false
-  base_url: ""
-  api_key: ""
-  submit_path: /v1/analyses
-  query_path: /v1/analyses/{task_id}
-  callback_url: ""
-  callback_token: ""
-  timeout: 15s
-  # 任务级超时：超过它仍没有结论就按超时收尾（事件不能永远停在「分析中」）
-  task_timeout: 30m
-  # 轮询兜底的间隔与每轮批量（回调丢失时靠它把结论取回来）
-  poll_interval: 60s
-  poll_batch: 20
-  # AI 服务在提交时就同步返回结论时打开
-  sync_mode: false
-  # 提交后立即先发一条（不带结论的）告警通知，结论到达后再发一条
-  notify_on_submit: false
 notify:
   # webhook / secret / password 已改由平台「系统设置 → 通知设置」管理（加密落库、保存即生效）。
   # 这里保留字段仅作兜底：首次启动时平台会把这里的非空值导入库（并在日志里说明），

@@ -129,7 +129,7 @@ func TestLogPipelineStatusJSONContract(t *testing.T) {
 func TestLogPipelineStatusExplainsWhyEmpty(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Kafka.Enabled = false
-	pipeline := NewLogPipeline(cfg, nil, nil)
+	pipeline := NewLogPipeline(cfg, nil, nil, nil)
 
 	status := pipeline.Status()
 	if status.Running || status.Consumed != 0 {

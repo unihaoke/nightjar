@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -37,7 +38,10 @@ type engineGuard interface {
 //  1. 出网白名单（security.outbound_whitelist）：服务不在名单里就不许问外部 AI；
 //  2. 脱敏：错误信息与堆栈在送出前先过一遍脱敏器（IP/手机号/邮箱/口令…）。
 type CodeAnalysisService struct {
-	cfg      *config.Config
+	cfg  *config.Config
+	mu   sync.RWMutex
+	// client 由「AI 设置」保存时热替换，所以读写都要过 mu：
+	// 提交链路正在用旧客户端发请求时，管理员点了保存，不能让读方拿到半个新对象。
 	client   *AIAnalysisClient
 	events   *repository.LogEventRepository
 	analyses *repository.CodeAnalysisRepository
@@ -46,6 +50,33 @@ type CodeAnalysisService struct {
 	audit    *AuditService
 	cost     engineGuard
 	log      *zap.Logger
+}
+
+// Reload 按当前内存配置重建 AI 分析客户端（「AI 设置」保存后即时生效）。
+func (s *CodeAnalysisService) Reload() {
+	if s == nil {
+		return
+	}
+	var next *AIAnalysisClient
+	if s.cfg != nil {
+		next = NewAIAnalysisClient(s.cfg.AIAnalysis, s.log)
+	}
+	s.mu.Lock()
+	s.client = next
+	s.mu.Unlock()
+	if next != nil && next.Configured() {
+		s.log.Info("AI 代码分析服务已按平台设置生效", zap.String("base_url", s.cfg.AIAnalysis.BaseURL))
+	}
+}
+
+// currentClient 取当前客户端快照。
+func (s *CodeAnalysisService) currentClient() *AIAnalysisClient {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.client
 }
 
 // NewCodeAnalysisService 构造代码分析服务。
@@ -77,7 +108,8 @@ func NewCodeAnalysisService(
 // 没配置时不能"假装能分析"：调用方据此把事件置为 disabled 并写明原因，
 // 而不是让它一直停在待分析队列里。
 func (s *CodeAnalysisService) Ready() bool {
-	return s != nil && s.client != nil && s.client.Configured()
+	client := s.currentClient()
+	return client != nil && client.Configured()
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +249,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	}
 	if !s.Ready() {
 		return nil, apperr.New(apperr.CodeOutboundDenied,
-			"未配置外部 AI 分析服务：请设置 ai_analysis.base_url 并把 ai_analysis.enabled 打开")
+			"未配置外部 AI 分析服务：请在「AI 设置 → AI 代码分析」中启用并填写服务地址")
 	}
 	if s.cost != nil && operator.UserID > 0 {
 		if err := s.cost.Check(operator.UserID); err != nil {
@@ -240,7 +272,12 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	// ③ 提交：平台先生成 task_id（幂等键），AI 服务不认就以它返回的为准。
 	taskID := newAnalysisTaskID(in.EventID)
 	deadline := time.Now().UTC().Add(s.taskTimeout())
-	res, err := s.client.Submit(ctx, SubmitInput{
+	client := s.currentClient()
+	if client == nil {
+		return nil, apperr.New(apperr.CodeOutboundDenied,
+			"未配置外部 AI 分析服务：请在「AI 设置 → AI 代码分析」中填写服务地址并启用")
+	}
+	res, err := client.Submit(ctx, SubmitInput{
 		TaskID:      taskID,
 		Service:     serviceName,
 		Question:    question,
@@ -434,13 +471,14 @@ func (s *CodeAnalysisService) PendingTasks(ctx context.Context, limit int) ([]mo
 // 只在"已经过了最小等待时间"时才查：刚提交就去查，既浪费一次请求，
 // 也容易让还没开始处理的任务被误判。最小等待时间取轮询间隔的一半。
 func (s *CodeAnalysisService) RefreshTask(ctx context.Context, task model.AIAnalysisTask) (*Completion, bool, error) {
-	if s == nil || s.client == nil {
+	client := s.currentClient()
+	if client == nil {
 		return nil, false, nil
 	}
 	if wait := s.pollInterval() / 2; wait > 0 && time.Since(task.CreatedAt) < wait {
 		return nil, false, nil
 	}
-	res, err := s.client.Query(ctx, task.TaskID)
+	res, err := client.Query(ctx, task.TaskID)
 	if err != nil {
 		return nil, false, err
 	}

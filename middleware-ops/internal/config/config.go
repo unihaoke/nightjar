@@ -536,7 +536,6 @@ func (c *Config) applyEnvOnly() {
 		c.Kafka.Brokers = splitAndTrim(raw)
 	}
 	c.applyEnvLogAlert()
-	c.applyEnvAIAnalysis()
 }
 
 // envOf 读取平台环境变量（MWOPS_ + 键名大写、点转下划线）。
@@ -568,62 +567,10 @@ func (c *Config) applyEnvLogAlert() {
 	}
 }
 
-// applyEnvAIAnalysis 用环境变量覆盖外部 AI 分析服务的对接参数。
-func (c *Config) applyEnvAIAnalysis() {
-	if raw, ok := envOf("ai_analysis.enabled"); ok {
-		c.AIAnalysis.Enabled = parseBool(raw, c.AIAnalysis.Enabled)
-	}
-	if raw, ok := envOf("ai_analysis.base_url"); ok {
-		if v := strings.TrimSpace(raw); v != "" {
-			c.AIAnalysis.BaseURL = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.api_key"); ok {
-		c.AIAnalysis.APIKey = strings.TrimSpace(raw)
-	}
-	if raw, ok := envOf("ai_analysis.submit_path"); ok {
-		if v := strings.TrimSpace(raw); v != "" {
-			c.AIAnalysis.SubmitPath = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.query_path"); ok {
-		if v := strings.TrimSpace(raw); v != "" {
-			c.AIAnalysis.QueryPath = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.callback_url"); ok {
-		c.AIAnalysis.CallbackURL = strings.TrimSpace(raw)
-	}
-	if raw, ok := envOf("ai_analysis.callback_token"); ok {
-		c.AIAnalysis.CallbackToken = strings.TrimSpace(raw)
-	}
-	if raw, ok := envOf("ai_analysis.timeout"); ok {
-		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
-			c.AIAnalysis.Timeout = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.task_timeout"); ok {
-		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
-			c.AIAnalysis.TaskTimeout = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.poll_interval"); ok {
-		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
-			c.AIAnalysis.PollInterval = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.poll_batch"); ok {
-		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
-			c.AIAnalysis.PollBatch = v
-		}
-	}
-	if raw, ok := envOf("ai_analysis.sync_mode"); ok {
-		c.AIAnalysis.SyncMode = parseBool(raw, c.AIAnalysis.SyncMode)
-	}
-	if raw, ok := envOf("ai_analysis.notify_on_submit"); ok {
-		c.AIAnalysis.NotifyOnSubmit = parseBool(raw, c.AIAnalysis.NotifyOnSubmit)
-	}
-}
+// AI 代码分析**不支持**环境变量覆盖：它的唯一来源是「AI 设置」界面（加密落库、保存即生效）。
+//
+// 与 AI 提供方同一套约定：地址与密钥若还能从 .env 读进来，就会出现
+// "界面改完、重启又变回旧值"——管理员会以为平台设置不生效。
 
 // parseBool 解析开关型环境变量；无法识别时保留原值（不静默改成 false）。
 func parseBool(raw string, fallback bool) bool {

@@ -310,26 +310,54 @@ async function copyHookExample(): Promise<void> {
         <el-row v-if="pipeline.enabled" :gutter="12" class="mb">
           <el-col :xs="12" :sm="8">
             <StatCard
-              label="已消费条数"
-              :value="pipeline.consumed"
+              label="累计已消费"
+              :value="pipeline.consumed_total"
               :status="pipeline.running ? 'ok' : 'neutral'"
-              hint="平台从 Kafka 取到并尝试入库的消息数"
+              :hint="pipeline.persistent
+                ? '跨重启、跨副本累加的历史总量（与 Kafka 消费组的已提交位点同口径）'
+                : '未启用计数落库，此值等于本次启动以来的条数'"
+            />
+          </el-col>
+          <el-col :xs="12" :sm="8">
+            <StatCard
+              label="入库条数"
+              :value="pipeline.ingested"
+              :status="'ok'"
+              hint="真正进入日志事件的条数（窗口内同指纹会合并进既有事件，因此它可能小于事件新增数）"
+            />
+          </el-col>
+          <el-col :xs="24" :sm="8">
+            <StatCard
+              label="有意忽略"
+              :value="pipeline.ignored"
+              :status="pipeline.ignored > 0 ? 'warning' : 'neutral'"
+              hint="命中屏蔽项或未命中任何告警规则：平台处理了但按配置不入库（已消费 = 入库 + 有意忽略）"
+            />
+          </el-col>
+        </el-row>
+        <el-row v-if="pipeline.enabled" :gutter="12" class="mb">
+          <el-col :xs="12" :sm="8">
+            <StatCard
+              label="本次启动以来"
+              :value="pipeline.consumed"
+              :status="'neutral'"
+              hint="进程重启会归零；用来判断现在是否仍在收日志"
             />
           </el-col>
           <el-col :xs="12" :sm="8">
             <StatCard
               label="丢弃条数"
-              :value="pipeline.dropped"
-              :status="pipeline.dropped > 0 ? 'warning' : 'neutral'"
-              hint="解析失败被跳过的脏消息（照常提交位点，不堵住分区）"
+              :value="pipeline.dropped_total"
+              :status="pipeline.dropped_total > 0 ? 'warning' : 'neutral'"
+              hint="解析失败被跳过的脏消息（照常提交位点，因此 Kafka 侧算已消费，平台不计入）"
             />
           </el-col>
           <el-col :xs="24" :sm="8">
             <StatCard
               label="失败条数"
-              :value="pipeline.failed"
-              :status="pipeline.failed > 0 ? 'critical' : 'neutral'"
-              hint="入库失败（会重试，成功前不提交位点）"
+              :value="pipeline.failed_total"
+              :status="pipeline.failed_total > 0 ? 'critical' : 'neutral'"
+              hint="入库失败（成功前不提交位点，会重试同一条）"
             />
           </el-col>
         </el-row>

@@ -386,7 +386,6 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | GET | `/api/log-alerts/events` | `logalert:read` | L0 | 日志事件列表 |
 | GET | `/api/log-alerts/events/:id` | `logalert:read` | L0 | 事件详情 + 代码分析报告 |
 | PUT | `/api/log-alerts/events/:id/status` | `logalert:write` | L1 | 更新状态（pending/analyzing/resolved/ignored） |
-| GET/POST/PUT/DELETE | `/api/log-alerts/servers[/:id]` | `logalert:read` / `server:manage` | L1 | 服务器实例管理 |
 | POST | `/api/ai/analysis/callback` | 回调令牌（`ai_analysis.callback_token`） | — | **外部 AI 分析服务的结论回调**（公开接口，无登录态）：`X-Callback-Token` 或 `Authorization: Bearer` 校验；幂等，重复回调不会写出两份报告 |
 | GET | `/api/log-alerts/pipeline` | `logalert:read` | L0 | **日志集成接收链路状态**：brokers / topic / 消费组、消费者是否运行、对外接入地址、最近错误与一句话说明（页面「Kafka 采集链路」卡片） |
 | POST | `/api/log-alerts/pipeline/probe` | `logalert:write` | L0 | **探测平台侧 Kafka 可达性**：连 broker、列出 topic、确认 `mwops-logs` 存在；返回 `ok` / `message` / `address` / `topic` / `latency_ms`，失败为 200 + `ok=false` + 原因（不是 500） |
@@ -511,8 +510,8 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 
 | 方法 | 路径 | 权限点 | 级别 | 说明 |
 |------|------|--------|------|------|
-| GET | `/api/settings/ai` | `system:config` | L0 | AI 策略、双提供方（密钥掩码）、token 额度 |
-| PUT | `/api/settings/ai` | `system:config:write` | L1 | 保存并即时生效（重建引擎 + 热更新护栏配额） |
+| GET | `/api/settings/ai` | `system:config` | L0 | AI 策略、双提供方（密钥掩码）、`code_analysis`（AI 代码分析，密钥掩码）、token 额度 |
+| PUT | `/api/settings/ai` | `system:config:write` | L1 | 保存并即时生效（重建引擎 + 重建 AI 代码分析客户端 + 热更新护栏配额） |
 | GET | `/api/settings/ai/usage?days=30` | `system:config` | L0 | 消费趋势、按来源分布、Top10 用户、剩余额度（`-1`＝不限） |
 | POST | `/api/settings/ai/test` | `system:config:write` | L0 | 引擎自检；失败为 200 + `ok=false` + 原因 |
 | GET | `/api/settings/notify` | `system:config` | L0 | 飞书/企微/钉钉/邮件渠道（webhook 掩码、口令只回 bool） |

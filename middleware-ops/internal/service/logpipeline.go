@@ -9,6 +9,7 @@ import (
 
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/logpipe"
+	"middleware-ops/internal/repository"
 )
 
 // LogPipeline 是「日志集成」的平台侧接收链路：Kafka 消费 → 平台日志事件。
@@ -19,13 +20,18 @@ import (
 type LogPipeline struct {
 	cfg      *config.Config
 	logs     *LogAlertService
+	stats    *repository.KafkaConsumeStatRepository
 	log      *zap.Logger
 	consumer *logpipe.Consumer
 }
 
 // NewLogPipeline 构造日志接收链路。
-func NewLogPipeline(cfg *config.Config, logs *LogAlertService, log *zap.Logger) *LogPipeline {
-	return &LogPipeline{cfg: cfg, logs: logs, log: log}
+//
+// stats 用于把消费计数累计落库（为空时只保留本次进程的会话计数——
+// 此时页面上的"累计"就是"本次启动以来"，并在卡片上写明口径）。
+func NewLogPipeline(cfg *config.Config, logs *LogAlertService,
+	stats *repository.KafkaConsumeStatRepository, log *zap.Logger) *LogPipeline {
+	return &LogPipeline{cfg: cfg, logs: logs, stats: stats, log: log}
 }
 
 // Start 启动 Kafka 消费者。
@@ -51,6 +57,7 @@ func (p *LogPipeline) Start(ctx context.Context) {
 		CommitInterval: p.cfg.Kafka.CommitInterval,
 		StartOffset:    p.cfg.Kafka.StartOffset,
 		Ingest:         p.ingest,
+		Store:          p.statsStore(),
 		Log:            p.log,
 	})
 	if p.consumer == nil {
@@ -60,11 +67,20 @@ func (p *LogPipeline) Start(ctx context.Context) {
 	p.consumer.Start(ctx)
 }
 
+// statsStore 把仓储暴露成消费者需要的 Storer（nil 也要如实返回 nil，
+// 让消费者知道自己不落库，页面上按"本次启动以来"口径展示）。
+func (p *LogPipeline) statsStore() logpipe.Storer {
+	if p == nil || p.stats == nil {
+		return nil
+	}
+	return p.stats
+}
+
 // ingest 把一条 Filebeat 日志交给既有的日志告警链路。
 //
 // 指纹、窗口去重、告警、AI 诊断入口全都在 LogAlertService.Ingest 里——
 // 接入侧只做"翻译"，不重复实现任何判定逻辑。
-func (p *LogPipeline) ingest(ctx context.Context, rec logpipe.Record) error {
+func (p *LogPipeline) ingest(ctx context.Context, rec logpipe.Record) (logpipe.IngestOutcome, error) {
 	return p.logs.IngestRecord(ctx, rec)
 }
 
@@ -89,8 +105,18 @@ type LogPipelineStatus struct {
 	Consumed        int64    `json:"consumed"`
 	Dropped         int64    `json:"dropped"`
 	Failed          int64    `json:"failed"`
-	LastMessageAt   string   `json:"last_message_at"`
-	LastError       string   `json:"last_error"`
+	// Ingested / Ignored 解释"消费了却在事件列表里看不到"的那部分：
+	// consumed = ingested + ignored（ignored = 命中屏蔽项或未命中任何规则，平台有意不入库）。
+	Ingested int64 `json:"ingested"`
+	Ignored  int64 `json:"ignored"`
+	// ConsumedTotal / DroppedTotal / FailedTotal 为含历史累计的总量（跨重启、跨副本累加）。
+	ConsumedTotal int64 `json:"consumed_total"`
+	DroppedTotal  int64 `json:"dropped_total"`
+	FailedTotal   int64 `json:"failed_total"`
+	// Persistent 表示累计值是否落库；false 时页面应说明"仅本次启动以来"。
+	Persistent   bool   `json:"persistent"`
+	LastMessageAt string `json:"last_message_at"`
+	LastError     string `json:"last_error"`
 	// Note 用一句话解释"为什么现在收不到日志"：未启用 / 未运行 / 最近的错误。
 	// 页面上宁可显示原因，也不要只显示一个 0（本项目硬约定，见 INC-016）。
 	Note string `json:"note"`
@@ -118,6 +144,12 @@ func (p *LogPipeline) Status() LogPipelineStatus {
 		status.Consumed = consumer.Consumed
 		status.Dropped = consumer.Dropped
 		status.Failed = consumer.Failed
+		status.Ingested = consumer.Ingested
+		status.Ignored = consumer.Ignored
+		status.ConsumedTotal = consumer.ConsumedTotal
+		status.DroppedTotal = consumer.DroppedTotal
+		status.FailedTotal = consumer.FailedTotal
+		status.Persistent = consumer.Persistent
 		status.LastMessageAt = consumer.LastMessage
 		if consumer.LastError != "" {
 			status.LastError = consumer.LastError
@@ -143,7 +175,7 @@ func (p *LogPipeline) Status() LogPipelineStatus {
 // 为什么 ServerName 与 ServerIP 都填同一个值：日志集成渲染的 `fields.server` 就是**目标机地址**
 // （集成时写入），而 Ingest 是按 IP 反查已登记的服务器记录来归集的——
 // 登记的那条记录带着正确的环境（dev/staging/prod），若查不到则按地址自动登记。
-func (s *LogAlertService) IngestRecord(ctx context.Context, rec logpipe.Record) error {
+func (s *LogAlertService) IngestRecord(ctx context.Context, rec logpipe.Record) (logpipe.IngestOutcome, error) {
 	report := LogReport{
 		ServerName: rec.ServerName,
 		ServerIP:   rec.ServerName,
@@ -157,8 +189,13 @@ func (s *LogAlertService) IngestRecord(ctx context.Context, rec logpipe.Record) 
 		ts := rec.Timestamp
 		report.Timestamp = &ts
 	}
-	_, err := s.Ingest(ctx, report)
-	return err
+	res, err := s.Ingest(ctx, report)
+	if err != nil {
+		return logpipe.IngestOutcome{}, err
+	}
+	// Ignored=true 表示平台按配置有意不入库（命中屏蔽项 / 未命中任何规则）：
+	// 这不是失败，但要能让消费计数说得清"这条去哪了"。
+	return logpipe.IngestOutcome{Ignored: res != nil && res.Ignored}, nil
 }
 
 // LogPipelineProbeResult 是「测试 Kafka 连接」的结果。
