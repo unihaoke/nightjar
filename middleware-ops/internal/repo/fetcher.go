@@ -13,16 +13,22 @@
 //   - RepoURL 里的凭据在日志与错误里一律脱敏（RedactURL）；
 //   - AllowOutbound=false 时直接拒绝，不执行任何 git 命令（合规开关，见 6.5）。
 //
-// 已知风险（运维须知）：git 会把 clone 用的 RepoURL 写进 <LocalPath>/.git/config，
-// 若 URL 内嵌令牌，令牌就落在缓存目录里——本包既要保证后续 fetch 可用，就无法抹掉它。
-// 因此缓存根目录必须限定在平台内部（不随镜像/备份外泄），并建议改用 credential helper
-// 或只读部署令牌。
+// 凭据的存放（INC-031 之后）：入库的 RepoURL 不含凭据，凭据单独加密保存并由调用方通过
+// Request.Credential 传入；git 命令用它拼出带凭据的地址，而缓存目录的 .git/config 里
+// 始终是**干净地址**（clone 后与每次 update 时都会 remote set-url 对齐）。
+// 因此令牌不再有"数据库明文 + .git/config"这两份静态副本。
+//
+// 已知风险（运维须知）：带凭据的地址会出现在**进程命令行**里（`git fetch <url>`），
+// 同一容器内的其他进程理论上可读 /proc/<pid>/cmdline。平台容器只跑本服务，这一项按可接受处理；
+// 若要求更严，可改为 credential helper（后续项）。
 //
 // 非目标：不做浅克隆、不做代码索引/解析，只保证「本地有一份与远端一致的代码」。
 package repo
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -79,20 +85,28 @@ type Request struct {
 	Service string // 服务名（决定缓存子目录名）
 	RepoURL string
 	Branch  string // 为空表示远端默认分支
+	// Credential 是访问凭据（`user:secret` 或 `?token=xxx`，见 credentials.go）。
+	//
+	// 它**只在执行 git 的那一刻**被拼进 URL：入库的 RepoURL 永远不含凭据，
+	// 缓存目录的 .git/config 里也不留凭据（clone/fetch 后会把 origin 改写成干净地址）。
+	// 这一条是 INC-031 的修复要点：凭据不再有第二份静态副本。
+	Credential string
 	// LocalPath 显式指定本地目录（来自 CodeRepo.local_path）；为空则由 RootDir/Service 推导。
 	//
-	// 安全提示（运维须知）：git 会把 clone 使用的 RepoURL 原样写进 <LocalPath>/.git/config，
-	// 因此 URL 里若内嵌了访问令牌，令牌就会落在缓存目录里。缓存根目录必须限定在平台内部、
-	// 不随镜像/备份外泄，并建议改用 credential helper 或只读部署令牌。
+	// 相对路径（如 "jd"）按「缓存根目录 + 该相对路径」拼接，等价于只配置子目录名；
+	// 绝对路径必须已经落在缓存根目录之内，否则按越界拒绝（ErrPathEscape）。
 	LocalPath string
 	// AllowOutbound 为合规开关：false 时**直接拒绝**（不允许把第三方代码拉到平台本地）。
 	AllowOutbound bool
 }
 
 // signature 用于并发去重：同一 LocalPath 上「目标一致」的请求可以共用一次执行结果。
-// LocalPath 本身已经是 map 的 key，因此这里只含远端与分支。
+// LocalPath 本身已经是 map 的 key，因此这里只含远端、分支与凭据指纹。
+//
+// 凭据进签名的原因：换了令牌（轮换）就是一次不同的同步请求，不能复用上一次的结果——
+// 否则"刚改完令牌点分析"会拿到旧令牌那次失败的结果。
 func (r Request) signature() string {
-	return r.RepoURL + "\x00" + strings.TrimSpace(r.Branch)
+	return r.RepoURL + "\x00" + strings.TrimSpace(r.Branch) + "\x00" + credentialFingerprint(r.Credential)
 }
 
 // Result 是一次操作的结果。
@@ -273,6 +287,71 @@ func (f *Fetcher) LocalPathFor(req Request) (string, error) {
 	return f.resolveLocalPath(req)
 }
 
+// TrackedFiles 返回本地缓存里**被 git 跟踪的**文件（相对路径，`/` 分隔，已排序去重）。
+//
+// 为什么不让调用方自己 WalkDir（INC-032）：工作区里除了源码还有依赖（node_modules、
+// vendor）、构建产物（target、dist、build）和未跟踪的残留文件，全仓遍历会按**遍历顺序**
+// 撞上第一个同名文件——Java 的 `OrderService.java` 极易命中 target/generated-sources 或
+// 测试目录里的同名类，最后给出一个"高置信度的错行"。git 的索引才是"这个仓库的源码有哪些"
+// 的权威答案，而且比遍历文件系统快得多。
+//
+// 不做凭据处理：ls-files 只读索引，不联网。
+func (f *Fetcher) TrackedFiles(ctx context.Context, local string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	local = strings.TrimSpace(local)
+	if local == "" {
+		return nil, fmt.Errorf("repo: TrackedFiles 需要本地目录")
+	}
+	// -z：以 NUL 分隔输出，避免文件名里的空格/换行把路径切错（-z 同时关闭路径转义，
+	// 因此含中文或引号的文件名会原样返回，正好是我们需要的）。
+	out, err := f.runGit(ctx, local, "ls-files", f.opts.PullTimeout, "",
+		"-C", local, "ls-files", "-z")
+	if err != nil {
+		return nil, err
+	}
+	items := make([]string, 0, 256)
+	seen := make(map[string]bool, 256)
+	for _, raw := range strings.Split(out, "\x00") {
+		rel := strings.TrimSpace(raw)
+		rel = strings.TrimPrefix(strings.ReplaceAll(rel, "\\", "/"), "./")
+		if rel == "" || seen[rel] {
+			continue
+		}
+		seen[rel] = true
+		items = append(items, rel)
+	}
+	return items, nil
+}
+
+// Revision 返回本地缓存的当前提交（短 sha）；取不到返回空串。
+//
+// 用途：把"这次 AI 结论是基于哪一版代码"落进报告。行号是会随时间失效的东西，
+// 没有版本号的结论事后无法复核（见 INC-032）。
+func (f *Fetcher) Revision(ctx context.Context, local string) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(local) == "" {
+		return ""
+	}
+	return f.shortRevision(ctx, local)
+}
+
+// credentialFingerprint 返回凭据的指纹（sha256 前 16 位十六进制），用于并发去重签名。
+//
+// 不用凭据原文：签名会随着 flight 结构驻留内存，没必要把秘密多留一份；
+// 指纹足以区分"换了令牌"这件事，且不会在内存转储里直接暴露凭据。
+func credentialFingerprint(credential string) string {
+	trimmed := strings.TrimSpace(credential)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:8])
+}
+
 // runLeader 在持有 pl.mu 的情况下执行同步，并把结果发布给同签名的等待者。
 //
 // pl.mu 串行化同一路径上的 git 操作（不同签名的请求会各自执行，但仍不并发）。
@@ -347,7 +426,8 @@ func (f *Fetcher) release(path string, pl *pathLock) {
 // 两道防线：
 //  1. Service 净化为只含 [A-Za-z0-9._-] 的单层目录名（拒绝 "."、".."、空），
 //     因此 "../../etc/passwd" 这类用户输入不可能穿出 RootDir；
-//  2. LocalPath 显式指定时用 filepath.Rel 判断其必须严格落在 RootDir 之内，
+//  2. LocalPath 显式指定时：相对路径拼到 RootDir 之下（配置里只填子目录名），
+//     绝对路径原样使用；两种情况都必须用 filepath.Rel 判定严格落在 RootDir 之内，
 //     并解析已存在部分的软链接后再判一次，防止 root 内的软链把写入引到外面。
 func (f *Fetcher) resolveLocalPath(req Request) (string, error) {
 	if strings.TrimSpace(f.opts.RootDir) == "" {
@@ -356,7 +436,13 @@ func (f *Fetcher) resolveLocalPath(req Request) (string, error) {
 
 	var candidate string
 	if p := strings.TrimSpace(req.LocalPath); p != "" {
-		candidate = p
+		if filepath.IsAbs(p) {
+			candidate = p
+		} else {
+			// 相对路径按「缓存根目录 + 该相对路径」拼接（配置里只填子目录名即可）。
+			// 拼接后仍要走下面的归属校验：p 里含 "../.." 时会跳出 RootDir，必须被拦住。
+			candidate = filepath.Join(f.rootAbs, filepath.Clean(p))
+		}
 	} else {
 		name, err := sanitizeServiceName(req.Service)
 		if err != nil {
@@ -371,8 +457,9 @@ func (f *Fetcher) resolveLocalPath(req Request) (string, error) {
 	}
 	if !withinDir(f.rootAbs, abs) {
 		return "", fmt.Errorf("%w：LocalPath %q 解析为 %q，不在仓库缓存根目录 %q 之内"+
-			"（Service 可能来自用户输入，禁止越界写入平台其它目录）",
-			ErrPathEscape, req.LocalPath, abs, f.rootAbs)
+			"（Service 可能来自用户输入，禁止越界写入平台其它目录）；"+
+			"只想放在缓存根目录下时请改填相对路径，例如 %q",
+			ErrPathEscape, req.LocalPath, abs, f.rootAbs, filepath.Base(abs))
 	}
 	if resolved := resolveExisting(abs); !withinDir(f.rootAbs, resolved) {
 		return "", fmt.Errorf("%w：LocalPath %q 经符号链接解析后为 %q，越出根目录 %q",
@@ -444,20 +531,24 @@ func (f *Fetcher) repoHealthy(ctx context.Context, local string) bool {
 
 // clone 首次克隆（硬性要求 2）。
 func (f *Fetcher) clone(ctx context.Context, req Request, local string) (*Result, error) {
-	if strings.TrimSpace(req.RepoURL) == "" {
+	cleanURL := SanitizeURL(req.RepoURL)
+	if strings.TrimSpace(cleanURL) == "" {
 		return nil, fmt.Errorf("repo: 本地目录 %s 不存在且 RepoURL 为空，无法克隆（请在 CodeRepo 中配置仓库地址）", local)
 	}
 	branch := strings.TrimSpace(req.Branch)
 	if err := validateBranch(branch); err != nil {
 		return nil, err
 	}
+	// git 命令用"带凭据的 URL"，但**只在这一条命令里**：克隆结束后立刻把 origin 改写成干净地址，
+	// 因此令牌不会留在缓存目录的 .git/config 里（INC-031）。
+	gitURL := WithCredential(cleanURL, req.Credential)
 
 	args := []string{"clone"}
 	if branch != "" {
 		args = append(args, "--branch", branch)
 	}
 	// 用 "--" 分隔选项与位置参数：即使 RepoURL/分支以 "-" 开头也不会被当成 git 选项。
-	args = append(args, "--", req.RepoURL, local)
+	args = append(args, "--", gitURL, local)
 
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
 		return nil, fmt.Errorf("repo: 创建缓存目录 %s 失败: %w", filepath.Dir(local), err)
@@ -472,6 +563,8 @@ func (f *Fetcher) clone(ctx context.Context, req Request, local string) (*Result
 		}
 		return nil, err
 	}
+	// 抹掉 .git/config 里的凭据（best-effort：失败只告警，不影响本次结果）。
+	f.syncRemoteURL(ctx, local, cleanURL)
 
 	return &Result{
 		LocalPath: local,
@@ -483,19 +576,29 @@ func (f *Fetcher) clone(ctx context.Context, req Request, local string) (*Result
 
 // update 更新已有缓存（硬性要求 3/4）。
 func (f *Fetcher) update(ctx context.Context, req Request, local string) (*Result, error) {
+	cleanURL := SanitizeURL(req.RepoURL)
 	branch := strings.TrimSpace(req.Branch)
 	// 变更判定：操作前后各取一次 HEAD（完整 sha 比较，短 sha 只用于对外展示）。
 	before := f.headRevision(ctx, local)
 
-	// 远端地址与缓存不一致时只告警不改写：URL 变化常常只是令牌轮换，
-	// 直接覆盖 origin 或报错都会破坏「下次 pull 就行」的预期。
-	f.warnRemoteMismatch(ctx, req, local)
+	// 远端地址与缓存不一致时**改写成配置里的地址**（旧实现只告警不改写，于是轮换令牌后
+	// 缓存会一直用 .git/config 里的旧令牌，认证永远失败、必须手工删缓存目录，见 INC-031）。
+	f.syncRemoteURL(ctx, local, cleanURL)
+
+	// fetch 一律**显式给地址**（而不是让 git 去读 origin）：
+	// 这样凭据只出现在这一条命令里，origin 可以是干净地址，fetch 依然能认证。
+	gitURL := WithCredential(cleanURL, req.Credential)
+	if gitURL == "" {
+		gitURL = "origin" // 没配地址（理论上不会）：退回用缓存里的 origin，至少给出可诊断的错误
+	}
 
 	var err error
 	if branch != "" {
 		if err = validateBranch(branch); err == nil {
+			// 显式 refspec：把远端分支抓到 refs/remotes/origin/<branch>，
+			// 这样 `checkout -B <branch> origin/<branch>` 仍然可用（不能只靠 FETCH_HEAD）。
 			_, err = f.runGit(ctx, local, "fetch", f.opts.PullTimeout, req.RepoURL,
-				"-C", local, "fetch", "--prune", "origin")
+				"-C", local, "fetch", "--prune", gitURL, "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
 		}
 		if err == nil {
 			// checkout -B + --force：把缓存分支强制重置到远端，丢弃本地手工改动，
@@ -504,8 +607,13 @@ func (f *Fetcher) update(ctx context.Context, req Request, local string) (*Resul
 				"-C", local, "checkout", "--force", "-B", branch, "origin/"+branch)
 		}
 	} else {
-		_, err = f.runGit(ctx, local, "pull", f.opts.PullTimeout, req.RepoURL,
-			"-C", local, "pull", "--ff-only")
+		// 没配分支 = 跟随远端默认分支。等价于原来的 `pull --ff-only`：
+		// fetch 到 FETCH_HEAD 再 --ff-only 合并（不产生合并提交、分叉时照样报错）。
+		if _, err = f.runGit(ctx, local, "fetch", f.opts.PullTimeout, req.RepoURL,
+			"-C", local, "fetch", gitURL); err == nil {
+			_, err = f.runGit(ctx, local, "merge", f.opts.PullTimeout, req.RepoURL,
+				"-C", local, "merge", "--ff-only", "FETCH_HEAD")
+		}
 	}
 	if err != nil {
 		// 硬性要求：本地已有旧副本时明确告知，调用方可以降级使用。
@@ -526,22 +634,35 @@ func (f *Fetcher) update(ctx context.Context, req Request, local string) (*Resul
 	}, nil
 }
 
-// warnRemoteMismatch 比较缓存里 origin 的 URL 与本次请求的 RepoURL，不一致只告警。
-// 失败（例如没有 origin）忽略：更新流程本身会给出真正的错误。
-func (f *Fetcher) warnRemoteMismatch(ctx context.Context, req Request, local string) {
+// syncRemoteURL 把缓存目录的 origin 改写成「配置里的干净地址」。
+//
+// 为什么必须改写（而不是像早期实现那样只告警）：origin 是 git 执行 `fetch origin`
+// 时的取址来源，若它一直是旧的带令牌地址，使用者轮换令牌后平台会**永久认证失败**，
+// 唯一出路是进容器删缓存目录。改写之后"配置即事实"，轮换令牌重新保存即可生效。
+//
+// 失败只告警：本次同步用的是显式 URL，origin 写不进去不影响这次能否拉到代码。
+func (f *Fetcher) syncRemoteURL(ctx context.Context, local, cleanURL string) {
+	if strings.TrimSpace(cleanURL) == "" {
+		return
+	}
+	// 以 "-" 开头的地址会被 git 当成选项（参数注入防护，与分支名校验同理）。
+	if strings.HasPrefix(strings.TrimSpace(cleanURL), "-") {
+		f.log.Warn("配置的仓库地址以 \"-\" 开头，已拒绝写入 origin", zap.String("repo_url", RedactURL(cleanURL)))
+		return
+	}
 	out, err := f.runGit(ctx, local, "remote-get-url", f.opts.PullTimeout, "",
 		"-C", local, "remote", "get-url", "origin")
-	if err != nil {
+	if err == nil && strings.TrimSpace(out) == strings.TrimSpace(cleanURL) {
+		return // 已经一致：不产生多余的写操作
+	}
+	if _, setErr := f.runGit(ctx, local, "remote-set-url", f.opts.PullTimeout, "",
+		"-C", local, "remote", "set-url", "origin", cleanURL); setErr != nil {
+		f.log.Warn("改写缓存目录的 origin 失败（本次同步仍使用显式地址，不受影响）",
+			zap.String("local_path", local), zap.String("repo_url", RedactURL(cleanURL)), zap.Error(setErr))
 		return
 	}
-	got := strings.TrimSpace(out)
-	if got == "" || strings.TrimSpace(req.RepoURL) == "" || got == strings.TrimSpace(req.RepoURL) {
-		return
-	}
-	f.log.Warn("缓存目录的 origin 与本次配置的 RepoURL 不一致，仍按缓存里的 origin 更新",
-		zap.String("local_path", local),
-		zap.String("origin", RedactURL(got)),
-		zap.String("configured", RedactURL(req.RepoURL)))
+	f.log.Info("已把缓存目录的 origin 对齐为配置里的地址（令牌轮换后无需手工清理缓存）",
+		zap.String("local_path", local), zap.String("repo_url", RedactURL(cleanURL)))
 }
 
 // resultBranch 给出结果里的分支名：请求指定则用它，否则探测当前分支（detached 时为空）。

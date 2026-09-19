@@ -60,6 +60,60 @@ func TestEstimateTokens(t *testing.T) {
 	}
 }
 
+// TestStatusDeclaresExternalProvider 钉住"第三方引擎必须自报 external"（INC-030 的判定基础）。
+//
+// 合规闸门问的是引擎自己（`Status().External`）而不是读配置字符串：工厂可能因为
+// 缺 base_url / 未启用把第三方降级成规则引擎，那种情况下确实不会出网，按配置判会误拦。
+func TestStatusDeclaresExternalProvider(t *testing.T) {
+	thirdParty := func() *config.Config {
+		cfg := &config.Config{}
+		cfg.AIEngine.Strategy = string(StrategyThirdParty)
+		cfg.AIEngine.ThirdParty.Enabled = true
+		cfg.AIEngine.ThirdParty.Kind = "openai"
+		cfg.AIEngine.ThirdParty.BaseURL = "https://api.example.com/v1"
+		cfg.AIEngine.ThirdParty.APIKey = "sk-test"
+		return cfg
+	}
+
+	if got := NewFactory(FactoryOptions{Config: thirdParty()}).Status(); !got.External {
+		t.Fatalf("third_party 策略下应声明 External=true，实际 %+v", got)
+	}
+
+	// 自建（内网）提供方不是外部：即便填了地址也不该被当成第三方。
+	selfCfg := &config.Config{}
+	selfCfg.AIEngine.Strategy = string(StrategySelfHosted)
+	selfCfg.AIEngine.SelfHosted.Enabled = true
+	selfCfg.AIEngine.SelfHosted.Kind = "openai"
+	selfCfg.AIEngine.SelfHosted.BaseURL = "http://vllm.internal:8000/v1"
+	if got := NewFactory(FactoryOptions{Config: selfCfg}).Status(); got.External {
+		t.Fatalf("self_hosted 不应被声明为 External，实际 %+v", got)
+	}
+
+	// 混合链：只要链上含第三方就必须保守地按"外部"处理（降级可能落到那一层）。
+	hybridCfg := thirdParty()
+	hybridCfg.AIEngine.Strategy = string(StrategyHybrid)
+	hybridCfg.AIEngine.SelfHosted.Enabled = true
+	hybridCfg.AIEngine.SelfHosted.Kind = "openai"
+	hybridCfg.AIEngine.SelfHosted.BaseURL = "http://vllm.internal:8000/v1"
+	if got := NewFactory(FactoryOptions{Config: hybridCfg}).Status(); !got.External {
+		t.Fatalf("混合链含第三方时应声明 External=true，实际 %+v", got)
+	}
+
+	// 第三方配了地址却没启用/被降级成规则引擎 → 不会出网。
+	ruleCfg := &config.Config{}
+	ruleCfg.AIEngine.Strategy = string(StrategyThirdParty)
+	ruleCfg.AIEngine.ThirdParty.Enabled = true
+	ruleCfg.AIEngine.ThirdParty.Kind = "openai"
+	ruleCfg.AIEngine.ThirdParty.BaseURL = "" // 缺地址 → 规则引擎
+	if got := NewFactory(FactoryOptions{Config: ruleCfg}).Status(); got.External {
+		t.Fatalf("降级成规则引擎后不该声明为 External，实际 %+v", got)
+	}
+	// 纯规则引擎同理。
+	if got := NewRuleEngine("x").Status(); got.External {
+		t.Fatalf("规则引擎永不出网，实际 %+v", got)
+	}
+}
+
 // TestFactoryDegradesWithoutProvider 校验「配置不可即降级」的启动语义（5.4）。
 func TestFactoryDegradesWithoutProvider(t *testing.T) {
 	cfg := &config.Config{}

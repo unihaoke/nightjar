@@ -827,6 +827,8 @@ export interface CodeAnalysis {
   engine_status: string
   cost_tokens: number
   outbound_ok: boolean
+  /** 本次分析所用的代码版本（短 sha）：行号会随代码演进失效，复核时要能对上版本。 */
+  repo_revision: string
   created_at: string
 }
 
@@ -847,12 +849,29 @@ export interface ServerInstance {
 export interface CodeRepo {
   id: number
   service_name: string
+  /** 不含任何访问凭据的仓库地址（令牌单独加密保存，永不回显）。 */
   repo_url: string
   branch: string
   local_path: string
   language: string
   allow_third_party: boolean
+  /** 是否已配置访问令牌（只有布尔量，没有明文）。 */
+  has_credential: boolean
   last_pull_at?: string
+}
+
+/** 代码仓库映射的提交入参（凭据只写不读）。 */
+export interface CodeRepoInput {
+  service_name: string
+  repo_url: string
+  branch: string
+  local_path: string
+  language: string
+  allow_third_party: boolean
+  /** 访问令牌：留空 = 不修改；非空 = 覆盖（平台加密保存，永不回显）。 */
+  credential?: string
+  /** 显式清除已保存的令牌。 */
+  clear_credential?: boolean
 }
 
 /** 大盘总览。 */

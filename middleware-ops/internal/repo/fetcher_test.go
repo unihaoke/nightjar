@@ -88,6 +88,59 @@ func (r *blockingRunner) Run(ctx context.Context, _ string, _ []string, _ string
 	return "", "", ctx.Err()
 }
 
+// TestTrackedFilesUsesGitIndex 钉住"定位代码的候选来自 git 索引"（INC-032 的基础）。
+//
+// 关键反例：工作区里放一个**未跟踪**的同名文件（构建产物/残留就是这类），
+// 索引必须看不到它——否则定位会命中一个根本不是源码的文件，给出高置信度的错行。
+func TestTrackedFilesUsesGitIndex(t *testing.T) {
+	remote := newTestRemote(t)
+	root := t.TempDir()
+	f := NewFetcher(Options{RootDir: root})
+	ctx := context.Background()
+
+	res, err := f.Ensure(ctx, Request{Service: "svc", RepoURL: remote.url, Branch: "main", AllowOutbound: true})
+	if err != nil {
+		t.Fatalf("Ensure 失败: %v", err)
+	}
+	files, err := f.TrackedFiles(ctx, res.LocalPath)
+	if err != nil {
+		t.Fatalf("TrackedFiles 失败: %v", err)
+	}
+	if !containsStr(files, "app/main.go") {
+		t.Fatalf("索引里应含 app/main.go，实际 %v", files)
+	}
+	if containsStr(files, "app/untracked.go") {
+		t.Fatalf("未跟踪文件不该出现在索引里：%v", files)
+	}
+
+	// 放一个未跟踪的同名文件，再确认它仍然不在清单里（这正是"遍历文件系统"会踩的坑）。
+	if err := os.WriteFile(filepath.Join(res.LocalPath, "app", "untracked.go"), []byte("package app\n"), 0o644); err != nil {
+		t.Fatalf("写入未跟踪文件失败: %v", err)
+	}
+	files2, err := f.TrackedFiles(ctx, res.LocalPath)
+	if err != nil {
+		t.Fatalf("TrackedFiles 失败: %v", err)
+	}
+	if containsStr(files2, "app/untracked.go") {
+		t.Fatalf("未跟踪文件污染了索引结果：%v", files2)
+	}
+
+	// Revision 应当等于远端 HEAD（报告要用它绑定代码版本）。
+	rev := f.Revision(ctx, res.LocalPath)
+	if rev == "" || !strings.HasPrefix(remote.head(t), rev) {
+		t.Fatalf("Revision = %q，远端 HEAD = %q", rev, remote.head(t))
+	}
+}
+
+func containsStr(items []string, want string) bool {
+	for _, it := range items {
+		if it == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestEnsureCloneUnchangedUpdated 覆盖核心链路：首次 clone → 无变化 unchanged
 // → 远端新增提交后 updated 且本地能看到新文件（"下次 pull 就行"的核心断言）。
 func TestEnsureCloneUnchangedUpdated(t *testing.T) {
@@ -281,6 +334,29 @@ func TestResolveLocalPathRejectsEscape(t *testing.T) {
 				t.Fatalf("错误类型不符（期望 ErrPathEscape/ErrInvalidService）: %v", err)
 			}
 		})
+	}
+}
+
+// TestResolveLocalPathRelativeJoinedToRoot 相对 LocalPath 应该拼到缓存根目录之下。
+//
+// 这是「配置里只填一个子目录名」用法的前提：相对路径不能再按进程当前目录解析，
+// 否则同一个配置在不同工作目录下会指向不同位置（容器里是 /app，本地调试是别处）。
+func TestResolveLocalPathRelativeJoinedToRoot(t *testing.T) {
+	root := t.TempDir()
+	absRoot := mustAbs(t, root)
+	f := NewFetcher(Options{RootDir: root})
+
+	got, err := f.LocalPathFor(Request{Service: "jd-logs", LocalPath: "jd"})
+	if err != nil {
+		t.Fatalf("相对 LocalPath 应被拼到缓存根目录下，实际报错: %v", err)
+	}
+	if !samePath(t, got, filepath.Join(absRoot, "jd")) {
+		t.Fatalf("LocalPath = %q，期望 %q", got, filepath.Join(absRoot, "jd"))
+	}
+
+	// 拼接不等于放行：带 "../.." 的相对路径仍必须被拒绝。
+	if _, err := f.LocalPathFor(Request{Service: "jd-logs", LocalPath: filepath.Join("..", "escape")}); err == nil {
+		t.Fatal("相对路径越界时应当报错")
 	}
 }
 

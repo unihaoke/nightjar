@@ -29,7 +29,8 @@ func NewRepoFetcher(fetcher *repo.Fetcher) RepoFetcher {
 func (a repoFetcherAdapter) Ensure(ctx context.Context, req RepoFetchRequest) (RepoFetchResult, error) {
 	result, err := a.fetcher.Ensure(ctx, repo.Request{
 		Service: req.Service, RepoURL: req.RepoURL, Branch: req.Branch,
-		LocalPath: req.LocalPath, AllowOutbound: req.AllowOutbound,
+		Credential: req.Credential,
+		LocalPath:  req.LocalPath, AllowOutbound: req.AllowOutbound,
 	})
 	if result == nil {
 		return RepoFetchResult{}, err
@@ -44,6 +45,31 @@ func (a repoFetcherAdapter) Ensure(ctx context.Context, req RepoFetchRequest) (R
 func (a repoFetcherAdapter) HasCode(ctx context.Context, req RepoFetchRequest) bool {
 	return a.fetcher.HasCode(ctx, repo.Request{
 		Service: req.Service, RepoURL: req.RepoURL, Branch: req.Branch,
-		LocalPath: req.LocalPath, AllowOutbound: req.AllowOutbound,
+		Credential: req.Credential,
+		LocalPath:  req.LocalPath, AllowOutbound: req.AllowOutbound,
 	})
+}
+
+// TrackedFiles 返回本地缓存里被 git 跟踪的文件（见 RepoFetcher 接口的说明）。
+//
+// 先把 LocalPath 解析出来（与 Ensure 用的是同一套净化/越界规则），避免调用方各写一份。
+func (a repoFetcherAdapter) TrackedFiles(ctx context.Context, req RepoFetchRequest) ([]string, error) {
+	local, err := a.fetcher.LocalPathFor(repo.Request{
+		Service: req.Service, RepoURL: req.RepoURL, Branch: req.Branch, LocalPath: req.LocalPath,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return a.fetcher.TrackedFiles(ctx, local)
+}
+
+// Revision 返回本地缓存的当前提交（短 sha）。
+func (a repoFetcherAdapter) Revision(ctx context.Context, req RepoFetchRequest) string {
+	local, err := a.fetcher.LocalPathFor(repo.Request{
+		Service: req.Service, RepoURL: req.RepoURL, Branch: req.Branch, LocalPath: req.LocalPath,
+	})
+	if err != nil {
+		return ""
+	}
+	return a.fetcher.Revision(ctx, local)
 }

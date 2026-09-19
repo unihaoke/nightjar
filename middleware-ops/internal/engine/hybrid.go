@@ -71,6 +71,12 @@ func (h *hybrid) Status() Status {
 			status.LastFailureAt = st.LastFailureAt
 			status.ConsecutiveFails = st.ConsecutiveFails
 		}
+		// 合规判定取"链上是否含外部引擎"，而不是"本次实际用了哪一层"：
+		// 主层熔断时会自动降级到备层，请求内容可能已经发出去过（也可能正要发往备层），
+		// 这种"取决于运行时状态"的判断不能作为合规依据——只要链上有外部引擎就按外部处理。
+		if st.External {
+			status.External = true
+		}
 	}
 	h.mu.Lock()
 	if h.degraded {

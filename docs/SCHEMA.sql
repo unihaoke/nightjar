@@ -322,7 +322,10 @@ CREATE TABLE IF NOT EXISTS code_repos (
     created_at          TIMESTAMPTZ,
     updated_at          TIMESTAMPTZ,
     service_name        VARCHAR(128) NOT NULL,
+    -- repo_url **不含凭据**：访问令牌单独加密存在 credential_encrypted（INC-031）。
+    -- 历史数据里内嵌在 URL 里的凭据会在读取时被自动拆分并迁移。
     repo_url            VARCHAR(255),
+    credential_encrypted VARCHAR(512),
     branch              VARCHAR(64) DEFAULT 'main',
     local_path          VARCHAR(255),
     language            VARCHAR(32),
@@ -435,7 +438,9 @@ CREATE TABLE IF NOT EXISTS ai_code_analyses (
     engine_used     VARCHAR(32),
     engine_status   VARCHAR(32),
     cost_tokens     INTEGER,
-    outbound_ok     BOOLEAN DEFAULT FALSE
+    outbound_ok     BOOLEAN DEFAULT FALSE,
+    -- 本次分析所用的代码版本（短 sha）：行号会随代码演进失效，事后复核必须能对上版本。
+    repo_revision   VARCHAR(64)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_code_analyses_event_id ON ai_code_analyses(event_id);
 CREATE INDEX IF NOT EXISTS idx_ai_code_analyses_event_key ON ai_code_analyses(event_key);

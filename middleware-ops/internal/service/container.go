@@ -159,7 +159,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Approval = NewApprovalService(deps.Approvals, deps.Notifier, deps.Audit, opt.Log)
 	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, deps.AlertSvc, opt.Log)
 	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos,
-		deps.LogAlertRules, deps.LogAlertExclusions, cfg, opt.Cache, deps.Audit, opt.Log)
+		deps.LogAlertRules, deps.LogAlertExclusions, cfg, opt.Cache, deps.Audit, opt.Cipher, opt.Log)
 	// 日志集成的接收链路（Filebeat → 平台 Kafka → 日志事件）。
 	// 只装配不启动：启动时机由 main 决定（跟随进程生命周期），未配置 Kafka 时它是空转的安全对象。
 	deps.LogPipeline = NewLogPipeline(cfg, deps.LogAlert, opt.Log)
@@ -178,7 +178,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	}
 	redactor := NewRedactor(&cfg.Security)
 	deps.CodeAnalysis = NewCodeAnalysisService(cfg, deps.Engine, deps.LogEvents, deps.CodeRepos,
-		deps.CodeAnalyses, redactor, deps.Audit, deps.Cost, opt.Log)
+		deps.CodeAnalyses, redactor, deps.Audit, deps.Cost, opt.Cipher, opt.Log)
 	// 日志告警的后处理：把"已落库但还没通知/还没分析"的事件推进到结论。
 	// 代码仓库缓存用**进程级** Options 构造（缓存根目录、git 路径、超时都属于平台配置），
 	// 每次请求只描述"要哪个服务的哪条分支"。
@@ -207,7 +207,8 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.CodeAnalysis.SetRepoFetcher(repoFetcher)
 	deps.LogAlertWorker = NewLogAlertWorker(LogAlertWorkerDeps{
 		Config: cfg, Events: deps.LogEvents, Rules: deps.LogAlertRules, CodeRepos: deps.CodeRepos,
-		Notifier: deps.Notifier, Analysis: deps.CodeAnalysis, Fetcher: repoFetcher, Log: opt.Log,
+		Notifier: deps.Notifier, Analysis: deps.CodeAnalysis, Fetcher: repoFetcher,
+		Cipher: opt.Cipher, Log: opt.Log,
 	})
 
 	deps.Dashboard = NewDashboardService(DashboardDeps{

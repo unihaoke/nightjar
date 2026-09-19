@@ -643,6 +643,12 @@ async function copyHookExample(): Promise<void> {
                 {{ analysis?.outbound_ok ? '已通过白名单 + 脱敏' : '本地分析（未出网）' }}
               </el-tag>
             </div>
+            <!-- 代码版本：行号会随代码演进失效，复核结论时必须知道当时看的是哪一版。
+                 没有它，"定位错了"与"代码后来改了"无法区分。 -->
+            <div v-if="analysis?.repo_revision" class="analysis-row">
+              <span class="field-label">代码版本</span>
+              <span class="mono">{{ analysis.repo_revision }}</span>
+            </div>
           </div>
           <pre v-if="analysis?.code_snippet" class="code-block">{{ analysis.code_snippet }}</pre>
         </template>

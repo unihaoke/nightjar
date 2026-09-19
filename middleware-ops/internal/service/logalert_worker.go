@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"middleware-ops/internal/apperr"
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/model"
 	"middleware-ops/internal/repository"
@@ -34,6 +35,7 @@ type LogAlertWorker struct {
 	notifier  *NotifierService
 	analysis  *CodeAnalysisService
 	fetcher   RepoFetcher
+	cipher    cipherCodec
 	log       *zap.Logger
 
 	busy atomic.Bool
@@ -52,6 +54,13 @@ type RepoFetcher interface {
 	// 与"本地没有代码、必须 clone"。没有它，"刚刚拉过"这个记忆会让代码缺失的服务
 	// 一直拿不到代码（容器重建丢缓存卷后最典型）。
 	HasCode(ctx context.Context, req RepoFetchRequest) bool
+	// TrackedFiles 返回本地缓存里被 git 跟踪的文件（相对路径）。
+	//
+	// 定位代码用它而不是遍历文件系统：工作区里有依赖目录、构建产物和未跟踪残留，
+	// 遍历顺序撞上的第一个同名文件常常不是服务自己的源码（INC-032）。
+	TrackedFiles(ctx context.Context, req RepoFetchRequest) ([]string, error)
+	// Revision 返回本地缓存的当前提交（短 sha）：结论必须能归属到具体代码版本。
+	Revision(ctx context.Context, req RepoFetchRequest) string
 }
 
 // RepoFetchRequest / RepoFetchResult 是跨层的数据形状（与 internal/repo 的 Request/Result 对应）。
@@ -59,10 +68,13 @@ type RepoFetcher interface {
 // 只描述"这次要哪个服务的哪条分支"：缓存根目录、git 路径、超时都是进程级配置，
 // 在容器装配时一次性交给 Fetcher（见 repo_adapter.go）。
 type RepoFetchRequest struct {
-	Service       string
-	RepoURL       string
-	Branch        string
-	LocalPath     string
+	Service   string
+	RepoURL   string
+	Branch    string
+	LocalPath string
+	// Credential 是解密后的访问凭据（空表示不需要认证，或凭据内嵌在 RepoURL 里）。
+	// 它只在执行 git 命令时使用，绝不落库、绝不回显。
+	Credential    string
 	AllowOutbound bool
 }
 
@@ -82,14 +94,17 @@ type LogAlertWorkerDeps struct {
 	Notifier  *NotifierService
 	Analysis  *CodeAnalysisService
 	Fetcher   RepoFetcher
-	Log       *zap.Logger
+	// Cipher 用于解密仓库凭据（见 coderepo_credential.go）。缺省时凭据为空 → 只能拉公开仓库。
+	Cipher cipherCodec
+	Log    *zap.Logger
 }
 
 // NewLogAlertWorker 构造后处理器。
 func NewLogAlertWorker(d LogAlertWorkerDeps) *LogAlertWorker {
 	return &LogAlertWorker{
 		cfg: d.Config, events: d.Events, rules: d.Rules, codeRepos: d.CodeRepos,
-		notifier: d.Notifier, analysis: d.Analysis, fetcher: d.Fetcher, log: d.Log,
+		notifier: d.Notifier, analysis: d.Analysis, fetcher: d.Fetcher,
+		cipher: d.Cipher, log: d.Log,
 	}
 }
 
@@ -231,6 +246,12 @@ func (w *LogAlertWorker) analyze(ctx context.Context, event model.LogAlertEvent,
 	result, analyzeErr := w.analysis.AnalyzeWithTimeout(ctx,
 		CodeAnalysisRequest{EventID: event.ID}, systemOperator, timeout)
 	if analyzeErr != nil {
+		// 合规阻断（CodeOutboundDenied）**不是故障**，是明确的配置结果：
+		// 它和"规则关了 AI"一样属于 disabled。若按 failed 落库，使用者会去查
+		// "AI 为什么挂了"，而真正该做的是去勾「允许第三方 AI」或改引擎策略（INC-030）。
+		if apperr.From(analyzeErr).Code == apperr.CodeOutboundDenied {
+			return nil, model.LogAnalysisDisabled, analyzeErr.Error()
+		}
 		return nil, model.LogAnalysisFailed, "AI 分析失败：" + analyzeErr.Error()
 	}
 	return briefOf(result), "", ""
@@ -302,7 +323,11 @@ func canReuseLocalCache(hasCode bool, last, now time.Time, interval time.Duratio
 	return now.Sub(last) < interval
 }
 
-// fetchRequest 把一条仓库映射转成拉取请求（进程级配置在这里补齐）。
+// fetchRequest 把一条仓库映射转成拉取请求（进程级配置与凭据在这里补齐）。
+//
+// 凭据在**这里**解密（而不是让 fetcher 自己去查库）：internal/repo 是纯粹的 git 门面，
+// 它不该知道"凭据从哪来、怎么加密"；同时这样也让"凭据只在内存里存在一小会儿"这件事
+// 只有一个出口，便于审计。
 func (w *LogAlertWorker) fetchRequest(repo model.CodeRepo) RepoFetchRequest {
 	allowOutbound := true
 	if w.cfg != nil {
@@ -311,6 +336,7 @@ func (w *LogAlertWorker) fetchRequest(repo model.CodeRepo) RepoFetchRequest {
 	return RepoFetchRequest{
 		Service: repo.ServiceName, RepoURL: repo.RepoURL, Branch: repo.Branch,
 		LocalPath: repo.LocalPath, AllowOutbound: allowOutbound,
+		Credential: decryptRepoCredential(w.cipher, &repo),
 	}
 }
 
@@ -320,6 +346,8 @@ func (w *LogAlertWorker) fetchRequest(repo model.CodeRepo) RepoFetchRequest {
 // 否则会出现「刚拉过 → 走缓存 → 但代码其实不在了（卷被重建/目录被清）」，
 // 分析阶段拿着不存在的目录去定位代码，静默返回空结论——这是最难查的一类失败。
 func (w *LogAlertWorker) ensureRepo(ctx context.Context, repo model.CodeRepo) (RepoFetchResult, error) {
+	// 旧数据里内嵌的凭据先迁移（幂等）：迁移后的 URL 才是能安全回显、且 origin 干净的那一份。
+	migrateRepoCredentialRow(ctx, w.codeRepos, w.cipher, w.log, &repo)
 	result, err := w.syncRepo(ctx, repo)
 	if err != nil {
 		return result, err
@@ -345,17 +373,36 @@ func (w *LogAlertWorker) syncRepo(ctx context.Context, repo model.CodeRepo) (Rep
 	if w.cfg != nil && w.cfg.CodeRepo.RefreshInterval > 0 {
 		interval = w.cfg.CodeRepo.RefreshInterval
 	}
-	var last time.Time
-	if at, ok := w.repoRefreshedAt.Load(repo.ServiceName); ok {
-		if t, ok := at.(time.Time); ok {
-			last = t
-		}
-	}
+	// "上次拉取时间"取两个来源里较新的那个：
+	//   - 进程内记忆：本次启动以来成功拉过的时间（最准）；
+	//   - DB 的 last_pull_at：**上次进程**留下的时间。
+	// 只认内存记忆的话，每次容器重建/滚动升级都会把所有仓库重新 fetch 一遍
+	//（缓存卷还在、代码也是新的，纯属白跑），仓库多的时候会把出网带宽和启动时间都吃掉（INC-031）。
+	last := repoLastPull(&w.repoRefreshedAt, repo)
 	if canReuseLocalCache(w.fetcher.HasCode(ctx, req), last, time.Now(), time.Duration(interval)*time.Second) {
 		// 距离上次拉取还没到最小间隔：直接用本地副本（它刚刚被刷新过）。
 		return RepoFetchResult{LocalPath: repo.LocalPath, Action: "cached"}, nil
 	}
 	return w.fetcher.Ensure(ctx, req)
+}
+
+// repoLastPull 取"该服务最近一次成功拉取"的时间（进程内记忆与 DB 记录取较新者）。
+//
+// 指针接收 sync.Map 是刻意的：sync.Map 含锁，按值传会被 go vet 判为复制锁
+//（而且复制出来的 map 与原 map 共享内部结构，语义也很容易写错）。
+func repoLastPull(memory *sync.Map, repo model.CodeRepo) time.Time {
+	var last time.Time
+	if memory != nil {
+		if at, ok := memory.Load(repo.ServiceName); ok {
+			if t, ok := at.(time.Time); ok {
+				last = t
+			}
+		}
+	}
+	if repo.LastPullAt != nil && repo.LastPullAt.After(last) {
+		last = *repo.LastPullAt
+	}
+	return last
 }
 
 // repoWarmLimit 是启动预热最多处理的仓库数（防御性上限：映射表不该有成千上万条，
@@ -391,6 +438,12 @@ func (w *LogAlertWorker) WarmRepos(ctx context.Context) (ok, failed int) {
 		w.log.Warn("读取代码仓库映射失败，跳过启动预热", zap.Error(err))
 		return 0, 0
 	}
+	// 预热也要认"最小拉取间隔"：容器重建后缓存卷里的代码往往还在、也还是新的，
+	// 只因为进程内的记忆随着重启丢了就全量 fetch 一遍，属于纯浪费（仓库多时尤其明显）。
+	interval := 300
+	if w.cfg != nil && w.cfg.CodeRepo.RefreshInterval > 0 {
+		interval = w.cfg.CodeRepo.RefreshInterval
+	}
 	for i := range items {
 		if ctx.Err() != nil {
 			return ok, failed
@@ -403,7 +456,18 @@ func (w *LogAlertWorker) WarmRepos(ctx context.Context) (ok, failed int) {
 			failed++
 			continue
 		}
-		res, err := w.fetcher.Ensure(ctx, w.fetchRequest(item))
+		// 旧数据里内嵌的凭据先迁移成"干净 URL + 加密凭据"（幂等）。
+		migrateRepoCredentialRow(ctx, w.codeRepos, w.cipher, w.log, &item)
+		req := w.fetchRequest(item)
+		if canReuseLocalCache(w.fetcher.HasCode(ctx, req), repoLastPull(&w.repoRefreshedAt, item),
+			time.Now(), time.Duration(interval)*time.Second) {
+			w.log.Info("跳过预热：距上次拉取还在最小间隔内，且本地已有代码",
+				zap.String("service", item.ServiceName),
+				zap.Time("last_pull_at", repoLastPull(&w.repoRefreshedAt, item)))
+			ok++
+			continue
+		}
+		res, err := w.fetcher.Ensure(ctx, req)
 		if err != nil {
 			failed++
 			w.log.Warn("启动预热失败（下次分析会重试）",

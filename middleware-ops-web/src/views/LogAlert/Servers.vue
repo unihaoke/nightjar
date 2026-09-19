@@ -40,6 +40,9 @@ const repoForm = reactive({
   local_path: '',
   language: '',
   allow_third_party: false,
+  // 访问令牌与地址**分开**：令牌只写不回显（页面拿不到明文），留空表示"不修改"。
+  credential: '',
+  clear_credential: false,
 })
 
 const canManage = computed(() => store.can('server:manage'))
@@ -125,11 +128,15 @@ function openRepo(item?: CodeRepo): void {
   editingRepo.value = item || null
   Object.assign(repoForm, {
     service_name: item?.service_name || '',
+    // 后端返回的地址已经是**不含凭据**的干净地址，可以安全回填。
     repo_url: item?.repo_url || '',
     branch: item?.branch || 'main',
     local_path: item?.local_path || '',
     language: item?.language || '',
     allow_third_party: item?.allow_third_party || false,
+    // 令牌永远不回显：编辑时这个框是空的，留空即保持原令牌不变。
+    credential: '',
+    clear_credential: false,
   })
   repoDialog.value = true
 }
@@ -239,6 +246,9 @@ function openRepo(item?: CodeRepo): void {
           <el-tag size="small" :type="row.allow_third_party ? 'warning' : 'info'" effect="light">
             {{ row.allow_third_party ? '出网已开启' : '出网未开启' }}
           </el-tag>
+          <el-tag size="small" :type="row.has_credential ? 'success' : 'info'" effect="plain">
+            {{ row.has_credential ? '已配置令牌' : '无令牌' }}
+          </el-tag>
         </div>
         <p class="entity-meta mono">{{ row.repo_url || '（未填写仓库地址）' }}</p>
         <p class="entity-meta muted">
@@ -255,6 +265,13 @@ function openRepo(item?: CodeRepo): void {
         <el-table :data="repos" size="small">
           <el-table-column prop="service_name" label="服务名" min-width="140" show-overflow-tooltip />
           <el-table-column prop="repo_url" label="仓库地址" min-width="220" show-overflow-tooltip />
+          <el-table-column label="访问令牌" width="100">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.has_credential ? 'success' : 'info'" effect="light">
+                {{ row.has_credential ? '已配置' : '无' }}
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="branch" label="分支" width="90" />
           <el-table-column prop="local_path" label="本地路径" min-width="200" show-overflow-tooltip />
           <el-table-column prop="language" label="语言" width="90" />
@@ -335,12 +352,37 @@ function openRepo(item?: CodeRepo): void {
           </el-col>
           <el-col :span="24">
             <el-form-item label="仓库地址">
-              <el-input v-model="repoForm.repo_url" placeholder="git@gitlab.internal:group/repo.git" />
+              <el-input v-model="repoForm.repo_url" placeholder="https://gitlab.internal/group/repo.git" />
+              <span class="muted hint">
+                只填地址，<b>不要</b>把访问令牌写进 URL。地址会原样展示在列表与审计里，内嵌令牌等于把令牌
+                发给所有能看日志告警的人；即使你粘了带令牌的地址，平台也会自动把它拆出来加密保存。
+              </span>
+            </el-form-item>
+          </el-col>
+          <el-col :span="24">
+            <el-form-item :label="editingRepo?.has_credential ? '访问令牌（已配置，留空=不修改）' : '访问令牌'">
+              <el-input
+                v-model="repoForm.credential"
+                type="password"
+                show-password
+                :placeholder="editingRepo?.has_credential ? '留空保持原令牌不变' : '私有仓库填只读令牌；公开仓库留空'"
+                :disabled="repoForm.clear_credential"
+              />
+              <span class="muted hint">
+                加密存储、<b>永不回显</b>（页面与接口都看不到明文）；HTTPS 令牌填在 userinfo 位置即可，
+                形如 <span class="mono">oauth2:&lt;token&gt;</span>，只写这一段平台会按 <span class="mono">oauth2</span> 补用户名。
+                查询参数形式的 <span class="mono">?token=…</span> 也能识别。
+              </span>
+              <div v-if="editingRepo?.has_credential" class="switch-row">
+                <el-switch v-model="repoForm.clear_credential" />
+                <span class="muted hint">清除已保存的令牌（公开仓库 / 改用 SSH 密钥时勾选）</span>
+              </div>
             </el-form-item>
           </el-col>
           <el-col :span="24">
             <el-form-item label="本地代码路径（用于简单检索定位）">
-              <el-input v-model="repoForm.local_path" placeholder="/data/repos/order-service" />
+              <el-input v-model="repoForm.local_path" placeholder="留空即可：缓存根目录/服务名" />
+              <span class="muted hint">留空 → 自动用「代码缓存根目录/服务名」；也可只填子目录名（如 jd），会拼到缓存根目录下。填绝对路径时必须已在该根目录内，否则按越界拒绝。</span>
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">

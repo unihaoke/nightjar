@@ -387,7 +387,7 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | GET | `/api/log-alerts/events/:id` | `logalert:read` | L0 | 事件详情 + 代码分析报告 |
 | PUT | `/api/log-alerts/events/:id/status` | `logalert:write` | L1 | 更新状态（pending/analyzing/resolved/ignored） |
 | GET/POST/PUT/DELETE | `/api/log-alerts/servers[/:id]` | `logalert:read` / `server:manage` | L1 | 服务器实例管理 |
-| GET/POST | `/api/log-alerts/code-repos` | `logalert:read` / `server:manage` | L1 | 服务→仓库映射与**出网白名单开关** |
+| GET/POST | `/api/log-alerts/code-repos` | `logalert:read` / `server:manage` | L1 | 服务→仓库映射与**出网白名单开关**；访问令牌单独加密保存、**只写不回显**（响应里只有 `has_credential` 布尔量，入参用 `credential` / `clear_credential`） |
 | GET | `/api/log-alerts/pipeline` | `logalert:read` | L0 | **日志集成接收链路状态**：brokers / topic / 消费组、消费者是否运行、对外接入地址、最近错误与一句话说明（页面「Kafka 采集链路」卡片） |
 | POST | `/api/log-alerts/pipeline/probe` | `logalert:write` | L0 | **探测平台侧 Kafka 可达性**：连 broker、列出 topic、确认 `mwops-logs` 存在；返回 `ok` / `message` / `address` / `topic` / `latency_ms`，失败为 200 + `ok=false` + 原因（不是 500） |
 | GET | `/api/log-alerts/rules` | `logalert:read` | L0 | **日志告警规则列表**（`keyword` / `page` / `page_size`）；按 `priority ASC, id ASC` 返回——**列表顺序即匹配顺序** |

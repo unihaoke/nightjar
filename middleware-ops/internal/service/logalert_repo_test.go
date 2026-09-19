@@ -20,6 +20,11 @@ type stubRepoFetcher struct {
 	ensured int
 	lastReq RepoFetchRequest
 	err     error
+	// files 是 TrackedFiles 的返回值（模拟 git 索引里的文件清单）；
+	// filesErr 非空时模拟"索引不可用"，用于跑兜底遍历那条路径。
+	files    []string
+	filesErr error
+	revision string
 }
 
 func (s *stubRepoFetcher) Ensure(ctx context.Context, req RepoFetchRequest) (RepoFetchResult, error) {
@@ -33,6 +38,15 @@ func (s *stubRepoFetcher) Ensure(ctx context.Context, req RepoFetchRequest) (Rep
 
 func (s *stubRepoFetcher) HasCode(ctx context.Context, req RepoFetchRequest) bool {
 	return s.hasCode
+}
+
+func (s *stubRepoFetcher) TrackedFiles(ctx context.Context, req RepoFetchRequest) ([]string, error) {
+	s.lastReq = req
+	return s.files, s.filesErr
+}
+
+func (s *stubRepoFetcher) Revision(ctx context.Context, req RepoFetchRequest) string {
+	return s.revision
 }
 
 // TestCanReuseLocalCache 钉住：本地没有代码时，无论"上次拉过多久"都不能走缓存。

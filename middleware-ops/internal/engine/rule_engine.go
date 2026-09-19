@@ -43,6 +43,8 @@ func (r *ruleEngine) Status() Status {
 		Available: true,
 		Degraded:  true,
 		LastError: r.lastErr,
+		// 规则引擎全部在进程内计算，任何内容都不会出网。
+		External: false,
 	}
 }
 

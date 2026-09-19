@@ -569,14 +569,65 @@ docker exec mwops-postgres psql -U mwo -d middleware_ops -c \
 
 #### git 凭据与脱敏
 
-- 私有仓库用 **HTTPS + 只读访问令牌**（URL 形如 `https://oauth2:<token>@gitlab.internal/group/repo.git`）
-  或 **SSH 部署密钥**；令牌只需 `read_repository` 之类的读权限，并纳入轮换。
-- **URL 内嵌的凭据会被脱敏**：userinfo 段（`user:token@`）与 `?token=` / `?access_token=` / `?private_token=`
-  这类查询参数在平台日志、错误信息与页面上统一替换为 `***`（`internal/repo/redact.go`），
+- 私有仓库用 **HTTPS + 只读访问令牌**（令牌填在「访问令牌」框里，形如 `oauth2:<token>`），
+  或用 **SSH 部署密钥**；令牌只需 `read_repository` 之类的读权限，并纳入轮换。
+- **地址与令牌是分开的两件事**（重要）：`repo_url` 入库前会被净化成**不含凭据**的地址，
+  令牌单独加密保存在 `code_repos.credential_encrypted`（AES-GCM，主密钥见 6.3）。
+  因此接口与页面**看不到令牌**，只有 `has_credential` 这个布尔量；表单里的令牌框**永不回显**，
+  留空 = 不修改，要删除请勾「清除已保存的令牌」（与 AI 设置的密钥同一套规矩）。
+- **令牌不再落进缓存目录**：git 命令才用它拼出带凭据的地址，克隆/更新之后平台会把缓存里的
+  `origin` 改写成干净地址。因此 `.git/config` 里没有令牌（早期版本会留一份）。
+  剩余暴露面只有进程命令行（`git fetch <url>`，同容器内可读 `/proc/<pid>/cmdline`）。
+- **令牌轮换立即生效**：缓存里的 `origin` 会被对齐成配置里的地址，
+  不需要（也不应该）再进容器手工删缓存目录。
+- **旧数据自动迁移**：`repo_url` 里内嵌的令牌（早期版本的填写方式）在第一次被读取时
+  自动拆出来加密保存、地址同时净化；迁移失败时**保持原样**（绝不把唯一的凭据副本弄丢）。
+- **URL 内的凭据在任何输出里都脱敏**：userinfo 段（`user:token@`）与 `?token=` / `?access_token=` /
+  `?private_token=` 这类查询参数统一替换为 `***`（`internal/repo/redact.go`），
   连 git 回显的 stderr 也先脱敏再截断（≤400 字符）后才落库/打日志。
 - 平台以服务方式运行、**关闭了交互式输入**：凭据不对时 git 不会弹窗等待，而是直接失败并给出
   「认证失败：请检查凭据是否有效/未过期…」的中文结论。
-- 真实凭据在数据库里仍是明文存储（`code_repos.repo_url`），因此**数据库与备份同等敏感**，按 5.1 的备份策略保护。
+
+#### 代码定位的依据、版本与成本
+
+- **候选来自 git 索引**（`git ls-files`）而不是遍历文件系统：工作区里还有依赖目录（`node_modules`、
+  `vendor`）、构建产物（`target`、`dist`）与未跟踪残留，逐个遍历会按顺序撞上第一个同名文件，
+  给出一个"来自依赖目录、却很自信"的错行。索引读不到时退化为带排除目录的遍历。
+- **按堆栈的路径线索打分**：Java 的 `a.b.OrderService` → `a/b/OrderService.java`，
+  Python/Go 用堆栈里的路径逐级后缀匹配；依赖/产物目录扣分、测试目录扣分，取分最高者。
+  降权不等于排除——源码确实缺失时仍会给出候选取代"什么都找不到"。
+- **不跟随符号链接**：指向仓库外的软链不会被读取（否则一个 `Foo.java -> /etc/passwd`
+  就能把任意文件内容带进报告、通知甚至第三方 AI）。
+- **结论绑定代码版本**：报告的 `repo_revision` 记录了本次定位所用的提交（短 sha），
+  页面「代码分析报告」里能看到。行号会随代码演进失效，没有版本号就无法判断
+  "当初定位错了"还是"代码后来改了"。
+- **重启不会重复拉取**：最小拉取间隔同时参考进程内记忆与数据库的 `last_pull_at`，
+  容器重建/滚动升级后不会把所有仓库重新 fetch 一遍（缓存卷里的代码本来就是新的）。
+
+#### 合规开关的**硬**语义（`allow_third_party` / `outbound_whitelist`）
+
+这两个开关现在**真正拦截出网**，而不只是打标（早期版本只记录不生效，见 INC-030）：
+
+- 平台当前的 AI 引擎若是**第三方提供方**（`ai_engine.third_party`，混合链含它也算），
+  而该服务没勾「允许第三方 AI」或不在白名单里 → **不调用引擎**，
+  该条事件的 `analysis_state=disabled`（不是 failed），原因里写清三种出路。
+- 平台给出的**本地定位结果照常记录**（文件、行号、片段、代码版本）：片段留在平台内部，
+  排障时依然有用，也让人看得出"定位是成功的，只是没发给外部 AI"。
+- 引擎是**自建**（`self_hosted`，内网 vLLM/Ollama）或降级成**规则引擎**时不受此限制：
+  这两种情况内容不出网。判定由引擎自己声明（`engine.Status.External`），
+  而不是读配置字符串——工厂可能因缺配置把第三方降级成规则引擎，那种情况下确实不会出网。
+
+**未在本仓库环境验证的部分**（如实说明）：上述守卫都由 Go 单测覆盖
+（`TestOutboundGate` / `TestApplyCodeRepoInputSanitizesAndEncrypts` / `TestLocateCode*` /
+`repo.TestCloneInjectsCredentialButKeepsConfigClean` 等），并且逐个用"注入故障看测试是否变红"
+确认过有效性；但以下三件事**没有真实环境证据**，交付后请在 Linux/容器里补一次：
+
+1. **软链守卫**：`Foo.java -> /etc/passwd` 这类候选必须被跳过。本机（Windows，无建软链权限）
+   该用例会 skip，而"候选是目录"那一段不能替代它（读目录本身就会失败）；
+2. **真实代码托管的认证与轮换**：令牌拆分/加密/`remote set-url` 都是用假执行器逐字断言的命令行契约，
+   没有对着真实的 GitLab/Gitea 跑过"配令牌 → 克隆 → 轮换令牌 → 再拉取"；
+3. **查询参数形式的凭据**（`?token=` / `?private_token=`）在真实服务上的可用性——
+   平台按约定把它原样追加回地址，但各家服务的接受方式并不统一。
 
 #### `code_repo.allow_outbound=false` 的后果
 

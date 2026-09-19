@@ -181,6 +181,10 @@ func (f *Factory) newProvider(name string, p config.ProviderConfig) (Engine, str
 		Timeout:          timeout,
 		FailureThreshold: f.cfg.AIEngine.Fallback.FailureThreshold,
 		OpenDuration:     f.cfg.AIEngine.Fallback.OpenDuration,
+		// 只有 third_party 这个名字代表"组织外部的 AI 服务"；self_hosted 的语义就是内网自建
+		// （vLLM/Ollama），即便它填了公网地址也由使用者自己负责。这个标记只用于合规判定
+		//（见 engine.Status.External），不改变任何网络行为。
+		External: name == "third_party",
 	})
 	if err != nil {
 		return nil, fmt.Sprintf("%s 初始化失败: %v", name, err)

@@ -322,13 +322,28 @@ type ServerInstance struct {
 type CodeRepo struct {
 	Base
 	ServiceName string `gorm:"size:128;index;not null" json:"service_name"`
-	RepoURL     string `gorm:"size:255" json:"repo_url"`
-	Branch      string `gorm:"size:64;default:main" json:"branch"`
-	LocalPath   string `gorm:"size:255" json:"local_path"`
-	Language    string `gorm:"size:32" json:"language"`
+	// RepoURL **不含任何访问凭据**（凭据走 CredentialEncrypted）。
+	//
+	// 这一条是硬约束：它会被接口原样返回、被页面回显、被日志与审计打印，
+	// 只要里面内嵌令牌，就等于把令牌发给了所有有「日志告警读」权限的人（INC-031）。
+	// 读取路径上有兼容处理：旧数据里内嵌的凭据会被拆出来并就地迁移。
+	RepoURL   string `gorm:"size:255" json:"repo_url"`
+	Branch    string `gorm:"size:64;default:main" json:"branch"`
+	LocalPath string `gorm:"size:255" json:"local_path"`
+	Language  string `gorm:"size:32" json:"language"`
+
 	// AllowThirdParty 为出网白名单开关，默认关闭（6.5）。
 	AllowThirdParty bool       `gorm:"default:false" json:"allow_third_party"`
 	LastPullAt      *time.Time `json:"last_pull_at"`
+
+	// CredentialEncrypted 是加密后的访问凭据（`user:secret` 或 `?token=xxx`，见 repo/credentials.go）。
+	//
+	// json:"-" 是**刻意的**：这个结构体会被直接序列化返回给前端，
+	// 标记为不输出可以保证"密钥类字段永不回显"这条规矩不依赖调用方记得脱敏（同 INC-018 的密钥规矩）。
+	CredentialEncrypted string `gorm:"size:512" json:"-"`
+	// HasCredential 是**只读的派生字段**（不落库）：告诉页面"这个仓库配了令牌"，
+	// 让使用者能确认令牌还在，而不需要（也不可能）把明文回显出来。
+	HasCredential bool `gorm:"-" json:"has_credential"`
 }
 
 // LogAlertEvent 应用日志告警事件（错误指纹 + 窗口去重 + 冷却）。
@@ -471,6 +486,11 @@ type AICodeAnalysis struct {
 	EngineStatus  string  `gorm:"size:32" json:"engine_status"`
 	CostTokens    int     `json:"cost_tokens"`
 	OutboundOK    bool    `json:"outbound_ok"`
+	// RepoRevision 是本次分析所用的代码版本（短 sha，来源见 repo.Fetcher.Revision）。
+	//
+	// 为什么必须落库：行号定位会随代码演进而失效，事后复核时要能回答
+	// "这条结论当时看的是哪一版代码"——没有它，"定位错了"与"代码已经改了"无法区分（INC-032）。
+	RepoRevision string `gorm:"size:64" json:"repo_revision"`
 }
 
 // NotificationLog 通知记录。

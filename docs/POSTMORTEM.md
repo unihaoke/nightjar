@@ -5,6 +5,155 @@
 
 ---
 
+## INC-032 · 按文件名全仓遍历定位代码：给出来自依赖目录的"高置信度错行"
+
+**背景**：同样是读代码读出来的（用户要求复核"日志告警里的 git clone 是否合理"），
+不是现场报障——但它的后果比多数现场故障更坏。
+
+**缺陷**（改动前的 `locateCode`）：
+
+```go
+_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+    if err != nil || d.IsDir() { return nil }
+    if strings.EqualFold(d.Name(), index.fileName) { found = path; return filepath.SkipAll }
+    return nil
+})
+```
+
+三个问题叠在一起：
+
+1. **遍历的是文件系统，不是 git 索引**：工作区里还有 `node_modules`、`vendor`、`target`、`dist`
+   以及未跟踪的构建产物；`OrderService.java`、`main.go`、`models.py` 这类名字在依赖里大量存在；
+2. **取第一个命中**：顺序由 `WalkDir` 的字典序决定，于是"命中哪个"取决于目录名——
+   `legacy/`、`target/` 常常排在 `src/` 前面；
+3. **堆栈里的路径线索被丢掉**：`at com.acme.order.OrderService.process(OrderService.java:42)`
+   里的类名（→ `com/acme/order/OrderService.java`）本来足以唯一定位，却被只保留了文件名。
+
+结果是**行号错、而且还带着置信度**：报告显示"定位到 target/classes/.../OrderService.java:120"，
+人工复核时反而更容易被带偏（对比"未能定位"至少是诚实的）。
+
+**修复**
+
+1. 候选来自 **git 索引**（`git ls-files -z`，见 `repo.Fetcher.TrackedFiles`），
+   索引不可用时退化为跳过依赖/产物目录的遍历；
+2. **按路径线索打分**：Java 的类名转路径、Python/Go 用堆栈里的路径**逐级后缀**匹配
+   （运行时路径 `/app/foo/bar.py` 与仓库布局 `src/foo/bar.py` 靠后缀对齐）；
+   依赖/产物目录 −50、测试目录 −25；并列时取路径更浅的那个；
+3. 降权而**不排除**：唯一候选在 `vendor/` 下时仍然返回它（总比什么都没有有用）；
+4. 顺手补两条安全与可用性：**不读符号链接**（`Foo.java -> /etc/passwd` 能把任意文件内容
+   带进报告、通知与第三方 AI）、返回**仓库内相对路径**而不是宿主绝对路径
+   （后者会泄露平台缓存目录布局）；
+5. 文件清单按 2 分钟 TTL 缓存：清单只随代码更新变化，而分析频率由日志量决定。
+
+**防复发**
+
+1. `TestLocateCodePrefersSourceOverVendorTargetAndTests`：源码 / 构建产物 / 依赖 / 测试四处同名，
+   必须命中源码那一份，且返回的是相对路径；
+2. `TestLocateCodeStillUsesVendorWhenSourceMissing`：唯一候选在依赖目录下仍要能用；
+3. `TestLocateCodeMatchesPathHintForDynamicLanguages`：Python 后缀匹配、Go 模块路径匹配；
+4. `TestLocateCodeFallsBackToWalkWhenIndexUnavailable`：索引不可用时的兜底不得走进依赖目录；
+5. `TestLocateCodeSkipsNonRegularCandidate`：候选是目录 / 指向仓库外的软链时都必须跳过。
+   **覆盖度要如实说明**：真正防的是软链，而本机（Windows，无建软链权限）会 skip，
+   目录那一段即使守卫失效也不会读出内容（`os.ReadFile` 读目录本身就失败）——
+   也就是说**这条守卫的失效在 Windows 上测不出来，需要在 Linux/容器里跑**。
+6. `repo.TestTrackedFilesUsesGitIndex`：往工作区放一个**未跟踪**的同名文件，
+   索引与 `Revision` 都必须看不到它。
+
+---
+
+## INC-031 · git 令牌明文入库、被页面回显，还会抄进缓存目录的 .git/config
+
+**背景**：与 INC-032 同批复核（"日志告警里的 git clone 是否合理"）。原设计把令牌写进
+`repo_url`（文档里还给了示例 `https://oauth2:<token>@gitlab.internal/...`），于是同一份令牌有**三处**静态暴露。
+
+**缺陷**
+
+1. **明文入库**：`code_repos.repo_url` 直接存带令牌的地址（备份、只读账号、慢查询日志同等敏感）；
+2. **页面回显**：`GET /api/log-alerts/code-repos` 只要求 `logalert:read` 权限，
+   而 **dev 角色就有这个权限**；前端把 `repo_url` 原样渲染进表格与详情（编辑表单还会回填）
+   ⇒ 任何能看日志告警的人都读到了令牌；
+3. **缓存目录**：git 会把 clone 用的 URL 写进 `<缓存>/<服务>/.git/config`，又多一份拷贝；
+4. **轮换即失效**：更新时用的是 `.git/config` 里的旧 origin（只告警不改写），
+   轮换令牌后该服务**永久认证失败**，唯一出路是进容器删缓存目录——而错误信息里看不出这一点。
+
+**修复**
+
+1. **地址与凭据分离**：新增 `repo.SpliCredentials/WithCredential`（支持 `user:secret@`、
+   单段 `token@`（按 `oauth2` 补用户名）、`?token=`/`?private_token=` 查询参数三种形态）；
+   入库的 `repo_url` 一律净化，令牌加密存 `credential_encrypted`（AES-GCM，
+   与 AI 密钥同一套主密钥）；
+2. **只写不回显**：模型上 `json:"-"` + 只读派生字段 `has_credential`；入参
+   `credential` 留空=不修改、`clear_credential`=显式清除（没有它就没有删令牌的办法）；
+   审计只记"有没有/改没改"这个布尔量；
+3. **凭据不落盘**：git 命令用带凭据的地址，克隆/更新后 `git remote set-url origin <干净地址>`；
+   更新时 fetch 走**显式地址 + 显式 refspec**（不再依赖 origin 认证），
+   "无分支"那条路改成等价的 `fetch` + `merge --ff-only FETCH_HEAD`；
+4. **轮换立即生效**：`syncRemoteURL` 在每次同步前把 origin 对齐成配置里的地址（原来是只告警）；
+5. **旧数据自动迁移**：读取路径上把 `repo_url` 里内嵌的凭据拆出来加密（幂等）；
+   迁移**失败时保持 URL 原样**——那份凭据是唯一副本，绝不能因为"净化"把它弄丢；
+6. **没有加密能力就拒绝保存**（`cipher == nil`），而不是退化成明文；
+7. 顺带修掉"重启后全量重拉"：最小拉取间隔改为同时参考进程内记忆与数据库 `last_pull_at`
+   （原来只读内存，于是每次滚动升级都把所有仓库 fetch 一遍）。
+
+**防复发**
+
+1. `repo.TestSplitCredentials` / `TestCredentialRoundTrip`：九种地址形态 + "拆出来能原样拼回去"；
+2. `repo.TestCloneInjectsCredentialButKeepsConfigClean` / `TestUpdateFetchesWithCredentialExplicitly`：
+   逐字断言命令行——clone/fetch 用带凭据地址、`set-url origin` 只写干净地址（并对"写进带凭据的
+   origin"做反证）；`TestUpdateWithoutBranchKeepsFastForwardSemantics` 锁住 `--ff-only` 语义不变；
+3. `service.TestApplyCodeRepoInputSanitizesAndEncrypts`：粘带令牌的 URL 会被拆出来加密、
+   留空不修改、`clear_credential` 生效、查询参数形式也搬走；
+4. `service.TestRepoCredentialJSONNotExposed`：直接断言序列化结果里没有密文字段（防呆）；
+5. `service.TestPrepareRepoCredentialMigratesLegacy`：迁移幂等；**无 cipher 时报错且不改动原地址**
+   （原地址里的凭据不能丢）。
+
+---
+
+## INC-030 · 合规开关只"标注"不"拦截"：没勾白名单，代码片段照样发给了第三方 AI
+
+**背景**：同样来自这轮复核。文档向使用者承诺"`allow_third_party` 管的是**能否把代码片段发给
+第三方 AI**"，而代码里它只影响两处**记录**。
+
+**缺陷**
+
+`Analyze` 算出了 `thirdPartyEnabled`，然后只把它写进 `evidence["third_party"]`、
+报告字段 `outbound_ok` 与审计明细；紧接着**无条件**调用 `s.engine.Chat(...)`：
+
+```go
+thirdPartyEnabled := repo != nil && repo.AllowThirdParty && !in.ForceLocal
+...
+resp, err := s.engine.Chat(ctx, engine.ChatRequest{...})  // ← 无论上面算出什么都会调用
+```
+
+而引擎是**进程级**按 `ai_engine.strategy` 选的（`third_party` / `self_hosted` / `hybrid`），
+与"这个仓库、这个服务"无关。于是当策略是第三方（或混合链以第三方为主）时：
+**未勾选、也不在白名单里的服务，私有代码片段照样发了出去**——而且报告里还写着 `outbound_ok=false`，
+看起来"合规已生效"。`force_local` 也一样：它只把标记改成 false，拦不住那次调用。
+
+**修复**
+
+1. 引擎**自报**是否会把内容发往组织外部：`engine.Status.External`
+   （第三方 true / 自建 false / 混合链含第三方即 true（保守）/ 规则引擎 false）。
+   用引擎声明而不是读配置字符串：工厂可能因缺 `base_url` 把第三方降级成规则引擎，那种情况确实不出网；
+2. 分析路径上加**硬闸门**：`engineExternal(engine) && !thirdPartyAllowed` → **不调用引擎**，
+   并且仍然完成本地定位、把文件/行号/片段/代码版本落库（片段留在平台内部，排障仍有用）；
+3. 明确的收场语义：返回 `apperr.CodeOutboundDenied`，后处理映射成
+   `analysis_state=disabled`（不是 `failed`）——它是**配置结果**不是故障，
+   按 failed 落库会让人去查"AI 为什么挂了"；
+4. 原因必须**可操作**：说清是"没勾允许第三方 / 不在白名单 / force_local"哪一种，
+   并给出三条出路（勾开关+加白名单 / 改用 self_hosted / 只看本地定位结果）。
+
+**防复发**
+
+1. `engine.TestStatusDeclaresExternalProvider`：第三方 true、自建 false、混合链 true、
+   降级成规则引擎 false、纯规则引擎 false；
+2. `service.TestThirdPartyAllowedFor`：五个格子的判定表（含 force_local 与白名单未命中）；
+3. `service.TestOutboundBlockReasonIsActionable`：原因里必须出现服务名、去哪勾、`self_hosted`、
+   以及"本地定位结果"这几样——"被拒绝了"本身不可操作；
+4. 经验提炼补一条（第 31 条）：**合规开关只有拦截才算数**。
+
+---
+
 ## INC-029 · 显式选了 Docker，却被判定成"复用"：handler 去重启 systemd，容器悄悄用着旧配置
 
 **背景**：这一条不是现场报障，而是在实现「覆盖 Filebeat」开关（用户要求："是否覆盖 Filebeat，
@@ -1731,3 +1880,12 @@ PostgreSQL 把内联 `UNIQUE` 命名为 `users_username_key`；
     同一个表单里的布尔项，缺省语义要**逐个按后果**决定，不能统一成一种写法。
     另外要把"开关管什么、不管什么"写清楚：这个开关只管程序本体（安装包/镜像），
     配置始终按内容同步——否则使用者会以为"不勾选就不会覆盖我的配置"。
+31. **合规开关只有"拦截"才算数，只打标等于没有**：`allow_third_party` 与出网白名单
+    算出来却只写进证据字段，真正的调用照发不误（INC-030）——这类缺陷最危险的地方在于
+    **报告里还写着"未出网"**，看的人会更加放心。凡是"允许/禁止"语义的配置，
+    都要能指出被它拦住的那一行代码，并有一条测试证明"禁止时确实没发生"。
+32. **密钥的"第二份副本"总在你想不到的地方**：把令牌写进 URL 会同时落进数据库列、
+    接口响应（谁有读权限谁就能看到）、以及 git 自己维护的 `.git/config`（INC-031）。
+    正确的形状是"地址归地址、凭据归凭据，凭据加密且只在用的一瞬间拼回去"；
+    同时要回答四个问题：留空是否等于不修改、怎么显式删除、审计记什么、旧数据怎么迁移
+    （迁移失败时**绝不能**把唯一那份凭据弄丢）。

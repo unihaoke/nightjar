@@ -376,7 +376,14 @@ func ansibleFailureExcerpt(output string, limit int) string {
 //	     异步、失败不阻断启动）、分析入口自兜（手工分析/重试也会先补代码），
 //	     「最小拉取间隔」只在本地确实有代码时生效，且空的/残缺的 .git 会被判定为
 //	     没有代码并重新 clone。
-const CodeRevision = "r16"
+//	r17：AI 代码分析链路的合规与凭据修复（复核「日志告警里的 git clone 是否合理」后落地）：
+//	     出网许可/白名单从"只标注"改为**硬拦截**（引擎自报 Status.External，未许可时不调用引擎，
+//	     事件记为 disabled 并给出三条出路，INC-030）；仓库地址与访问令牌分离（令牌加密入库、
+//	     接口与页面不回显、只在执行 git 时拼回、.git/config 保持干净、旧数据自动迁移、
+//	     轮换即时生效，INC-031）；代码定位改用 git 索引并按堆栈路径线索打分（依赖/产物/测试
+//	     目录降权、不跟随软链、返回仓库内相对路径，INC-032）；分析报告落库 repo_revision；
+//	     最小拉取间隔同时参考 DB 的 last_pull_at（重启不再全量重拉）。
+const CodeRevision = "r17"
 
 // writeSecret 把含凭据的内容写到 0600 的临时文件，返回路径。
 func (s *IntegrationService) writeSecret(name, content string) (string, error) {

@@ -112,6 +112,16 @@ type Status struct {
 	ConsecutiveFails int       `json:"consecutive_fails"`
 	LastError        string    `json:"last_error"`
 	LastFailureAt    time.Time `json:"last_failure_at"`
+	// External 表示本引擎可能把请求内容发往**组织外部**（第三方 AI 服务）。
+	//
+	// 这是**合规判定**的依据，不是健康信息：代码分析会把私有代码片段放进提示词，
+	// 因此"这份内容会不会离开组织"必须能由引擎自己声明，而不是让调用方去猜配置。
+	// 判定规则（保守优先）：
+	//   - 第三方提供方（third_party）→ true；
+	//   - 自建提供方（self_hosted，如内网 vLLM/Ollama）→ false；
+	//   - 混合链（hybrid）→ 链上**任意**一层是外部即 true（降级可能落到那一层）；
+	//   - 规则引擎（rule_engine）→ false（全部在进程内完成，不出网）。
+	External bool `json:"external"`
 }
 
 // 引擎层错误。

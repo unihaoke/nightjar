@@ -31,6 +31,9 @@ type httpProvider struct {
 	price    float64
 	timeout  config.TimeoutConfig
 	client   *http.Client
+	// external 表示该提供方在组织外部（第三方 AI）：由工厂按提供方名字设置，
+	// 供合规判定使用（见 Status.External）。它不影响任何网络行为，只是一个事实声明。
+	external bool
 
 	mu        sync.Mutex
 	fails     int
@@ -54,6 +57,8 @@ type HTTPProviderOptions struct {
 	Timeout          config.TimeoutConfig
 	FailureThreshold int
 	OpenDuration     time.Duration
+	// External 见 httpProvider.external：由工厂按提供方名字（third_party / self_hosted）设置。
+	External bool
 }
 
 // NewHTTPProvider 构造可用的 HTTP 引擎；baseURL 为空时返回错误，由工厂决定降级。
@@ -88,6 +93,7 @@ func NewHTTPProvider(opt HTTPProviderOptions) (Engine, error) {
 		timeout:          opt.Timeout,
 		failureThreshold: opt.FailureThreshold,
 		openDuration:     opt.OpenDuration,
+		external:         opt.External,
 		client: &http.Client{
 			Transport: &http.Transport{
 				DialContext:           dialer.DialContext,
@@ -129,6 +135,7 @@ func (p *httpProvider) Status() Status {
 		ConsecutiveFails: p.fails,
 		LastError:        p.lastErr,
 		LastFailureAt:    p.lastFail,
+		External:         p.external,
 	}
 }
 
