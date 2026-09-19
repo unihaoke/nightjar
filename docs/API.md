@@ -301,7 +301,7 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | GET | `/api/knowledge/options` | `knowledge:read` | L0 | 状态与来源选项 |
 | GET | `/api/knowledge/:id` | `knowledge:read` | L0 | 详情 |
 | POST | `/api/knowledge` | `knowledge:write` | L1 | 新增（人工录入默认 `published`） |
-| PUT | `/api/knowledge/:id` | `knowledge:write` | L1 | 更新（草稿转正：`status=published`） |
+| PUT | `/api/knowledge/:id` | `knowledge:write` | L1 | 更新（全字段可选；草稿转正只需 `{"status":"published"}`） |
 | POST | `/api/knowledge/:id/adopt` | `knowledge:write` | L1 | 采纳（累加采纳数并回写诊断反馈） |
 | DELETE | `/api/knowledge/:id` | `knowledge:write` | L1 | 删除 |
 

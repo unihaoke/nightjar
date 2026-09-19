@@ -64,7 +64,7 @@ func (h *Handler) UpdateKnowledge(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var in service.KnowledgeInput
+	var in service.KnowledgeUpdateInput
 	if !bindJSON(c, &in) {
 		return
 	}

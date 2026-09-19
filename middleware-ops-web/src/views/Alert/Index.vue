@@ -60,9 +60,40 @@ async function resolve(alert: Alert): Promise<void> {
   }
 }
 
+/**
+ * 将告警上下文拼成结构化问题描述。
+ * 一键诊断时带到 AI 诊断页预填「问题描述」，用户可再编辑，避免人工复述告警信息。
+ */
+function buildAlertQuestion(alert: Alert): string {
+  const level = alertLevelLabels[alert.alert_level] || alert.alert_level
+  const status = alertStatusLabels[alert.status] || alert.status
+  const type = mwTypeLabels[alert.mw_type] || alert.mw_type
+  const lines = [
+    `【告警 #${alert.id}｜${level}】${alert.alert_message}`,
+    `中间件类型：${type}；实例 ID：#${alert.instance_id}；告警状态：${status}`,
+    `当前指标值：${formatNumber(alert.metric_value)}；触发时间：${formatTime(alert.triggered_at)}`,
+  ]
+  if (alert.count > 1) {
+    lines.push(`去重窗口内合并触发 ${alert.count} 次`)
+  }
+  if (alert.cluster_id) {
+    lines.push(`语义聚类：${alert.cluster_id}`)
+  }
+  lines.push('请结合该实例近期指标与上下文定位根因，并给出可执行的处置建议。')
+  // 与 AI 诊断页问题描述的 maxlength 保持一致，避免超长被截断。
+  return lines.join('\n').slice(0, 1000)
+}
+
 /** 一键 AI 诊断（事件驱动，带告警上下文）。 */
 function diagnose(alert: Alert): void {
-  void router.push({ name: 'ai-diagnose', query: { instance_id: String(alert.instance_id), alert_id: String(alert.id) } })
+  void router.push({
+    name: 'ai-diagnose',
+    query: {
+      instance_id: String(alert.instance_id),
+      alert_id: String(alert.id),
+      question: buildAlertQuestion(alert),
+    },
+  })
 }
 
 /** 触发一轮规则评估。 */

@@ -25,6 +25,9 @@ const store = useUserStore()
 /** 来源告警（告警中心一键诊断带入；随诊断写回 Alert.diagnosis_id）。 */
 const alertId = ref<number>(Number(route.query.alert_id) || 0)
 
+/** 来源告警预填的问题描述（告警中心一键诊断带入，用户可自由编辑）。 */
+const presetQuestion = (Array.isArray(route.query.question) ? route.query.question[0] : route.query.question) || ''
+
 const instances = ref<MiddlewareInstance[]>([])
 const loadingInstances = ref(false)
 const streaming = ref(false)
@@ -34,7 +37,7 @@ const cancelStream = ref<(() => void) | null>(null)
 
 const form = reactive({
   instance_id: 0,
-  question: '',
+  question: String(presetQuestion).slice(0, 1000),
   skip_cache: false,
 })
 
@@ -226,6 +229,16 @@ onMounted(loadInstances)
             </el-form-item>
           </el-col>
         </el-row>
+
+        <el-alert
+          v-if="alertId"
+          class="mb"
+          type="info"
+          show-icon
+          :closable="false"
+          :title="`来自告警 #${alertId} 的一键诊断`"
+          description="问题描述已预填该告警的级别、类型、实例、指标值与触发时间，可按需修改；诊断完成后结论会回写到这条告警。"
+        />
 
         <el-form-item label="问题描述">
           <el-input

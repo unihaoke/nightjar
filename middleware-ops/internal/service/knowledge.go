@@ -29,13 +29,25 @@ func NewKnowledgeService(repo *repository.KnowledgeRepository, diagnoses *reposi
 	return &KnowledgeService{repo: repo, diagnoses: diagnoses, audit: audit, log: log}
 }
 
-// KnowledgeInput 是知识条目入参。
+// KnowledgeInput 是知识条目创建入参（标题与内容必填）。
 type KnowledgeInput struct {
 	Title   string   `json:"title" binding:"required,max=255"`
 	Content string   `json:"content" binding:"required"`
 	MWType  string   `json:"mw_type"`
 	Tags    []string `json:"tags"`
 	Status  string   `json:"status"`
+}
+
+// KnowledgeUpdateInput 是知识条目更新入参。
+//
+// 全部字段可选：指针用于区分"未传"与"传空串"。草稿转正只需提交 status，
+// 因此这里不能用 required，否则部分更新会被校验拦截。
+type KnowledgeUpdateInput struct {
+	Title   *string  `json:"title" binding:"omitempty,max=255"`
+	Content *string  `json:"content"`
+	MWType  *string  `json:"mw_type"`
+	Tags    []string `json:"tags"`
+	Status  *string  `json:"status"`
 }
 
 // List 分页检索知识条目。
@@ -82,31 +94,31 @@ func (s *KnowledgeService) Create(ctx context.Context, in KnowledgeInput, operat
 	return entry, nil
 }
 
-// Update 更新条目（含草稿转正：draft → published）。
-func (s *KnowledgeService) Update(ctx context.Context, id int64, in KnowledgeInput, operator Operator) (*model.KnowledgeBase, error) {
+// Update 更新条目（含草稿转正：draft → published，可只提交 status）。
+func (s *KnowledgeService) Update(ctx context.Context, id int64, in KnowledgeUpdateInput, operator Operator) (*model.KnowledgeBase, error) {
 	entry, err := s.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(in.Title) != "" {
-		entry.Title = strings.TrimSpace(in.Title)
+	if in.Title != nil && strings.TrimSpace(*in.Title) != "" {
+		entry.Title = strings.TrimSpace(*in.Title)
 	}
-	if in.Content != "" {
-		entry.Content = in.Content
+	if in.Content != nil {
+		entry.Content = *in.Content
 	}
-	if in.MWType != "" {
-		entry.MWType = in.MWType
+	if in.MWType != nil {
+		entry.MWType = *in.MWType
 	}
 	if in.Tags != nil {
 		entry.Tags = model.JSONStringSlice(in.Tags)
 	}
 	statusChanged := false
-	if in.Status != "" {
-		if !validKnowledgeStatus(in.Status) {
-			return nil, apperr.Newf(apperr.CodeInvalidParam, "状态 %q 非法", in.Status)
+	if in.Status != nil && *in.Status != "" {
+		if !validKnowledgeStatus(*in.Status) {
+			return nil, apperr.Newf(apperr.CodeInvalidParam, "状态 %q 非法", *in.Status)
 		}
-		statusChanged = entry.Status != in.Status
-		entry.Status = in.Status
+		statusChanged = entry.Status != *in.Status
+		entry.Status = *in.Status
 	}
 	if err := s.repo.Update(ctx, entry); err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
