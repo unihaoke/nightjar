@@ -413,6 +413,9 @@ dial unix /var/run/docker.sock: connect: permission denied
 - 抓取与大盘：平台自带的 Prometheus + Grafana，被管项目**不再需要自带监控栈**。
 
 > 日志是**另一条独立链路**，且已不再需要被管项目配合：集成中心的「日志集成」
+> （`mw_type=log`）由平台用 Ansible 在目标机装 Filebeat，推送到平台自带的 Kafka，
+> 再由后端消费成日志事件并做规则化告警与 AI 代码定位，详见 `docs/LOG_INTEGRATION.md`。
+> 注意它在**纳管与监控域之外**：不会出现在中间件列表、统一监控下拉、指标告警的实例选择与大盘统计里。
 > （`category=log`）用 Ansible 在目标服务器上部署 Filebeat、把日志推到平台自带的 Kafka，
 > 既不需要共享日志卷、也不读对方的 docker 配置，更不需要 `docker.sock`——
 > 详见 §8.6 与 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)。
@@ -456,12 +459,22 @@ Filebeat 把日志推到**平台自带的 Kafka**。
         ↓
 ⑤ Filebeat ──▶ 平台 Kafka（EXTERNAL :9092）──▶ 消费组 mwops-log-ingest 消费 topic mwops-logs
         ↓
-⑥ 后端 internal/logpipe 解析事件 → service/logpipeline.go 编排 → LogAlertService.Ingest
-   （错误指纹 + 窗口去重 + 告警 + AI 诊断入口）→ 日志告警 → 事件
+⑥ 后端 internal/logpipe 解析事件 → LogAlertService.Ingest 按规则处理
+   （去重窗口合并 + 冷却抑制）→ 落 log_alert_events
+        ↓
+⑦ 后处理（service/logalert_worker.go，定时任务）：拉取/更新代码仓库 → AI 定位代码（三点式结论）
+   → 带结论外发通知渠道；页面可对单条事件「重新分析」（会打破冷却抑制）
 ```
 
 要点：
 
+- **日志集成不属于「中间件纳管域」**（重要边界）：它虽然也记录在 `middleware_instances`
+  （复用部署/尝试/自检那一套机制），但**没有指标画像、没有实例端口**，因此
+  **不会**出现在「中间件纳管」列表、统一监控的实例下拉、指标告警规则的实例选择、
+  大盘的实例统计与健康探测里。这个边界由 `service.MiddlewareDomainTypes()` 统一收口
+  （白名单 = 手工纳管的中间件类型 ∪ 有指标画像的集成类型），并有守卫测试钉住。
+  历史问题：这几个入口各自查同一张表且没排除 `mw_type=log`，结果是日志集成混进监控域，
+  还会被健康探测标成"离线"（它根本没有实例端口）。
 - **目标机出网与接入地址**：被管机必须能访问 `.env` 里的 `KAFKA_ADVERTISED_HOST:KAFKA_PORT`。
   这个值写 `localhost`/`127.0.0.1` 时，Filebeat 会**握手成功、随后立刻断开**并报
   `dial tcp 127.0.0.1:9092: connect: connection refused`——它被 broker 元数据引导去了自己那台机器。

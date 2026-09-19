@@ -163,7 +163,9 @@ func (h *Handler) HealthMiddleware(c *gin.Context) {
 
 // MiddlewareOptions 返回纳管元数据（类型、默认端口、分组、环境）。
 func (h *Handler) MiddlewareOptions(c *gin.Context) {
-	groups, envs, err := h.deps.Instances.ListGroups(c.Request.Context())
+	// 分组/环境下拉同样按纳管域过滤：这些下拉是给中间件列表与统一监控用的，
+	// 若把"只有日志集成在用"的分组列出来，使用者选完会发现一条记录都没有。
+	groups, envs, err := h.deps.Instances.ListGroups(c.Request.Context(), service.MiddlewareDomainTypes())
 	if err != nil {
 		response.Fail(c, apperr.Wrap(apperr.CodeInternal, err))
 		return

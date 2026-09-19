@@ -68,11 +68,13 @@ func NewDashboardService(d DashboardDeps) *DashboardService {
 
 // Overview 返回大盘总览。
 func (s *DashboardService) Overview(ctx context.Context, session *Session, scope Scope) (map[string]any, error) {
-	online, offline, err := s.instances.CountStatus(ctx, scope.EnvScope, scope.GroupScope)
+	// 大盘的实例口径 = 纳管域（见 MiddlewareDomainTypes）：日志集成不是"中间件实例"，
+	// 否则会出现 by_type: {log: 1} 这种让人困惑的统计。
+	online, offline, err := s.instances.CountStatus(ctx, scope.EnvScope, scope.GroupScope, MiddlewareDomainTypes())
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
-	byType, err := s.instances.CountByType(ctx, scope.EnvScope, scope.GroupScope)
+	byType, err := s.instances.CountByType(ctx, scope.EnvScope, scope.GroupScope, MiddlewareDomainTypes())
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}

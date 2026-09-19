@@ -19,6 +19,10 @@ type InstanceFilter struct {
 	Environment string
 	GroupName   string
 	Status      *int16
+	// MWTypes 为**白名单**（留空表示不限）：中间件纳管域只列中间件类型，
+	// 日志集成（mw_type=log）之类不属于该域的记录必须被数据库层直接挡掉，
+	// 而不是靠每个调用方记得过滤（漏一处它就会出现在统一监控的下拉里）。
+	MWTypes []string
 	// EnvScope / GroupScope 为数据权限过滤（为空表示不限制）。
 	EnvScope   []string
 	GroupScope []string
@@ -43,6 +47,9 @@ func (r *InstanceRepository) query(ctx context.Context, f InstanceFilter) *gorm.
 	}
 	if f.MWType != "" {
 		q = q.Where("mw_type = ?", f.MWType)
+	}
+	if len(f.MWTypes) > 0 {
+		q = q.Where("mw_type IN ?", f.MWTypes)
 	}
 	if f.Environment != "" {
 		q = q.Where("environment = ?", f.Environment)
@@ -165,7 +172,11 @@ func (r *InstanceRepository) Delete(ctx context.Context, id int64) error {
 }
 
 // CountByType 统计各中间件类型的实例数量。
-func (r *InstanceRepository) CountByType(ctx context.Context, envScope, groupScope []string) (map[string]int64, error) {
+//
+// mwTypes 为白名单（留空表示不限）：大盘的"实例总数/按类型"只应统计**中间件**，
+// 否则日志集成会被算成一种实例类型（`by_type: {log: 1}`），
+// 使用者看到的是"我明明没纳管这个中间件，怎么多了一个实例"。
+func (r *InstanceRepository) CountByType(ctx context.Context, envScope, groupScope, mwTypes []string) (map[string]int64, error) {
 	type row struct {
 		MWType string
 		Total  int64
@@ -179,6 +190,9 @@ func (r *InstanceRepository) CountByType(ctx context.Context, envScope, groupSco
 	if len(groupScope) > 0 {
 		q = q.Where("group_name IN ?", groupScope)
 	}
+	if len(mwTypes) > 0 {
+		q = q.Where("mw_type IN ?", mwTypes)
+	}
 	var rows []row
 	if err := q.Scan(&rows).Error; err != nil {
 		return nil, wrap(err, "count instances by type")
@@ -190,14 +204,17 @@ func (r *InstanceRepository) CountByType(ctx context.Context, envScope, groupSco
 	return out, nil
 }
 
-// CountStatus 统计在线/离线实例数量。
-func (r *InstanceRepository) CountStatus(ctx context.Context, envScope, groupScope []string) (online, offline int64, err error) {
+// CountStatus 统计在线/离线实例数量（mwTypes 为白名单，见 CountByType 的说明）。
+func (r *InstanceRepository) CountStatus(ctx context.Context, envScope, groupScope, mwTypes []string) (online, offline int64, err error) {
 	q := r.withCtx(ctx).Model(&model.MiddlewareInstance{})
 	if len(envScope) > 0 {
 		q = q.Where("environment IN ?", envScope)
 	}
 	if len(groupScope) > 0 {
 		q = q.Where("group_name IN ?", groupScope)
+	}
+	if len(mwTypes) > 0 {
+		q = q.Where("mw_type IN ?", mwTypes)
 	}
 	if err = q.Where("status = ?", 1).Count(&online).Error; err != nil {
 		return 0, 0, wrap(err, "count online")
@@ -209,13 +226,21 @@ func (r *InstanceRepository) CountStatus(ctx context.Context, envScope, groupSco
 }
 
 // ListGroups 返回现有分组与环境清单（供前端筛选器）。
-func (r *InstanceRepository) ListGroups(ctx context.Context) (groups []string, envs []string, err error) {
-	if err = r.withCtx(ctx).Model(&model.MiddlewareInstance{}).
-		Distinct().Pluck("group_name", &groups).Error; err != nil {
+//
+// mwTypes 同样按域过滤：分组筛选器是给中间件列表用的，
+// 若把"只有日志集成用过的分组"也列出来，使用者选完会发现一条记录都没有。
+func (r *InstanceRepository) ListGroups(ctx context.Context, mwTypes []string) (groups []string, envs []string, err error) {
+	base := func() *gorm.DB {
+		q := r.withCtx(ctx).Model(&model.MiddlewareInstance{})
+		if len(mwTypes) > 0 {
+			q = q.Where("mw_type IN ?", mwTypes)
+		}
+		return q
+	}
+	if err = base().Distinct().Pluck("group_name", &groups).Error; err != nil {
 		return nil, nil, wrap(err, "list groups")
 	}
-	if err = r.withCtx(ctx).Model(&model.MiddlewareInstance{}).
-		Distinct().Pluck("environment", &envs).Error; err != nil {
+	if err = base().Distinct().Pluck("environment", &envs).Error; err != nil {
 		return nil, nil, wrap(err, "list envs")
 	}
 	out := make([]string, 0, len(groups))

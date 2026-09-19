@@ -12,6 +12,7 @@ import (
 
 	"middleware-ops/internal/apperr"
 	"middleware-ops/internal/engine"
+	"middleware-ops/internal/integration"
 	"middleware-ops/internal/model"
 	"middleware-ops/internal/monitor"
 	"middleware-ops/internal/repository"
@@ -87,11 +88,45 @@ type TestResult struct {
 	Endpoint string `json:"endpoint"`
 }
 
+// MiddlewareDomainTypes 返回属于「中间件/主机纳管与监控域」的类型白名单。
+//
+// 判定依据是**有没有指标画像**，而不是在每个调用方硬编码"排除 log"：
+//   - redis/mysql/pg/kafka/es/nginx/node：都有指标画像 → 属于该域（统一监控里能选指标）；
+//   - 日志集成（mw_type=log）：没有画像、也没有实例端口 → **不属于该域**。
+//
+// 为什么必须收口成一函数：中间件纳管列表、统一监控的实例下拉、指标告警的实例选择、
+// 大盘的实例统计、健康探测……都在查同一张表。漏掉任何一处，
+// 日志集成就会以"一个实例"的身份冒出来（真实反馈：纳管列表与统一监控下拉里混进了 logs，
+// 而且健康探测会把它标成离线——它根本没有实例端口）。
+//
+// 手工纳管的类型也要保留（如二期的 rabbitmq 没有集成模板，但能手填），
+// 因此白名单 = 手工支持的类型 ∪ 有画像的集成类型。
+func MiddlewareDomainTypes() []string {
+	set := make(map[string]bool, len(supportedTypes)+2)
+	for mwType := range supportedTypes {
+		set[mwType] = true
+	}
+	for _, tplType := range integration.SupportedTypes() {
+		if profile := monitor.ProfileOf(tplType); len(profile.Metrics) > 0 {
+			set[tplType] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for mwType := range set {
+		out = append(out, mwType)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // List 分页查询实例。
+//
+// 只列**纳管域**内的实例（见 MiddlewareDomainTypes）：日志集成不属于这里。
 func (s *MiddlewareService) List(ctx context.Context, keyword, mwType, environment, group string, scope Scope, limit, offset int) ([]model.MiddlewareInstance, int64, error) {
 	items, total, err := s.repo.List(ctx, repository.InstanceFilter{
 		Keyword:     keyword,
 		MWType:      mwType,
+		MWTypes:     MiddlewareDomainTypes(),
 		Environment: environment,
 		GroupName:   group,
 		EnvScope:    scope.EnvScope,
@@ -301,7 +336,9 @@ func (s *MiddlewareService) HealthCheck(ctx context.Context, id int64, operator 
 //
 // 返回在线数量与探测总数，便于调度日志观测。
 func (s *MiddlewareService) ProbeAll(ctx context.Context) (online, total int, err error) {
-	items, err := s.repo.All(ctx, repository.InstanceFilter{})
+	// 只探纳管域内的实例：日志集成没有实例端口，探它只会必然失败、
+	// 把它标成"离线"，并在大盘上多出一个假的离线实例。
+	items, err := s.repo.All(ctx, repository.InstanceFilter{MWTypes: MiddlewareDomainTypes()})
 	if err != nil {
 		return 0, 0, err
 	}
@@ -329,7 +366,10 @@ func (s *MiddlewareService) ProbeAll(ctx context.Context) (online, total int, er
 
 // Targets 返回可用于监控查询的目标列表（受数据权限约束）。
 func (s *MiddlewareService) Targets(ctx context.Context, scope Scope, ids []int64) ([]monitor.Target, error) {
-	items, err := s.repo.All(ctx, repository.InstanceFilter{EnvScope: scope.EnvScope, GroupScope: scope.GroupScope})
+	items, err := s.repo.All(ctx, repository.InstanceFilter{
+		MWTypes:  MiddlewareDomainTypes(),
+		EnvScope: scope.EnvScope, GroupScope: scope.GroupScope,
+	})
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}

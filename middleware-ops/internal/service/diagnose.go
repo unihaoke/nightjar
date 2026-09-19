@@ -160,7 +160,12 @@ func (s *DiagnoseService) Resolve(ctx context.Context, in Request, scope Scope) 
 		return &Target{Instance: *item, MWType: item.MWType}, nil
 	}
 
-	items, err := s.instances.All(ctx, repository.InstanceFilter{EnvScope: scope.EnvScope, GroupScope: scope.GroupScope})
+	// 自动选实例时同样只在纳管域内选：日志集成没有指标可诊断，
+	// 被选中只会让诊断报"取不到指标"，而使用者根本没打算诊断它。
+	items, err := s.instances.All(ctx, repository.InstanceFilter{
+		MWTypes:  MiddlewareDomainTypes(),
+		EnvScope: scope.EnvScope, GroupScope: scope.GroupScope,
+	})
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}

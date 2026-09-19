@@ -95,6 +95,7 @@ func (s *MetricsService) Compare(ctx context.Context, ids []int64, metric string
 		return nil, apperr.New(apperr.CodeInvalidParam, "必须指定对比指标")
 	}
 	items, err := s.instances.All(ctx, repository.InstanceFilter{
+		MWTypes:  MiddlewareDomainTypes(),
 		EnvScope: scope.EnvScope, GroupScope: scope.GroupScope,
 	})
 	if err != nil {

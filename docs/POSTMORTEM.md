@@ -5,6 +5,123 @@
 
 ---
 
+## INC-024 · Filebeat 的 docker 单文件挂载把配置路径变成了目录，「下发配置」必然失败
+
+**首次暴露**：2026-09-19，日志集成在目标机 `203.195.191.75` 部署失败：
+
+```
+待处理项：创建只读账号并拉起 Exporter失败：Ansible 执行失败：exit status 2
+（前面 36 行成功的任务已省略）
+TASK [下发 filebeat.yml（内容不变时不重启采集）]
+fatal: [203.195.191.75]: FAILED! => {"changed": false, "msg": "can not use content with a dir as dest"}
+```
+
+**定位过程**
+
+1. 把渲染出来的 playbook 拉出来一看便知：任务顺序是 **docker 分支先跑**（`docker run`），
+   **之后**才用 `copy` 下发 `filebeat.yml`；
+2. docker 分支用的是**单文件挂载**：`-v /etc/filebeat/filebeat.yml:/etc/filebeat/filebeat.yml:ro`。
+   宿主上这个文件**首次并不存在**，而 Docker 的既定行为是——把缺失的宿主路径**创建成目录**；
+3. 于是紧接着的 `copy: dest=/etc/filebeat/filebeat.yml + content=…` 发现 dest 是个目录，
+   报 `can not use content with a dir as dest`。**只要走 docker 分支就 100% 失败**；
+   package 分支不会（deb 安装时已落了真实文件），所以这个缺陷只在"目标机有 docker"时暴露；
+4. 更麻烦的是**目标机已被污染**：那台机器上的 `/etc/filebeat/filebeat.yml` 已经是个目录，
+   光调整顺序并不能让它恢复。
+
+顺带发现两个同源问题：
+- **auto 模式的分支提示顺序写反**：日志里先打印一串安装任务、最后才说"检测到已安装，跳过安装"，
+  读起来与结论相反（决策明明是"复用"）；
+- **文案错位**：日志集成的待处理项写着"创建只读账号并拉起 Exporter"——它既没有只读账号也没有
+  Exporter，会把人往错误的排查方向带。
+
+**根因**
+
+1. 把"配置文件"当成"容器挂载的输入"，却忽略了**单文件挂载会创建宿主路径**这条 Docker 语义；
+   而执行顺序（先起容器、后写配置）又恰好让这个副作用发生在写配置之前；
+2. 幂等探测只覆盖了"是否已安装 Filebeat"，没有覆盖"**配置路径本身是否可用**"（是不是普通文件），
+   于是历史残留能一直卡住后续所有部署。
+
+**修复**
+
+1. **先落配置、再起容器**：新增"准备配置父目录"任务，并把 `下发 filebeat.yml` 的 copy
+   （含 `notify`）**移到所有安装/容器任务之前**；
+2. **自愈被污染的路径**：`stat` 探测配置路径，当 `exists and not isreg`（目录/软链等非普通文件）时
+   先 `state: absent` 再继续，并 debug 说明原因——**普通文件永不删**（不会清掉用户正在用的配置）；
+   已被污染的机器**下次执行即自愈**，无需人工介入；
+3. **启动容器前的闸门**：docker 分支加 `assert`——配置路径不是普通文件就**拒绝启动容器**并给出
+   `rm -rf` 的修法（宁可报错，也不让 Docker 再制造一个目录）；
+4. 配置路径统一由 `parent + "/" + 文件名` 推导，杜绝"两个来源各写一遍"再次分叉；
+5. auto 模式的分支提示顺序改为与决策一致（复用 → docker → package）；
+6. 待处理与后台任务的文案按集成类型分（日志集成显示"部署 Filebeat 日志采集"/"重新部署 Filebeat"）。
+
+**防复发**
+
+1. `TestRenderFilebeatInstallConfigBeforeContainer`：用 **YAML 解析出的任务名下标**断言顺序
+   `确保目录 < 自愈 < copy < docker run`（不是字符串搜索——名字出现在别处就会误判通过）；
+   三种安装方式都跑，且要求 Kafka 探测晚于 copy；
+2. `TestRenderFilebeatInstallHealsPollutedPath`：自愈任务必须含 `stat` + `register` + `state: absent`，
+   且 `when` 同时包含 `exists` 与 `not …isreg`（"普通文件不可删"这条边界）；docker/auto 还要断言
+   启动前的 `assert` 闸门存在；
+3. `TestRenderFilebeatInstallConfigPathsShareOneVariable`：配置路径必须由父目录推导，
+   且"确保目录"任务用变量而不是写死路径；
+4. 交付前**用另一种 YAML 实现（Python pyyaml）再次解析产物复核顺序**——与 Go 侧测试不同的解析器，
+   避免"测试和实现犯同一个错"。
+
+**给现场的提示**：若你的目标机已经被这个缺陷污染（`/etc/filebeat/filebeat.yml` 是目录），
+平台下次「重新应用」会自愈；想立刻手工清理可以执行
+`rmdir /etc/filebeat/filebeat.yml 2>/dev/null; mkdir -p /etc/filebeat`（`rmdir` 只能删空目录，更安全）。
+
+---
+
+## INC-023 · 日志集成混进了中间件纳管域：纳管列表、统一监控下拉、大盘统计里都冒出了 logs
+
+**首次暴露**：2026-09-19，使用者提问：
+
+> 「为什么 log 集成还是走的 redis 那个实例？logs 应该不走中间件纳管？」
+
+**定位过程**
+
+1. 日志集成复用了 `middleware_instances` 表（`mw_type=log`）——这是刻意的：它要复用远程部署、
+   凭据、发起尝试、自检那一整套机制。**但"共表"不等于"同域"**；
+2. 而这一域的入口全都直接查这张表，没有一个过滤掉 `log`：
+   - `/api/middlewares`（**中间件纳管列表**）→ 日志集成被列成一条"实例"；
+   - 同一个接口也是**统一监控页实例下拉**的数据源（`Monitor/Index.vue` 调 `middlewareApi.list`），
+     于是日志集也会出现在监控的实例选择里；
+   - `/api/middlewares/options` 的分组/环境下拉；大盘 `CountStatus` / `CountByType`
+     （会统计出 `by_type: {log: 1}`）；指标告警的实例选择；AI 诊断的自动选实例；
+   - 最隐蔽的一处：`ProbeAll` 健康巡检会去探日志集成的 `Host:Port`——它**根本没有实例端口**
+     （Port=0），探测必然失败，于是它被标成"离线"，大盘上凭空多出一个离线实例；
+3. 前端只看接口结果，所以"接口层面没过滤"等于"页面上到处都是"。
+
+**根因**
+
+把"共表"当成了"同域"。判断一条记录属不属于纳管域的依据不是它在哪张表，
+而是**它有没有指标画像**：有画像的（redis/mysql/pg/kafka/es/nginx/node）才能被纳管、被监控、
+被选进告警与诊断；日志集成没有画像、没有实例端口，就不该出现在这些地方。
+
+**修复**
+
+1. 新增 `service.MiddlewareDomainTypes()` 作为**唯一**的域白名单：
+   手工纳管的中间件类型（含二期 rabbitmq）∪ 有指标画像的集成类型（含主机监控 node）
+   ——`log` 没有画像，自动被排除；将来任何"无画像的一类集成"也自动不在域内，
+   不需要再回来补过滤；
+2. 仓储层支持白名单（`InstanceFilter.MWTypes`，`CountStatus`/`CountByType`/`ListGroups` 增加同参数），
+   **在数据库层挡掉**，而不是靠每个调用方记得过滤；
+3. 逐一收口：中间件列表、`Options` 的分组/环境下拉、统一监控实例对比（`Metrics.Compare`）、
+   `Targets`、健康巡检 `ProbeAll`、大盘统计、AI 诊断的自动选实例；
+4. 落地 `model.MWTypeLog` 常量，并在 `docs/INTEGRATION.md` §8.6 写明这条边界。
+
+**防复发**
+
+1. `TestMiddlewareDomainTypesExcludeLogIntegration`：白名单必须含全部中间件类型与主机监控
+   （有画像才在域内），且**必须不含** `log`；
+2. `TestMiddlewareDomainOnlyContainsProfiledTypes`：**通用规则**——凡是没有指标画像的集成类型
+   都不允许出现在该域；将来新增类型时这条测试自动生效；
+3. `TestLogTypeConstantsAgree`：`model.MWTypeLog` 与 `integration.TypeLog` 必须一致
+   （两处常量漂移会让域过滤静默失效）。
+
+---
+
 ## INC-022 · 日志进了平台就断了：没有规则、没有通知、没有 AI 分析、代码也拉不下来
 
 **首次暴露**：2026-09-19，使用者指出链路应该是完整的一段：

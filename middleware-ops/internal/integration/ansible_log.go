@@ -187,9 +187,14 @@ type filebeatVars struct {
 	container string
 	unit      string
 	config    string
-	mirror    string
-	image     string
-	mode      string
+	// parent 是 config 的父目录；dir 是集成自己的配置目录（放可读副本）。
+	// 两者都由变量表达：INC-013 的根因之一就是"配置目录"有两个来源
+	//（一个是 /etc/filebeat，一个是 opts.InstallDir），最终谁也没保证它存在。
+	parent string
+	dir    string
+	mirror string
+	image  string
+	mode   string
 }
 
 func filebeatCardinality() filebeatVars {
@@ -197,6 +202,8 @@ func filebeatCardinality() filebeatVars {
 		container: "filebeat_container",
 		unit:      "filebeat_unit",
 		config:    "filebeat_config_path",
+		parent:    "filebeat_config_parent_dir",
+		dir:       "filebeat_config_dir",
 		mirror:    "filebeat_mirror_path",
 		image:     "filebeat_image",
 		mode:      "filebeat_tested_mode",
@@ -308,6 +315,10 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 	b.WriteString("    filebeat_container: " + yamlScalar(in.Container) + "\n")
 	b.WriteString("    filebeat_unit: " + yamlScalar(FilebeatUnitName) + "\n")
 	b.WriteString("    filebeat_config_path: " + yamlScalar(in.ConfigPath) + "\n")
+	// 父目录也用变量表达（由 ConfigPath 推导，见 configParentDir）：INC-013 的教训是
+	// "配置目录"一旦有两个来源（写死的 /etc/filebeat 与 opts.InstallDir），
+	// 就会出现"建了 A、却往 B 写"的分叉，而这次的代价是产出一份必然失败的 playbook。
+	b.WriteString("    " + v.parent + ": " + yamlScalar(configParentDir(in.ConfigPath)) + "\n")
 	b.WriteString("    filebeat_config_dir: " + yamlScalar(in.ConfigDir) + "\n")
 	b.WriteString("    filebeat_mirror_path: " + yamlScalar(in.MirrorPath) + "\n")
 	b.WriteString("    filebeat_data_dir: " + yamlScalar(in.DataDir) + "\n")
@@ -316,6 +327,20 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 	writeFilebeatDetectTasks(&b)
 	writeFilebeatConfigDirTask(&b)
 	writeFilebeatResolveTasks(&b, v)
+	// 顺序是**刻意**的，改动前请先读下面这段（线上真实故障 INC-013）：
+	//
+	//	docker 的单文件挂载 `-v /etc/filebeat/filebeat.yml:...` 在宿主路径不存在时，
+	//	Docker 会**把缺失的宿主路径创建成目录**。如果先起容器、后 copy 配置，
+	//	copy 就会拿到一个目录当 dest，直接报：
+	//	  can not use content with a dir as dest
+	//	只要走 docker 分支，这个顺序就 100% 失败（package 分支不会，因为 deb 已经装了真实文件）。
+	//
+	// 因此固定为：
+	//	  建目录 → 自愈历史遗留（把被 Docker 造成目录的 filebeat.yml 清掉）
+	//	  → 下发 filebeat.yml（容器挂载前文件必须已存在）
+	//	  → 起容器 → Kafka 连通性探测 → 自检
+	writeFilebeatHealTasks(&b, v)
+	writeFilebeatConfigTask(&b, in)
 	switch in.Mode {
 	case LogInstallPackage:
 		writeFilebeatPackageTasks(&b, in, v)
@@ -326,7 +351,6 @@ func renderFilebeatPlaybook(in filebeatPlaybookInput) string {
 		// 这样"为什么这台机器用了 package 而不是 docker"可以直接从产物里读出来。
 		writeFilebeatAutoTasks(&b, in, v)
 	}
-	writeFilebeatConfigTask(&b, in)
 	writeFilebeatKafkaProbeTask(&b, in)
 	writeFilebeatVerifyTasks(&b, in)
 	// handlers 必须放在最后：Ansible 要求它和 tasks 同级，且写在 tasks 之后更贴近
@@ -393,13 +417,53 @@ func writeFilebeatDetectTasks(b *strings.Builder) {
 	b.WriteString("      register: filebeat_debian\n")
 }
 
-// writeFilebeatConfigDirTask 准备配置目录（集成名作为子目录，机器上可并存多份配置）。
+// writeFilebeatConfigDirTask 准备配置目录。
+//
+// 两个目录都要建（顺序也重要：先建 filebeat.yml 的父目录，再建集成自己的配置目录）：
+//   - filebeat_config_parent_dir（固定为 /etc/filebeat）：copy 的 dest 是它下面的文件，
+//     父目录不存在时 copy 同样会失败；历史上这里只建了集成配置目录（/opt/mwops/filebeat），
+//     父目录靠"docker 挂载顺手创建"——而 docker 创建出来的是**目录**，于是有了 INC-013；
+//   - filebeat_config_dir（/opt/mwops/filebeat）：保留一份可读副本的下发目录。
 func writeFilebeatConfigDirTask(b *strings.Builder) {
+	v := filebeatCardinality()
 	logTask(b, "准备 Filebeat 配置目录")
 	b.WriteString("      ansible.builtin.file:\n")
-	b.WriteString("        path: \"{{ filebeat_config_dir }}\"\n")
+	b.WriteString("        path: \"{{ " + v.parent + " }}\"\n")
 	b.WriteString("        state: directory\n")
 	b.WriteString("        mode: '0755'\n")
+	logTask(b, "准备集成配置目录（保留一份可读副本）")
+	b.WriteString("      ansible.builtin.file:\n")
+	b.WriteString("        path: \"{{ " + v.dir + " }}\"\n")
+	b.WriteString("        state: directory\n")
+	b.WriteString("        mode: '0755'\n")
+}
+
+// writeFilebeatHealTasks 自愈"配置文件位置被占用成非普通文件"的历史遗留。
+//
+// 真实故障 INC-013（用户环境 203.195.191.75）：docker 分支先跑，宿主上没有
+// /etc/filebeat/filebeat.yml，`-v <缺失路径>:/etc/filebeat/filebeat.yml:ro` 让 Docker
+// 把它创建成了一个**目录**；随后 copy 报 `can not use content with a dir as dest`。
+// 调整任务顺序只能防住"以后不再犯"，**用户那台机器已经被污染**，必须能自愈。
+//
+// when 条件 `exists and not isreg` 是安全边界：
+//   - 普通文件（isreg）**绝不删** —— 否则会把用户正在用的采集配置清掉；
+//   - 只有目录 / 软链（及设备文件等）这类"本来就不可能是 filebeat.yml"的东西才清。
+func writeFilebeatHealTasks(b *strings.Builder, v filebeatVars) {
+	logTask(b, "检查 filebeat.yml 是否被占用成目录（历史 docker 单文件挂载遗留）")
+	b.WriteString("      ansible.builtin.stat:\n")
+	b.WriteString("        path: \"{{ " + v.config + " }}\"\n")
+	b.WriteString("      register: filebeat_config_stat\n")
+	logTask(b, "清理非普通文件的 filebeat.yml（仅当它存在且不是普通文件）")
+	b.WriteString("      ansible.builtin.file:\n")
+	b.WriteString("        path: \"{{ " + v.config + " }}\"\n")
+	// state=absent 对目录是递归删除；这里的目标一定是个空目录（Docker 刚创建的挂载点），
+	// 但用递归语义更稳：万一里面被 Docker 写进了内容也不会半途报错。
+	b.WriteString("        state: absent\n")
+	b.WriteString("      when: " + yamlScalar("filebeat_config_stat.stat.exists and not filebeat_config_stat.stat.isreg") + "\n")
+	logTask(b, "说明清理原因（供使用者与平台自检核对）")
+	b.WriteString("      ansible.builtin.debug:\n")
+	b.WriteString("        msg: \"检测到 {{ " + v.config + " }} 是目录（历史 docker 单文件挂载生成），已清理并重建为文件\"\n")
+	b.WriteString("      when: " + yamlScalar("filebeat_config_stat.stat.exists and not filebeat_config_stat.stat.isreg") + "\n")
 }
 
 // writeFilebeatResolveTasks 计算"选哪条安装路径"，并把探测结果固化成可读变量。
@@ -428,6 +492,11 @@ func writeFilebeatResolveTasks(b *strings.Builder, v filebeatVars) {
 //   - docker → 起容器；
 //   - 其余 → 包安装。
 func writeFilebeatAutoTasks(b *strings.Builder, in filebeatPlaybookInput, v filebeatVars) {
+	b.WriteString("    # ---- auto 分支：已安装 → 复用；否则 docker；再否则 package ----\n")
+	// 顺序与决策顺序一致：先"复用"提示，再 docker，最后 package。
+	// 曾经把这条提示写在两个分支之后，于是日志里会先看到一堆安装/拉镜像任务、
+	// 最后才出现"检测到已安装…跳过安装"，读起来与结论相反（就是上面那个 INC 的同款问题：
+	// 任务顺序必须与真实决策顺序一致，否则排障时会被日志误导）。
 	logTask(b, "复用目标机已安装的 Filebeat（已存在则不部署）")
 	b.WriteString("      ansible.builtin.debug:\n")
 	b.WriteString("        msg: \"检测到已安装的 Filebeat（{{ filebeat_bin.stdout | default('') | trim }}），" +
@@ -612,12 +681,43 @@ func writeFilebeatContainerTasks(b *strings.Builder, in filebeatPlaybookInput, v
 	b.WriteString("      failed_when: false\n")
 	b.WriteString("      changed_when: false\n")
 	b.WriteString("      when: " + yamlScalar(cond) + "\n")
+	// 起容器之前的最后一道闸：配置文件必须是**普通文件**。
+	// 只要它不是普通文件（最典型的是上一次 docker 单文件挂载留下的目录），Docker 会再把它
+	// 当成"缺失路径"创建成目录，把问题滚雪球；这里明确失败并说清怎么修（宁可报错也不要制造目录）。
+	logTask(b, "启动容器前确认 filebeat.yml 已是普通文件（防止 Docker 再制造目录）")
+	b.WriteString("      ansible.builtin.assert:\n")
+	b.WriteString("        that:\n")
+	b.WriteString("          - filebeat_config_stat.stat.exists\n")
+	b.WriteString("          - filebeat_config_stat.stat.isreg\n")
+	b.WriteString("        fail_msg: \"{{ " + v.config + " }} 不是普通文件（可能是目录或软链），" +
+		"拒绝启动容器：Docker 会把缺失的宿主路径创建成目录，容器拿到的就不是配置文件。" +
+		"请先手工删除该路径（rm -rf {{ " + v.config + " }}）后重试。\"\n")
+	b.WriteString("      when: " + yamlScalar(cond) + "\n")
 	logTask(b, "创建 Filebeat 容器（已存在则跳过，避免无故重启采集）")
 	b.WriteString("      ansible.builtin.shell: |\n")
 	b.WriteString("        set -eu\n")
 	b.WriteString("        " + dockerRunLineForFilebeat(in, v) + "\n")
 	b.WriteString("      register: filebeat_container_run\n")
 	b.WriteString("      when: " + yamlScalar(cond+" and (filebeat_container_inspect.rc | default(1) | int) != 0") + "\n")
+}
+
+// configParentDir 返回配置文件所在目录（用于"确保父目录存在"那条任务）。
+//
+// 由 ConfigPath 推导而不是另写常量：父目录与 dest 必须同源，否则又会分叉出
+// "建了一个目录、往另一个目录写"的老问题（INC-013）。
+func configParentDir(configPath string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(configPath), "/")
+	idx := strings.LastIndex(trimmed, "/")
+	switch {
+	case idx > 0:
+		return trimmed[:idx]
+	case idx == 0:
+		// /filebeat.yml → 父目录就是根。
+		return "/"
+	default:
+		// 相对路径（理论上不会出现）：原样返回，交给 ansible 的 file 模块报错更清楚。
+		return trimmed
+	}
 }
 
 // dockerRunLineForFilebeat 生成 docker run 命令（含配置与日志目录挂载）。

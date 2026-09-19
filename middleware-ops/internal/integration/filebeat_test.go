@@ -466,6 +466,230 @@ func TestRenderFilebeatInstallKafkaProbe(t *testing.T) {
 	}
 }
 
+// playbookTaskNames 用 YAML 解析取出 playbook 里的任务名列表（按执行顺序）。
+//
+// 为什么不用字符串搜索：任务之间的先后关系是这次修复（INC-013）的核心契约，
+// 而"某段文本出现得更早"在有注释、有多个分支的情况下很容易看走眼；
+// 解析成任务名列表再比下标，才是对"执行顺序"本身的断言。
+func playbookTaskNames(t *testing.T, playbook string) []string {
+	t.Helper()
+	doc := parseYAML(t, "playbook", playbook)
+	// playbook 的根是**序列**（一个 play 一个元素），tasks 在 play 里，因此先取第一个 play，
+	// 再取它的 tasks（直接 yamlAt(doc, "tasks") 会因为根是序列而找不到）。
+	root := valueNode(doc)
+	if root.Kind != yaml.SequenceNode || len(root.Content) == 0 {
+		t.Fatalf("playbook 根应为序列（play 列表），实际 kind=%d", root.Kind)
+	}
+	tasks := yamlAt(t, root.Content[0], "tasks")
+	if tasks.Kind != yaml.SequenceNode {
+		t.Fatalf("playbook 的 tasks 应为序列，实际 kind=%d", tasks.Kind)
+	}
+	names := make([]string, 0, len(tasks.Content))
+	for i, task := range tasks.Content {
+		if task.Kind != yaml.MappingNode {
+			t.Fatalf("第 %d 个任务不是映射（YAML 结构错位）", i+1)
+		}
+		name := mappingChild(task, "name")
+		if name == nil {
+			t.Fatalf("第 %d 个任务缺少 name（无法做顺序断言）", i+1)
+		}
+		names = append(names, name.Value)
+	}
+	return names
+}
+
+// taskIndex 返回名字以 prefix 开头的第一个任务下标（找不到即用例失败）。
+func taskIndex(t *testing.T, names []string, prefix string) int {
+	t.Helper()
+	for i, name := range names {
+		if strings.HasPrefix(name, prefix) {
+			return i
+		}
+	}
+	t.Fatalf("任务列表里找不到以 %q 开头的任务，实际任务：\n%s", prefix, strings.Join(names, "\n"))
+	return -1
+}
+
+// TestRenderFilebeatInstallConfigBeforeContainer 锁定任务顺序（INC-013 的根因修复）。
+//
+// 线上真实故障（目标机 203.195.191.75，有 docker）：
+//
+//	fatal: [203.195.191.75]: FAILED! => {"changed": false,
+//	  "msg": "can not use content with a dir as dest"}
+//
+// 根因不是 copy 写错，而是**顺序错了**：docker 分支先跑，
+// `-v /etc/filebeat/filebeat.yml:...:ro` 遇到宿主上不存在的路径时，Docker 会把它创建成
+// **目录**；紧接着 copy 拿着这个目录当 dest，必然报上面那句。
+// 因此固定顺序必须是：
+//
+//	确保配置目录 → 自愈非普通文件 → 下发 filebeat.yml → 创建容器
+//
+// 少任何一步，或者把 copy 排到 docker 后面，都会重新掉进这个坑。
+func TestRenderFilebeatInstallConfigBeforeContainer(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+		names := playbookTaskNames(t, art.Playbook)
+
+		dirAt := taskIndex(t, names, "准备 Filebeat 配置目录")
+		healAt := taskIndex(t, names, "检查 filebeat.yml 是否被占用成目录")
+		copyAt := taskIndex(t, names, "下发 filebeat.yml")
+		if !(dirAt < healAt && healAt < copyAt) {
+			t.Fatalf("%s 模式的任务顺序必须满足「确保目录(%d) < 自愈(%d) < 下发配置(%d)」："+
+				"配置必须在容器挂载之前落成**文件**，否则 Docker 会把缺失的宿主路径创建成目录，"+
+				"copy 报 can not use content with a dir as dest：\n%s",
+				mode, dirAt, healAt, copyAt, strings.Join(names, "\n"))
+		}
+		// docker 分支只在 auto / docker 模式下存在（package 模式不碰容器）。
+		if mode != LogInstallPackage {
+			containerAt := taskIndex(t, names, "创建 Filebeat 容器")
+			if copyAt >= containerAt {
+				t.Fatalf("%s 模式：docker run 必须排在 copy 之后（copy=%d, run=%d）——"+
+					"先起容器就会让 Docker 把 filebeat.yml 的宿主路径创建成目录：\n%s",
+					mode, copyAt, containerAt, strings.Join(names, "\n"))
+			}
+		}
+		// Kafka 探测与自检必须在配置下发之后（它们要读的是刚下发的配置）。
+		if probe := taskIndex(t, names, "探测目标机到平台 Kafka"); probe < copyAt {
+			t.Fatalf("%s 模式：Kafka 探测不应排在配置下发之前（probe=%d, copy=%d）", mode, probe, copyAt)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallHealsPollutedPath 锁定自愈任务及其安全边界。
+//
+// 用户那台机器现在**已经被污染**：/etc/filebeat/filebeat.yml 是一个目录。
+// 只调整顺序防不住它，必须能在下次执行时把目录清掉并重建为文件；
+// 但**绝不能**误删正常的配置文件（那会把用户正在用的采集配置清空）。
+// 因此 when 条件必须是 `exists and not isreg` —— 只在「存在且不是普通文件」时才删。
+func TestRenderFilebeatInstallHealsPollutedPath(t *testing.T) {
+	for _, mode := range []string{LogInstallAuto, LogInstallPackage, LogInstallDocker} {
+		in := logTestInput()
+		in.InstallMode = mode
+		art := mustRenderFilebeatInstall(t, in, logTestOptions())
+
+		// 自愈任务：探测 → 注册变量 → 条件删除 → 说明原因。
+		statBlock := playbookTaskBlock(t, art.Playbook, "检查 filebeat.yml 是否被占用成目录")
+		for _, want := range []string{
+			"ansible.builtin.stat:",          // 先探测
+			"register: filebeat_config_stat", // 结果注册成变量（后面 copy 前的闸门也用）
+		} {
+			if !strings.Contains(statBlock, want) {
+				t.Fatalf("%s 模式的探测任务应包含 %q：\n%s", mode, want, statBlock)
+			}
+		}
+		removeBlock := playbookTaskBlock(t, art.Playbook, "清理非普通文件的 filebeat.yml")
+		for _, want := range []string{
+			"state: absent",                       // 删除非普通文件
+			"when:",                               // 必须带条件
+			"filebeat_config_stat.stat.exists",    // 存在才处理
+			"not filebeat_config_stat.stat.isreg", // 普通文件绝不删
+		} {
+			if !strings.Contains(removeBlock, want) {
+				t.Fatalf("%s 模式的清理任务应包含 %q（否则可能误删正常配置）：\n%s", mode, want, removeBlock)
+			}
+		}
+		debugBlock := playbookTaskBlock(t, art.Playbook, "说明清理原因")
+		for _, want := range []string{
+			"ansible.builtin.debug:",
+			"历史 docker 单文件挂载生成",
+			"已清理并重建为文件",
+		} {
+			if !strings.Contains(debugBlock, want) {
+				t.Fatalf("%s 模式的说明任务应包含 %q（使用者要能一眼看懂发生了什么）：\n%s", mode, want, debugBlock)
+			}
+		}
+		// 启动容器前必须有「必须是普通文件」的闸门：宁可报错，也不要让 Docker 再制造一个目录。
+		// package 模式不碰容器，因此这条只对 auto / docker 断言。
+		if mode == LogInstallPackage {
+			continue
+		}
+		guard := playbookTaskBlock(t, art.Playbook, "启动容器前确认 filebeat.yml 已是普通文件")
+		for _, want := range []string{
+			"ansible.builtin.assert:",
+			"filebeat_config_stat.stat.isreg",
+			"拒绝启动容器",
+		} {
+			if !strings.Contains(guard, want) {
+				t.Fatalf("%s 模式的启动前闸门应包含 %q：\n%s", mode, want, guard)
+			}
+		}
+		if !strings.Contains(guard, "when:") {
+			t.Fatalf("%s 模式的启动前闸门必须带 when（只在需要起容器时才校验）：\n%s", mode, guard)
+		}
+	}
+}
+
+// TestRenderFilebeatInstallConfigPathsShareOneVariable 锁定「配置目录只有一个来源」。
+//
+// INC-013 的次生根因：playbook 里同时存在写死的 /etc/filebeat 与 opts.InstallDir 两种
+// 「配置目录」概念，谁也没保证它存在。现在统一由 filebeat_config_path 推导出
+// filebeat_config_parent_dir，并被 copy 的 dest 与「确保目录」的 path 共同引用。
+func TestRenderFilebeatInstallConfigPathsShareOneVariable(t *testing.T) {
+	in := logTestInput()
+	art := mustRenderFilebeatInstall(t, in, logTestOptions())
+	root := valueNode(parseYAML(t, "playbook", art.Playbook))
+	// playbook 根是序列（play 列表），vars 在第一个 play 里。
+	play := root.Content[0]
+
+	if got := yamlAt(t, play, "vars.filebeat_config_parent_dir").Value; got != "/etc/filebeat" {
+		t.Fatalf("filebeat_config_parent_dir 应为 /etc/filebeat，实际 %q", got)
+	}
+	if got := yamlAt(t, play, "vars.filebeat_config_path").Value; got != "/etc/filebeat/filebeat.yml" {
+		t.Fatalf("filebeat_config_path 应为 /etc/filebeat/filebeat.yml，实际 %q", got)
+	}
+	// config_path 必须真的位于 config_parent_dir 之下：两者一旦分叉，就会出现
+	// "建了 A、往 B 写"的必然失败（正是 INC-013 的次生根因）。
+	parent := yamlAt(t, play, "vars.filebeat_config_parent_dir").Value
+	dest := yamlAt(t, play, "vars.filebeat_config_path").Value
+	if !strings.HasPrefix(dest, parent+"/") {
+		t.Fatalf("config_path(%q) 必须位于 config_parent_dir(%q) 之下", dest, parent)
+	}
+
+	// 「确保目录」的 path 必须引用那个变量，不得写死路径。
+	ensure := playbookTaskBlock(t, art.Playbook, "准备 Filebeat 配置目录")
+	if !strings.Contains(ensure, "path: \"{{ filebeat_config_parent_dir }}\"") {
+		t.Fatalf("确保目录任务必须用 filebeat_config_parent_dir 变量（写死路径会再次分叉）：\n%s", ensure)
+	}
+	if strings.Contains(ensure, "path: \"/etc/filebeat\"") {
+		t.Fatalf("确保目录任务不得写死 /etc/filebeat：\n%s", ensure)
+	}
+	// copy 的 dest 必须引用 config_path 变量。
+	copyBlock := playbookTaskBlock(t, art.Playbook, "下发 filebeat.yml")
+	if !strings.Contains(copyBlock, "dest: \"{{ filebeat_config_path }}\"") {
+		t.Fatalf("copy 的 dest 必须用 filebeat_config_path：\n%s", copyBlock)
+	}
+}
+
+// playbookTaskBlock 取出以 prefix 命名的任务块（下一个同级任务或 handlers 之前）。
+//
+// 用缩进判定任务边界：任务头是 "    - name: …"（4 空格），下一个任务头即结束。
+func playbookTaskBlock(t *testing.T, playbook, prefix string) string {
+	t.Helper()
+	lines := strings.Split(playbook, "\n")
+	start := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- name: ") && strings.Contains(trimmed, prefix) {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("找不到任务 %q：\n%s", prefix, playbook)
+	}
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "- name: ") || strings.HasPrefix(lines[i], "  handlers:") {
+			end = i
+			break
+		}
+	}
+	return strings.Join(lines[start:end], "\n")
+}
+
 // TestSplitHostPort 锁定探测地址的拆解（含 IPv6 与缺端口两种边界）。
 func TestSplitHostPort(t *testing.T) {
 	cases := []struct {

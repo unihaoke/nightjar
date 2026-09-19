@@ -458,10 +458,10 @@ func (s *IntegrationService) Create(ctx context.Context, in IntegrationInput, op
 	// 顺序很重要：先建只读账号，再拉起 Exporter；反过来的话 Exporter 会因认证失败反复重启。
 	if s.deployEnabled(in) || s.shouldBootstrapAccount(in, tpl.Type) {
 		// 用清理后的实例组装响应：否则返回的 last_error 还是上一次的旧失败。
-		if fresh := s.beginAttempt(ctx, item.ID, "创建只读账号并拉起 Exporter"); fresh != nil {
+		if fresh := s.beginAttempt(ctx, item.ID, deployAttemptLabel(tpl)); fresh != nil {
 			item = fresh
 		}
-		s.runAsync(item.ID, item.Name, "创建只读账号并拉起 Exporter", func(bgCtx context.Context) error {
+		s.runAsync(item.ID, item.Name, deployAttemptLabel(tpl), func(bgCtx context.Context) error {
 			bootstrapNote, bootstrapErr, _ := s.bootstrapAccount(bgCtx, item, tpl, instance, in, operator)
 			if bootstrapNote != "" {
 				s.setDeployNote(context.Background(), item.ID, bootstrapNote)
@@ -576,10 +576,10 @@ func (s *IntegrationService) Update(ctx context.Context, id int64, in Integratio
 	// 重活放后台（与 Create 一致）：编辑保存同样会重建 Exporter/建号。
 	if s.deployEnabled(in) || s.shouldBootstrapAccount(in, tpl.Type) {
 		// 用清理后的实例组装响应：否则返回的 last_error 还是上一次的旧失败。
-		if fresh := s.beginAttempt(ctx, item.ID, "重建账号与 Exporter"); fresh != nil {
+		if fresh := s.beginAttempt(ctx, item.ID, redeployAttemptLabel(tpl)); fresh != nil {
 			item = fresh
 		}
-		s.runAsync(item.ID, item.Name, "重建账号与 Exporter", func(bgCtx context.Context) error {
+		s.runAsync(item.ID, item.Name, redeployAttemptLabel(tpl), func(bgCtx context.Context) error {
 			bootstrapNote, bootstrapErr, _ := s.bootstrapAccount(bgCtx, item, tpl, instance, in, operator)
 			if bootstrapNote != "" {
 				s.setDeployNote(context.Background(), item.ID, bootstrapNote)

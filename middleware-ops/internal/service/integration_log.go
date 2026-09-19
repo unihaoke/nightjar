@@ -54,6 +54,25 @@ func isLogTemplate(tpl integration.Template) bool {
 	return tpl.CategoryOf() == integration.CategoryLog
 }
 
+// deployAttemptLabel / redeployAttemptLabel 是「平台正在为你做什么」的文案。
+//
+// 为什么必须按类型分：这两个字符串会出现在待处理横幅、实例备注与后台任务日志里
+// （真实反馈："待处理项：创建只读账号并拉起 Exporter失败"——可那是日志集成，
+// 既没有只读账号也没有 Exporter）。文案错位会让人按错误的思路排查。
+func deployAttemptLabel(tpl integration.Template) string {
+	if isLogTemplate(tpl) {
+		return "部署 Filebeat 日志采集"
+	}
+	return "创建只读账号并拉起 Exporter"
+}
+
+func redeployAttemptLabel(tpl integration.Template) string {
+	if isLogTemplate(tpl) {
+		return "重新部署 Filebeat"
+	}
+	return "重建账号与 Exporter"
+}
+
 // isLogMeta 从集成元信息判断它是不是日志集成（删除、自检等处只有 meta）。
 func isLogMeta(meta IntegrationMeta) bool {
 	tpl, ok := integration.TemplateOf(meta.Template)

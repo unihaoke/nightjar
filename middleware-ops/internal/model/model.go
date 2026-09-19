@@ -24,6 +24,13 @@ const (
 	MWTypeRMQ   = "rabbitmq"
 	// MWTypeNode 为主机监控（node_exporter）：采集对象是服务器本身，不是中间件实例。
 	MWTypeNode = "node"
+	// MWTypeLog 为**日志集成**（Filebeat → 平台 Kafka）。
+	//
+	// 它虽然也记录在 middleware_instances（复用部署/尝试/自检那一套机制），
+	// 但**不属于中间件纳管域**：没有指标、没有实例端口，也不该出现在「中间件纳管」列表、
+	// 统一监控的实例下拉、指标告警规则的实例选择与大盘的实例统计里。
+	// 域过滤统一走 service.MiddlewareDomainTypes()，不要在各处手写字符串比较。
+	MWTypeLog = "log"
 )
 
 // 环境分级（数据权限的隔离维度）。
