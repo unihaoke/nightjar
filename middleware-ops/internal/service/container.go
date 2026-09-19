@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,18 +13,9 @@ import (
 	"middleware-ops/internal/engine/guardrail"
 	"middleware-ops/internal/monitor"
 	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repo"
 	"middleware-ops/internal/repository"
 	"middleware-ops/internal/utils"
 )
-
-// cacheDirOrDefault 归一化代码仓库缓存目录（留空时用 ./data/repos，容器里落在 backend-data 卷内）。
-func cacheDirOrDefault(dir string) string {
-	if trimmed := strings.TrimSpace(dir); trimmed != "" {
-		return trimmed
-	}
-	return "./data/repos"
-}
 
 // ContainerOptions 是服务容器构造参数。
 type ContainerOptions struct {
@@ -78,7 +68,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Approvals = repository.NewApprovalRepository(opt.DB)
 	deps.Fixes = repository.NewFixRepository(opt.DB)
 	deps.Servers = repository.NewServerRepository(opt.DB)
-	deps.CodeRepos = repository.NewCodeRepoRepository(opt.DB)
+	deps.AIAnalysisTasks = repository.NewAIAnalysisTaskRepository(opt.DB)
 	deps.LogEvents = repository.NewLogEventRepository(opt.DB)
 	deps.LogAlertRules = repository.NewLogAlertRuleRepository(opt.DB)
 	deps.LogAlertExclusions = repository.NewLogAlertExclusionRepository(opt.DB)
@@ -158,8 +148,8 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.KnowledgeSvc = NewKnowledgeService(deps.Knowledge, deps.Diagnoses, deps.Audit, opt.Log)
 	deps.Approval = NewApprovalService(deps.Approvals, deps.Notifier, deps.Audit, opt.Log)
 	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, deps.AlertSvc, opt.Log)
-	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos,
-		deps.LogAlertRules, deps.LogAlertExclusions, cfg, opt.Cache, deps.Audit, opt.Cipher, opt.Log)
+	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents,
+		deps.LogAlertRules, deps.LogAlertExclusions, cfg, opt.Cache, deps.Audit, opt.Log)
 	// 日志集成的接收链路（Filebeat → 平台 Kafka → 日志事件）。
 	// 只装配不启动：启动时机由 main 决定（跟随进程生命周期），未配置 Kafka 时它是空转的安全对象。
 	deps.LogPipeline = NewLogPipeline(cfg, deps.LogAlert, opt.Log)
@@ -177,38 +167,13 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 		}
 	}
 	redactor := NewRedactor(&cfg.Security)
-	deps.CodeAnalysis = NewCodeAnalysisService(cfg, deps.Engine, deps.LogEvents, deps.CodeRepos,
-		deps.CodeAnalyses, redactor, deps.Audit, deps.Cost, opt.Cipher, opt.Log)
+	deps.CodeAnalysis = NewCodeAnalysisService(cfg, deps.LogEvents, deps.CodeAnalyses,
+		deps.AIAnalysisTasks, redactor, deps.Audit, deps.Cost, opt.Log)
 	// 日志告警的后处理：把"已落库但还没通知/还没分析"的事件推进到结论。
-	// 代码仓库缓存用**进程级** Options 构造（缓存根目录、git 路径、超时都属于平台配置），
-	// 每次请求只描述"要哪个服务的哪条分支"。
-	//
-	// 先自检 git 是否可用：本链路用 exec 调用外部 git，缺 git 不会让平台启动失败，
-	// 而是每条事件的 AI 代码分析都悄悄失败（analysis_state=failed）。这里把结论前置到
-	// 启动日志——出网许可关闭时平台不执行任何 git，也就没必要报。
-	if cfg.CodeRepo.AllowOutbound {
-		version, err := repo.ProbeGitBinary("")
-		if err != nil {
-			opt.Log.Error("AI 代码分析依赖 git，但当前环境不可用：每条日志事件的代码定位都会失败（analysis_state=failed）",
-				zap.String("hint", "请在运行镜像中安装 git（见 Dockerfile 运行阶段），"+
-					"或把 code_repo.allow_outbound 设为 false 明确关闭代码拉取能力"),
-				zap.Error(err))
-		} else {
-			opt.Log.Info("代码仓库缓存就绪", zap.String("git", version))
-		}
-	}
-	repoFetcher := NewRepoFetcher(repo.NewFetcher(repo.Options{
-		RootDir:      cacheDirOrDefault(cfg.CodeRepo.CacheDir),
-		CloneTimeout: cfg.CodeRepo.CloneTimeout,
-		PullTimeout:  cfg.CodeRepo.PullTimeout,
-		Log:          opt.Log,
-	}))
-	// 分析入口也能自己补代码（本地没有就 clone）：手工分析与事件重试不一定经过 worker。
-	deps.CodeAnalysis.SetRepoFetcher(repoFetcher)
+	// AI 分析走异步：worker 只负责"提交任务"与"收到结论后收尾"，慢分析不再占用 worker。
 	deps.LogAlertWorker = NewLogAlertWorker(LogAlertWorkerDeps{
-		Config: cfg, Events: deps.LogEvents, Rules: deps.LogAlertRules, CodeRepos: deps.CodeRepos,
-		Notifier: deps.Notifier, Analysis: deps.CodeAnalysis, Fetcher: repoFetcher,
-		Cipher: opt.Cipher, Log: opt.Log,
+		Config: cfg, Events: deps.LogEvents, Rules: deps.LogAlertRules,
+		Notifier: deps.Notifier, Analysis: deps.CodeAnalysis, Log: opt.Log,
 	})
 
 	deps.Dashboard = NewDashboardService(DashboardDeps{

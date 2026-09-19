@@ -12,8 +12,6 @@ import type {
   AuditLog,
   AuditSnapshot,
   CodeAnalysis,
-  CodeRepo,
-  CodeRepoInput,
   DiagnoseResult,
   DiagnosisRecord,
   DiagnosisResponse,
@@ -396,10 +394,6 @@ export const logAlertApi = {
   createServer: (payload: Partial<ServerInstance>) => post<ServerInstance>('/api/log-alerts/servers', payload),
   updateServer: (id: number, payload: Partial<ServerInstance>) => put<ServerInstance>(`/api/log-alerts/servers/${id}`, payload),
   removeServer: (id: number) => del<{ message: string }>(`/api/log-alerts/servers/${id}`),
-  codeRepos: (params: PageQuery, signal?: AbortSignal) =>
-    get<PageResult<CodeRepo>>('/api/log-alerts/code-repos', params, withSignal(signal)),
-  saveCodeRepo: (id: number | undefined, payload: Partial<CodeRepoInput>) =>
-    post<CodeRepo>(`/api/log-alerts/code-repos${id ? `?id=${id}` : ''}`, payload),
   /** 平台自带 Kafka 的采集链路现状（Filebeat 推送到平台 Kafka 后由消费者入库）。 */
   pipeline: () => get<LogPipelineStatus>('/api/log-alerts/pipeline'),
   /** 测试 Kafka 连接：失败也返回 ok=false 与原因，不抛错。 */

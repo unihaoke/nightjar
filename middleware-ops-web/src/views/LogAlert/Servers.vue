@@ -1,10 +1,10 @@
 <script setup lang="ts">
-/** 服务器与代码仓库映射：日志采集对象 + 出网白名单开关（6.5）。 */
+/** 服务器：日志采集对象与纳管目标（代码仓库映射已移除，AI 分析改由外部 AI 服务完成）。 */
 import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { logAlertApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { CodeRepo, ServerInstance } from '@/api/types'
+import type { ServerInstance } from '@/api/types'
 import { useListPage } from '@/composables/useListPage'
 import ResponsiveList from '@/components/ResponsiveList.vue'
 import { envLabels, envTagType, formatTime } from '@/utils/format'
@@ -13,37 +13,16 @@ import { useUserStore } from '@/stores/user'
 const store = useUserStore()
 
 const serverDialog = ref(false)
-const repoDialog = ref(false)
 const submitting = ref(false)
 const editingServer = ref<ServerInstance | null>(null)
-const editingRepo = ref<CodeRepo | null>(null)
 
-// 同一页面两个列表：用 keyPrefix 隔离地址栏参数，避免互相覆盖 page / keyword。
 const serverList = useListPage<ServerInstance>({
   fetch: (params, signal) => logAlertApi.servers(params, signal),
   defaults: { keyword: '', environment: '', page: 1, page_size: 20 },
-  keyPrefix: 'srv_',
-})
-const repoList = useListPage<CodeRepo>({
-  fetch: (params, signal) => logAlertApi.codeRepos(params, signal),
-  defaults: { keyword: '', page: 1, page_size: 20 },
-  keyPrefix: 'repo_',
 })
 const { query: serverQuery, items: servers, total: serverTotal, loading: serverLoading, error: serverError } = serverList
-const { query: repoQuery, items: repos, total: repoTotal, loading: repoLoading, error: repoError } = repoList
 
 const serverForm = reactive({ name: '', ip: '', hostname: '', environment: 'dev', group_name: '', tags: [] as string[] })
-const repoForm = reactive({
-  service_name: '',
-  repo_url: '',
-  branch: 'main',
-  local_path: '',
-  language: '',
-  allow_third_party: false,
-  // 访问令牌与地址**分开**：令牌只写不回显（页面拿不到明文），留空表示"不修改"。
-  credential: '',
-  clear_credential: false,
-})
 
 const canManage = computed(() => store.can('server:manage'))
 
@@ -90,25 +69,6 @@ async function removeServer(item: ServerInstance): Promise<void> {
   }
 }
 
-/** 保存仓库映射。 */
-async function saveRepo(): Promise<void> {
-  if (!repoForm.service_name.trim()) {
-    ElMessage({ type: 'warning', message: '请填写服务名' })
-    return
-  }
-  submitting.value = true
-  try {
-    await logAlertApi.saveCodeRepo(editingRepo.value?.id, { ...repoForm })
-    ElMessage({ type: 'success', message: '已保存' })
-    repoDialog.value = false
-    await repoList.load()
-  } catch (error) {
-    toastError(error)
-  } finally {
-    submitting.value = false
-  }
-}
-
 /** 打开服务器表单。 */
 function openServer(item?: ServerInstance): void {
   editingServer.value = item || null
@@ -122,32 +82,14 @@ function openServer(item?: ServerInstance): void {
   })
   serverDialog.value = true
 }
-
-/** 打开仓库表单。 */
-function openRepo(item?: CodeRepo): void {
-  editingRepo.value = item || null
-  Object.assign(repoForm, {
-    service_name: item?.service_name || '',
-    // 后端返回的地址已经是**不含凭据**的干净地址，可以安全回填。
-    repo_url: item?.repo_url || '',
-    branch: item?.branch || 'main',
-    local_path: item?.local_path || '',
-    language: item?.language || '',
-    allow_third_party: item?.allow_third_party || false,
-    // 令牌永远不回显：编辑时这个框是空的，留空即保持原令牌不变。
-    credential: '',
-    clear_credential: false,
-  })
-  repoDialog.value = true
-}
 </script>
 
 <template>
   <div class="page">
     <div class="page-header">
       <div>
-        <h2 class="page-title">服务器与代码仓库</h2>
-        <p class="page-subtitle">出网白名单默认关闭：仅显式开启的服务允许将堆栈/代码片段发送至第三方 AI（并强制脱敏）</p>
+        <h2 class="page-title">服务器</h2>
+        <p class="page-subtitle">日志采集对象与纳管目标；AI 分析由外部 AI 服务完成，出网白名单仍按服务控制（默认关闭）</p>
       </div>
     </div>
 
@@ -222,76 +164,6 @@ function openRepo(item?: CodeRepo): void {
       </template>
     </ResponsiveList>
 
-    <ResponsiveList
-      :items="repos"
-      :loading="repoLoading"
-      :error="repoError"
-      :total="repoTotal"
-      :page="repoQuery.page"
-      :page-size="repoQuery.page_size"
-      title="服务 → 代码仓库映射"
-      empty-text="尚未配置仓库映射"
-      @update:page="repoList.setPage"
-      @update:page-size="repoList.setPageSize"
-      @retry="repoList.load"
-    >
-      <template #toolbar>
-        <el-input v-model="repoQuery.keyword" size="small" placeholder="搜索服务或仓库" clearable class="search" @keyup.enter="repoList.search" />
-        <el-button v-if="canManage" size="small" type="primary" :icon="'Plus'" @click="openRepo()">新增</el-button>
-      </template>
-
-      <template #card="{ row }">
-        <div class="entity-head">
-          <span class="entity-name">{{ row.service_name }}</span>
-          <el-tag size="small" :type="row.allow_third_party ? 'warning' : 'info'" effect="light">
-            {{ row.allow_third_party ? '出网已开启' : '出网未开启' }}
-          </el-tag>
-          <el-tag size="small" :type="row.has_credential ? 'success' : 'info'" effect="plain">
-            {{ row.has_credential ? '已配置令牌' : '无令牌' }}
-          </el-tag>
-        </div>
-        <p class="entity-meta mono">{{ row.repo_url || '（未填写仓库地址）' }}</p>
-        <p class="entity-meta muted">
-          {{ row.branch }}<span v-if="row.language"> · {{ row.language }}</span>
-          <span v-if="row.local_path"> · {{ row.local_path }}</span>
-        </p>
-        <div v-if="canManage" class="entity-actions">
-          <el-button size="small" @click="openRepo(row)">编辑</el-button>
-        </div>
-      </template>
-
-      <template #table>
-        <div class="table-scroll">
-        <el-table :data="repos" size="small">
-          <el-table-column prop="service_name" label="服务名" min-width="140" show-overflow-tooltip />
-          <el-table-column prop="repo_url" label="仓库地址" min-width="220" show-overflow-tooltip />
-          <el-table-column label="访问令牌" width="100">
-            <template #default="{ row }">
-              <el-tag size="small" :type="row.has_credential ? 'success' : 'info'" effect="light">
-                {{ row.has_credential ? '已配置' : '无' }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column prop="branch" label="分支" width="90" />
-          <el-table-column prop="local_path" label="本地路径" min-width="200" show-overflow-tooltip />
-          <el-table-column prop="language" label="语言" width="90" />
-          <el-table-column label="出网白名单" width="110">
-            <template #default="{ row }">
-              <el-tag size="small" :type="row.allow_third_party ? 'warning' : 'info'" effect="light">
-                {{ row.allow_third_party ? '已开启' : '未开启' }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column v-if="canManage" label="操作" width="90" fixed="right">
-            <template #default="{ row }">
-              <el-button text size="small" @click="openRepo(row)">编辑</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-        </div>
-      </template>
-    </ResponsiveList>
-
     <el-dialog v-model="serverDialog" :title="editingServer ? '编辑服务器' : '新增服务器'" width="520px">
       <el-form label-position="top">
         <el-row :gutter="12">
@@ -337,72 +209,6 @@ function openRepo(item?: CodeRepo): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="repoDialog" :title="editingRepo ? '编辑仓库映射' : '新增仓库映射'" width="560px">
-      <el-form label-position="top">
-        <el-row :gutter="12">
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="服务名">
-              <el-input v-model="repoForm.service_name" placeholder="与日志上报的 service 一致" />
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="分支">
-              <el-input v-model="repoForm.branch" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="24">
-            <el-form-item label="仓库地址">
-              <el-input v-model="repoForm.repo_url" placeholder="https://gitlab.internal/group/repo.git" />
-              <span class="muted hint">
-                只填地址，<b>不要</b>把访问令牌写进 URL。地址会原样展示在列表与审计里，内嵌令牌等于把令牌
-                发给所有能看日志告警的人；即使你粘了带令牌的地址，平台也会自动把它拆出来加密保存。
-              </span>
-            </el-form-item>
-          </el-col>
-          <el-col :span="24">
-            <el-form-item :label="editingRepo?.has_credential ? '访问令牌（已配置，留空=不修改）' : '访问令牌'">
-              <el-input
-                v-model="repoForm.credential"
-                type="password"
-                show-password
-                :placeholder="editingRepo?.has_credential ? '留空保持原令牌不变' : '私有仓库填只读令牌；公开仓库留空'"
-                :disabled="repoForm.clear_credential"
-              />
-              <span class="muted hint">
-                加密存储、<b>永不回显</b>（页面与接口都看不到明文）；HTTPS 令牌填在 userinfo 位置即可，
-                形如 <span class="mono">oauth2:&lt;token&gt;</span>，只写这一段平台会按 <span class="mono">oauth2</span> 补用户名。
-                查询参数形式的 <span class="mono">?token=…</span> 也能识别。
-              </span>
-              <div v-if="editingRepo?.has_credential" class="switch-row">
-                <el-switch v-model="repoForm.clear_credential" />
-                <span class="muted hint">清除已保存的令牌（公开仓库 / 改用 SSH 密钥时勾选）</span>
-              </div>
-            </el-form-item>
-          </el-col>
-          <el-col :span="24">
-            <el-form-item label="本地代码路径（用于简单检索定位）">
-              <el-input v-model="repoForm.local_path" placeholder="留空即可：缓存根目录/服务名" />
-              <span class="muted hint">留空 → 自动用「代码缓存根目录/服务名」；也可只填子目录名（如 jd），会拼到缓存根目录下。填绝对路径时必须已在该根目录内，否则按越界拒绝。</span>
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="语言">
-              <el-input v-model="repoForm.language" placeholder="java / go / python" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="24">
-            <el-form-item label="出网白名单">
-              <el-switch v-model="repoForm.allow_third_party" />
-              <span class="muted hint">开启后允许将该服务的堆栈与代码片段（脱敏、≤200 行/文件）发送至第三方 AI</span>
-            </el-form-item>
-          </el-col>
-        </el-row>
-      </el-form>
-      <template #footer>
-        <el-button @click="repoDialog = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="saveRepo">保存</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 

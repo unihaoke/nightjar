@@ -32,14 +32,11 @@ import (
 type LogAlertService struct {
 	servers    *repository.ServerRepository
 	events     *repository.LogEventRepository
-	repos      *repository.CodeRepoRepository
 	rules      *repository.LogAlertRuleRepository
 	exclusions *repository.LogAlertExclusionRepository
 	cfg        *config.Config
 	audit      *AuditService
 	log        *zap.Logger
-	// cipher 用于仓库凭据的加解密（见 coderepo_credential.go）。
-	cipher cipherCodec
 	// window 为**兜底**去重窗口（分钟）。真实窗口始终来自命中的规则；
 	// 这里不再读取任何配置默认值（默认值已按产品要求移除），保留是因为
 	// EnsureWindow 是既有对外接口。
@@ -68,18 +65,16 @@ const ruleCacheTTL = 10 * time.Second
 func NewLogAlertService(
 	servers *repository.ServerRepository,
 	events *repository.LogEventRepository,
-	repos *repository.CodeRepoRepository,
 	rules *repository.LogAlertRuleRepository,
 	exclusions *repository.LogAlertExclusionRepository,
 	cfg *config.Config,
 	store cache.Store,
 	audit *AuditService,
-	cipher cipherCodec,
 	log *zap.Logger,
 ) *LogAlertService {
 	return &LogAlertService{
-		servers: servers, events: events, repos: repos, rules: rules, exclusions: exclusions,
-		cfg: cfg, audit: audit, cipher: cipher, log: log, window: 5 * time.Minute,
+		servers: servers, events: events, rules: rules, exclusions: exclusions,
+		cfg: cfg, audit: audit, log: log, window: 5 * time.Minute,
 		cooldown: newCooldownTracker(store, "logalert:cd:"),
 	}
 }
@@ -520,100 +515,6 @@ func (s *LogAlertService) DeleteServer(ctx context.Context, id int64, operator O
 		})
 	}
 	return nil
-}
-
-// 代码仓库映射 -------------------------------------------------------------
-
-// CodeRepoInput 是仓库映射入参。
-type CodeRepoInput struct {
-	ServiceName string `json:"service_name" binding:"required"`
-	// RepoURL 是**不含凭据**的仓库地址；若使用者把带令牌的地址整段粘进来，
-	// 服务层会自动把令牌拆出来加密保存（见 coderepo_credential.go）。
-	RepoURL   string `json:"repo_url"`
-	Branch    string `json:"branch"`
-	LocalPath string `json:"local_path"`
-	Language  string `json:"language"`
-	// Credential 是访问凭据（只写不读）：留空 = 不修改，非空 = 覆盖。
-	Credential string `json:"credential"`
-	// ClearCredential 显式清除已保存的凭据（没有它就没有"删掉令牌"的办法）。
-	ClearCredential bool `json:"clear_credential"`
-	// AllowThirdParty 为出网白名单开关，默认关闭（6.5）。
-	AllowThirdParty bool `json:"allow_third_party"`
-}
-
-// ListCodeRepos 分页查询仓库映射。
-//
-// 出参里**不含凭据**：URL 在入库时已净化，密文由 json:"-" 挡在响应之外，
-// 这里再补一次防御性净化（历史数据、手工改库都可能留下内嵌凭据）。
-func (s *LogAlertService) ListCodeRepos(ctx context.Context, keyword string, limit, offset int) ([]model.CodeRepo, int64, error) {
-	items, total, err := s.repos.List(ctx, keyword, limit, offset)
-	if err != nil {
-		return nil, 0, apperr.Wrap(apperr.CodeInternal, err)
-	}
-	for i := range items {
-		// 读路径上顺手迁移旧数据（幂等）：迁移之后页面显示的就是干净地址。
-		if item := migrateRepoCredentialRow(ctx, s.repos, s.cipher, s.log, &items[i]); item != nil {
-			items[i] = *item
-		}
-	}
-	return items, total, nil
-}
-
-// UpsertCodeRepo 新增或更新仓库映射。
-//
-// 凭据的三条规矩见 applyCodeRepoInput：留空=不修改、非空=覆盖、clear_credential=清除。
-// 审计只记"有没有凭据"这个布尔量，不记凭据本身（同 INC-018 的密钥审计规矩）。
-func (s *LogAlertService) UpsertCodeRepo(ctx context.Context, id int64, in CodeRepoInput, operator Operator) (*model.CodeRepo, error) {
-	if id > 0 {
-		item, err := s.repos.Get(ctx, id)
-		if err != nil {
-			if repository.EnsureNotFound(err) {
-				return nil, apperr.New(apperr.CodeNotFound, "仓库映射不存在")
-			}
-			return nil, apperr.Wrap(apperr.CodeInternal, err)
-		}
-		// 先把历史遗留的内嵌凭据迁移好，再套用本次入参——
-		// 否则"URL 里带令牌"这种旧记录在保存时会被新入参的干净地址覆盖掉令牌。
-		item = migrateRepoCredentialRow(ctx, s.repos, s.cipher, s.log, item)
-		credentialChanged, applyErr := applyCodeRepoInput(s.cipher, item, in)
-		if applyErr != nil {
-			return nil, apperr.Wrap(apperr.CodeInvalidParam, applyErr)
-		}
-		if err := s.repos.Update(ctx, item); err != nil {
-			return nil, apperr.Wrap(apperr.CodeInternal, err)
-		}
-		s.auditCodeRepoSave(ctx, operator, item, credentialChanged, "update")
-		return markRepoCredential(item), nil
-	}
-	item := &model.CodeRepo{}
-	credentialChanged, applyErr := applyCodeRepoInput(s.cipher, item, in)
-	if applyErr != nil {
-		return nil, apperr.Wrap(apperr.CodeInvalidParam, applyErr)
-	}
-	if err := s.repos.Create(ctx, item); err != nil {
-		return nil, apperr.Wrap(apperr.CodeInternal, err)
-	}
-	s.auditCodeRepoSave(ctx, operator, item, credentialChanged, "create")
-	return markRepoCredential(item), nil
-}
-
-// auditCodeRepoSave 写一条仓库映射的审计（只记布尔与地址，不记凭据）。
-func (s *LogAlertService) auditCodeRepoSave(ctx context.Context, operator Operator, item *model.CodeRepo, credentialChanged bool, action string) {
-	if s.audit == nil || item == nil {
-		return
-	}
-	s.audit.RecordAsync(ctx, AuditEntry{
-		UserID: operator.UserID, Username: operator.Username, ActionType: "code_repo_save",
-		Level: LevelLow, IPAddress: operator.IP, UserAgent: operator.Agent,
-		Detail: map[string]any{
-			"id": item.ID, "service": item.ServiceName, "action": action,
-			"allow_third_party": item.AllowThirdParty,
-			"repo_url":          item.RepoURL,
-			// 只记"有没有凭据/是否改过"，不记凭据内容。
-			"has_credential":     strings.TrimSpace(item.CredentialEncrypted) != "",
-			"credential_changed": credentialChanged,
-		},
-	})
 }
 
 // ErrorSignature 生成错误指纹：异常类名 + 错误消息模板（去变量）。

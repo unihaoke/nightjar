@@ -27,8 +27,9 @@ type Config struct {
 	Notify      NotifyConfig      `mapstructure:"notify"`
 	Kafka       KafkaConfig       `mapstructure:"kafka"`
 	LogAlert    LogAlertConfig    `mapstructure:"log_alert"`
-	CodeRepo    CodeRepoConfig    `mapstructure:"code_repo"`
-	Guardrail   GuardrailConfig   `mapstructure:"guardrail"`
+	// AIAnalysis 为外部 AI 分析服务的对接参数（异步任务 + 回调，见类型注释）。
+	AIAnalysis AIAnalysisConfig `mapstructure:"ai_analysis"`
+	Guardrail  GuardrailConfig  `mapstructure:"guardrail"`
 	Scheduler   SchedulerConfig   `mapstructure:"scheduler"`
 	Log         LogConfig         `mapstructure:"log"`
 }
@@ -48,24 +49,47 @@ type LogAlertConfig struct {
 	AnalyzeTimeout time.Duration `mapstructure:"analyze_timeout"`
 }
 
-// CodeRepoConfig 是"AI 分析用的代码仓库本地缓存"的配置。
-type CodeRepoConfig struct {
-	// CacheDir 为仓库缓存根目录（每个服务一个子目录）。
-	CacheDir string `mapstructure:"cache_dir"`
-	// CloneTimeout / PullTimeout 为首次克隆与后续更新的超时。
-	CloneTimeout time.Duration `mapstructure:"clone_timeout"`
-	PullTimeout  time.Duration `mapstructure:"pull_timeout"`
-	// RefreshInterval 为同一仓库两次拉取的最小间隔（秒）：风暴期间同服务反复触发分析时，
-	// 不能每条都去 pull 一次远端（既慢又容易被代码托管限流）。
-	RefreshInterval int `mapstructure:"refresh_interval_seconds"`
-	// AllowOutbound 控制"平台是否允许从代码托管拉取代码"（默认允许）。
-	//
-	// 与 CodeRepo.AllowThirdParty 是**两件事**，刻意分开：
-	//   - 本开关管"能不能 git clone/pull"（内网 GitLab 也该允许）；
-	//   - AllowThirdParty 管"能不能把代码片段发给第三方 AI"（合规上更敏感）。
-	// 把它们合成一个开关的后果是：不想用第三方 AI 的团队会连内网仓库都拉不下来，
-	// 于是整个 AI 代码分析功能形同虚设。
-	AllowOutbound bool `mapstructure:"allow_outbound"`
+// AIAnalysisConfig 是「外部 AI 分析服务」的对接参数（异步任务 + 回调）。
+//
+// 对接模型（主流做法）：
+//  1. 平台把"问题"提交给 AI 服务，拿到 task_id；
+//  2. AI 服务慢慢分析，完成后回调平台的接收接口；
+//  3. 平台另起轮询兜底：回调丢了/AI 服务不支持回调时，按 task_id 主动查；
+//  4. 超过 TaskTimeout 仍没有结论 → 判定超时并收尾（事件不能永远停在"分析中"）。
+//
+// 所有地址、路径、超时都可配：不同的 AI 服务在路径与字段命名上差别很大，
+// 把差异收敛到配置里，服务层只认"提交/查询/回调"这三个动作。
+type AIAnalysisConfig struct {
+	// Enabled 为总开关：关闭时日志告警不做 AI 分析（事件直接置为 disabled，原因写清楚）。
+	Enabled bool `mapstructure:"enabled"`
+	// BaseURL 为 AI 服务地址，例如 http://ai.internal:8000。
+	BaseURL string `mapstructure:"base_url"`
+	// APIKey 为调用凭据（放在 Authorization: Bearer 头里；为空则不带头）。
+	APIKey string `mapstructure:"api_key"`
+	// SubmitPath 为提交任务的路径（POST），默认 /v1/analyses。
+	SubmitPath string `mapstructure:"submit_path"`
+	// QueryPath 为查询任务状态的路径模板（GET），其中 {task_id} 会替换成真实任务号。
+	QueryPath string `mapstructure:"query_path"`
+	// CallbackURL 为平台对外可访问的地址（提交时告诉 AI 服务"回调这里"）。
+	// 留空时改用请求里的 Host 推导，反向代理场景请显式配置。
+	CallbackURL string `mapstructure:"callback_url"`
+	// CallbackToken 为回调鉴权令牌：AI 服务回调时必须带上，否则拒收。
+	CallbackToken string `mapstructure:"callback_token"`
+	// Timeout 为提交/查询的单次 HTTP 超时（提交应该很快，真正慢的是分析本身）。
+	Timeout time.Duration `mapstructure:"timeout"`
+	// TaskTimeout 为任务级超时：从提交算起超过它仍没有结论就判定超时。
+	TaskTimeout time.Duration `mapstructure:"task_timeout"`
+	// PollInterval 为轮询兜底的间隔（回调正常时它只是保险）。
+	PollInterval time.Duration `mapstructure:"poll_interval"`
+	// PollBatch 为每轮轮询最多处理的任务数（限流）。
+	PollBatch int `mapstructure:"poll_batch"`
+	// SyncMode 表示 AI 服务在提交时就同步返回结论：此时不写 awaiting，直接出结论。
+	// 用于"同一个服务、有的接口同步有的异步"的过渡期。
+	SyncMode bool `mapstructure:"sync_mode"`
+	// NotifyOnSubmit 为 true 时，提交成功就先发一条（不带结论的）告警通知，
+	// 结论到达后再发一条带结论的。默认关闭：一条告警变成两条消息容易打扰，
+	// 但对"告警必须秒到"的团队可以打开。
+	NotifyOnSubmit bool `mapstructure:"notify_on_submit"`
 }
 
 // KafkaConfig 是日志总线配置（「日志集成」：Filebeat → Kafka → 平台消费）。
@@ -512,7 +536,7 @@ func (c *Config) applyEnvOnly() {
 		c.Kafka.Brokers = splitAndTrim(raw)
 	}
 	c.applyEnvLogAlert()
-	c.applyEnvCodeRepo()
+	c.applyEnvAIAnalysis()
 }
 
 // envOf 读取平台环境变量（MWOPS_ + 键名大写、点转下划线）。
@@ -544,30 +568,60 @@ func (c *Config) applyEnvLogAlert() {
 	}
 }
 
-// applyEnvCodeRepo 用环境变量覆盖代码仓库缓存参数。
-func (c *Config) applyEnvCodeRepo() {
-	if raw, ok := envOf("code_repo.cache_dir"); ok {
+// applyEnvAIAnalysis 用环境变量覆盖外部 AI 分析服务的对接参数。
+func (c *Config) applyEnvAIAnalysis() {
+	if raw, ok := envOf("ai_analysis.enabled"); ok {
+		c.AIAnalysis.Enabled = parseBool(raw, c.AIAnalysis.Enabled)
+	}
+	if raw, ok := envOf("ai_analysis.base_url"); ok {
 		if v := strings.TrimSpace(raw); v != "" {
-			c.CodeRepo.CacheDir = v
+			c.AIAnalysis.BaseURL = v
 		}
 	}
-	if raw, ok := envOf("code_repo.clone_timeout"); ok {
+	if raw, ok := envOf("ai_analysis.api_key"); ok {
+		c.AIAnalysis.APIKey = strings.TrimSpace(raw)
+	}
+	if raw, ok := envOf("ai_analysis.submit_path"); ok {
+		if v := strings.TrimSpace(raw); v != "" {
+			c.AIAnalysis.SubmitPath = v
+		}
+	}
+	if raw, ok := envOf("ai_analysis.query_path"); ok {
+		if v := strings.TrimSpace(raw); v != "" {
+			c.AIAnalysis.QueryPath = v
+		}
+	}
+	if raw, ok := envOf("ai_analysis.callback_url"); ok {
+		c.AIAnalysis.CallbackURL = strings.TrimSpace(raw)
+	}
+	if raw, ok := envOf("ai_analysis.callback_token"); ok {
+		c.AIAnalysis.CallbackToken = strings.TrimSpace(raw)
+	}
+	if raw, ok := envOf("ai_analysis.timeout"); ok {
 		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
-			c.CodeRepo.CloneTimeout = v
+			c.AIAnalysis.Timeout = v
 		}
 	}
-	if raw, ok := envOf("code_repo.pull_timeout"); ok {
+	if raw, ok := envOf("ai_analysis.task_timeout"); ok {
 		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
-			c.CodeRepo.PullTimeout = v
+			c.AIAnalysis.TaskTimeout = v
 		}
 	}
-	if raw, ok := envOf("code_repo.refresh_interval_seconds"); ok {
+	if raw, ok := envOf("ai_analysis.poll_interval"); ok {
+		if v, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
+			c.AIAnalysis.PollInterval = v
+		}
+	}
+	if raw, ok := envOf("ai_analysis.poll_batch"); ok {
 		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
-			c.CodeRepo.RefreshInterval = v
+			c.AIAnalysis.PollBatch = v
 		}
 	}
-	if raw, ok := envOf("code_repo.allow_outbound"); ok {
-		c.CodeRepo.AllowOutbound = parseBool(raw, c.CodeRepo.AllowOutbound)
+	if raw, ok := envOf("ai_analysis.sync_mode"); ok {
+		c.AIAnalysis.SyncMode = parseBool(raw, c.AIAnalysis.SyncMode)
+	}
+	if raw, ok := envOf("ai_analysis.notify_on_submit"); ok {
+		c.AIAnalysis.NotifyOnSubmit = parseBool(raw, c.AIAnalysis.NotifyOnSubmit)
 	}
 }
 

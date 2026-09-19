@@ -318,33 +318,45 @@ type ServerInstance struct {
 	LastSeenAt  *time.Time      `json:"last_seen_at"`
 }
 
-// CodeRepo 服务与代码仓库映射（6.5 出网白名单按仓库维度开启）。
-type CodeRepo struct {
+// AIAnalysisTask 记录一次「提交给外部 AI 服务的分析任务」（异步回调模型）。
+//
+// 为什么必须落库而不是只放在内存里：日志告警的 AI 分析是分钟级的慢操作，
+// 提交方与收结论方往往不是同一次执行（进程重启、多副本、回调晚到）。
+// 只有把任务号与状态写进库，回调到达时才能对上号，超时轮询也才有依据。
+type AIAnalysisTask struct {
 	Base
-	ServiceName string `gorm:"size:128;index;not null" json:"service_name"`
-	// RepoURL **不含任何访问凭据**（凭据走 CredentialEncrypted）。
-	//
-	// 这一条是硬约束：它会被接口原样返回、被页面回显、被日志与审计打印，
-	// 只要里面内嵌令牌，就等于把令牌发给了所有有「日志告警读」权限的人（INC-031）。
-	// 读取路径上有兼容处理：旧数据里内嵌的凭据会被拆出来并就地迁移。
-	RepoURL   string `gorm:"size:255" json:"repo_url"`
-	Branch    string `gorm:"size:64;default:main" json:"branch"`
-	LocalPath string `gorm:"size:255" json:"local_path"`
-	Language  string `gorm:"size:32" json:"language"`
-
-	// AllowThirdParty 为出网白名单开关，默认关闭（6.5）。
-	AllowThirdParty bool       `gorm:"default:false" json:"allow_third_party"`
-	LastPullAt      *time.Time `json:"last_pull_at"`
-
-	// CredentialEncrypted 是加密后的访问凭据（`user:secret` 或 `?token=xxx`，见 repo/credentials.go）。
-	//
-	// json:"-" 是**刻意的**：这个结构体会被直接序列化返回给前端，
-	// 标记为不输出可以保证"密钥类字段永不回显"这条规矩不依赖调用方记得脱敏（同 INC-018 的密钥规矩）。
-	CredentialEncrypted string `gorm:"size:512" json:"-"`
-	// HasCredential 是**只读的派生字段**（不落库）：告诉页面"这个仓库配了令牌"，
-	// 让使用者能确认令牌还在，而不需要（也不可能）把明文回显出来。
-	HasCredential bool `gorm:"-" json:"has_credential"`
+	// EventID 为触发这次分析的日志事件（0 表示手工提交的分析）。
+	EventID int64 `gorm:"index" json:"event_id"`
+	// ServiceName 为服务名（回调与超时处理都要按它回写事件）。
+	ServiceName string `gorm:"size:128;index" json:"service_name"`
+	// TaskID 为外部 AI 服务返回的任务号，也是幂等键（回调与轮询都靠它对上号）。
+	TaskID string `gorm:"size:128;uniqueIndex" json:"task_id"`
+	// Status 取 submitted / succeeded / failed / timeout（见下面的状态常量）。
+	Status string `gorm:"size:16;index;default:submitted" json:"status"`
+	// Question 为提交给 AI 的问题（已脱敏），用于事后核对"到底问了什么"。
+	Question string `gorm:"type:text" json:"question"`
+	// Answer 为 AI 回传的结论原文（JSON 或纯文本）。
+	Answer string `gorm:"type:text" json:"answer"`
+	// Error 为失败原因（AI 侧报错、解析失败、超时等）。
+	Error string `gorm:"size:512" json:"error"`
+	// DeadlineAt 为任务超时时刻：超过它仍没有结论就按超时收尾，
+	// 避免事件因为一次丢失的回调永远停在"分析中"。
+	DeadlineAt *time.Time `gorm:"index" json:"deadline_at"`
+	// CompletedAt 为收到结论（或判定失败）的时间。
+	CompletedAt *time.Time `json:"completed_at"`
 }
+
+// 异步分析任务的状态常量。
+const (
+	// AIAnalysisTaskSubmitted 表示已提交给 AI 服务，等待回调或轮询结果。
+	AIAnalysisTaskSubmitted = "submitted"
+	// AIAnalysisTaskSucceeded 表示已收到结论。
+	AIAnalysisTaskSucceeded = "succeeded"
+	// AIAnalysisTaskFailed 表示 AI 侧明确失败，或结论无法解析。
+	AIAnalysisTaskFailed = "failed"
+	// AIAnalysisTaskTimeout 表示超过 DeadlineAt 仍没有结论（平台侧判定）。
+	AIAnalysisTaskTimeout = "timeout"
+)
 
 // LogAlertEvent 应用日志告警事件（错误指纹 + 窗口去重 + 冷却）。
 type LogAlertEvent struct {
@@ -400,12 +412,17 @@ const (
 	LogAnalysisPending = "pending"
 	// LogAnalysisRunning 表示正在分析（避免并发重复分析同一条事件）。
 	LogAnalysisRunning = "running"
-	// LogAnalysisDone 表示分析已完成（可能有结论，也可能是"没有代码仓库"这类正常结束）。
+	// LogAnalysisDone 表示分析已完成（可能有结论，也可能是"规则未启用 AI"这类正常结束）。
 	LogAnalysisDone = "done"
 	// LogAnalysisFailed 表示分析失败（原因在 AnalysisError，页面上可点「重新分析」）。
 	LogAnalysisFailed = "failed"
 	// LogAnalysisDisabled 表示规则关闭了 AI 分析：这是明确的配置结果，不是故障。
 	LogAnalysisDisabled = "disabled"
+	// LogAnalysisAwaiting 表示已把问题提交给外部 AI 服务，正在等它的回调（或轮询结论）。
+	//
+	// 与 running 的区别：running 是"本进程正在做"，awaiting 是"球在对方场地"——
+	// 进程重启也不会丢，因为它只反映库里的任务状态，而不是内存里的执行状态。
+	LogAnalysisAwaiting = "awaiting"
 )
 
 // LogAlertRule 日志告警规则（4.8.2）。
@@ -436,7 +453,7 @@ type LogAlertRule struct {
 	// Cooldown 为冷却期（分钟）：冷却期内同指纹不再通知、不再触发 AI，但**事件仍记录**。
 	Cooldown       int             `gorm:"default:10" json:"cooldown"`
 	NotifyChannels JSONStringSlice `gorm:"type:text" json:"notify_channels"`
-	// AIEnabled 表示是否自动做代码分析（需要该服务在「代码仓库」里配了映射）。
+	// AIEnabled 表示是否自动把问题提交给外部 AI 服务做分析。
 	AIEnabled bool `gorm:"default:true" json:"ai_enabled"`
 	Enabled   bool `gorm:"default:true;index" json:"enabled"`
 	// Priority 数字小的优先：多条规则同时命中时取第一条，便于"特例压过通用"。
@@ -548,7 +565,7 @@ func MigrationList() []any {
 		&KnowledgeBase{},
 		&AuditLog{}, &AuditSnapshot{},
 		&Approval{}, &FixRecord{},
-		&ServerInstance{}, &CodeRepo{}, &LogAlertEvent{}, &LogAlertRule{}, &LogAlertExclusion{}, &AICodeAnalysis{},
+		&ServerInstance{}, &LogAlertEvent{}, &LogAlertRule{}, &LogAlertExclusion{}, &AICodeAnalysis{}, &AIAnalysisTask{},
 		&NotificationLog{},
 		&PlatformSetting{},
 	}

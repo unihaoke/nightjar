@@ -642,7 +642,7 @@ async function toggle(rule: LogAlertRule): Promise<void> {
                 <el-switch v-model="form.enabled" />
                 <span class="muted">启用规则</span>
               </div>
-              <p class="field-hint">AI 分析需要该服务已在「服务器与仓库」里配置代码仓库映射。</p>
+              <p class="field-hint">AI 分析由外部 AI 服务完成：平台需已配置 ai_analysis.base_url，且该服务在出网白名单内。</p>
             </el-form-item>
           </el-col>
         </el-row>

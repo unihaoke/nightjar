@@ -61,6 +61,9 @@ func New(opt Options) *gin.Engine {
 	// 集成中心的服务发现（Prometheus http_sd_configs 拉取，公开接口）。
 	// 只暴露被管实例地址与标签，不含口令；需要鉴权时设置 integration.sd_token。
 	engine.GET("/api/sd/integrations", h.IntegrationServiceDiscovery)
+	// 外部 AI 分析服务的结论回调：没有登录态，靠 ai_analysis.callback_token 校验。
+	// 放在公开路由是必然的——回调的发起方是 AI 服务，它拿不到平台的用户令牌。
+	engine.POST("/api/ai/analysis/callback", h.AIAnalysisCallback)
 
 	api := engine.Group("/api")
 
@@ -212,8 +215,6 @@ func New(opt Options) *gin.Engine {
 		logAlerts.POST("/servers", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.CreateServer)
 		logAlerts.PUT("/servers/:id", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.UpdateServer)
 		logAlerts.DELETE("/servers/:id", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.DeleteServer)
-		logAlerts.GET("/code-repos", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListCodeRepos)
-		logAlerts.POST("/code-repos", mw.RequirePerm(opt.Deps.Auth, service.PermServerManage), h.SaveCodeRepo)
 		// 日志集成接收链路（Kafka）：状态用于页面卡片，probe 用于「测试 Kafka 连接」按钮。
 		logAlerts.GET("/pipeline", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.LogPipelineStatus)
 		logAlerts.POST("/pipeline/probe", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.ProbeLogPipeline)

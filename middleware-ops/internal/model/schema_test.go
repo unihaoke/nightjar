@@ -34,6 +34,7 @@ var expectedUniqueIndexes = map[string]string{
 	"users":             "username",
 	"roles":             "code",
 	"approvals":         "ticket_id",
+	"ai_analysis_tasks": "task_id",
 	"log_alert_events":  "event_id",
 	"log_alert_rules":   "name",
 	"audit_snapshots":   "snapshot_date",

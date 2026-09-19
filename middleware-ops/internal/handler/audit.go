@@ -1,8 +1,13 @@
 package handler
 
 import (
+	"crypto/subtle"
+	"io"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 
+	"middleware-ops/internal/apperr"
 	"middleware-ops/internal/repository"
 	"middleware-ops/internal/response"
 	"middleware-ops/internal/service"
@@ -153,18 +158,58 @@ func (h *Handler) IngestLogHook(c *gin.Context) {
 	response.OK(c, result)
 }
 
-// AnalyzeCode 触发 AI 代码分析（一期：第三方 API + 本地检索兜底）。
+// AnalyzeCode 提交一次 AI 分析（异步：返回 task_id，结论由回调/轮询带回）。
+//
+// 同步模式（ai_analysis.sync_mode）下响应里直接带 report；
+// 否则只返回 task_id，页面按事件的分析报告查询结论。
 func (h *Handler) AnalyzeCode(c *gin.Context) {
 	var in service.CodeAnalysisRequest
 	if !bindJSON(c, &in) {
 		return
 	}
-	result, err := h.deps.CodeAnalysis.Analyze(c.Request.Context(), in, h.operator(c))
+	result, err := h.deps.CodeAnalysis.Submit(c.Request.Context(), in, h.operator(c))
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
 	response.OK(c, result)
+}
+
+// AIAnalysisCallback 接收外部 AI 分析服务回传的结论（异步模型的第二半）。
+//
+// 鉴权：AI 服务拿不到平台的用户令牌，这里用独立的回调令牌（ai_analysis.callback_token）；
+// 令牌未配置时**拒绝所有回调**——宁可让结论走轮询兜底，也不能让任何人往平台里写结论。
+//
+// 幂等：AI 服务没收到 2xx 会重试，CompleteTask 内部按"当前状态必须是 submitted"更新，
+// 重复回调不会写出两份报告。
+func (h *Handler) AIAnalysisCallback(c *gin.Context) {
+	want := ""
+	if h.deps.Config != nil {
+		want = strings.TrimSpace(h.deps.Config.AIAnalysis.CallbackToken)
+	}
+	got := strings.TrimSpace(c.GetHeader("X-Callback-Token"))
+	if got == "" {
+		got = strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+	}
+	if want == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+		response.Fail(c, apperr.New(apperr.CodeUnauthorized, "回调令牌无效或未配置（ai_analysis.callback_token）"))
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil {
+		response.Fail(c, apperr.New(apperr.CodeInvalidParam, "读取回调内容失败"))
+		return
+	}
+	taskID, status, answer, errMsg, err := service.ParseCallback(body)
+	if err != nil {
+		response.Fail(c, apperr.New(apperr.CodeInvalidParam, err.Error()))
+		return
+	}
+	if err := h.deps.LogAlertWorker.CompleteTask(c.Request.Context(), taskID, status, answer, errMsg); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{"message": "ok", "task_id": taskID})
 }
 
 // ListCodeAnalyses 代码分析报告列表。
@@ -234,28 +279,4 @@ func (h *Handler) DeleteServer(c *gin.Context) {
 	response.OK(c, gin.H{"message": "已删除"})
 }
 
-// ListCodeRepos 代码仓库映射列表。
-func (h *Handler) ListCodeRepos(c *gin.Context) {
-	pageNo, pageSize, offset := page(c)
-	items, total, err := h.deps.LogAlert.ListCodeRepos(c.Request.Context(), c.Query("keyword"), pageSize, offset)
-	if err != nil {
-		response.Fail(c, err)
-		return
-	}
-	response.OKPage(c, items, total, pageNo, pageSize)
-}
 
-// SaveCodeRepo 新增或更新仓库映射（出网白名单开关，6.5）。
-func (h *Handler) SaveCodeRepo(c *gin.Context) {
-	var in service.CodeRepoInput
-	if !bindJSON(c, &in) {
-		return
-	}
-	id := queryInt64(c, "id")
-	item, err := h.deps.LogAlert.UpsertCodeRepo(c.Request.Context(), id, in, h.operator(c))
-	if err != nil {
-		response.Fail(c, err)
-		return
-	}
-	response.OK(c, item)
-}

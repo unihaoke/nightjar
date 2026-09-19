@@ -205,19 +205,31 @@ func run(configPath string) error {
 	}
 	defer scheduler.Stop()
 
-	// 代码缓存预热：平台（重新）构建后缓存目录可能是空的（数据卷没挂/被清理），
-	// 这里按已配置的仓库映射补齐——本地没有就 clone，有就 pull 到最新。
-	//
-	// 异步、失败只记日志：预热是"让第一条告警更快更准"，不该拖住启动，
-	// 也不该因某个仓库的凭据过期就让平台起不来（失败的仓库会在事件处理里重试）。
-	go func() {
-		warmCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-		defer cancel()
-		ok, failed := deps.LogAlertWorker.WarmRepos(warmCtx)
-		if ok+failed > 0 {
-			log.Info("代码缓存预热结束", zap.Int("ok", ok), zap.Int("failed", failed))
+	// AI 分析任务的轮询兜底：回调丢了、或 AI 服务根本不支持回调时靠它把结论取回来，
+	// 顺带把超过 task_timeout 的任务按超时收尾（事件不能永远停在"分析中"）。
+	if deps.LogAlertWorker != nil && cfg.AIAnalysis.Enabled {
+		pollInterval := cfg.AIAnalysis.PollInterval
+		if pollInterval <= 0 {
+			pollInterval = 60 * time.Second
 		}
-	}()
+		go func() {
+			ticker := time.NewTicker(pollInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					done, err := deps.LogAlertWorker.PollTasks(ctx)
+					if err != nil {
+						log.Warn("轮询 AI 分析任务失败", zap.Error(err))
+					} else if done > 0 {
+						log.Info("AI 分析任务已收尾", zap.Int("count", done))
+					}
+				}
+			}
+		}()
+	}
 
 	// 日志集成接收链路：Filebeat → 平台 Kafka → 日志事件。
 	// 与 HTTP 服务同生命周期：进程退出时停止消费（未提交的位点下次会重新消费，日志事件层按指纹去重）。

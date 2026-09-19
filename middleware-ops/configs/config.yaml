@@ -198,7 +198,7 @@ kafka:
 # 日志告警的后处理参数
 #
 # 完整链路：Kafka → 按规则做去重/冷却与屏蔽判定 → 落库 → 本段参数驱动的后处理
-#   （外发通知渠道 + 拉取代码仓库 + AI 分析定位代码）
+#   （外发通知渠道 + 提交 AI 分析任务并等待结论）
 #
 # 这里**只有运行参数，没有规则默认值**：去重窗口、冷却期、通知渠道、AI 开关
 # 一律在页面「日志告警 → 日志告警规则」里新增后才生效（表 log_alert_rules）。
@@ -212,21 +212,30 @@ log_alert:
   analyze_timeout: 2m
 
 # ---------------------------------------------------------------------------
-# AI 分析用的代码仓库本地缓存（首次 clone，之后更新到远端）
+# 外部 AI 分析服务（日志告警用）：提交问题 → 回调/轮询 → 结论
 #
-# 为什么要有这件事：AI 要回答"日志里的错误对应哪一行代码"，就必须先把代码拉下来。
-# 缓存目录落在 backend-data 卷里，容器重建不丢；下次分析只做增量更新。
+# 为什么不再 clone 代码：代码分析交给专门的 AI 服务（它自己有代码与上下文），
+# 平台只负责把问题（脱敏后的错误信息与堆栈）问出去、把答案收回来并送进通知。
+# 平台因此不再持有任何代码副本，也不再有「把代码片段外发」这个合规面。
 # ---------------------------------------------------------------------------
-code_repo:
-  cache_dir: ./data/repos
-  clone_timeout: 10m
-  pull_timeout: 2m
-  # 同一仓库两次拉取的最小间隔（秒）：故障风暴期间避免反复拉远端
-  refresh_interval_seconds: 300
-  # 是否允许平台从代码托管拉取代码（与 CodeRepo.allow_third_party 是两件事：
-  # 后者管"能否把代码片段发给第三方 AI"，本项管"能否 git clone/pull"，内网 GitLab 也该允许）
-  allow_outbound: true
-
+ai_analysis:
+  enabled: false
+  base_url: ""
+  api_key: ""
+  submit_path: /v1/analyses
+  query_path: /v1/analyses/{task_id}
+  callback_url: ""
+  callback_token: ""
+  timeout: 15s
+  # 任务级超时：超过它仍没有结论就按超时收尾（事件不能永远停在「分析中」）
+  task_timeout: 30m
+  # 轮询兜底的间隔与每轮批量（回调丢失时靠它把结论取回来）
+  poll_interval: 60s
+  poll_batch: 20
+  # AI 服务在提交时就同步返回结论时打开
+  sync_mode: false
+  # 提交后立即先发一条（不带结论的）告警通知，结论到达后再发一条
+  notify_on_submit: false
 notify:
   # webhook / secret / password 已改由平台「系统设置 → 通知设置」管理（加密落库、保存即生效）。
   # 这里保留字段仅作兜底：首次启动时平台会把这里的非空值导入库（并在日志里说明），

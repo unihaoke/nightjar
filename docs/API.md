@@ -387,7 +387,7 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | GET | `/api/log-alerts/events/:id` | `logalert:read` | L0 | 事件详情 + 代码分析报告 |
 | PUT | `/api/log-alerts/events/:id/status` | `logalert:write` | L1 | 更新状态（pending/analyzing/resolved/ignored） |
 | GET/POST/PUT/DELETE | `/api/log-alerts/servers[/:id]` | `logalert:read` / `server:manage` | L1 | 服务器实例管理 |
-| GET/POST | `/api/log-alerts/code-repos` | `logalert:read` / `server:manage` | L1 | 服务→仓库映射与**出网白名单开关**；访问令牌单独加密保存、**只写不回显**（响应里只有 `has_credential` 布尔量，入参用 `credential` / `clear_credential`） |
+| POST | `/api/ai/analysis/callback` | 回调令牌（`ai_analysis.callback_token`） | — | **外部 AI 分析服务的结论回调**（公开接口，无登录态）：`X-Callback-Token` 或 `Authorization: Bearer` 校验；幂等，重复回调不会写出两份报告 |
 | GET | `/api/log-alerts/pipeline` | `logalert:read` | L0 | **日志集成接收链路状态**：brokers / topic / 消费组、消费者是否运行、对外接入地址、最近错误与一句话说明（页面「Kafka 采集链路」卡片） |
 | POST | `/api/log-alerts/pipeline/probe` | `logalert:write` | L0 | **探测平台侧 Kafka 可达性**：连 broker、列出 topic、确认 `mwops-logs` 存在；返回 `ok` / `message` / `address` / `topic` / `latency_ms`，失败为 200 + `ok=false` + 原因（不是 500） |
 | GET | `/api/log-alerts/rules` | `logalert:read` | L0 | **日志告警规则列表**（`keyword` / `page` / `page_size`）；按 `priority ASC, id ASC` 返回——**列表顺序即匹配顺序** |
@@ -450,8 +450,8 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | `cooldown_until` | **冷却截止时间**：在此之前同指纹不通知、不触发 AI |
 | `suppressed` | 是否处于冷却抑制（true = 事件已记录但未外发通知） |
 | `notified_at` | 最近一次**成功外发通知**的时间（空 = 还没通知过） |
-| `analysis_state` | AI 分析状态：`pending`（已入队）/ `running`（处理中）/ `done`（已产出结论）/ `failed`（失败）/ `disabled`（规则关了 AI、或没配仓库映射——是配置结果，不是故障） |
-| `analysis_error` | 失败或跳过的**中文原因**（页面直接展示，例如「拉取代码失败：repo: git clone 失败：认证失败…」） |
+| `analysis_state` | AI 分析状态：`pending`（已入队）/ `running`（处理中）/ `awaiting`（**已提交给外部 AI 服务，等它的回调或轮询结论**）/ `done`（已产出结论）/ `failed`（失败）/ `disabled`（规则关了 AI、或未配置 AI 服务——是配置结果，不是故障） |
+| `analysis_error` | 失败或跳过的**中文原因**（页面直接展示，例如「AI 分析超时（超过 30m0s 仍未返回结论）」） |
 
 事件详情 `GET /api/log-alerts/events/:id` 同时返回代码分析报告（三点式：定位文件行 / 根因 /
 应急处置 / 修复建议 + 置信度与证据）。

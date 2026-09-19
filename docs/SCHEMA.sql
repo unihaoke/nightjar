@@ -317,22 +317,26 @@ CREATE TABLE IF NOT EXISTS server_instances (
 CREATE INDEX IF NOT EXISTS idx_server_instances_ip ON server_instances(ip);
 CREATE INDEX IF NOT EXISTS idx_server_instances_environment ON server_instances(environment);
 
-CREATE TABLE IF NOT EXISTS code_repos (
-    id                  BIGSERIAL PRIMARY KEY,
-    created_at          TIMESTAMPTZ,
-    updated_at          TIMESTAMPTZ,
-    service_name        VARCHAR(128) NOT NULL,
-    -- repo_url **不含凭据**：访问令牌单独加密存在 credential_encrypted（INC-031）。
-    -- 历史数据里内嵌在 URL 里的凭据会在读取时被自动拆分并迁移。
-    repo_url            VARCHAR(255),
-    credential_encrypted VARCHAR(512),
-    branch              VARCHAR(64) DEFAULT 'main',
-    local_path          VARCHAR(255),
-    language            VARCHAR(32),
-    allow_third_party   BOOLEAN DEFAULT FALSE,
-    last_pull_at        TIMESTAMPTZ
+-- 异步 AI 分析任务：提交 → 回调/轮询 → 结论（见 internal/service/ai_analysis_client.go）。
+CREATE TABLE IF NOT EXISTS ai_analysis_tasks (
+    id               BIGSERIAL PRIMARY KEY,
+    created_at       TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ,
+    event_id         BIGINT,
+    service_name     VARCHAR(128),
+    task_id          VARCHAR(128) NOT NULL,
+    status           VARCHAR(16) DEFAULT 'submitted',
+    question         TEXT,
+    answer           TEXT,
+    error            VARCHAR(512),
+    deadline_at      TIMESTAMPTZ,
+    completed_at     TIMESTAMPTZ,
+    CONSTRAINT uni_ai_analysis_tasks_task_id UNIQUE (task_id)
 );
-CREATE INDEX IF NOT EXISTS idx_code_repos_service_name ON code_repos(service_name);
+CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_event_id ON ai_analysis_tasks(event_id);
+CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_service_name ON ai_analysis_tasks(service_name);
+CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_status ON ai_analysis_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_deadline_at ON ai_analysis_tasks(deadline_at);
 
 CREATE TABLE IF NOT EXISTS log_alert_events (
     id               BIGSERIAL PRIMARY KEY,

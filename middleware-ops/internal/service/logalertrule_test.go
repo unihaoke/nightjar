@@ -300,20 +300,16 @@ func TestAnalysisDecision(t *testing.T) {
 	on := model.LogAlertRule{AIEnabled: true}
 	off := model.LogAlertRule{AIEnabled: false}
 
-	if state, _ := analysisDecision(on, "order-api", true, true); state != "" {
+	if state, _ := analysisDecision(on, "order-api", true); state != "" {
 		t.Fatalf("条件齐备时应继续分析，实际 state=%q", state)
 	}
-	if state, reason := analysisDecision(off, "order-api", true, true); state != model.LogAnalysisDisabled ||
+	if state, reason := analysisDecision(off, "order-api", true); state != model.LogAnalysisDisabled ||
 		!strings.Contains(reason, "未启用") {
 		t.Fatalf("规则关闭 AI 时应判禁用并说明原因：state=%q reason=%q", state, reason)
 	}
-	if state, reason := analysisDecision(on, "order-api", false, true); state != model.LogAnalysisDisabled ||
+	if state, reason := analysisDecision(on, "order-api", false); state != model.LogAnalysisDisabled ||
 		!strings.Contains(reason, "未装配") {
-		t.Fatalf("平台能力缺失时应判禁用并说明原因：state=%q reason=%q", state, reason)
-	}
-	if state, reason := analysisDecision(on, "order-api", true, false); state != model.LogAnalysisDisabled ||
-		!strings.Contains(reason, "order-api") {
-		t.Fatalf("缺仓库映射时应判禁用并指出是哪个服务：state=%q reason=%q", state, reason)
+		t.Fatalf("平台未配置 AI 分析服务时应判禁用并说明原因：state=%q reason=%q", state, reason)
 	}
 }
 

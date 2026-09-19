@@ -41,6 +41,8 @@ const analyzeResult = ref<Record<string, unknown> | null>(null)
 const ANALYSIS_STATE_META: Record<string, { label: string; type: 'success' | 'warning' | 'danger' | 'info' }> = {
   pending: { label: '待分析', type: 'info' },
   running: { label: '分析中', type: 'warning' },
+  // awaiting：已把问题提交给外部 AI 服务，等它回调/轮询结论（可能要几分钟）。
+  awaiting: { label: 'AI 分析中', type: 'warning' },
   done: { label: '已分析', type: 'success' },
   failed: { label: '分析失败', type: 'danger' },
   disabled: { label: '未启用', type: 'info' },
@@ -600,7 +602,7 @@ async function copyHookExample(): Promise<void> {
           <el-button
             v-if="canWrite"
             :loading="reanalyzing"
-            :disabled="current.analysis_state === 'running'"
+            :disabled="current.analysis_state === 'running' || current.analysis_state === 'awaiting'"
             :icon="'RefreshRight'"
             @click="reanalyze"
           >

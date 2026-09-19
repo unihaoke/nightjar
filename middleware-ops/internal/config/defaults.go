@@ -160,12 +160,21 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_alert.worker_batch", 10)
 	v.SetDefault("log_alert.analyze_timeout", 2*time.Minute)
 
-	// AI 代码分析用的仓库本地缓存：首次 clone、之后按最小间隔更新（见 internal/repo）。
-	v.SetDefault("code_repo.cache_dir", "./data/repos")
-	v.SetDefault("code_repo.clone_timeout", 10*time.Minute)
-	v.SetDefault("code_repo.pull_timeout", 2*time.Minute)
-	v.SetDefault("code_repo.refresh_interval_seconds", 300)
-	v.SetDefault("code_repo.allow_outbound", true)
+	// 外部 AI 分析服务（提交任务 → 回调/轮询 → 结论）。
+	// 默认关闭：没配地址就不该假装能分析（事件会被明确置为 disabled 并写明原因）。
+	v.SetDefault("ai_analysis.enabled", false)
+	v.SetDefault("ai_analysis.base_url", "")
+	v.SetDefault("ai_analysis.api_key", "")
+	v.SetDefault("ai_analysis.submit_path", "/v1/analyses")
+	v.SetDefault("ai_analysis.query_path", "/v1/analyses/{task_id}")
+	v.SetDefault("ai_analysis.callback_url", "")
+	v.SetDefault("ai_analysis.callback_token", "")
+	v.SetDefault("ai_analysis.timeout", 15*time.Second)
+	v.SetDefault("ai_analysis.task_timeout", 30*time.Minute)
+	v.SetDefault("ai_analysis.poll_interval", 60*time.Second)
+	v.SetDefault("ai_analysis.poll_batch", 20)
+	v.SetDefault("ai_analysis.sync_mode", false)
+	v.SetDefault("ai_analysis.notify_on_submit", false)
 
 	v.SetDefault("guardrail.input_token_budget", 8192)
 	v.SetDefault("guardrail.output_token_budget", 2048)

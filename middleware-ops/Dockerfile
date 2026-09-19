@@ -67,7 +67,7 @@ RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}
     if [ -n "$M" ]; then BASE="https://${M}/alpine"; \
     else BASE="https://dl-cdn.alpinelinux.org/alpine"; fi && \
     printf '%s\n' "${BASE}/v${ALPINE_VERSION}/main" "${BASE}/v${ALPINE_VERSION}/community" > /etc/apk/repositories && \
-    apk add --no-cache ca-certificates tzdata curl git openssh-client && \
+    apk add --no-cache ca-certificates tzdata curl openssh-client && \
     if [ "$WITH_ANSIBLE" = "true" ]; then \
       apk add --no-cache ansible openssh-client sshpass && \
       ansible-playbook --version >/dev/null && \
@@ -75,8 +75,8 @@ RUN M="${ALPINE_MIRROR#http://}"; M="${M#https://}"; M="${M%/}"; M="${M%/alpine}
     fi
 
 RUN addgroup -S mwops && adduser -S -G mwops mwops && \
-    # repos：AI 代码分析的代码仓库缓存目录（config code_repo.cache_dir 指向 /app/data/repos）。
-    # 预建并赋权，避免首次 clone 时因卷的权限回落导致 mwops 无法写入。
+    # integrations / ansible：集成中心与远程安装的工作目录。
+    # 预建并赋权，避免卷挂载后权限回落导致 mwops 无法写入。
     mkdir -p /app/data/logs /app/data/audit-snapshots /app/data/integrations /app/data/ansible /app/data/repos /app/configs && \
     chown -R mwops:mwops /app
 

@@ -802,7 +802,7 @@ export interface LogAlertExclusionInput {
 export interface ReanalyzeResult {
   /** 受理结论，原样展示（如「已重新入队」或「该规则已关闭 AI 分析」）。 */
   message: string
-  /** 触发后的分析状态（pending/running/done/failed/disabled）；后端未返回时按"已提交"提示。 */
+  /** 触发后的分析状态（pending/running/awaiting/done/failed/disabled）；后端未返回时按"已提交"提示。 */
   analysis_state?: string
   /** 被重新分析的事件 id。 */
   event_id?: number
@@ -843,35 +843,6 @@ export interface ServerInstance {
   status: number
   tags: string[] | null
   last_seen_at?: string
-}
-
-/** 代码仓库映射。 */
-export interface CodeRepo {
-  id: number
-  service_name: string
-  /** 不含任何访问凭据的仓库地址（令牌单独加密保存，永不回显）。 */
-  repo_url: string
-  branch: string
-  local_path: string
-  language: string
-  allow_third_party: boolean
-  /** 是否已配置访问令牌（只有布尔量，没有明文）。 */
-  has_credential: boolean
-  last_pull_at?: string
-}
-
-/** 代码仓库映射的提交入参（凭据只写不读）。 */
-export interface CodeRepoInput {
-  service_name: string
-  repo_url: string
-  branch: string
-  local_path: string
-  language: string
-  allow_third_party: boolean
-  /** 访问令牌：留空 = 不修改；非空 = 覆盖（平台加密保存，永不回显）。 */
-  credential?: string
-  /** 显式清除已保存的令牌。 */
-  clear_credential?: boolean
 }
 
 /** 大盘总览。 */
