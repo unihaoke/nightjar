@@ -181,6 +181,21 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	// 日志告警的后处理：把"已落库但还没通知/还没分析"的事件推进到结论。
 	// 代码仓库缓存用**进程级** Options 构造（缓存根目录、git 路径、超时都属于平台配置），
 	// 每次请求只描述"要哪个服务的哪条分支"。
+	//
+	// 先自检 git 是否可用：本链路用 exec 调用外部 git，缺 git 不会让平台启动失败，
+	// 而是每条事件的 AI 代码分析都悄悄失败（analysis_state=failed）。这里把结论前置到
+	// 启动日志——出网许可关闭时平台不执行任何 git，也就没必要报。
+	if cfg.CodeRepo.AllowOutbound {
+		version, err := repo.ProbeGitBinary("")
+		if err != nil {
+			opt.Log.Error("AI 代码分析依赖 git，但当前环境不可用：每条日志事件的代码定位都会失败（analysis_state=failed）",
+				zap.String("hint", "请在运行镜像中安装 git（见 Dockerfile 运行阶段），"+
+					"或把 code_repo.allow_outbound 设为 false 明确关闭代码拉取能力"),
+				zap.Error(err))
+		} else {
+			opt.Log.Info("代码仓库缓存就绪", zap.String("git", version))
+		}
+	}
 	repoFetcher := NewRepoFetcher(repo.NewFetcher(repo.Options{
 		RootDir:      cacheDirOrDefault(cfg.CodeRepo.CacheDir),
 		CloneTimeout: cfg.CodeRepo.CloneTimeout,
