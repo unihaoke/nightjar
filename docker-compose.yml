@@ -244,11 +244,8 @@ services:
       MWOPS_KAFKA_EXTERNAL_HOST: ${KAFKA_ADVERTISED_HOST:-127.0.0.1}
       MWOPS_KAFKA_EXTERNAL_PORT: '${KAFKA_PORT:-9092}'
       MWOPS_KAFKA_FILEBEAT_VERSION: ${FILEBEAT_VERSION:-8.16.0}
-      # ---------- 日志告警（规则默认值 + 后处理）与代码仓库缓存 ----------
-      # 规则本身在页面上配（log_alert_rules 表）；这里是"没命中规则时"的默认值与限流参数。
-      MWOPS_LOG_ALERT_DEFAULT_DEDUP_WINDOW: ${LOG_ALERT_DEDUP_WINDOW:-5}
-      MWOPS_LOG_ALERT_DEFAULT_COOLDOWN: ${LOG_ALERT_COOLDOWN:-10}
-      MWOPS_LOG_ALERT_DEFAULT_AI_ENABLED: ${LOG_ALERT_AI_ENABLED:-true}
+      # ---------- 日志告警后处理与代码仓库缓存 ----------
+      # 告警规则（去重窗口/冷却期/通知渠道/AI 开关）一律在页面新增后才生效，此处只有限流参数。
       MWOPS_LOG_ALERT_WORKER_INTERVAL_SECONDS: ${LOG_ALERT_WORKER_INTERVAL:-15}
       MWOPS_LOG_ALERT_WORKER_BATCH: ${LOG_ALERT_WORKER_BATCH:-10}
       MWOPS_LOG_ALERT_ANALYZE_TIMEOUT: ${LOG_ALERT_ANALYZE_TIMEOUT:-2m}

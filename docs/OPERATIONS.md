@@ -83,10 +83,6 @@
 | `kafka.group_id` | `mwops-log-ingest` | 平台消费组（`MWOPS_KAFKA_GROUP_ID`） |
 | `kafka.external_host` / `external_port` | `127.0.0.1` / `9092` | **被管服务器上的 Filebeat 要连的地址**（`MWOPS_KAFKA_EXTERNAL_HOST`），必须与 compose 的 `KAFKA_ADVERTISED_HOST` 一致 |
 | `kafka.filebeat_version` | `8.16.0` | 目标机安装的 Filebeat 版本（`FILEBEAT_VERSION`） |
-| `log_alert.default_dedup_window` | `5` | **没命中任何日志告警规则时**的去重窗口（分钟）：窗口内同指纹只合并计数 |
-| `log_alert.default_cooldown` | `10` | 默认冷却期（分钟）：冷却内不重复通知、不重复触发 AI（事件仍记录） |
-| `log_alert.default_ai_enabled` | `true` | 默认是否对日志事件自动做 AI 代码分析（需该服务已配仓库映射） |
-| `log_alert.default_notify_channels` | `[]` | 默认通知渠道（`feishu/wecom/dingtalk/email`）；空 = 用「通知渠道」里已启用的渠道 |
 | `log_alert.worker_interval_seconds` | `15` | 日志告警**后处理**（通知 + AI）的扫描间隔（秒） |
 | `log_alert.worker_batch` | `10` | 每轮最多处理的事件数（AI 很贵，靠它与间隔限流） |
 | `log_alert.analyze_timeout` | `2m` | 单条事件的 AI 分析超时 |
@@ -99,11 +95,12 @@
 > 环境变量名按同一规则拼：`log_alert.worker_interval_seconds` → `MWOPS_LOG_ALERT_WORKER_INTERVAL_SECONDS`，
 > `code_repo.cache_dir` → `MWOPS_CODE_REPO_CACHE_DIR`。
 > **这两组已支持环境变量覆盖**（后端启动时显式读取，不依赖 viper 对嵌套键的自动覆盖），
-> 且 `.env.example` 与 compose 都提供了对应的短名（如 `LOG_ALERT_COOLDOWN` → `MWOPS_LOG_ALERT_DEFAULT_COOLDOWN`）：
 > 改 `.env` 后 `docker compose up -d backend` 即可生效，不必重建镜像。
-> 注意**只有**写进 `docker-compose.yml` 的那几项能这样传（`default_notify_channels`、`clone_timeout`
+> 注意**只有**写进 `docker-compose.yml` 的那几项能这样传（`clone_timeout`
 > 等未注入的项请直接改 `middleware-ops/configs/config.yaml`）。
-> 日常调参应优先在页面「日志告警规则」里改（保存即生效，不需要重启）；这一组只是"没命中规则时的兜底"。
+> 日志告警的**去重窗口 / 冷却期 / 通知渠道 / AI 开关一律在页面「日志告警规则」里配**（保存即生效，不需要重启）；
+> 平台没有默认规则兜底：没命中任何规则的日志不入库、不通知、不分析。
+> 想让某类错误彻底不告警，在页面「屏蔽规则」里加一条（按日志原文匹配，支持多条）。
 
 ---
 
@@ -531,7 +528,7 @@ docker exec mwops-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-serv
 
 | 现象 | 看哪里 | 含义与处理 |
 |---|---|---|
-| 没通知 | 「日志告警规则」页顶部的**平台默认值**卡片（`GET /api/log-alerts/rules/defaults`） | 日志没命中任何启用规则时，按 `log_alert.default_*`（去重窗口 5 分钟 / 冷却 10 分钟 / AI 开 / 渠道 = 平台已启用渠道）处理。规则匹配是「priority 小者优先、同优先级按 id 升序、取第一条命中」——最常见的错是规则建了但 `enabled=false` |
+| 没通知 | 「日志告警规则」页顶部的**屏蔽规则**卡片与规则列表 | 平台没有默认规则：日志必须命中一条**已启用**的规则才会产生告警，否则不入库、不通知、不分析（先确认该服务/指纹有规则且 `enabled=true`）；其次看是否被「屏蔽规则」命中（屏蔽优先于所有规则）。规则匹配是「priority 小者优先、同优先级按 id 升序、取第一条命中」——最常见的错是规则建了但 `enabled=false` |
 | 没通知 | 事件列表的「抑制 / 通知」列：`suppressed=true` + `cooldown_until` | 处于**冷却期**：事件已记录，只是不重复打扰。想立刻拿到结论，对该条点「**重新分析**」（会清掉冷却记录，立即重跑通知与 AI） |
 | 没分析 | 事件列表 / 详情的「AI 分析」列：`analysis_state` 与 `analysis_error` | `disabled` = 规则关了 AI、或该服务没配仓库映射（原因写在 `analysis_error`，照做即可）；`failed` = 拉代码或调用 AI 失败（原因写在 `analysis_error`）；`pending/running` 停留过久 = 后处理没在跑（见下）；`done` = 已有结论 |
 

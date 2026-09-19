@@ -641,7 +641,7 @@ curl -s -H "Authorization: Bearer $TOKEN" 'http://<平台>/api/metrics/1' | jq '
 | ES 显示 warning | 集群为 yellow（1）属正常告警 | 若期望只在 red 告警，改用平台规则 `cluster_status < 1` |
 | 日志页无事件（走 Hook 直推） | Hook 401 或字段不合规 | 核对 `X-Hook-Token` 与 `MWOPS_HOOK_TOKEN`；`service`/`level`/`message` 必填 |
 | 日志页无事件（走日志集成） | 目标机没采到 / 连不上 Kafka / 时钟偏移 | ① 集成中心对该集成点**自检**看是哪一段红；② 目标机 `systemctl status filebeat` + `filebeat test output`；③ `nc -vz <KAFKA_ADVERTISED_HOST> <KAFKA_PORT>`；④ 目标机 `timedatectl` 核对时钟（偏移过大被 Kafka 以 `InvalidTimestampException` 拒收） |
-| **日志收到了但不通知 / 不分析** | 见 6.5 与 6.6：规则没命中 / 冷却抑制 / 规则关了 AI / 没配仓库映射 | ① 先看「日志告警规则」页顶部卡片给出的**默认值**（`GET /api/log-alerts/rules/defaults`）：没命中任何规则时就是按它处理；② 事件列表看「抑制 / 通知」列，`cooldown_until` 有值说明在冷却中（事件已记录，想立刻看结论点「重新分析」）；③ 看「AI 分析」列：`disabled` 表示规则关了 AI 或没配仓库映射、`failed` 表示拉代码/调用 AI 失败，原因都在 `analysis_error` 里 |
+| **日志收到了但不通知 / 不分析** | 见 6.5 与 6.6：规则没命中 / 冷却抑制 / 规则关了 AI / 没配仓库映射 | ① 先看「日志告警规则」页的规则列表与**屏蔽规则**卡片：平台没有默认规则，没命中任何已启用规则就不产生告警，被屏蔽项命中的日志连事件都不落库；② 事件列表看「抑制 / 通知」列，`cooldown_until` 有值说明在冷却中（事件已记录，想立刻看结论点「重新分析」）；③ 看「AI 分析」列：`disabled` 表示规则关了 AI 或没配仓库映射、`failed` 表示拉代码/调用 AI 失败，原因都在 `analysis_error` 里 |
 | 日志事件 `analysis_state=disabled`，原因写「服务 X 未配置代码仓库映射」 | 该服务在「服务器与仓库」里没有映射（服务名必须与日志的 `service` 完全一致） | 加一条映射后对该条事件点「重新分析」 |
 | 日志事件 `analysis_state=failed`，原因写「拉取代码失败：repo: git …」 | 平台拉代码失败（认证/分支/网络/磁盘，或 `code_repo.allow_outbound=false`） | 按 6.6 的错误翻译表逐条处理；凭据用只读令牌（URL 内嵌 token 在日志里会被脱敏） |
 | 代码分析提示「不在出网白名单」 | 合规默认禁止第三方分析 | 「服务器与仓库」中为服务开启 `allow_third_party`，并把服务名加入 `security.outbound_whitelist` |

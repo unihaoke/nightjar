@@ -26,26 +26,33 @@ import (
 //
 // 为什么要按"规则"而不是写死参数：去重窗口与冷却期决定了"多久打扰人一次"，
 // 它随服务重要性而变（核心交易服务要立刻通知、批处理服务可以攒一攒），
-// 因此必须由页面配置（log_alert_rules），代码只提供回调默认值。
+// 因此必须由页面配置（log_alert_rules）。代码里**没有任何默认规则**：
+// 没命中规则（或被屏蔽项命中）的日志不入库、不通知、不分析——
+// 告警只来自使用者自己在平台上新增的规则。
 type LogAlertService struct {
-	servers *repository.ServerRepository
-	events  *repository.LogEventRepository
-	repos   *repository.CodeRepoRepository
-	rules   *repository.LogAlertRuleRepository
-	cfg     *config.Config
-	audit   *AuditService
-	log     *zap.Logger
-	// window 为**兜底**去重窗口（分钟）。真实窗口来自命中的规则；
-	// 保留它是因为 EnsureWindow 是既有对外接口（定时任务会按配置刷新）。
+	servers    *repository.ServerRepository
+	events     *repository.LogEventRepository
+	repos      *repository.CodeRepoRepository
+	rules      *repository.LogAlertRuleRepository
+	exclusions *repository.LogAlertExclusionRepository
+	cfg        *config.Config
+	audit      *AuditService
+	log        *zap.Logger
+	// window 为**兜底**去重窗口（分钟）。真实窗口始终来自命中的规则；
+	// 这里不再读取任何配置默认值（默认值已按产品要求移除），保留是因为
+	// EnsureWindow 是既有对外接口。
 	window time.Duration
 	// cooldown 用 Redis 记录"最近一次外发时间"，实现冷却期（与指标告警同一套实现）。
 	cooldown cooldownTracker
-	// 规则缓存：Ingest 是**每条日志**都会走的路径，如果每次都查一次规则表，
+	// 规则/屏蔽项缓存：Ingest 是**每条日志**都会走的路径，如果每次都查一次表，
 	// 一次日志风暴就会把 DB 打成瓶颈（同一条 SQL 每秒重复上千次）。
-	// 规则是人工维护、极少变动的，因此按 TTL 缓存；规则增删改时立即失效（见 invalidateRuleCache）。
+	// 规则是人工维护、极少变动的，因此按 TTL 缓存；增删改时立即失效
+	// （见 invalidateRuleCache / invalidateExclusionCache）。
 	ruleCacheMu sync.RWMutex
 	ruleCache   []model.LogAlertRule
 	ruleCacheAt time.Time
+	exclCache   []model.LogAlertExclusion
+	exclCacheAt time.Time
 }
 
 // ruleCacheTTL 是规则缓存的存活时间。
@@ -61,20 +68,17 @@ func NewLogAlertService(
 	events *repository.LogEventRepository,
 	repos *repository.CodeRepoRepository,
 	rules *repository.LogAlertRuleRepository,
+	exclusions *repository.LogAlertExclusionRepository,
 	cfg *config.Config,
 	store cache.Store,
 	audit *AuditService,
 	log *zap.Logger,
 ) *LogAlertService {
-	svc := &LogAlertService{
-		servers: servers, events: events, repos: repos, rules: rules, cfg: cfg,
-		audit: audit, log: log, window: 5 * time.Minute,
+	return &LogAlertService{
+		servers: servers, events: events, repos: repos, rules: rules, exclusions: exclusions,
+		cfg: cfg, audit: audit, log: log, window: 5 * time.Minute,
 		cooldown: newCooldownTracker(store, "logalert:cd:"),
 	}
-	if cfg != nil && cfg.LogAlert.DefaultDedupWindow > 0 {
-		svc.window = time.Duration(cfg.LogAlert.DefaultDedupWindow) * time.Minute
-	}
-	return svc
 }
 
 // LogReport 是应用/Agent 上报的日志条目。
@@ -111,6 +115,13 @@ type IngestResult struct {
 	Count      int    `json:"count"`
 	Status     string `json:"status"`
 	Suppressed bool   `json:"suppressed"`
+	// Ignored 表示这条日志**没有产生告警事件**：被屏蔽项命中，或没命中任何规则。
+	// 上报方（Hook / Kafka 消费者）据此知道"收到了，但按配置不告警"，而不是"平台出错了"。
+	Ignored bool `json:"ignored"`
+	// Reason 说明为什么被忽略（页面与调用方排查"为什么没看到这条日志"的唯一线索）。
+	Reason string `json:"reason"`
+	// RuleID 为本次命中的规则（0 表示未命中）。
+	RuleID int64 `json:"rule_id"`
 }
 
 // Ingest 接收日志上报并执行去重聚合（4.8.2）。
@@ -153,17 +164,42 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 	alertType := defaultString(in.AlertType, detectAlertType(in))
 	level := defaultString(in.Level, "ERROR")
 
-	// ① 选规则：命中规则优先，否则用平台默认值（保证"零配置也能跑通"）。
-	rule := s.effectiveRuleFor(ctx, in.Service, signature, level)
+	// ① 屏蔽判定：命中屏蔽项的日志**完全不入库**——不生成事件、不通知、不触发 AI。
+	//
+	// 放在规则匹配之前：屏蔽的语义是"这类错误根本不该成为告警"，
+	// 与"命中后怎么处理"无关，因此不该受任何规则的开关影响。
+	if item, blocked := s.exclusionFor(ctx, in.Service, in.Message); blocked {
+		s.log.Debug("日志命中屏蔽项，已忽略",
+			zap.String("service", in.Service), zap.Int64("exclusion_id", item.ID),
+			zap.String("pattern", item.Pattern))
+		return &IngestResult{
+			Signature: signature, Status: model.LogEventIgnored, Ignored: true,
+			Reason: "命中屏蔽项：" + item.Pattern,
+		}, nil
+	}
 
-	// ② 冷却判定：冷却期内**不重复通知、不重复触发 AI**，但事件照记录（抑制 ≠ 丢弃）。
+	// ② 选规则：没有命中任何规则就**不产生告警事件**。
+	//
+	// 平台不再有任何"默认规则/默认值"兜底：告警必须由使用者在页面上新增的规则触发，
+	// 否则一条没配过的服务也会源源不断产生通知，而没人说得清它从哪来。
+	rule, matched := s.matchRule(ctx, in.Service, signature, level)
+	if !matched {
+		s.log.Debug("日志未命中任何日志告警规则，已忽略",
+			zap.String("service", in.Service), zap.String("signature", signature))
+		return &IngestResult{
+			Signature: signature, Status: model.LogEventIgnored, Ignored: true,
+			Reason: "未命中任何日志告警规则（请先在「日志告警规则」中新增规则）",
+		}, nil
+	}
+
+	// ③ 冷却判定：冷却期内**不重复通知、不重复触发 AI**，但事件照记录（抑制 ≠ 丢弃）。
 	cooling, coolErr := s.cooldown.inCooldown(ctx, cooldownKey(in.Service, signature), rule.Cooldown, now)
 	if coolErr != nil {
 		// 读失败按"不冷却"处理：宁可多打扰一次，也不能因为 Redis 抖动把告警静默掉。
 		s.log.Warn("日志告警冷却判定失败（本次按不冷却处理）", zap.Error(coolErr))
 	}
 
-	// ③ 窗口去重：窗口内同指纹合并到既有事件。
+	// ④ 窗口去重：窗口内同指纹合并到既有事件。
 	if rule.DedupWindow > 0 {
 		windowStart := now.Add(-time.Duration(rule.DedupWindow) * time.Minute)
 		existing, err := s.events.FindBySignature(ctx, in.Service, signature, windowStart)
@@ -175,7 +211,7 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 		}
 	}
 
-	// ④ 新事件：入队等待后处理（通知 + AI 分析），并把冷却起点写下来。
+	// ⑤ 新事件：入队等待后处理（通知 + AI 分析），并把冷却起点写下来。
 	event := &model.LogAlertEvent{
 		EventID:        "LE" + utils.Fingerprint(in.Service, signature, now.Format(time.RFC3339Nano))[:14],
 		ServerID:       serverID,
@@ -221,7 +257,7 @@ func (s *LogAlertService) Ingest(ctx context.Context, in LogReport) (*IngestResu
 
 	return &IngestResult{
 		EventID: event.EventID, Signature: signature, Merged: false,
-		Count: count, Status: event.Status, Suppressed: cooling,
+		Count: count, Status: event.Status, Suppressed: cooling, RuleID: rule.ID,
 	}, nil
 }
 

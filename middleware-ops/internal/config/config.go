@@ -33,20 +33,13 @@ type Config struct {
 	Log         LogConfig         `mapstructure:"log"`
 }
 
-// LogAlertConfig 是日志告警的**默认**处理参数。
+// LogAlertConfig 是日志告警后处理的运行参数。
 //
-// 为什么要有默认值：规则表是"按需细化"的——没人配规则时链路也必须能跑通
-// （去重合并 + 冷却 + 自动 AI 分析 + 通知）。因此在 log_alert_rules 里没有命中时，
-// 用这里的默认值构造一条虚拟规则（见 service.effectiveRuleFor）。
+// 刻意**不含任何规则默认值**：去重窗口 / 冷却期 / 通知渠道 / AI 开关只在平台的
+// log_alert_rules 里配置，日志必须命中一条平台上新增的规则才会产生事件
+// （没命中 = 不入库、不通知、不分析）。以前这里存过 default_* 兜底值，
+// 结果是"什么都没配也会告警"，而使用者无从解释消息是哪来的。
 type LogAlertConfig struct {
-	// DefaultDedupWindow 为默认去重窗口（分钟）：窗口内同指纹只合并计数。
-	DefaultDedupWindow int `mapstructure:"default_dedup_window"`
-	// DefaultCooldown 为默认冷却期（分钟）：冷却内不重复通知、不重复触发 AI。
-	DefaultCooldown int `mapstructure:"default_cooldown"`
-	// DefaultAIEnabled 为默认是否自动做 AI 代码分析。
-	DefaultAIEnabled bool `mapstructure:"default_ai_enabled"`
-	// DefaultNotifyChannels 为默认通知渠道（空表示用平台通知配置里的启用渠道）。
-	DefaultNotifyChannels []string `mapstructure:"default_notify_channels"`
 	// WorkerInterval 为后处理（通知 + AI 分析）的扫描间隔（秒）。
 	WorkerInterval int `mapstructure:"worker_interval_seconds"`
 	// WorkerBatch 为每轮处理的事件数上限（限流：AI 分析很贵，批量不能太大）。
@@ -534,22 +527,6 @@ func envOf(key string) (string, bool) {
 
 // applyEnvLogAlert 用环境变量覆盖日志告警参数（只在变量真实存在时覆盖）。
 func (c *Config) applyEnvLogAlert() {
-	if raw, ok := envOf("log_alert.default_dedup_window"); ok {
-		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
-			c.LogAlert.DefaultDedupWindow = v
-		}
-	}
-	if raw, ok := envOf("log_alert.default_cooldown"); ok {
-		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
-			c.LogAlert.DefaultCooldown = v
-		}
-	}
-	if raw, ok := envOf("log_alert.default_ai_enabled"); ok {
-		c.LogAlert.DefaultAIEnabled = parseBool(raw, c.LogAlert.DefaultAIEnabled)
-	}
-	if raw, ok := envOf("log_alert.default_notify_channels"); ok {
-		c.LogAlert.DefaultNotifyChannels = splitAndTrim(raw)
-	}
 	if raw, ok := envOf("log_alert.worker_interval_seconds"); ok {
 		if v, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
 			c.LogAlert.WorkerInterval = v

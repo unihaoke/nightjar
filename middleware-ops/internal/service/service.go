@@ -50,6 +50,8 @@ type Deps struct {
 	CodeRepos     *repository.CodeRepoRepository
 	LogEvents     *repository.LogEventRepository
 	LogAlertRules *repository.LogAlertRuleRepository
+	// LogAlertExclusions 为日志告警屏蔽项仓储（"这类错误不告警"）。
+	LogAlertExclusions *repository.LogAlertExclusionRepository
 	CodeAnalyses  *repository.CodeAnalysisRepository
 	Notifies      *repository.NotificationLogRepository
 

@@ -417,6 +417,30 @@ type LogAlertRule struct {
 	Priority int `gorm:"default:100" json:"priority"`
 }
 
+// LogAlertExclusion 日志告警屏蔽项：命中的日志**不入库、不通知、不分析**。
+//
+// 为什么单独一张表、而不是做成 LogAlertRule 的一个字段：
+// 规则回答"命中之后怎么处理"，屏蔽项回答"这类错误根本不该成为告警"
+// （典型是框架打印的噪音，如 Request method 'GET' is not supported）。
+// 两者的生效位置也不同——屏蔽在所有规则**之前**生效，命中即结束；
+// 若塞进规则表，同一条屏蔽就得在每条规则里重复配一遍。
+type LogAlertExclusion struct {
+	Base
+	// Name 为屏蔽项的备注（可空）：页面上主要展示 Pattern，名字只用于说明"为什么屏蔽"。
+	Name string `gorm:"size:128" json:"name"`
+	// ServiceName 为空表示对任意服务生效。
+	ServiceName string `gorm:"size:128;index" json:"service_name"`
+	// Pattern 匹配**日志原文（message）**：普通文本按子串匹配，`/re/` 形式按正则匹配；必填。
+	//
+	// 刻意不匹配 error_signature：指纹是哈希值，使用者写不出"我想屏蔽的那句话"对应的哈希，
+	// 只能写出日志消息里的文本——匹配原文才是他能真正配置的维度。
+	Pattern string `gorm:"size:512;not null" json:"pattern"`
+	Enabled bool   `gorm:"default:true;index" json:"enabled"`
+}
+
+// TableName 显式指定表名，避免 GORM 复数化差异。
+func (LogAlertExclusion) TableName() string { return "log_alert_exclusions" }
+
 // AICodeAnalysis AI 代码分析报告（4.8.3 三点式模板）。
 type AICodeAnalysis struct {
 	Base
@@ -493,7 +517,7 @@ func MigrationList() []any {
 		&KnowledgeBase{},
 		&AuditLog{}, &AuditSnapshot{},
 		&Approval{}, &FixRecord{},
-		&ServerInstance{}, &CodeRepo{}, &LogAlertEvent{}, &LogAlertRule{}, &AICodeAnalysis{},
+		&ServerInstance{}, &CodeRepo{}, &LogAlertEvent{}, &LogAlertRule{}, &LogAlertExclusion{}, &AICodeAnalysis{},
 		&NotificationLog{},
 		&PlatformSetting{},
 	}

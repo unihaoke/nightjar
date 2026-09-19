@@ -47,16 +47,6 @@ type LogAlertRuleInput struct {
 	Priority  int   `json:"priority"`
 }
 
-// LogAlertRuleDefaults 是"没有命中任何规则时平台用的默认值"（页面展示用）。
-type LogAlertRuleDefaults struct {
-	DedupWindow    int      `json:"dedup_window"`
-	Cooldown       int      `json:"cooldown"`
-	AIEnabled      bool     `json:"ai_enabled"`
-	NotifyChannels []string `json:"notify_channels"`
-	// Services 为已配置代码仓库的服务名：只有这些服务才可能真的产出 AI 代码结论。
-	Services []string `json:"services"`
-}
-
 // ---------------------------------------------------------------------------
 // 匹配（纯函数，可单测）
 // ---------------------------------------------------------------------------
@@ -154,47 +144,11 @@ func (s *LogAlertService) ListRules(ctx context.Context, keyword string, limit, 
 	return items, total, nil
 }
 
-// RuleDefaults 返回平台默认处理参数（页面用来说明"没命中规则时会怎样"）。
-func (s *LogAlertService) RuleDefaults(ctx context.Context) LogAlertRuleDefaults {
-	out := LogAlertRuleDefaults{
-		DedupWindow:    5,
-		Cooldown:       10,
-		AIEnabled:      true,
-		NotifyChannels: []string{},
-		Services:       []string{},
-	}
-	if s.cfg != nil {
-		out.DedupWindow = s.cfg.LogAlert.DefaultDedupWindow
-		out.Cooldown = s.cfg.LogAlert.DefaultCooldown
-		out.AIEnabled = s.cfg.LogAlert.DefaultAIEnabled
-		if channels := s.cfg.LogAlert.DefaultNotifyChannels; len(channels) > 0 {
-			out.NotifyChannels = channels
-		}
-	}
-	// 已配置代码仓库的服务：只有它们才可能产出真正的 AI 代码结论（页面据此提示）。
-	if s.repos != nil {
-		if repos, _, err := s.repos.List(ctx, "", 200, 0); err == nil {
-			for _, item := range repos {
-				if name := strings.TrimSpace(item.ServiceName); name != "" {
-					out.Services = append(out.Services, name)
-				}
-			}
-			sort.Strings(out.Services)
-		}
-	}
-	return out
-}
-
 // CreateRule 新建规则。
 func (s *LogAlertService) CreateRule(ctx context.Context, in LogAlertRuleInput, operator Operator) (*model.LogAlertRule, error) {
-	// 新建时的基线：开关默认开、窗口与冷却取平台默认值——
+	// 新建时的基线：开关默认开、窗口与冷却给一组合理初值——
 	// 这样"只填名字就保存"也能得到一条语义合理的规则，而不是 window=0/cooldown=0 的"每条都通知"。
 	base := model.LogAlertRule{DedupWindow: 5, Cooldown: 10, AIEnabled: true, Enabled: true}
-	if s.cfg != nil {
-		base.DedupWindow = s.cfg.LogAlert.DefaultDedupWindow
-		base.Cooldown = s.cfg.LogAlert.DefaultCooldown
-		base.AIEnabled = s.cfg.LogAlert.DefaultAIEnabled
-	}
 	rule, err := s.buildRule(base, in)
 	if err != nil {
 		return nil, err
@@ -374,26 +328,16 @@ func (s *LogAlertService) invalidateRuleCache() {
 	s.ruleCacheMu.Unlock()
 }
 
-// effectiveRuleFor 取出这次日志该用的规则：命中规则优先，否则回落到平台默认值。
+// matchRule 取出这次日志命中的规则；没有命中就是"不告警"。
 //
-// 回落成一个"虚拟规则"而不是返回 nil：调用方（Ingest / 后处理）只面对一种形态，
-// 少一层 nil 判断就少一处"忘记处理没规则的情况"的机会。
-func (s *LogAlertService) effectiveRuleFor(ctx context.Context, service, signature, level string) model.LogAlertRule {
-	if rules, err := s.enabledRules(ctx); err == nil && len(rules) > 0 {
-		if matched, ok := MatchLogAlertRule(rules, service, signature, level); ok {
-			return matched
-		}
-	} else if err != nil {
-		s.log.Warn("读取日志告警规则失败，本次按平台默认值处理", zap.Error(err))
+// 刻意**不回落任何默认规则**：告警只能由平台上新增的规则触发（产品要求），
+// 否则一个从没配过的服务也会持续产出通知，而没人说得清它依据什么在告警。
+// 规则读取失败时同样按未命中处理并记 warn——读不到规则时的"静默告警"
+// 和"凭空告警"一样都是不可接受的静默失效，至少要在日志里留下痕迹。
+func (s *LogAlertService) matchRule(ctx context.Context, service, signature, level string) (model.LogAlertRule, bool) {
+	rules, err := s.enabledRules(ctx)
+	if err != nil {
+		s.log.Warn("读取日志告警规则失败，本次按未命中处理", zap.Error(err))
 	}
-	fallback := model.LogAlertRule{
-		Name: "（平台默认）", DedupWindow: 5, Cooldown: 10, AIEnabled: true, Enabled: true,
-	}
-	if s.cfg != nil {
-		fallback.DedupWindow = s.cfg.LogAlert.DefaultDedupWindow
-		fallback.Cooldown = s.cfg.LogAlert.DefaultCooldown
-		fallback.AIEnabled = s.cfg.LogAlert.DefaultAIEnabled
-		fallback.NotifyChannels = model.JSONStringSlice(s.cfg.LogAlert.DefaultNotifyChannels)
-	}
-	return fallback
+	return MatchLogAlertRule(rules, service, signature, level)
 }

@@ -30,8 +30,9 @@ import type {
   IntegrationView,
   IntegrationSelfCheck,
   KnowledgeEntry,
+  LogAlertExclusion,
+  LogAlertExclusionInput,
   LogAlertRule,
-  LogAlertRuleDefaults,
   LogAlertRuleInput,
   LogEvent,
   LogPipelineProbeResult,
@@ -409,11 +410,19 @@ export const logAlertApi = {
    */
   rules: (params: PageQuery, signal?: AbortSignal) =>
     get<PageResult<LogAlertRule>>('/api/log-alerts/rules', params, withSignal(signal)),
-  /** 平台默认处理参数：没命中任何规则时按它执行（页面必须能展示，否则无法解释"为什么没通知"）。 */
-  ruleDefaults: () => get<LogAlertRuleDefaults>('/api/log-alerts/rules/defaults'),
   createRule: (payload: LogAlertRuleInput) => post<LogAlertRule>('/api/log-alerts/rules', payload),
   updateRule: (id: number, payload: LogAlertRuleInput) => put<LogAlertRule>(`/api/log-alerts/rules/${id}`, payload),
   removeRule: (id: number) => del<{ message: string }>(`/api/log-alerts/rules/${id}`),
+  /**
+   * 日志告警屏蔽项：命中即丢弃（不入库、不通知、不分析），优先于所有规则。
+   * 典型用法是屏蔽框架噪音，如 "Request method 'GET' is not supported"。
+   */
+  exclusions: (params: PageQuery, signal?: AbortSignal) =>
+    get<PageResult<LogAlertExclusion>>('/api/log-alerts/exclusions', params, withSignal(signal)),
+  createExclusion: (payload: LogAlertExclusionInput) => post<LogAlertExclusion>('/api/log-alerts/exclusions', payload),
+  updateExclusion: (id: number, payload: Partial<LogAlertExclusionInput>) =>
+    put<LogAlertExclusion>(`/api/log-alerts/exclusions/${id}`, payload),
+  removeExclusion: (id: number) => del<{ message: string }>(`/api/log-alerts/exclusions/${id}`),
   /** 重新分析：对同一条事件重新入队 AI 代码分析（失败原因由后端 message 原样返回）。 */
   reanalyze: (eventId: number) => post<ReanalyzeResult>(`/api/log-alerts/events/${eventId}/reanalyze`),
 }

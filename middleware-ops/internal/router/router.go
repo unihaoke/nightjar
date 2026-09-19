@@ -218,11 +218,16 @@ func New(opt Options) *gin.Engine {
 		logAlerts.GET("/pipeline", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.LogPipelineStatus)
 		logAlerts.POST("/pipeline/probe", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.ProbeLogPipeline)
 		// 日志告警规则：决定去重窗口 / 冷却期 / 通知渠道 / 是否自动 AI 分析。
+		// 平台没有任何默认规则：只在页面上新增过的规则才会让日志产生告警。
 		logAlerts.GET("/rules", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListLogAlertRules)
-		logAlerts.GET("/rules/defaults", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.LogAlertRuleDefaults)
 		logAlerts.POST("/rules", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.CreateLogAlertRule)
 		logAlerts.PUT("/rules/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.UpdateLogAlertRule)
 		logAlerts.DELETE("/rules/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.DeleteLogAlertRule)
+		// 日志告警屏蔽项：命中即丢弃（不入库、不通知、不分析），优先于所有规则。
+		logAlerts.GET("/exclusions", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertRead), h.ListLogAlertExclusions)
+		logAlerts.POST("/exclusions", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.CreateLogAlertExclusion)
+		logAlerts.PUT("/exclusions/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.UpdateLogAlertExclusion)
+		logAlerts.DELETE("/exclusions/:id", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.DeleteLogAlertExclusion)
 		// 手动重新分析：打破冷却抑制，立即重跑通知与 AI 分析。
 		logAlerts.POST("/events/:id/reanalyze", mw.RequirePerm(opt.Deps.Auth, service.PermLogAlertWrite), h.ReanalyzeLogEvent)
 	}

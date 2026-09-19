@@ -338,21 +338,18 @@ func analysisDecision(rule model.LogAlertRule, service string, analysisReady, re
 	return "", ""
 }
 
-// ruleOf 取出事件命中的规则；事件没记规则（老数据/默认值）时回落到平台默认规则。
+// ruleOf 取出事件命中的规则。
+//
+// 事件没有 rule_id 只可能是规则化之前的**历史数据**（现在没命中规则的日志根本不会入库）：
+// 给一条"零窗口零冷却、允许 AI"的最小规则，让它们仍能被通知与分析一次，
+// 而不是回落任何平台默认参数——默认值已按产品要求彻底移除。
 func (w *LogAlertWorker) ruleOf(ctx context.Context, event model.LogAlertEvent) model.LogAlertRule {
 	if event.RuleID > 0 && w.rules != nil {
 		if rule, err := w.rules.Get(ctx, event.RuleID); err == nil && rule != nil {
 			return *rule
 		}
 	}
-	fallback := model.LogAlertRule{Name: "（平台默认）", DedupWindow: 5, Cooldown: 10, AIEnabled: true}
-	if w.cfg != nil {
-		fallback.DedupWindow = w.cfg.LogAlert.DefaultDedupWindow
-		fallback.Cooldown = w.cfg.LogAlert.DefaultCooldown
-		fallback.AIEnabled = w.cfg.LogAlert.DefaultAIEnabled
-		fallback.NotifyChannels = model.JSONStringSlice(w.cfg.LogAlert.DefaultNotifyChannels)
-	}
-	return fallback
+	return model.LogAlertRule{Name: "（历史事件）", AIEnabled: true, Enabled: true}
 }
 
 // notifySuffix 把通知失败的原因拼进分析状态的说明里（没有失败时返回空串）。

@@ -153,11 +153,9 @@ func setDefaults(v *viper.Viper) {
 	// 首次消费从头开始：宁可重复处理（日志事件本身按指纹去重），也不要漏掉积压日志。
 	v.SetDefault("kafka.start_offset", "earliest")
 
-	// 日志告警的默认处理参数（没有命中任何规则时用它，链路必须能"零配置跑通"）。
-	v.SetDefault("log_alert.default_dedup_window", 5)
-	v.SetDefault("log_alert.default_cooldown", 10)
-	v.SetDefault("log_alert.default_ai_enabled", true)
-	v.SetDefault("log_alert.default_notify_channels", []string{})
+	// 日志告警的后处理运行参数。
+	// 注意：这里**不设任何规则默认值**——日志告警规则一律在平台上新增后才生效，
+	// 没有命中规则的日志不产生事件（没有 default_* 兜底，避免"零配置也在告警"）。
 	v.SetDefault("log_alert.worker_interval_seconds", 15)
 	v.SetDefault("log_alert.worker_batch", 10)
 	v.SetDefault("log_alert.analyze_timeout", 2*time.Minute)

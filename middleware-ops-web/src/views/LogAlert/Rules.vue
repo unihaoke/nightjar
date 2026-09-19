@@ -6,14 +6,17 @@
  * 差别在"判定输入"——指标规则比数值（metric > threshold），日志规则比**错误指纹与级别**
  * （哪个服务的哪类错误），因此字段是 service_name / signature_pattern / min_severity。
  *
- * 顶部先回答"没命中规则会怎样"：默认处理参数（去重窗口/冷却期/AI 开关/通知渠道）全部来自
- * 后端 /rules/defaults，前端不写死。否则使用者无法解释某条事件为什么被合并、为什么没通知。
+ * 平台**没有任何默认规则**：日志必须命中这里新增的某条规则才会产生告警，
+ * 否则不入库、不通知、不分析——页面顶部必须把这条说清，否则使用者会以为平台漏收了日志。
+ *
+ * 顶部另一块是「屏蔽规则」：把"这类错误我不想收到"（如框架噪音 Request method 'GET' is not supported）
+ * 变成可配置条目，命中即丢弃，优先于所有规则生效；可配多条。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { logAlertApi } from '@/api'
 import { toastError } from '@/api/http'
-import type { LogAlertRule, LogAlertRuleDefaults, LogAlertRuleInput } from '@/api/types'
+import type { LogAlertExclusion, LogAlertRule, LogAlertRuleInput } from '@/api/types'
 import { useListPage } from '@/composables/useListPage'
 import ResponsiveList from '@/components/ResponsiveList.vue'
 import { useUserStore } from '@/stores/user'
@@ -40,37 +43,127 @@ const { query, items, total, loading, error } = list
 const canWrite = computed(() => store.can('logalert:write'))
 
 // ---------------------------------------------------------------------------
-// 默认值卡片：区分"接口读不到（无数据）"与"后端给了什么"
+// 屏蔽规则：命中的日志不入库、不通知、不分析（优先于所有规则）
+//
+// 单独存失败原因，而不是只看"列表为空"：接口不通与"确实没配屏蔽项"是两件事，
+// 界面必须区分（INC-016：不能把未知显示成结论）。
 // ---------------------------------------------------------------------------
-const defaults = ref<LogAlertRuleDefaults | null>(null)
-const defaultsLoading = ref(false)
-/**
- * 单独存失败原因，而不是只看 defaults=null：
- * 接口不通与"后端没配默认值"是两件事，界面必须区分（INC-016：不能把未知显示成结论）。
- */
-const defaultsError = ref('')
+const exclusions = ref<LogAlertExclusion[]>([])
+const exclLoading = ref(false)
+const exclError = ref('')
 
-/** 读取平台默认处理参数；失败即视为无数据，绝不把 null 当成 0 或"关闭"。 */
-async function loadDefaults(): Promise<void> {
-  defaultsLoading.value = true
+async function loadExclusions(): Promise<void> {
+  exclLoading.value = true
   try {
-    const result = await logAlertApi.ruleDefaults()
-    if (!result) {
-      defaults.value = null
-      defaultsError.value = '接口未返回默认值'
-      return
-    }
-    defaults.value = result
-    defaultsError.value = ''
+    const result = await logAlertApi.exclusions({ keyword: '', page: 1, page_size: 200 })
+    exclusions.value = result?.list || []
+    exclError.value = ''
   } catch (err) {
-    defaults.value = null
-    defaultsError.value = err instanceof Error ? err.message : String(err)
+    exclusions.value = []
+    exclError.value = err instanceof Error ? err.message : String(err)
   } finally {
-    defaultsLoading.value = false
+    exclLoading.value = false
   }
 }
 
-onMounted(loadDefaults)
+const exclDialogVisible = ref(false)
+const exclEditing = ref<LogAlertExclusion | null>(null)
+const exclFormRef = ref<FormInstance>()
+const exclSubmitting = ref(false)
+const exclForm = reactive({ name: '', service_name: '', pattern: '', enabled: true })
+
+const exclRules: FormRules = {
+  pattern: [
+    { required: true, message: '请填写要屏蔽的内容', trigger: 'blur' },
+    {
+      validator: (_rule, value, callback) => {
+        // 与规则里的指纹匹配同一套写法：只有 `/.../` 形式才按正则校验。
+        const text = String(value ?? '').trim()
+        if (!text.startsWith('/') || !text.endsWith('/') || text.length < 2) {
+          callback()
+          return
+        }
+        try {
+          new RegExp(text.slice(1, -1))
+          callback()
+        } catch (err) {
+          callback(new Error(`正则不合法：${err instanceof Error ? err.message : String(err)}`))
+        }
+      },
+      trigger: 'blur',
+    },
+  ],
+}
+
+function openExclusion(item?: LogAlertExclusion): void {
+  exclEditing.value = item || null
+  Object.assign(
+    exclForm,
+    item
+      ? { name: item.name || '', service_name: item.service_name || '', pattern: item.pattern || '', enabled: item.enabled }
+      : { name: '', service_name: '', pattern: '', enabled: true },
+  )
+  exclDialogVisible.value = true
+  exclFormRef.value?.clearValidate()
+}
+
+async function submitExclusion(): Promise<void> {
+  if (!exclFormRef.value) {
+    return
+  }
+  const valid = await exclFormRef.value.validate().catch(() => false)
+  if (!valid) {
+    return
+  }
+  exclSubmitting.value = true
+  try {
+    const payload = { ...exclForm }
+    if (exclEditing.value) {
+      await logAlertApi.updateExclusion(exclEditing.value.id, payload)
+      ElMessage({ type: 'success', message: '屏蔽项已更新' })
+    } else {
+      await logAlertApi.createExclusion(payload)
+      ElMessage({ type: 'success', message: '屏蔽项已新增，即刻生效' })
+    }
+    exclDialogVisible.value = false
+    await loadExclusions()
+  } catch (error) {
+    toastError(error)
+  } finally {
+    exclSubmitting.value = false
+  }
+}
+
+async function toggleExclusion(item: LogAlertExclusion): Promise<void> {
+  try {
+    await logAlertApi.updateExclusion(item.id, { enabled: !item.enabled })
+    await loadExclusions()
+  } catch (error) {
+    toastError(error)
+  }
+}
+
+/** 删除屏蔽项：删除后同类错误会重新开始告警，所以确认文案要说清后果。 */
+async function removeExclusion(item: LogAlertExclusion): Promise<void> {
+  try {
+    await ElMessageBox.confirm(`删除后包含「${item.pattern}」的错误将重新开始告警，确认删除？`, '删除确认', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    await logAlertApi.removeExclusion(item.id)
+    ElMessage({ type: 'success', message: '屏蔽项已删除' })
+    await loadExclusions()
+  } catch (error) {
+    toastError(error)
+  }
+}
+
+onMounted(loadExclusions)
 
 /** 列表文案：空数组返回空串——由调用方决定显示"无数据"还是"平台默认"，两者语义不同。 */
 function joinList(items: string[] | null | undefined): string {
@@ -269,7 +362,7 @@ async function remove(rule: LogAlertRule): Promise<void> {
   }
 }
 
-/** 切换启用状态：停用后该规则不再参与匹配（事件改由默认值或下一条规则处理）。 */
+/** 切换启用状态：停用后该规则不再参与匹配（未命中任何规则的日志不会产生告警）。 */
 async function toggle(rule: LogAlertRule): Promise<void> {
   try {
     await logAlertApi.updateRule(rule.id, { ...toPayload(rule), enabled: !rule.enabled })
@@ -292,40 +385,68 @@ async function toggle(rule: LogAlertRule): Promise<void> {
       <el-button v-if="canWrite" type="primary" :icon="'Plus'" @click="openForm()">新建规则</el-button>
     </div>
 
-    <!-- 默认规则：先讲清"没命中任何规则会怎样"，再看规则列表 -->
-    <div v-loading="defaultsLoading" class="card defaults-card">
+    <el-alert
+      type="info"
+      :closable="false"
+      show-icon
+      class="page-alert"
+      title="平台没有内置默认规则：日志必须命中下方某条规则才会产生告警（未命中的日志不入库、不通知、不分析）"
+    />
+
+    <!-- 屏蔽规则：先讲清"哪些错误根本不该告警"，再看规则列表 -->
+    <div v-loading="exclLoading" class="card exclusion-card">
       <h3 class="card-title">
-        <span>默认规则</span>
-        <el-button v-if="defaultsError" size="small" text @click="loadDefaults">重试</el-button>
-      </h3>
-      <el-alert
-        type="info"
-        :closable="false"
-        show-icon
-        title="没有命中任何规则时，平台按默认值处理（去重窗口/冷却期/AI 开关/通知渠道见下方说明）"
-      >
-        <div v-if="defaults" class="defaults-grid">
-          <span>
-            去重窗口：{{ defaults.dedup_window }} 分钟（{{
-              defaults.dedup_window > 0 ? '窗口内同一指纹只合并计数，不重复通知' : '0 表示不做窗口合并'
-            }}）
-          </span>
-          <span>
-            冷却期：{{ defaults.cooldown }} 分钟（{{
-              defaults.cooldown > 0 ? '冷却期内同指纹不再通知、不再触发 AI，事件仍记录' : '0 表示不冷却'
-            }}）
-          </span>
-          <span>自动 AI 代码分析：{{ defaults.ai_enabled ? '开启' : '关闭' }}</span>
-          <span>通知渠道：{{ joinList(defaults.notify_channels) || '无数据' }}</span>
-          <span>已配代码仓库的服务（只有这些服务能产出 AI 代码结论）：{{ joinList(defaults.services) || '无数据' }}</span>
+        <span>屏蔽规则（命中的日志完全不告警）</span>
+        <div class="row">
+          <el-button v-if="exclError" size="small" text @click="loadExclusions">重试</el-button>
+          <el-button v-if="canWrite" size="small" type="primary" :icon="'Plus'" @click="openExclusion()">
+            新增屏蔽
+          </el-button>
         </div>
-        <!-- 读不到就明确说"无数据"，不能把未知显示成 0 / 关闭（INC-016） -->
-        <p v-else-if="defaultsError" class="field-hint">无数据：无法获取平台默认值（{{ defaultsError }}）</p>
-        <p v-else class="field-hint">正在读取平台默认值…</p>
-      </el-alert>
+      </h3>
       <p class="field-hint">
-        多条规则同时命中时按优先级取第一条（数字小的优先，默认 100），便于"特例压过通用"；
-        停用（或未命中）后事件回到默认值处理。
+        屏蔽的是**日志原文**：填普通文本按子串匹配，填 <span class="mono">/正则/</span> 按正则匹配；
+        服务名留空表示对所有服务生效。支持多条，命中第一条即生效——例如屏蔽框架噪音
+        <span class="mono">Request method 'GET' is not supported</span>。
+      </p>
+      <div class="table-scroll">
+        <el-table :data="exclusions" size="small">
+          <el-table-column label="屏蔽内容" min-width="240">
+            <template #default="{ row }"><span class="mono">{{ row.pattern }}</span></template>
+          </el-table-column>
+          <el-table-column label="服务" min-width="130">
+            <template #default="{ row }">
+              <span v-if="row.service_name" class="mono">{{ row.service_name }}</span>
+              <span v-else class="muted">任意服务</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="备注" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.name || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.enabled ? 'success' : 'info'" effect="light">
+                {{ row.enabled ? '生效中' : '已停用' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column v-if="canWrite" label="操作" width="150" fixed="right">
+            <template #default="{ row }">
+              <el-switch size="small" :model-value="row.enabled" @change="toggleExclusion(row)" />
+              <el-button text size="small" @click="openExclusion(row)">编辑</el-button>
+              <el-button text size="small" type="danger" @click="removeExclusion(row)">删除</el-button>
+            </template>
+          </el-table-column>
+          <template #empty>
+            <!-- 读不到与"确实没配"必须分开说（INC-016） -->
+            <span v-if="exclError">无数据：无法获取屏蔽规则（{{ exclError }}）</span>
+            <span v-else>暂无屏蔽项：所有命中的日志都会按下方规则告警</span>
+          </template>
+        </el-table>
+      </div>
+      <p class="field-hint">
+        屏蔽优先于所有规则：被屏蔽的日志连事件都不落库（不会出现在日志事件列表，也不会通知与 AI 分析）；
+        停用或删除后同类错误会重新开始告警。
       </p>
     </div>
 
@@ -458,10 +579,7 @@ async function toggle(rule: LogAlertRule): Promise<void> {
           <el-col :xs="24" :sm="12">
             <el-form-item label="服务名">
               <el-input v-model="form.service_name" placeholder="留空表示任意服务" />
-              <p class="field-hint">
-                只对某服务生效；留空表示任意服务。<template v-if="defaults && defaults.services.length">
-                  已配代码仓库的服务：{{ joinList(defaults.services) }}</template>
-              </p>
+              <p class="field-hint">只对某服务生效；留空表示任意服务。</p>
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
@@ -502,9 +620,7 @@ async function toggle(rule: LogAlertRule): Promise<void> {
               <el-checkbox-group v-model="form.notify_channels">
                 <el-checkbox v-for="item in CHANNEL_OPTIONS" :key="item" :value="item">{{ item }}</el-checkbox>
               </el-checkbox-group>
-              <p class="field-hint">
-                留空表示使用平台默认渠道（当前默认值：{{ joinList(defaults?.notify_channels) || '无数据' }}）。
-              </p>
+              <p class="field-hint">留空表示使用平台「通知渠道」里已启用的渠道。</p>
             </el-form-item>
           </el-col>
 
@@ -534,20 +650,63 @@ async function toggle(rule: LogAlertRule): Promise<void> {
         <el-button type="primary" :loading="submitting" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="exclDialogVisible"
+      :title="exclEditing ? '编辑屏蔽项' : '新增屏蔽项'"
+      width="560px"
+    >
+      <el-form ref="exclFormRef" :model="exclForm" :rules="exclRules" label-position="top">
+        <el-form-item label="屏蔽内容（必填）" prop="pattern">
+          <el-input
+            v-model="exclForm.pattern"
+            placeholder="如 Request method 'GET' is not supported"
+          />
+          <p class="field-hint">
+            匹配日志原文：填普通文本=子串匹配，填 <span class="mono">/正则/</span>=按正则匹配，例如
+            <span class="mono">/Request method .* is not supported/i</span>。命中的日志不入库、不通知、不分析。
+          </p>
+        </el-form-item>
+        <el-row :gutter="12">
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="服务名">
+              <el-input v-model="exclForm.service_name" placeholder="留空表示任意服务" />
+              <p class="field-hint">只对该服务生效；留空表示所有服务。</p>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="备注">
+              <el-input v-model="exclForm.name" placeholder="如 框架噪音，不是故障" />
+              <p class="field-hint">说明为什么屏蔽，方便其他人看懂。</p>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="开关">
+          <div class="row switch-row">
+            <el-switch v-model="exclForm.enabled" />
+            <span class="muted">启用该屏蔽项</span>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="exclDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="exclSubmitting" @click="submitExclusion">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
-.defaults-card {
+.page-alert {
   margin-bottom: 12px;
 }
 
-.defaults-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  line-height: 1.6;
+.exclusion-card {
+  margin-bottom: 12px;
+}
+
+.card-title .row {
+  gap: 8px;
 }
 
 .field-hint {

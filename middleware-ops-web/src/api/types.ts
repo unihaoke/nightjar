@@ -761,18 +761,32 @@ export interface LogAlertRuleInput {
 }
 
 /**
- * 平台默认处理参数（GET /api/log-alerts/rules/defaults）。
+ * 日志告警屏蔽项（GET /api/log-alerts/exclusions）。
  *
- * 用途：页面上必须能说清"没命中任何规则时会怎样"，否则使用者无法判断
- * 某条事件为什么被合并、为什么没通知。这些值全部来自后端，前端不写死。
+ * 用途：把"这类错误我不想收到"变成平台上的配置——命中的日志**不入库、不通知、不分析**。
+ * 它优先于所有规则生效，删掉即恢复告警。可配多条，逐条判定。
  */
-export interface LogAlertRuleDefaults {
-  dedup_window: number
-  cooldown: number
-  ai_enabled: boolean
-  notify_channels: string[]
-  /** 后端给出的服务清单（填写 service_name 时可作参考）。 */
-  services: string[]
+export interface LogAlertExclusion {
+  id: number
+  /** 屏蔽项的备注，说明"为什么屏蔽"；为空时页面只展示屏蔽内容。 */
+  name: string
+  /** 只对某服务生效；为空表示任意服务。 */
+  service_name: string
+  /**
+   * 屏蔽内容，匹配**日志原文（message）**：
+   * 普通文本按子串匹配，`/re/` 形式按正则匹配。
+   * 例：Request method 'GET' is not supported
+   */
+  pattern: string
+  enabled: boolean
+}
+
+/** 日志告警屏蔽项入参（POST/PUT /api/log-alerts/exclusions）。 */
+export interface LogAlertExclusionInput {
+  name: string
+  service_name: string
+  pattern: string
+  enabled: boolean
 }
 
 /** 重新触发 AI 代码分析的结果（POST /api/log-alerts/events/:id/reanalyze）。 */

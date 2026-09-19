@@ -391,10 +391,13 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 | GET | `/api/log-alerts/pipeline` | `logalert:read` | L0 | **日志集成接收链路状态**：brokers / topic / 消费组、消费者是否运行、对外接入地址、最近错误与一句话说明（页面「Kafka 采集链路」卡片） |
 | POST | `/api/log-alerts/pipeline/probe` | `logalert:write` | L0 | **探测平台侧 Kafka 可达性**：连 broker、列出 topic、确认 `mwops-logs` 存在；返回 `ok` / `message` / `address` / `topic` / `latency_ms`，失败为 200 + `ok=false` + 原因（不是 500） |
 | GET | `/api/log-alerts/rules` | `logalert:read` | L0 | **日志告警规则列表**（`keyword` / `page` / `page_size`）；按 `priority ASC, id ASC` 返回——**列表顺序即匹配顺序** |
-| GET | `/api/log-alerts/rules/defaults` | `logalert:read` | L0 | **没命中任何规则时平台用的默认值**：`dedup_window` / `cooldown` / `ai_enabled` / `notify_channels` + `services`（已配仓库映射、可能真的产出 AI 代码结论的服务名） |
 | POST | `/api/log-alerts/rules` | `logalert:write` | L1 | 新建规则（改动写审计 `log_alert_rule_create`） |
 | PUT | `/api/log-alerts/rules/:id` | `logalert:write` | L1 | 更新规则：**未传的开关/窗口保持原值**（只改名字不会把 AI 悄悄关掉）；改 `dedup_window`/`cooldown` 传 `0` 才是显式关闭去重/冷却 |
 | DELETE | `/api/log-alerts/rules/:id` | `logalert:write` | L1 | 删除规则（审计 `log_alert_rule_delete`） |
+| GET | `/api/log-alerts/exclusions` | `logalert:read` | L0 | **日志告警屏蔽项列表**（`keyword` / `page` / `page_size`）：按 `id ASC` 返回 |
+| POST | `/api/log-alerts/exclusions` | `logalert:write` | L1 | 新增屏蔽项（`pattern` 必填：普通文本子串或 `/正则/`，`service_name` 空 = 任意服务）；保存即生效（缓存立即失效），审计 `log_alert_exclusion_create` |
+| PUT | `/api/log-alerts/exclusions/:id` | `logalert:write` | L1 | 更新屏蔽项（含停用/启用：停用后同类错误重新开始告警），审计 `log_alert_exclusion_update` |
+| DELETE | `/api/log-alerts/exclusions/:id` | `logalert:write` | L1 | 删除屏蔽项，审计 `log_alert_exclusion_delete` |
 | POST | `/api/log-alerts/events/:id/reanalyze` | `logalert:write` | L1 | **手动重新入队**：把事件置回 `pending`、解除抑制并**清掉冷却记录**，立即重跑通知与 AI；响应 `{"ok":true,"message":"已重新入队：通知与分析会在数秒内执行（可在列表中查看状态）"}` |
 | POST | `/api/hooks/logs` | Hook 令牌 | — | 日志上报（应用 HTTP Hook 直推，零侵入兜底） |
 | POST | `/api/hooks/alerts` | Hook 令牌 | — | 外部告警推送（Alertmanager / 自定义） |
@@ -422,8 +425,11 @@ data: {"code":5002,"message":"AI 引擎不可用"}
 **规则驱动的窗口与冷却（语义必须按此理解）**
 
 去重窗口与冷却期不写死在代码里，而由 `log_alert_rules` 逐条配置：匹配按「服务 + 错误指纹 + 级别」，
-**priority 数字小者优先、同优先级按 id 升序取第一条命中的启用规则**；**没有命中任何规则时**用
-`log_alert.default_*` 构造的默认值（页面在「日志告警规则」顶部展示 `GET /api/log-alerts/rules/defaults`）。
+**priority 数字小者优先、同优先级按 id 升序取第一条命中的启用规则**；**没有命中任何规则时**
+**不产生告警**（不入库、不通知、不分析）——平台没有内置默认规则，告警只能来自页面上新增过的规则。
+
+在这之前还有一层**屏蔽项**（`log_alert_exclusions`）：按日志原文（子串或 `/正则/`）匹配，
+命中即丢弃，优先于所有规则；停用或删除后同类错误恢复告警。
 两条容易误读的语义：
 
 1. **抑制 ≠ 丢弃**：冷却期内同指纹**只合并计数**（`error_count` 累加），事件仍在列表里，标 `suppressed=true` + `cooldown_until`；

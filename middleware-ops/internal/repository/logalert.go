@@ -512,6 +512,91 @@ func (r *LogAlertRuleRepository) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
+// LogAlertExclusionRepository 提供日志告警屏蔽项（排除规则）数据访问。
+type LogAlertExclusionRepository struct {
+	Base
+}
+
+// NewLogAlertExclusionRepository 构造屏蔽项仓储。
+func NewLogAlertExclusionRepository(db *gorm.DB) *LogAlertExclusionRepository {
+	return &LogAlertExclusionRepository{Base: Base{db: db}}
+}
+
+// List 分页检索屏蔽项（按 id 升序：先加的先展示）。
+func (r *LogAlertExclusionRepository) List(ctx context.Context, keyword string, limit, offset int) ([]model.LogAlertExclusion, int64, error) {
+	q := r.withCtx(ctx).Model(&model.LogAlertExclusion{})
+	if keyword != "" {
+		like := "%" + keyword + "%"
+		q = q.Where("name LIKE ? OR service_name LIKE ? OR pattern LIKE ?", like, like, like)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, wrap(err, "count log alert exclusions")
+	}
+	var items []model.LogAlertExclusion
+	if err := q.Order("id ASC").Limit(limit).Offset(offset).Find(&items).Error; err != nil {
+		return nil, 0, wrap(err, "list log alert exclusions")
+	}
+	return items, total, nil
+}
+
+// ListEnabled 取全部启用屏蔽项（Ingest 匹配时用；条目由人工维护，量级很小）。
+func (r *LogAlertExclusionRepository) ListEnabled(ctx context.Context) ([]model.LogAlertExclusion, error) {
+	var items []model.LogAlertExclusion
+	if err := r.withCtx(ctx).Where("enabled = ?", true).
+		Order("id ASC").Find(&items).Error; err != nil {
+		return nil, wrap(err, "list enabled log alert exclusions")
+	}
+	return items, nil
+}
+
+// Get 按 ID 查询。
+func (r *LogAlertExclusionRepository) Get(ctx context.Context, id int64) (*model.LogAlertExclusion, error) {
+	var item model.LogAlertExclusion
+	if err := r.withCtx(ctx).First(&item, id).Error; err != nil {
+		return nil, wrap(err, "get log alert exclusion")
+	}
+	return &item, nil
+}
+
+// Create 新增屏蔽项。
+func (r *LogAlertExclusionRepository) Create(ctx context.Context, item *model.LogAlertExclusion) error {
+	if err := r.withCtx(ctx).Create(item).Error; err != nil {
+		return wrap(err, "create log alert exclusion")
+	}
+	return nil
+}
+
+// Update 更新屏蔽项。
+func (r *LogAlertExclusionRepository) Update(ctx context.Context, item *model.LogAlertExclusion) error {
+	res := r.withCtx(ctx).Model(&model.LogAlertExclusion{}).Where("id = ?", item.ID).
+		Updates(map[string]any{
+			"name":         item.Name,
+			"service_name": item.ServiceName,
+			"pattern":      item.Pattern,
+			"enabled":      item.Enabled,
+		})
+	if res.Error != nil {
+		return wrap(res.Error, "update log alert exclusion")
+	}
+	if res.RowsAffected == 0 {
+		return wrap(gorm.ErrRecordNotFound, "update log alert exclusion")
+	}
+	return nil
+}
+
+// Delete 删除屏蔽项。
+func (r *LogAlertExclusionRepository) Delete(ctx context.Context, id int64) error {
+	res := r.withCtx(ctx).Delete(&model.LogAlertExclusion{}, id)
+	if res.Error != nil {
+		return wrap(res.Error, "delete log alert exclusion")
+	}
+	if res.RowsAffected == 0 {
+		return wrap(gorm.ErrRecordNotFound, "delete log alert exclusion")
+	}
+	return nil
+}
+
 // GetByService 按服务名取启用规则（页面提示"这个服务当前命中哪条规则"）。
 func (r *LogAlertRuleRepository) GetByService(ctx context.Context, service string) ([]model.LogAlertRule, error) {
 	var items []model.LogAlertRule

@@ -81,6 +81,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.CodeRepos = repository.NewCodeRepoRepository(opt.DB)
 	deps.LogEvents = repository.NewLogEventRepository(opt.DB)
 	deps.LogAlertRules = repository.NewLogAlertRuleRepository(opt.DB)
+	deps.LogAlertExclusions = repository.NewLogAlertExclusionRepository(opt.DB)
 	deps.CodeAnalyses = repository.NewCodeAnalysisRepository(opt.DB)
 	deps.Notifies = repository.NewNotificationLogRepository(opt.DB)
 
@@ -158,7 +159,7 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	deps.Approval = NewApprovalService(deps.Approvals, deps.Notifier, deps.Audit, opt.Log)
 	deps.Fix = NewFixService(deps.Instances, deps.Fixes, deps.Approval, deps.Audit, deps.SQLGuard, deps.Registry, dryRunExecutor{}, deps.AlertSvc, opt.Log)
 	deps.LogAlert = NewLogAlertService(deps.Servers, deps.LogEvents, deps.CodeRepos,
-		deps.LogAlertRules, cfg, opt.Cache, deps.Audit, opt.Log)
+		deps.LogAlertRules, deps.LogAlertExclusions, cfg, opt.Cache, deps.Audit, opt.Log)
 	// 日志集成的接收链路（Filebeat → 平台 Kafka → 日志事件）。
 	// 只装配不启动：启动时机由 main 决定（跟随进程生命周期），未配置 Kafka 时它是空转的安全对象。
 	deps.LogPipeline = NewLogPipeline(cfg, deps.LogAlert, opt.Log)

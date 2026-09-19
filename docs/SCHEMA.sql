@@ -392,6 +392,28 @@ CREATE TABLE IF NOT EXISTS log_alert_rules (
 CREATE INDEX IF NOT EXISTS idx_log_alert_rules_service_name ON log_alert_rules(service_name);
 CREATE INDEX IF NOT EXISTS idx_log_alert_rules_enabled ON log_alert_rules(enabled);
 
+-- ---------------------------------------------------------------------------
+-- 日志告警屏蔽项（"这类错误不告警"）
+--
+-- 与规则的区别：规则回答"命中之后怎么处理"，屏蔽项回答"根本不该成为告警"
+-- （典型是框架噪音，如 Request method 'GET' is not supported）。
+-- 生效顺序也不同：屏蔽在所有规则**之前**，命中即丢弃（不入库、不通知、不分析）。
+--
+-- 匹配的是日志原文（message）而不是 error_signature：指纹是哈希值，
+-- 使用者写不出"我想屏蔽的那句话"对应的哈希，只能写出日志里的文本。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS log_alert_exclusions (
+    id           BIGSERIAL PRIMARY KEY,
+    created_at   TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ,
+    name         VARCHAR(128),            -- 备注（为什么屏蔽）
+    service_name VARCHAR(128),            -- 空 = 对任意服务生效
+    pattern      VARCHAR(512) NOT NULL,   -- 普通文本=子串；/re/=正则；匹配日志原文
+    enabled      BOOLEAN DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_log_alert_exclusions_service_name ON log_alert_exclusions(service_name);
+CREATE INDEX IF NOT EXISTS idx_log_alert_exclusions_enabled ON log_alert_exclusions(enabled);
+
 CREATE TABLE IF NOT EXISTS ai_code_analyses (
     id              BIGSERIAL PRIMARY KEY,
     created_at      TIMESTAMPTZ,
