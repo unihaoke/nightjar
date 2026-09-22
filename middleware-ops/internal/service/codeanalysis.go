@@ -164,6 +164,10 @@ const engineNone = "none"
 // engineExternal 是外部 AI 分析服务在报告里的名字。
 const engineExternal = "external_ai_analysis"
 
+// syncTimeoutDefault 是同步模式下的等待上限（CallMode=sync 且未配置 SyncTimeout 时取它）。
+// 给足 5 分钟：同步调用会占住后处理线程，太短会把本来就慢的分析误判失败。
+const syncTimeoutDefault = 5 * time.Minute
+
 // defaultCallbackPath 是平台接收 AI 结论的路径（注册在公开路由上，靠令牌鉴权）。
 const defaultCallbackPath = "/api/ai/analysis/callback"
 
@@ -201,7 +205,7 @@ type SubmitOutcome struct {
 	EventID     int64  `json:"event_id"`
 	ServiceName string `json:"service_name"`
 	// Async 为 true 表示结论要等回调/轮询（事件应置为 awaiting）；
-	// false 表示 AI 服务同步给了结论（sync_mode 或未配置异步能力）。
+	// false 表示 AI 服务同步给了结论（call_mode=sync 或未配置异步能力）。
 	Async bool `json:"async"`
 	// Report 只在同步模式下有值。
 	Report map[string]any `json:"report,omitempty"`
@@ -277,14 +281,15 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		return nil, apperr.New(apperr.CodeOutboundDenied,
 			"未配置外部 AI 分析服务：请在「AI 设置 → AI 代码分析」中填写服务地址并启用")
 	}
-	res, err := client.Submit(ctx, SubmitInput{
-		TaskID:      taskID,
-		Service:     serviceName,
-		Question:    question,
-		CallbackURL: s.callbackURL(),
-		EventID:     in.EventID,
-	})
+	res, err := s.submitAnalysis(ctx, client, taskID, serviceName, question, in.EventID)
 	if err != nil {
+		// 提交/等待阶段就失败（含同步模式超时、网络不可达）：写一条失败任务，
+		// 让事件明确标 failed 并带上原因，而不是永远停在"分析中"。
+		_ = s.tasks.Create(ctx, &model.AIAnalysisTask{
+			EventID: in.EventID, ServiceName: serviceName, TaskID: taskID,
+			Status: model.AIAnalysisTaskSubmitted, Question: question, DeadlineAt: &deadline,
+		})
+		_, _ = s.tasks.Complete(ctx, taskID, model.AIAnalysisTaskFailed, "", err.Error(), time.Now().UTC())
 		return nil, apperr.Wrap(apperr.CodeEngineFailed, err)
 	}
 	task := &model.AIAnalysisTask{
@@ -306,7 +311,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		Async:       res.Status != modelStatusSucceeded,
 	}
 
-	// 同步模式：提交响应里就带着结论，直接收尾，不进等待队列。
+	// 提交响应里就带着结论：直接收尾，不进等待队列（同步模式必然走这里）。
 	if res.Status == modelStatusSucceeded {
 		completion, err := s.CompleteByTask(ctx, res.TaskID, model.AIAnalysisTaskSucceeded, res.Answer, "")
 		if err != nil {
@@ -318,18 +323,81 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		if completion.Failed {
 			return nil, apperr.New(apperr.CodeEngineFailed, completion.Reason)
 		}
+		return out, s.auditSubmit(ctx, out, in, operator)
 	}
-	if s.audit != nil {
-		s.audit.RecordAsync(ctx, AuditEntry{
-			UserID: operator.UserID, Username: operator.Username, ActionType: "ai_code_analyze_submit",
-			Level: LevelLow, IPAddress: operator.IP, UserAgent: operator.Agent,
-			Detail: map[string]any{
-				"event_id": in.EventID, "service": serviceName,
-				"task_id": res.TaskID, "async": out.Async,
-			},
-		})
+
+	// 提交响应说"还在处理"：异步模式下正常，等回调/轮询即可；
+	// 同步模式下没有回调/轮询通道，等于没把结论给出来，按失败收尾并给出出路。
+	if s.callMode() == callModeSync {
+		completion, err := s.CompleteByTask(ctx, res.TaskID, model.AIAnalysisTaskFailed, "",
+			"同步模式下 AI 服务未在等待时间内返回结论（请改用异步回调模式，或确认该服务支持同步返回）")
+		if err != nil {
+			return nil, err
+		}
+		out.Async = false
+		out.Brief = completion.Brief
+		return nil, apperr.New(apperr.CodeEngineFailed, "同步调用未返回结论")
 	}
-	return out, nil
+
+	return out, s.auditSubmit(ctx, out, in, operator)
+}
+
+// callModeAsync / callModeSync 是 CallMode 的取值。
+const (
+	callModeAsync = "async"
+	callModeSync  = "sync"
+)
+
+// callMode 返回当前生效的调用方式（归一化；非 sync 一律按 async）。
+func (s *CodeAnalysisService) callMode() string {
+	if s == nil || s.cfg == nil {
+		return callModeAsync
+	}
+	if strings.EqualFold(strings.TrimSpace(s.cfg.AIAnalysis.CallMode), callModeSync) {
+		return callModeSync
+	}
+	return callModeAsync
+}
+
+// syncTimeout 返回同步模式下的等待上限（未配置或非法返回 5 分钟）。
+func (s *CodeAnalysisService) syncTimeout() time.Duration {
+	if s == nil || s.cfg == nil {
+		return syncTimeoutDefault
+	}
+	if t := s.cfg.AIAnalysis.SyncTimeout; t > 0 {
+		return t
+	}
+	return syncTimeoutDefault
+}
+
+// submitAnalysis 按调用方式选择提交姿势：
+//   - async：短超时提交，只拿 task_id 就返回，结论交给回调/轮询；
+//   - sync ：长超时提交，原地等 AI 服务把结论一起返回（不依赖回调）。
+func (s *CodeAnalysisService) submitAnalysis(ctx context.Context, client *AIAnalysisClient, taskID, service, question string, eventID int64) (*TaskResult, error) {
+	in := SubmitInput{
+		TaskID: taskID, Service: service, Question: question,
+		CallbackURL: s.callbackURL(), EventID: eventID,
+	}
+	if s.callMode() == callModeSync {
+		return client.SubmitWithTimeout(ctx, in, s.syncTimeout())
+	}
+	return client.Submit(ctx, in)
+}
+
+// auditSubmit 记一条"提交分析"的审计（提交成功、会进等待或已同步收尾时调用）。
+func (s *CodeAnalysisService) auditSubmit(ctx context.Context, out *SubmitOutcome, in CodeAnalysisRequest, operator Operator) error {
+	if s.audit == nil {
+		return nil
+	}
+	s.audit.RecordAsync(ctx, AuditEntry{
+		UserID: operator.UserID, Username: operator.Username, ActionType: "ai_code_analyze_submit",
+		Level: LevelLow, IPAddress: operator.IP, UserAgent: operator.Agent,
+		Detail: map[string]any{
+			"event_id": in.EventID, "service": out.ServiceName,
+			"task_id": out.TaskID, "async": out.Async,
+		},
+	})
+	return nil
 }
 
 // CompleteByTask 收下一条结论（回调与轮询共用），返回可供通知的结果。

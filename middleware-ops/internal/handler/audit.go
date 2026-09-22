@@ -160,7 +160,7 @@ func (h *Handler) IngestLogHook(c *gin.Context) {
 
 // AnalyzeCode 提交一次 AI 分析（异步：返回 task_id，结论由回调/轮询带回）。
 //
-// 同步模式（ai_analysis.sync_mode）下响应里直接带 report；
+// 同步模式（ai_analysis.call_mode=sync）下响应里直接带 report；
 // 否则只返回 task_id，页面按事件的分析报告查询结论。
 func (h *Handler) AnalyzeCode(c *gin.Context) {
 	var in service.CodeAnalysisRequest

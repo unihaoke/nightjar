@@ -158,7 +158,8 @@ type aiAnalysisPayload struct {
 	TaskTimeout     string `json:"task_timeout"`
 	PollInterval    string `json:"poll_interval"`
 	PollBatch       int    `json:"poll_batch"`
-	SyncMode        bool   `json:"sync_mode"`
+	CallMode        string `json:"call_mode"`
+	SyncTimeout     string `json:"sync_timeout"`
 	NotifyOnSubmit  bool   `json:"notify_on_submit"`
 }
 
@@ -233,7 +234,8 @@ type AIAnalysisView struct {
 	TaskTimeout         string `json:"task_timeout"`
 	PollInterval        string `json:"poll_interval"`
 	PollBatch           int    `json:"poll_batch"`
-	SyncMode            bool   `json:"sync_mode"`
+	CallMode            string `json:"call_mode"`
+	SyncTimeout         string `json:"sync_timeout"`
 	NotifyOnSubmit      bool   `json:"notify_on_submit"`
 	// Configured 表示"现在真的能调用"（开关已开且地址非空）。
 	// 页面据此提示"填了但没生效"，避免管理员以为配好了却在日志页看到"未装配"。
@@ -322,7 +324,8 @@ type AIAnalysisInput struct {
 	TaskTimeout        string `json:"task_timeout"`
 	PollInterval       string `json:"poll_interval"`
 	PollBatch          int    `json:"poll_batch"`
-	SyncMode           bool   `json:"sync_mode"`
+	CallMode           string `json:"call_mode"`
+	SyncTimeout        string `json:"sync_timeout"`
 	NotifyOnSubmit     bool   `json:"notify_on_submit"`
 }
 
@@ -669,6 +672,7 @@ func defaultAISettingsPayload() aiSettingsPayload {
 		CodeAnalysis: aiAnalysisPayload{
 			Enabled: false, SubmitPath: defaultSubmitPath, QueryPath: defaultQueryPath,
 			Timeout: "15s", TaskTimeout: "30m", PollInterval: "60s", PollBatch: defaultPollBatch,
+			CallMode: defaultCallModeAsync, SyncTimeout: defaultSyncTimeout,
 		},
 		DailyTokenQuota: 0,
 		PerUserQuota:    0,
@@ -680,7 +684,23 @@ const (
 	defaultSubmitPath = "/v1/analyses"
 	defaultQueryPath  = "/v1/analyses/{task_id}"
 	defaultPollBatch  = 20
+	// 调用方式默认异步（回调/轮询），除非用户明确选同步。
+	defaultCallModeAsync = "async"
+	defaultCallModeSync  = "sync"
+	defaultSyncTimeout   = "5m"
 )
+
+// resolveCallMode 归一化调用方式：只认 async / sync，其它一律回落异步（默认更安全）。
+func resolveCallMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case defaultCallModeAsync:
+		return defaultCallModeAsync
+	case defaultCallModeSync:
+		return defaultCallModeSync
+	default:
+		return defaultCallModeAsync
+	}
+}
 
 // parseDurationOr 解析 "30m" 这类时长；空值或非法时**保留原值**而不是静默改成 0。
 //
@@ -728,7 +748,8 @@ func (p aiSettingsPayload) applyCodeAnalysisTo(cfg *config.Config) {
 		TaskTimeout:    parseDurationOr(p.CodeAnalysis.TaskTimeout, cfg.AIAnalysis.TaskTimeout),
 		PollInterval:   parseDurationOr(p.CodeAnalysis.PollInterval, cfg.AIAnalysis.PollInterval),
 		PollBatch:      p.CodeAnalysis.PollBatch,
-		SyncMode:       p.CodeAnalysis.SyncMode,
+		CallMode:       resolveCallMode(p.CodeAnalysis.CallMode),
+		SyncTimeout:    parseDurationOr(p.CodeAnalysis.SyncTimeout, cfg.AIAnalysis.SyncTimeout),
 		NotifyOnSubmit: p.CodeAnalysis.NotifyOnSubmit,
 	}
 	if cfg.AIAnalysis.PollBatch <= 0 {
@@ -761,7 +782,8 @@ func (p aiAnalysisPayload) view() AIAnalysisView {
 		TaskTimeout:         p.TaskTimeout,
 		PollInterval:        p.PollInterval,
 		PollBatch:           p.PollBatch,
-		SyncMode:            p.SyncMode,
+		CallMode:            p.CallMode,
+		SyncTimeout:         p.SyncTimeout,
 		NotifyOnSubmit:      p.NotifyOnSubmit,
 		Configured:          p.Enabled && strings.TrimSpace(p.BaseURL) != "",
 	}
@@ -794,7 +816,10 @@ func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayloa
 	if in.PollBatch > 0 {
 		out.PollBatch = in.PollBatch
 	}
-	out.SyncMode = in.SyncMode
+	out.CallMode = resolveCallMode(in.CallMode)
+	if v := strings.TrimSpace(in.SyncTimeout); v != "" {
+		out.SyncTimeout = v
+	}
 	out.NotifyOnSubmit = in.NotifyOnSubmit
 	out.APIKey = mergeSecret(old.APIKey, in.APIKey, in.ClearAPIKey)
 	out.CallbackToken = mergeSecret(old.CallbackToken, in.CallbackToken, in.ClearCallbackToken)
@@ -907,7 +932,7 @@ func (s *SettingService) SaveAISettings(ctx context.Context, in AISettingsInput,
 		"code_analysis_enabled":        next.CodeAnalysis.Enabled,
 		"code_analysis_base_url":       redactCredentials(next.CodeAnalysis.BaseURL),
 		"code_analysis_key_changed":    analysisSecretChanged(existing.CodeAnalysis, in.CodeAnalysis),
-		"code_analysis_sync_mode":      next.CodeAnalysis.SyncMode,
+		"code_analysis_call_mode":      next.CodeAnalysis.CallMode,
 		"code_analysis_task_timeout":   next.CodeAnalysis.TaskTimeout,
 		"code_analysis_notify_submit":  next.CodeAnalysis.NotifyOnSubmit,
 	})

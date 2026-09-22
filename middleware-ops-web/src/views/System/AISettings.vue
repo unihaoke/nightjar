@@ -182,7 +182,8 @@ async function load(): Promise<void> {
         task_timeout: ca.task_timeout || '30m',
         poll_interval: ca.poll_interval || '60s',
         poll_batch: ca.poll_batch ?? 20,
-        sync_mode: ca.sync_mode ?? false,
+        call_mode: ca.call_mode || 'async',
+        sync_timeout: ca.sync_timeout || '5m',
         notify_on_submit: ca.notify_on_submit ?? false,
       })
       analysisKeyMasked.api_key = ca.api_key_masked || ''
@@ -224,7 +225,8 @@ const codeAnalysis = reactive({
   task_timeout: '30m',
   poll_interval: '60s',
   poll_batch: 20,
-  sync_mode: false,
+  call_mode: 'async',
+  sync_timeout: '5m',
   notify_on_submit: false,
 })
 
@@ -262,7 +264,8 @@ function buildCodeAnalysis(): AISettingsInput['code_analysis'] {
     task_timeout: codeAnalysis.task_timeout,
     poll_interval: codeAnalysis.poll_interval,
     poll_batch: Number(codeAnalysis.poll_batch) || 20,
-    sync_mode: codeAnalysis.sync_mode,
+    call_mode: codeAnalysis.call_mode,
+    sync_timeout: codeAnalysis.sync_timeout,
     notify_on_submit: codeAnalysis.notify_on_submit,
   }
   if (analysisKeyDraft.api_key.trim()) {
@@ -767,11 +770,21 @@ onMounted(async () => {
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
-            <el-form-item label="同步返回结论">
-              <div class="row">
-                <el-switch v-model="codeAnalysis.sync_mode" />
-                <span class="muted">AI 服务在提交时就给出结论（不进等待队列）</span>
-              </div>
+            <el-form-item label="调用方式">
+              <el-select v-model="codeAnalysis.call_mode" class="mobile-block">
+                <el-option label="异步回调 / 轮询（推荐）" value="async" />
+                <el-option label="同步等待结论" value="sync" />
+              </el-select>
+              <p class="field-hint">
+                异步：提交后只拿 task_id，结论由回调或平台轮询带回（慢分析不占后处理线程）；
+                同步：提交后在「同步等待上限」内原地等到结论，不依赖回调，但会占用线程（建议配小批量）。
+              </p>
+            </el-form-item>
+          </el-col>
+          <el-col v-if="codeAnalysis.call_mode === 'sync'" :xs="24" :sm="12">
+            <el-form-item label="同步等待上限">
+              <el-input v-model="codeAnalysis.sync_timeout" class="mono" placeholder="5m" />
+              <p class="field-hint">超过该时长仍未返回结论，本次分析按失败处理（事件明确标 failed）。</p>
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">

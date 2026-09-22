@@ -98,10 +98,34 @@ type submitPayload struct {
 	EventID     int64  `json:"event_id,omitempty"`
 }
 
-// Submit 提交一次分析任务。
+// Submit 提交一次分析任务（异步模式用）：默认短超时，只拿 task_id 就返回。
+//
+// 异步模式不关心"等多久出结论"：结论由回调或轮询带回，提交阶段只要把任务挂上去即可。
 func (c *AIAnalysisClient) Submit(ctx context.Context, in SubmitInput) (*TaskResult, error) {
+	return c.doSubmit(ctx, in, c.http)
+}
+
+// SubmitWithTimeout 提交并原地等待 AI 服务返回结论，最长 wait 时长。
+//
+// 用于"同步调用"模式：AI 服务在提交接口里就把分析做完一起返回，平台不再依赖回调。
+// 注意 c.http 的超时是短超时（默认 15s），同步等几分钟必须换成更长的新 client，
+// 否则 HTTP 层会在 AI 服务还在分析时就掐断连接。
+func (c *AIAnalysisClient) SubmitWithTimeout(ctx context.Context, in SubmitInput, wait time.Duration) (*TaskResult, error) {
+	if wait <= 0 {
+		wait = 5 * time.Minute
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	return c.doSubmit(waitCtx, in, &http.Client{Timeout: wait})
+}
+
+// doSubmit 是 Submit / SubmitWithTimeout 共享的提交执行；cli 由调用方决定（不同超时）。
+func (c *AIAnalysisClient) doSubmit(ctx context.Context, in SubmitInput, cli *http.Client) (*TaskResult, error) {
 	if !c.Configured() {
 		return nil, ErrAIAnalysisNotConfigured
+	}
+	if cli == nil {
+		cli = c.http
 	}
 	payload, err := json.Marshal(submitPayload{
 		TaskID:      in.TaskID,
@@ -121,7 +145,7 @@ func (c *AIAnalysisClient) Submit(ctx context.Context, in SubmitInput) (*TaskRes
 	req.Header.Set("Content-Type", "application/json")
 	c.setAuth(req)
 
-	resp, err := c.http.Do(req)
+	resp, err := cli.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("提交 AI 分析任务失败: %w", err)
 	}
@@ -143,8 +167,16 @@ func (c *AIAnalysisClient) Submit(ctx context.Context, in SubmitInput) (*TaskRes
 	}
 	c.log.Info("已提交 AI 分析任务",
 		zap.String("task_id", res.TaskID), zap.String("status", res.Status),
-		zap.String("service", in.Service))
+		zap.String("service", in.Service), zap.Duration("wait", ctxTimeout(ctx)))
 	return res, nil
+}
+
+// ctxTimeout 取 context 剩余的等待时长（仅用于日志，拿不到就返回 0）。
+func ctxTimeout(ctx context.Context) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		return time.Until(dl)
+	}
+	return 0
 }
 
 // Query 主动查询任务状态（回调的兜底路径）。

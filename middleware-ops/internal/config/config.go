@@ -83,9 +83,16 @@ type AIAnalysisConfig struct {
 	PollInterval time.Duration `mapstructure:"poll_interval"`
 	// PollBatch 为每轮轮询最多处理的任务数（限流）。
 	PollBatch int `mapstructure:"poll_batch"`
-	// SyncMode 表示 AI 服务在提交时就同步返回结论：此时不写 awaiting，直接出结论。
-	// 用于"同一个服务、有的接口同步有的异步"的过渡期。
-	SyncMode bool `mapstructure:"sync_mode"`
+	// CallMode 是日志告警调用 AI 分析的方式，取值 async（默认）| sync：
+	//   - async：提交后只拿 task_id，结论由回调或轮询带回——慢分析不占住 worker，推荐；
+	//   - sync ：提交后原地等 AI 服务返回结论（上限 SyncTimeout），不再依赖回调，
+	//            适合"分析只要几十秒、且没有回调通道"的部署。
+	//
+	// 注意 sync 会占用后处理线程：一轮里每条事件都要等到结论才处理下一条，
+	// 因此必须配合理的 SyncTimeout，并配合较小的 WorkerBatch。
+	CallMode string `mapstructure:"call_mode"`
+	// SyncTimeout 为同步模式的等待上限；太小会把本来就慢的分析判成失败。
+	SyncTimeout time.Duration `mapstructure:"sync_timeout"`
 	// NotifyOnSubmit 为 true 时，提交成功就先发一条（不带结论的）告警通知，
 	// 结论到达后再发一条带结论的。默认关闭：一条告警变成两条消息容易打扰，
 	// 但对"告警必须秒到"的团队可以打开。

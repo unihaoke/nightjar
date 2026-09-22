@@ -973,7 +973,10 @@ export interface AIAnalysisSetting {
   task_timeout: string
   poll_interval: string
   poll_batch: number
-  sync_mode: boolean
+  /** 调用方式：async（异步回调/轮询）| sync（提交后同步等待结论）。 */
+  call_mode: string
+  /** 同步模式下的等待上限，形如 "5m"；仅 call_mode=sync 时生效。 */
+  sync_timeout: string
   notify_on_submit: boolean
   /** 是否真的具备调用条件（开关已开且地址非空）。 */
   configured: boolean
@@ -994,7 +997,10 @@ export interface AIAnalysisInput {
   task_timeout: string
   poll_interval: string
   poll_batch: number
-  sync_mode: boolean
+  /** 调用方式：async | sync（默认 async）。 */
+  call_mode: string
+  /** 同步模式下的等待上限，形如 "5m"。 */
+  sync_timeout: string
   notify_on_submit: boolean
 }
 

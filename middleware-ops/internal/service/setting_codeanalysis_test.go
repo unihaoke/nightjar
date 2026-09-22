@@ -65,7 +65,7 @@ func TestApplyCodeAnalysisToConfig(t *testing.T) {
 		SubmitPath: "/v1/tasks", QueryPath: "/v1/tasks/{task_id}",
 		CallbackURL: "http://platform", CallbackToken: "t",
 		Timeout: "20s", TaskTimeout: "45m", PollInterval: "90s", PollBatch: 5,
-		SyncMode: true, NotifyOnSubmit: true,
+		CallMode: defaultCallModeSync, SyncTimeout: "5m", NotifyOnSubmit: true,
 	}
 	payload.applyCodeAnalysisTo(cfg)
 
@@ -76,7 +76,7 @@ func TestApplyCodeAnalysisToConfig(t *testing.T) {
 	if got.TaskTimeout != 45*time.Minute || got.PollInterval != 90*time.Second || got.Timeout != 20*time.Second {
 		t.Fatalf("时长解析错误：%+v", got)
 	}
-	if got.PollBatch != 5 || !got.SyncMode || !got.NotifyOnSubmit {
+	if got.PollBatch != 5 || got.CallMode != defaultCallModeSync || got.SyncTimeout != 5*time.Minute || !got.NotifyOnSubmit {
 		t.Fatalf("开关/批量未生效：%+v", got)
 	}
 	if got.CallbackURL != "http://platform" || got.CallbackToken != "t" {
