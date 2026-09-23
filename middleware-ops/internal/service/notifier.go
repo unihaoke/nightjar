@@ -246,6 +246,12 @@ type AlertNotification struct {
 	Level     string              `json:"level"`
 	AlertID   int64               `json:"alert_id"`
 	DetailURL string              `json:"detail_url"`
+	// DetailLabel 覆盖卡片上「查看详情」按钮的文案。
+	//
+	// 指标告警可以点进去"确认/驳回"，所以默认文案是「查看详情 / 确认」；
+	// 日志告警在 IM 上没有确认动作（忽略要在平台上做），沿用这句话会让人以为点一下就算确认了。
+	// 留空表示用默认文案。
+	DetailLabel string `json:"detail_label,omitempty"`
 	// ReportURL 为外部 AI 服务给出的完整报告地址（日志告警的 AI 代码分析才有）。
 	//
 	// 为什么要单独一个字段而不是塞进 Fields：卡片里它要变成一个可点的按钮，
@@ -429,12 +435,16 @@ func (s *NotifierService) NotifyLogEvent(
 
 	var failed []string
 	sent := 0
-	// 详情地址指向日志告警页并直接带上事件；不带可执行动作——修复必须回平台走审批。
+	// 详情地址指向日志告警**列表**并带上事件号：页面会按 event_id 自动展开该条事件的详情，
+	// 落点仍是列表——回到列表才能看到同一时间还有哪些告警，而不是只盯着这一条。
+	// 地址前缀由 server.public_url 决定（默认拼出来是容器内地址，点开打不开）。
 	detailURL := fmt.Sprintf("%s/log-alerts?event_id=%d", s.appURL, event.ID)
 	for _, channel := range targets {
 		err := s.sendSync(ctx, AlertNotification{
 			Channel: channel, Title: title, Content: content,
 			Level: defaultString(event.Severity, "error"), AlertID: event.ID,
+			// 日志告警在 IM 上没有"确认"动作（忽略要在平台上做），文案只说查看详情。
+			DetailLabel: "查看详情",
 			DetailURL: detailURL, ReportURL: reportURL, Fields: fields, Sections: sections,
 		})
 		if err != nil {
@@ -612,7 +622,7 @@ func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) e
 	}
 
 	actions := []map[string]any{
-		{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "查看详情 / 确认"},
+		{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": defaultString(n.DetailLabel, "查看详情 / 确认")},
 			"type": "primary", "url": n.DetailURL},
 	}
 	// 完整报告按钮：报告在外部 AI 服务那边（补丁、验证结果、完整 Markdown 都在上面），
@@ -757,8 +767,9 @@ func (s *NotifierService) sendWeCom(ctx context.Context, n AlertNotification) er
 	if n.Level == model.AlertLevelCritical {
 		color = "warning"
 	}
-	content := fmt.Sprintf("**%s**\n> %s\n\n[查看详情并确认](%s)\n\n<font color=\"%s\">高危操作请在平台内审批执行</font>",
-		n.Title, strings.ReplaceAll(n.renderText(), "\n", "\n> "), n.DetailURL, color)
+	content := fmt.Sprintf("**%s**\n> %s\n\n[%s](%s)\n\n<font color=\"%s\">高危操作请在平台内审批执行</font>",
+		n.Title, strings.ReplaceAll(n.renderText(), "\n", "\n> "),
+		defaultString(n.DetailLabel, "查看详情并确认"), n.DetailURL, color)
 	payload := map[string]any{
 		"msgtype": "markdown",
 		"markdown": map[string]any{

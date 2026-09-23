@@ -209,6 +209,12 @@ type AppConfig struct {
 type ServerConfig struct {
 	Host            string        `mapstructure:"host"`
 	Port            int           `mapstructure:"port"`
+	// PublicURL 为 IM 卡片回跳用的**对外**基础地址（如 https://platform.example.com）。
+	//
+	// 为什么必须单独配：监听地址是 0.0.0.0:8080（容器内），拿它拼出来的回跳链接是
+	// http://0.0.0.0:8080/... ——值班同学在飞书里点开就是"打不开"。
+	// 留空时退回 host:port（并把通配监听地址换成 127.0.0.1，至少是个能访问的本机地址）。
+	PublicURL string `mapstructure:"public_url"`
 	ReadTimeout     time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout    time.Duration `mapstructure:"write_timeout"`
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
@@ -216,6 +222,21 @@ type ServerConfig struct {
 	TrustedProxies []string `mapstructure:"trusted_proxies"`
 	// RateLimitPerMinute 为应用层限流（Nginx 为第一层，见 8.1）。
 	RateLimitPerMinute int `mapstructure:"rate_limit_per_minute"`
+}
+
+// PublicBaseURL 返回对外可访问的基础地址（用于 IM 卡片回跳）。
+//
+// 优先用 PublicURL；没有时退回 host:port，并把 0.0.0.0 / :: 这类通配监听地址
+// 换成 127.0.0.1——通配地址拼进链接里必然打不开，宁可退成本机地址让人看出"这没配对外地址"。
+func (s ServerConfig) PublicBaseURL() string {
+	if v := strings.TrimRight(strings.TrimSpace(s.PublicURL), "/"); v != "" {
+		return v
+	}
+	host := strings.TrimSpace(s.Host)
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s:%d", host, s.Port)
 }
 
 // DatabaseConfig PostgreSQL 连接参数。
@@ -571,6 +592,12 @@ func (c *Config) applyEnvOnly() {
 		c.Kafka.Brokers = splitAndTrim(raw)
 	} else if raw := strings.TrimSpace(viper.GetString("kafka.brokers")); raw != "" {
 		c.Kafka.Brokers = splitAndTrim(raw)
+	}
+	// server.public_url 是嵌套键，同样需要显式补（理由同 kafka.brokers）。
+	if raw := strings.TrimSpace(viper.GetString("MWOPS_SERVER_PUBLIC_URL")); raw != "" {
+		c.Server.PublicURL = raw
+	} else if raw := strings.TrimSpace(viper.GetString("server.public_url")); raw != "" {
+		c.Server.PublicURL = raw
 	}
 	c.applyEnvLogAlert()
 }

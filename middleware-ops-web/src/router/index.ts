@@ -147,6 +147,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '通知渠道', group: '系统', permissions: ['system:config'] },
       },
       {
+        path: 'system/security',
+        name: 'security-settings',
+        component: () => import('@/views/System/Security.vue'),
+        meta: { title: '合规设置', group: '系统', permissions: ['system:config'] },
+      },
+      {
         path: 'system/info',
         name: 'system-info',
         component: () => import('@/views/System/Info.vue'),

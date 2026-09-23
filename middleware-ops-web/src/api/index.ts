@@ -6,6 +6,8 @@ import type {
   AISettingsView,
   AIProviderTestInput,
   AITestResult,
+  SecuritySettingsInput,
+  SecuritySettingsView,
   AIUsageView,
   Alert,
   AlertRule,
@@ -444,6 +446,10 @@ export const settingApi = {
   saveNotify: (payload: NotifySettingsInput) => put<NotifySettingsView>('/api/settings/notify', payload),
   /** 给单个渠道发一条测试消息。 */
   testNotify: (channel: string) => post<NotifyTestResult>('/api/settings/notify/test', { channel }),
+  /** 读取合规设置（出网白名单）。 */
+  security: () => get<SecuritySettingsView>('/api/settings/security'),
+  /** 保存合规设置：保存后立即生效，不需要重启。 */
+  saveSecurity: (payload: SecuritySettingsInput) => put<SecuritySettingsView>('/api/settings/security', payload),
 }
 
 /** 用户与角色（管理员）。 */

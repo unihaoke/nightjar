@@ -11,6 +11,7 @@
  * 顶部「Kafka 采集链路」卡片回答"采集这条路现在通不通"，避免只看到事件列表却不知道链路状态。
  */
 import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { aiApi, logAlertApi } from '@/api'
 import { toastError } from '@/api/http'
@@ -156,7 +157,22 @@ watch(lastLoadedAt, (stamp) => {
   void loadPipeline()
 })
 
-onMounted(loadPipeline)
+const route = useRoute()
+
+/**
+ * 支持从 IM 卡片直达：链接形如 /log-alerts?event_id=123。
+ *
+ * 落点是**列表页**（能看到同一时间还有哪些告警），再自动展开这一条的详情抽屉——
+ * 只展开详情会让人失去上下文，只落在列表又得自己翻找，两者都要。
+ */
+onMounted(async () => {
+  void loadPipeline()
+  const raw = route.query.event_id
+  const id = Number(Array.isArray(raw) ? raw[0] : raw)
+  if (Number.isFinite(id) && id > 0) {
+    await openEventById(id)
+  }
+})
 
 /** 读取事件详情：列表行是聚合结果，详情带完整堆栈与规则处理结果。 */
 async function loadDetail(id: number): Promise<void> {
@@ -165,15 +181,26 @@ async function loadDetail(id: number): Promise<void> {
   analysis.value = detail.analysis
 }
 
-/** 查看详情。 */
-async function openDetail(event: LogEvent): Promise<void> {
+/**
+ * 打开指定事件的详情。
+ *
+ * 抽出来是为了让「IM 卡片带 event_id 跳进来」与「在列表里点一行」走同一条路径：
+ * 之前 URL 上的 event_id 没人读，飞书卡片点了只落在列表上，还得自己翻找那一条。
+ */
+async function openEventById(id: number): Promise<void> {
   detailVisible.value = true
   analyzeResult.value = null
   try {
-    await loadDetail(event.id)
+    await loadDetail(id)
   } catch (error) {
     toastError(error)
+    detailVisible.value = false
   }
+}
+
+/** 查看详情。 */
+function openDetail(event: LogEvent): void {
+  void openEventById(event.id)
 }
 
 /** 触发 AI 代码分析。 */

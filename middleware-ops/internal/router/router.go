@@ -259,6 +259,8 @@ func New(opt Options) *gin.Engine {
 		settings.POST("/ai/test", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.TestAISettings)
 		settings.POST("/ai/test-provider", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.TestAIProviderSettings)
 		settings.POST("/ai/test-code-analysis", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.TestCodeAnalysisSettings)
+		settings.GET("/security", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigRead), h.SecuritySettings)
+		settings.PUT("/security", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.SaveSecuritySettings)
 		settings.GET("/notify", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigRead), h.NotifySettings)
 		settings.PUT("/notify", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.SaveNotifySettings)
 		settings.POST("/notify/test", mw.RequirePerm(opt.Deps.Auth, service.PermSystemConfigWrite), h.TestNotifySettings)

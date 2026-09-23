@@ -93,8 +93,9 @@ func (s *SettingService) SetAIAppliedHook(fn func()) {
 
 // 设置项标识（platform_settings.name）。
 const (
-	SettingNameAI     = "ai"
-	SettingNameNotify = "notify"
+	SettingNameAI       = "ai"
+	SettingNameNotify   = "notify"
+	SettingNameSecurity = "security"
 )
 
 // 设置来源：platform=平台库生效，env=.env / config.yaml 兜底。
@@ -296,6 +297,30 @@ type EmailChannelView struct {
 	From        string   `json:"from"`
 	To          []string `json:"to"`
 	UseTLS      bool     `json:"use_tls"`
+}
+
+// securitySettingsPayload 是「合规设置」的持久化形态。
+//
+// 出网白名单决定"哪些服务的日志可以被送去外部 AI 分析"，是整条链路上最敏感的一道闸门：
+// 默认空 = 全禁。它必须能在界面上逐条维护，而不是让管理员去改 .env 再重启容器——
+// 那会让"放行一个新服务"变成一次部署动作。
+type securitySettingsPayload struct {
+	// OutboundWhitelist 为允许外发的服务名；"*" 表示全部放行。
+	OutboundWhitelist []string `json:"outbound_whitelist"`
+}
+
+// SecuritySettingsView 是 GET/PUT /api/settings/security 的响应体。
+type SecuritySettingsView struct {
+	OutboundWhitelist []string `json:"outbound_whitelist"`
+	UpdatedBy         string   `json:"updated_by"`
+	UpdatedAt         string   `json:"updated_at"`
+	// Source 为 platform（平台库生效）| env（仍读进程配置，保存后转为 platform）。
+	Source string `json:"source"`
+}
+
+// SecuritySettingsInput 是 PUT /api/settings/security 的请求体。
+type SecuritySettingsInput struct {
+	OutboundWhitelist []string `json:"outbound_whitelist"`
 }
 
 // NotifySettingsView 是 GET/PUT /api/settings/notify 的响应体。
@@ -672,6 +697,104 @@ func (s *SettingService) loadSetting(ctx context.Context, name string, target an
 		return "", time.Time{}, false, apperr.Wrapf(apperr.CodeInternal, err, "解析平台设置 %q 失败", name)
 	}
 	return item.UpdatedBy, item.UpdatedAt, true, nil
+}
+
+// ---------------------------------------------------------------------------
+// 合规设置（出网白名单）
+// ---------------------------------------------------------------------------
+
+// securityPayloadFromConfig 以当前内存配置为基线（DB 无记录时的展示与合并基线）。
+func securityPayloadFromConfig(cfg *config.Config) securitySettingsPayload {
+	if cfg == nil {
+		return securitySettingsPayload{}
+	}
+	return securitySettingsPayload{OutboundWhitelist: append([]string(nil), cfg.Security.OutboundWhitelist...)}
+}
+
+// normalizeWhitelist 规范化白名单：去空白、去重、丢空项。
+//
+// 去重不只是为了好看：同一个服务名写两遍会让"移除了一个、其实还在"这种误判发生，
+// 而白名单是合规闸门，宁可严格也不能含糊。
+func normalizeWhitelist(items []string) []string {
+	out := make([]string, 0, len(items))
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		v := strings.TrimSpace(item)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// SecuritySettings 读取合规设置；DB 无记录时以进程配置（.env / config.yaml）为基线，source=env。
+func (s *SettingService) SecuritySettings(ctx context.Context) (*SecuritySettingsView, error) {
+	var payload securitySettingsPayload
+	updatedBy, updatedAt, found, err := s.loadSetting(ctx, SettingNameSecurity, &payload)
+	if err != nil {
+		return nil, err
+	}
+	source := SettingSourceEnv
+	if found {
+		source = SettingSourcePlatform
+	} else {
+		payload = securityPayloadFromConfig(s.cfg)
+	}
+	return &SecuritySettingsView{
+		OutboundWhitelist: normalizeWhitelist(payload.OutboundWhitelist),
+		UpdatedBy:         updatedBy,
+		UpdatedAt:         formatSettingTime(updatedAt),
+		Source:            source,
+	}, nil
+}
+
+// SaveSecuritySettings 保存合规设置：加密落库 → 立即覆盖内存配置 → 记审计。
+//
+// 白名单不需要"重建客户端"，只要把内存配置改掉，下一次合规判定就按新名单走——
+// 判定是每次调用时读 cfg（见 CodeAnalysisService.outboundGate），不缓存。
+func (s *SettingService) SaveSecuritySettings(ctx context.Context, in SecuritySettingsInput, operator Operator) (*SecuritySettingsView, error) {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
+	next := securitySettingsPayload{OutboundWhitelist: normalizeWhitelist(in.OutboundWhitelist)}
+	if err := s.persist(ctx, SettingNameSecurity, next, operator.Username); err != nil {
+		return nil, err
+	}
+	s.applySecurityPayload(next)
+	s.record(ctx, operator, "security_settings_update", map[string]any{
+		"outbound_whitelist": next.OutboundWhitelist,
+	})
+	return s.SecuritySettings(ctx)
+}
+
+// applySecurityPayload 把白名单写回内存配置（保存与启动时共用）。
+func (s *SettingService) applySecurityPayload(p securitySettingsPayload) {
+	if s.cfg == nil {
+		return
+	}
+	s.cfg.Security.OutboundWhitelist = normalizeWhitelist(p.OutboundWhitelist)
+}
+
+// ApplySecurity 在启动时把平台库里的合规设置对齐到内存。
+//
+// 无记录时**不动**内存配置：与通知设置同一套约定——没在平台配过就沿用进程配置，
+// 界面上以它为基线展示（source=env），管理员保存一次即转为平台托管。
+func (s *SettingService) ApplySecurity(ctx context.Context) error {
+	var payload securitySettingsPayload
+	updatedBy, _, found, err := s.loadSetting(ctx, SettingNameSecurity, &payload)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	s.applySecurityPayload(payload)
+	s.log.Info("合规设置已按平台记录生效",
+		zap.String("updated_by", updatedBy),
+		zap.Strings("outbound_whitelist", payload.OutboundWhitelist))
+	return nil
 }
 
 // formatSettingTime 统一时间展示口径（空值输出空串，界面不用再判 null）。

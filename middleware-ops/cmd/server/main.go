@@ -170,7 +170,9 @@ func run(configPath string) error {
 		Tokens:        tokens,
 		EngineFactory: factory,
 		Monitor:       mon,
-		AppURL:        fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port),
+		// 回跳地址必须用对外地址：监听地址是 0.0.0.0:8080（容器内），
+		// 直接拿它拼会把 IM 卡片上的「查看详情」指向一个谁都打不开的链接。
+		AppURL:        cfg.Server.PublicBaseURL(),
 	})
 	if err != nil {
 		return fmt.Errorf("装配服务: %w", err)

@@ -120,6 +120,9 @@ func NewContainer(opt ContainerOptions) (*Deps, error) {
 	if err := deps.Settings.ApplyNotify(settingsCtx); err != nil {
 		opt.Log.Warn("通知设置初始化失败，本次沿用 .env / config.yaml 配置", zap.Error(err))
 	}
+	if err := deps.Settings.ApplySecurity(settingsCtx); err != nil {
+		opt.Log.Warn("合规设置初始化失败，本次沿用 .env / config.yaml 配置", zap.Error(err))
+	}
 	cancelSettings()
 
 	// 领域服务

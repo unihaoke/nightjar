@@ -1030,6 +1030,21 @@ export interface AIAnalysisInput {
   auto_verify: boolean
 }
 
+/** 合规设置视图（GET /api/settings/security）：出网白名单。 */
+export interface SecuritySettingsView {
+  /** 允许把日志送去外部 AI 分析的服务名；`*` 表示全部放行；空 = 全禁。 */
+  outbound_whitelist: string[]
+  updated_by: string
+  updated_at: string
+  /** platform（平台库生效）| env（仍读环境变量，保存后转为 platform）。 */
+  source: string
+}
+
+/** 合规设置入参（PUT /api/settings/security）。 */
+export interface SecuritySettingsInput {
+  outbound_whitelist: string[]
+}
+
 /** AI 设置视图（GET /api/settings/ai）。 */
 export interface AISettingsView {
   /** third_party | self_hosted | hybrid */

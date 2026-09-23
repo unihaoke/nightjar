@@ -144,6 +144,30 @@ func (h *Handler) TestCodeAnalysisSettings(c *gin.Context) {
 	})
 }
 
+// SecuritySettings 读取合规设置（出网白名单）。
+func (h *Handler) SecuritySettings(c *gin.Context) {
+	data, err := h.deps.Settings.SecuritySettings(c.Request.Context())
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, data)
+}
+
+// SaveSecuritySettings 保存合规设置并立即生效（白名单每次判定时实时读取，无需重启）。
+func (h *Handler) SaveSecuritySettings(c *gin.Context) {
+	var in service.SecuritySettingsInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	data, err := h.deps.Settings.SaveSecuritySettings(c.Request.Context(), in, h.operator(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, data)
+}
+
 // NotifySettings 读取通知渠道设置（webhook 只回掩码，secret/口令只回 bool）。
 func (h *Handler) NotifySettings(c *gin.Context) {
 	data, err := h.deps.Settings.NotifySettings(c.Request.Context())

@@ -232,6 +232,9 @@ services:
       MWOPS_NOTIFY_WECOM_ENABLED: ${WECOM_ENABLED:-false}
       MWOPS_LOG_LEVEL: ${LOG_LEVEL:-info}
       MWOPS_HOOK_TOKEN: ${HOOK_TOKEN:-}
+      # IM 卡片「查看详情」的回跳地址前缀：必须填值班同学浏览器能打开的对外地址。
+      # 留空会退回 http://127.0.0.1:8080（容器内网地址，点开打不开）。
+      MWOPS_SERVER_PUBLIC_URL: ${PUBLIC_URL:-}
       # ---------- 日志总线 Kafka（日志集成：Filebeat → Kafka → 平台消费）----------
       # brokers 用 INTERNAL 监听器（容器网络内的 kafka:29092）；
       # external_host/port 是被管服务器上 Filebeat 要连的地址，必须与 compose 里
