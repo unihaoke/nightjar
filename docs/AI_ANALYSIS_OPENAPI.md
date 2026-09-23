@@ -64,7 +64,7 @@ curl -i -X POST 'https://<AI 域名>/api/v1/openapi/analyze' \
 | 查询路径 | `/api/v1/runs/{run_id}` |
 | 回调地址 | **异步模式必填**：`https://<平台域名>`；要自带校验参数时写 `https://<平台域名>/{path}?token=xxx`。详见 §5.2 |
 | 回调令牌 | 与上面 URL 里的 `token` 一致（不一致会被 401 拒收，改由轮询兜底） |
-| 仓库定位方式 | 服务名（默认）／固定 git 地址（单仓） |
+| 仓库定位方式 | 服务名（当 host，默认）／服务名→git 地址映射 ／ 服务名→repoId 映射 |
 | 环境标识 | 如 `prod`（可选） |
 | 调用方式 | async（推荐） |
 | 任务超时 / 轮询间隔 / 每轮条数 | `30m` / `60s` / `20`（按需） |
@@ -158,7 +158,7 @@ curl -sS -X POST http://<平台地址>/api/hooks/logs \
 
 | 说明里的文字 | 根因 | 处理 |
 |---|---|---|
-| `仓库定位失败：请先在 AI 服务控制台注册该仓库并配置 hostPatterns/keywords，或改用固定 gitUrl` | HTTP 404/422 | 回第 1 步，确认服务名与仓库的 `hostPatterns` 对得上；或在平台改用「固定 git 地址」 |
+| `仓库定位失败：请先在 AI 服务控制台注册该仓库并配置 hostPatterns/keywords` | HTTP 404/422 | 回第 1 步，确认服务名与仓库的 `hostPatterns` 对得上；或在平台配「服务名→git 地址」映射 / 「服务名→repoId」映射 |
 | `API Key 无效或未携带：请确认「鉴权头」填的是 X-API-Key 且密钥正确` | HTTP 401 | 鉴权头没配成 `X-API-Key`，或密钥错了 |
 | `密钥缺少 task:write 权限` | HTTP 403 | 换一把有权限的 key |
 | `请求参数不合法：常见原因是缺 stacktrace、异步模式缺 callbackUrl，或栈超过 maxStacktraceBytes` | HTTP 400 | 检查堆栈是否超 64KB；异步模式必须能生成回调地址 |

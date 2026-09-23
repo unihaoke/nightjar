@@ -108,8 +108,6 @@ type testCodeAnalysisInput struct {
 	AuthHeader      string `json:"auth_header"`
 	SubmitPath      string `json:"submit_path"`
 	SyncSubmitPath  string `json:"sync_submit_path"`
-	RepoLocatorMode string                      `json:"repo_locator_mode"`
-	RepoGitURL      string                      `json:"repo_git_url"`
 	ServiceRepoMap  *[]service.ServiceRepoItem  `json:"service_repo_map,omitempty"`
 	Priority        int                         `json:"priority"`
 	AutoVerify      bool                        `json:"auto_verify"`
@@ -131,8 +129,6 @@ func (h *Handler) TestCodeAnalysisSettings(c *gin.Context) {
 		AuthHeader:      in.AuthHeader,
 		SubmitPath:      in.SubmitPath,
 		SyncSubmitPath:  in.SyncSubmitPath,
-		RepoLocatorMode: in.RepoLocatorMode,
-		RepoGitURL:      in.RepoGitURL,
 		ServiceRepoMap:  in.ServiceRepoMap,
 		Priority:        in.Priority,
 		AutoVerify:      in.AutoVerify,

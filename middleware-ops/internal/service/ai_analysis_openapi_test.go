@@ -236,12 +236,16 @@ func TestOpenAPIStacktraceFallback(t *testing.T) {
 	if p.Stacktrace != "下单失败" {
 		t.Fatalf("stacktrace 为空时应退回错误信息：%q", p.Stacktrace)
 	}
-	// 单仓模式：改用固定 gitUrl 定位。
-	client.cfg.RepoLocatorMode = repoLocatorModeGitURL
-	client.cfg.RepoGitURL = "https://git.x/order.git"
+	// 未命中任何映射时，回落为 host=服务名（依赖 AI 侧 matchRules）。
+	p = client.openAPIPayload(context.Background(), SubmitInput{Service: "order-svc", Stacktrace: "NPE"})
+	if p.RepoLocator == nil || p.RepoLocator.Host != "order-svc" {
+		t.Fatalf("未命中映射应回落 host=服务名：%+v", p.RepoLocator)
+	}
+	// 服务名 → git 地址映射命中时，直接带 gitUrl 定位（不再依赖全局单仓配置）。
+	client.cfg.ServiceRepoMap = map[string]string{"order-svc": "https://git.x/order.git"}
 	p = client.openAPIPayload(context.Background(), SubmitInput{Service: "order-svc", Stacktrace: "NPE"})
 	if p.RepoLocator == nil || p.RepoLocator.GitURL != "https://git.x/order.git" {
-		t.Fatalf("git_url 模式定位异常：%+v", p.RepoLocator)
+		t.Fatalf("服务名→git 地址映射定位异常：%+v", p.RepoLocator)
 	}
 }
 

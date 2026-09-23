@@ -988,9 +988,6 @@ export interface AIAnalysisSetting {
   auth_header: string
   /** 同步模式的提交路径（开放接口的同步与异步是两个端点）。 */
   sync_submit_path: string
-  /** 仓库定位方式：service（用服务名当 host）| git_url（固定 git 地址）。 */
-  repo_locator_mode: string
-  repo_git_url: string
   /** 「服务名 → git 地址 / repoId」映射：开放接口按服务名定位仓库时逐条匹配。 */
   service_repo_map?: { service: string; git_url: string; repo_id?: string }[]
   /** 随任务提交的环境标识，如 prod。 */
@@ -1027,8 +1024,6 @@ export interface AIAnalysisInput {
   protocol: string
   auth_header: string
   sync_submit_path: string
-  repo_locator_mode: string
-  repo_git_url: string
   /** 「服务名 → git 地址 / repoId」映射：开放接口按服务名定位仓库时逐条匹配。 */
   service_repo_map?: { service: string; git_url: string; repo_id?: string }[]
   /** 「X-Callback-Key-Id → callbackSecret」映射（多密钥）：secret 空表示沿用已存的该 key 的 secret。 */

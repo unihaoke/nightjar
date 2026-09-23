@@ -196,6 +196,8 @@ type ProbeResult struct {
 	StatusCode int
 	// Message 为本次探测拿到的任务状态（如 succeeded / running），可能为空。
 	Message string
+	// Body 为服务端原始响应体，用于把 4xx 的真实报错透传给使用者（否则只能看到通用提示）。
+	Body []byte
 	// LatencyMS 为往返耗时。
 	LatencyMS int64
 }
@@ -249,8 +251,8 @@ func (c *AIAnalysisClient) Probe(ctx context.Context) (*ProbeResult, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
-		// 4xx/5xx 也是"打通了"的证据：把状态码带回去，由调用方翻译成人能看懂的原因。
-		return &ProbeResult{StatusCode: resp.StatusCode, LatencyMS: latency}, nil
+		// 4xx/5xx 也是"打通了"的证据：把状态码与原始响应体带回去，由调用方翻译成人能看懂的原因。
+		return &ProbeResult{StatusCode: resp.StatusCode, Body: body, LatencyMS: latency}, nil
 	}
 	return &ProbeResult{
 		StatusCode: resp.StatusCode,
@@ -405,7 +407,6 @@ type openAPIRepoLocator struct {
 // 字段顺序按文档排列；可选字段一律 omitempty，避免把零值塞给服务端
 // （例如 priority=0 会被当成"最高优先级"而不是"不指定"）。
 type openAPISubmitPayload struct {
-	Mode           string              `json:"mode"`
 	RepoID         string              `json:"repoId,omitempty"`
 	RepoLocator    *openAPIRepoLocator `json:"repoLocator,omitempty"`
 	Stacktrace     string              `json:"stacktrace"`
@@ -422,25 +423,20 @@ type openAPISubmitPayload struct {
 // openAPIPayload 把平台侧的提交入参翻译成开放接口的正文。
 func (c *AIAnalysisClient) openAPIPayload(ctx context.Context, in SubmitInput) openAPISubmitPayload {
 	out := openAPISubmitPayload{
-		Mode:           openAPIModeAnalyze,
 		Stacktrace:     c.openAPIStacktrace(in),
 		Logs:           strings.TrimSpace(in.Message),
 		Environment:    strings.TrimSpace(defaultString(in.Environment, c.cfg.Environment)),
 		IdempotencyKey: defaultString(strings.TrimSpace(in.IdempotencyKey), in.TaskID),
 		CallbackURL:    strings.TrimSpace(in.CallbackURL),
 	}
-	// 仓库定位（开放接口）：
-	// 1) 服务名在「服务名 → git 地址」映射表命中 → 直接发该 gitUrl（按服务分流到各自仓库，最高优先级）；
-	// 2) 全局 git_url 模式且配了 RepoGitURL → 发固定 gitUrl（单仓场景）；
+	// 仓库定位（开放接口，文档 §4 优先级 repoId > repoLocator）：
+	// 1) 服务名在「服务名 → repoId」映射表命中 → 直接发 repoId；
+	// 2) 否则在「服务名 → git 地址」映射表命中 → 发该 gitUrl（按服务分流到各自仓库）；
 	// 3) 否则把服务名当 host 提交，依赖 AI 侧 matchRules 匹配（hostPatterns/keywords）。
-	// 仓库定位（文档 §4，优先级 repoId > repoLocator）：repoId 命中直接用，否则回落 gitUrl/host 方案。
 	if repoID := c.resolveRepoID(strings.TrimSpace(in.Service)); repoID != "" {
 		out.RepoID = repoID
 	} else if gitURL := c.resolveRepoGitURL(strings.TrimSpace(in.Service)); gitURL != "" {
 		out.RepoLocator = &openAPIRepoLocator{GitURL: gitURL}
-	} else if strings.EqualFold(strings.TrimSpace(c.cfg.RepoLocatorMode), repoLocatorModeGitURL) &&
-		strings.TrimSpace(c.cfg.RepoGitURL) != "" {
-		out.RepoLocator = &openAPIRepoLocator{GitURL: strings.TrimSpace(c.cfg.RepoGitURL)}
 	} else if strings.TrimSpace(in.Service) != "" {
 		out.RepoLocator = &openAPIRepoLocator{Host: strings.TrimSpace(in.Service)}
 	}
@@ -462,9 +458,6 @@ func (c *AIAnalysisClient) openAPIPayload(ctx context.Context, in SubmitInput) o
 	}
 	return out
 }
-
-// openAPIModeAnalyze 是开放接口的提交模式（文档 §一 示例 mode=analyze）。
-const openAPIModeAnalyze = "analyze"
 
 // resolveRepoGitURL 在「服务名 → git 地址」映射表里查服务名；命中且地址非空时返回该地址。
 // 用于开放接口下按服务名定位仓库，避免依赖 AI 服务侧的 matchRules（hostPatterns/keywords）。

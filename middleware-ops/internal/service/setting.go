@@ -169,8 +169,6 @@ type aiAnalysisPayload struct {
 	Protocol        string `json:"protocol"`
 	AuthHeader      string `json:"auth_header"`
 	SyncSubmitPath  string `json:"sync_submit_path"`
-	RepoLocatorMode string `json:"repo_locator_mode"`
-	RepoGitURL      string             `json:"repo_git_url"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口按服务名定位仓库用）。
 	ServiceRepoMap  []ServiceRepoItem `json:"service_repo_map"`
 	Environment     string             `json:"environment"`
@@ -279,8 +277,6 @@ type AIAnalysisView struct {
 	Protocol        string `json:"protocol"`
 	AuthHeader      string `json:"auth_header"`
 	SyncSubmitPath  string `json:"sync_submit_path"`
-	RepoLocatorMode string `json:"repo_locator_mode"`
-	RepoGitURL      string             `json:"repo_git_url"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口按服务名定位仓库用）。
 	ServiceRepoMap  []ServiceRepoItem `json:"service_repo_map"`
 	Environment     string             `json:"environment"`
@@ -408,8 +404,6 @@ type AIAnalysisInput struct {
 	Protocol           string `json:"protocol"`
 	AuthHeader         string `json:"auth_header"`
 	SyncSubmitPath     string `json:"sync_submit_path"`
-	RepoLocatorMode    string `json:"repo_locator_mode"`
-	RepoGitURL         string             `json:"repo_git_url"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射；用指针区分「未传」与「传空数组（清空）」。
 	ServiceRepoMap     *[]ServiceRepoItem `json:"service_repo_map,omitempty"`
 	Environment        string             `json:"environment"`
@@ -859,7 +853,7 @@ func defaultAISettingsPayload() aiSettingsPayload {
 			Enabled: false, SubmitPath: defaultSubmitPath, QueryPath: defaultQueryPath,
 			Timeout: "15s", TaskTimeout: "30m", PollInterval: "60s", PollBatch: defaultPollBatch,
 			CallMode: defaultCallModeAsync, SyncTimeout: defaultSyncTimeout,
-			Protocol: defaultProtocol, RepoLocatorMode: repoLocatorModeService,
+			Protocol: defaultProtocol,
 		},
 		DailyTokenQuota: 0,
 		PerUserQuota:    0,
@@ -941,8 +935,6 @@ func (p aiSettingsPayload) applyCodeAnalysisTo(cfg *config.Config) {
 		Protocol:        resolveProtocol(p.CodeAnalysis.Protocol),
 		AuthHeader:      strings.TrimSpace(p.CodeAnalysis.AuthHeader),
 		SyncSubmitPath:  strings.TrimSpace(p.CodeAnalysis.SyncSubmitPath),
-		RepoLocatorMode: resolveRepoLocatorMode(p.CodeAnalysis.RepoLocatorMode),
-		RepoGitURL:      strings.TrimSpace(p.CodeAnalysis.RepoGitURL),
 		ServiceRepoMap:   toServiceRepoMap(p.CodeAnalysis.ServiceRepoMap),
 		ServiceRepoIDMap: toServiceRepoIDMap(p.CodeAnalysis.ServiceRepoMap),
 		CallbackKeyMap:   toCallbackKeyMap(p.CodeAnalysis.CallbackKeyMap),
@@ -987,8 +979,6 @@ func (p aiAnalysisPayload) view() AIAnalysisView {
 		Protocol:            p.Protocol,
 		AuthHeader:          p.AuthHeader,
 		SyncSubmitPath:      p.SyncSubmitPath,
-		RepoLocatorMode:     p.RepoLocatorMode,
-		RepoGitURL:          p.RepoGitURL,
 		ServiceRepoMap:      p.ServiceRepoMap,
 		Environment:         p.Environment,
 		Priority:            p.Priority,
@@ -1061,9 +1051,6 @@ const (
 	defaultOpenAPISubmitPath = "/api/v1/openapi/tasks"
 	defaultOpenAPISyncPath   = "/api/v1/openapi/analyze"
 	defaultOpenAPIQueryPath  = "/api/v1/runs/{run_id}"
-	// 仓库定位方式：service（用服务名当 host）| git_url（固定 git 地址）。
-	repoLocatorModeService = "service"
-	repoLocatorModeGitURL  = "git_url"
 )
 
 // resolveProtocol 归一化协议：只认 generic / openapi_v1，其它一律回落 generic。
@@ -1079,13 +1066,7 @@ func resolveProtocol(raw string) string {
 	}
 }
 
-// resolveRepoLocatorMode 归一化仓库定位方式（只认 service / git_url）。
-func resolveRepoLocatorMode(raw string) string {
-	if strings.EqualFold(strings.TrimSpace(raw), repoLocatorModeGitURL) {
-		return repoLocatorModeGitURL
-	}
-	return repoLocatorModeService
-}
+
 
 // applyProtocolDefaults 在协议切换时把"还没被改过的"路径改写成该协议的默认值。
 //
@@ -1117,9 +1098,6 @@ func applyProtocolDefaults(p aiAnalysisPayload, prevProtocol string) aiAnalysisP
 		if p.QueryPath == "" || p.QueryPath == defaultOpenAPIQueryPath {
 			p.QueryPath = defaultQueryPath
 		}
-	}
-	if p.RepoLocatorMode == "" {
-		p.RepoLocatorMode = repoLocatorModeService
 	}
 	return p
 }
@@ -1197,12 +1175,6 @@ func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayloa
 	}
 	if v := strings.TrimSpace(in.SyncSubmitPath); v != "" {
 		out.SyncSubmitPath = v
-	}
-	if v := strings.TrimSpace(in.RepoLocatorMode); v != "" {
-		out.RepoLocatorMode = resolveRepoLocatorMode(v)
-	}
-	if v := strings.TrimSpace(in.RepoGitURL); v != "" {
-		out.RepoGitURL = v
 	}
 	if in.ServiceRepoMap != nil {
 		out.ServiceRepoMap = *in.ServiceRepoMap
@@ -2027,7 +1999,7 @@ func (s *SettingService) TestCodeAnalysis(ctx context.Context, in AIAnalysisInpu
 				res.LatencyMS, nil
 		}
 	}
-	return false, name, truncateMessage(httpErrorHint(res.StatusCode, nil, openAPI)), res.LatencyMS, nil
+	return false, name, truncateMessage(httpErrorHint(res.StatusCode, res.Body, openAPI)), res.LatencyMS, nil
 }
 
 // protocolLabel 把协议值翻成页面上看得懂的名字（测试结果标题用）。

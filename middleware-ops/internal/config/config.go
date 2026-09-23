@@ -119,16 +119,10 @@ type AIAnalysisConfig struct {
 	// SyncSubmitPath 为同步模式（call_mode=sync）的提交路径；留空时按 Protocol 推导。
 	// 开放接口的同步与异步是两个不同端点，必须分开配。
 	SyncSubmitPath string `mapstructure:"sync_submit_path"`
-	// RepoLocatorMode 决定开放接口下如何定位仓库：
-	//   - service（默认）：把服务名当作 repoLocator.host（要求 AI 侧配了 hostPatterns）；
-	//   - git_url：固定用 RepoGitURL 作为 repoLocator.gitUrl（单仓场景）。
-	RepoLocatorMode string `mapstructure:"repo_locator_mode"`
-	// RepoGitURL 为 RepoLocatorMode=git_url 时使用的仓库地址。
-	RepoGitURL string `mapstructure:"repo_git_url"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口下使用）。
 	// 提交分析时若能从该表查到 service 名对应的 git 地址，则直接用 repoLocator.gitUrl 发送，
 	// 不再依赖 AI 服务侧的 matchRules（hostPatterns/keywords）去匹配服务名；
-	// 查不到时回落到 service 模式（host=服务名）。该映射优先于全局 RepoGitURL。
+	// 查不到时回落到 host=服务名（依赖 AI 侧 matchRules）。
 	ServiceRepoMap map[string]string `mapstructure:"service_repo_map"`
 	// ServiceRepoIDMap 是「服务名 → CodeAgent 内部 repoId」映射（开放接口按服务名定位仓库用）。
 	// 配置了的服务在提交时直接带 repoId（文档 §4 优先级最高），不再依赖 gitUrl/host 或 AI 侧 matchRules。

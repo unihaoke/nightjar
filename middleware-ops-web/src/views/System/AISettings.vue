@@ -188,8 +188,6 @@ async function load(): Promise<void> {
         protocol: ca.protocol || 'generic',
         auth_header: ca.auth_header || '',
         sync_submit_path: ca.sync_submit_path || '',
-        repo_locator_mode: ca.repo_locator_mode || 'service',
-        repo_git_url: ca.repo_git_url || '',
         service_repo_map: Array.isArray(ca.service_repo_map)
           ? ca.service_repo_map.map((m: { service: string; git_url: string; repo_id?: string }) => ({ service: m.service, git_url: m.git_url, repo_id: m.repo_id || '' }))
           : [],
@@ -246,8 +244,6 @@ const codeAnalysis = reactive({
   protocol: 'generic',
   auth_header: '',
   sync_submit_path: '',
-  repo_locator_mode: 'service',
-  repo_git_url: '',
   service_repo_map: [] as { service: string; git_url: string; repo_id: string }[],
   callback_key_map: [] as { key_id: string; secret: string }[],
   environment: '',
@@ -304,8 +300,6 @@ function buildCodeAnalysis(): AISettingsInput['code_analysis'] {
     protocol: codeAnalysis.protocol,
     auth_header: codeAnalysis.auth_header,
     sync_submit_path: codeAnalysis.sync_submit_path,
-    repo_locator_mode: codeAnalysis.repo_locator_mode,
-    repo_git_url: codeAnalysis.repo_git_url,
     service_repo_map: codeAnalysis.service_repo_map.filter(
       (m) => m.service.trim() && (m.git_url.trim() || m.repo_id.trim()),
     ),
@@ -870,22 +864,7 @@ onMounted(async () => {
               <p class="field-hint">开放接口的同步与异步是两个端点，仅 call_mode=sync 时使用。</p>
             </el-form-item>
           </el-col>
-          <el-col v-if="isOpenAPI" :xs="24" :sm="12">
-            <el-form-item label="仓库定位方式">
-              <el-select v-model="codeAnalysis.repo_locator_mode" class="mobile-block">
-                <el-option label="用服务名当 host（推荐）" value="service" />
-                <el-option label="固定 git 地址（单仓）" value="git_url" />
-              </el-select>
-              <p class="field-hint">
-                用服务名时，需要在 AI 服务控制台给仓库配好 hostPatterns / keywords。
-              </p>
-            </el-form-item>
-          </el-col>
-          <el-col v-if="isOpenAPI && codeAnalysis.repo_locator_mode === 'git_url'" :xs="24" :sm="12">
-            <el-form-item label="仓库 git 地址">
-              <el-input v-model="codeAnalysis.repo_git_url" class="mono" placeholder="https://git.x/order.git" />
-            </el-form-item>
-          </el-col>
+
           <el-col v-if="isOpenAPI" :span="24">
             <el-form-item label="服务名 → Git 仓库映射">
               <p class="field-hint">
