@@ -81,6 +81,7 @@ const groups: NavGroup[] = [
       { name: 'users', title: '用户与角色', icon: 'UserFilled', permission: 'user:manage' },
       { name: 'ai-settings', title: 'AI 设置', icon: 'MagicStick', permission: 'system:config' },
       { name: 'notify-channels', title: '通知渠道', icon: 'Bell', permission: 'system:config' },
+      { name: 'security-settings', title: '合规设置', icon: 'Lock', permission: 'system:config' },
       { name: 'system-info', title: '系统信息', icon: 'InfoFilled', permission: 'system:overview' },
     ],
   },
