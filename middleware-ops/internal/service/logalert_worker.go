@@ -295,7 +295,19 @@ func (w *LogAlertWorker) finish(ctx context.Context, event model.LogAlertEvent, 
 	if completion != nil {
 		brief = completion.Brief
 	}
-	notifyErr := w.notify(ctx, event, rule, brief)
+	// 已经投递过、且这次没有新结论（分析失败/超时/被跳过）：不再重复投递。
+	// 通知的意义是"把结论送到人手里"；已经发过一次告警、又没有新信息时再发一条，
+	// 只会把一次失败的分析放大成两倍的打扰（"提交即通知"场景尤其明显）。
+	// 有结论时照发：那才是"带根因的告警"的价值所在。
+	var notifyErr error
+	notified := false
+	if event.NotifiedAt != nil && brief == nil {
+		w.log.Info("已投递过通知且本次没有新结论，跳过重复投递",
+			zap.Int64("event_id", event.ID), zap.String("service", event.ServiceName))
+	} else {
+		notifyErr = w.notify(ctx, event, rule, brief)
+		notified = notifyErr == nil
+	}
 
 	finalState := state
 	reason := ""
@@ -315,7 +327,7 @@ func (w *LogAlertWorker) finish(ctx context.Context, event model.LogAlertEvent, 
 	}
 	w.log.Info("日志告警后处理完成",
 		zap.Int64("event_id", event.ID), zap.String("service", event.ServiceName),
-		zap.String("state", finalState), zap.Bool("notified", notifyErr == nil),
+		zap.String("state", finalState), zap.Bool("notified", notified),
 		zap.Bool("has_analysis", brief != nil))
 	return nil
 }

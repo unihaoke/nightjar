@@ -176,6 +176,15 @@ func (c *AIAnalysisClient) doSubmit(ctx context.Context, in SubmitInput, cli *ht
 	if res.Status == "" {
 		res.Status = modelStatusSubmitted
 	}
+	// 开放接口的受理响应（文档 §6.3）应当返回 runId：轮询兜底按 GET /api/v1/runs/{runId} 组织，
+	// 缺了它轮询会打到空地址上，一旦回调丢失就再也取不回结论（只能等超时收尾）。
+	// 这里明确告警并给出可操作提示，便于与 AI 服务提供方对齐，而不是等结论丢了才发现。
+	if c.isOpenAPI() && strings.TrimSpace(res.RunID) == "" {
+		c.log.Warn("AI 服务受理响应缺少 runId，轮询兜底失效（结论只能依赖回调）",
+			zap.String("service", in.Service),
+			zap.String("task_id", res.TaskID),
+			zap.String("hint", "请让 AI 服务按文档 §6.3 在 202 受理响应中返回 runId，否则回调丢失时结论无法取回"))
+	}
 	c.log.Info("已提交 AI 分析任务",
 		zap.String("task_id", res.TaskID), zap.String("status", res.Status),
 		zap.String("service", in.Service), zap.Duration("wait", ctxTimeout(ctx)))
@@ -505,20 +514,20 @@ func (c *AIAnalysisClient) parseResult(body []byte) *TaskResult {
 // 只声明平台真正会用的字段：未声明的字段被丢弃不影响分析，
 // 但"结论"相关的字段一个都不能少（少了就是"分析成功但没有内容"）。
 type openAPIResultPayload struct {
-	RunID     string             `json:"runId"`
-	TaskID    string             `json:"taskId"`
-	Status    string             `json:"status"`
-	Severity  string             `json:"severity"`
-	Repo      map[string]any     `json:"repo"`
-	RootCause *openAPIRootCause  `json:"rootCause"`
-	Patches   []openAPIPatch     `json:"patches"`
-	ReportID  string             `json:"reportId"`
-	ReportURL string             `json:"reportUrl"`
-	Markdown  string             `json:"markdown"`
-	Warnings  []string           `json:"warnings"`
-	Degraded  bool               `json:"degraded"`
-	Error     string             `json:"error"`
-	Message   string             `json:"message"`
+	RunID     string            `json:"runId"`
+	TaskID    string            `json:"taskId"`
+	Status    string            `json:"status"`
+	Severity  string            `json:"severity"`
+	Repo      map[string]any    `json:"repo"`
+	RootCause *openAPIRootCause `json:"rootCause"`
+	Patches   []openAPIPatch    `json:"patches"`
+	ReportID  string            `json:"reportId"`
+	ReportURL string            `json:"reportUrl"`
+	Markdown  string            `json:"markdown"`
+	Warnings  []string          `json:"warnings"`
+	Degraded  bool              `json:"degraded"`
+	Error     string            `json:"error"`
+	Message   string            `json:"message"`
 }
 
 // openAPIRootCause 是根因结构（文档 §5.5）。
@@ -802,18 +811,22 @@ func ParseCallbackWithProtocol(body []byte, protocol string) (taskID, runID, sta
 
 // openAPICallbackPayload 是开放接口的终态回调报文（文档 §6.4）。
 type openAPICallbackPayload struct {
-	RunID     string            `json:"runId"`
-	State     string            `json:"state"`
-	ReportID  string            `json:"reportId"`
-	Severity  string            `json:"severity"`
-	Summary   string            `json:"summary"`
-	TenantID  string            `json:"tenantId"`
-	TaskID    string            `json:"taskId"`
-	Attempt   int               `json:"attempt"`
-	Error     string            `json:"error"`
-	RootCause *openAPIRootCause `json:"rootCause"`
-	Patches   []openAPIPatch    `json:"patches"`
-	ReportURL string            `json:"reportUrl"`
+	RunID    string `json:"runId"`
+	State    string `json:"state"`
+	ReportID string `json:"reportId"`
+	Severity string `json:"severity"`
+	Summary  string `json:"summary"`
+	TenantID string `json:"tenantId"`
+	TaskID   string `json:"taskId"`
+	// IdempotencyKey 是平台提交时带出去的幂等键，AI 服务在终态回调里原样回显。
+	// 它与平台本地任务主键一致，是对号的第一选择；漏读这个字段就只能拿 AI 侧自己的
+	// taskId/runId 去查，那两个与本地主键不是同一个，必然"分析任务不存在"。
+	IdempotencyKey string            `json:"idempotencyKey"`
+	Attempt        int               `json:"attempt"`
+	Error          string            `json:"error"`
+	RootCause      *openAPIRootCause `json:"rootCause"`
+	Patches        []openAPIPatch    `json:"patches"`
+	ReportURL      string            `json:"reportUrl"`
 }
 
 // parseOpenAPICallback 解析开放接口的回调。
@@ -822,11 +835,13 @@ func parseOpenAPICallback(body []byte) (taskID, runID, status, answer, errMsg st
 	if e := json.Unmarshal(body, &raw); e != nil {
 		return "", "", "", "", "", errors.New("回调不是合法的开放接口报文：" + e.Error())
 	}
-	// 对号优先 taskId（平台提交响应里存的就是它）；runId 单独带回，作为兜底对号手段。
-	taskID = defaultString(strings.TrimSpace(raw.TaskID), strings.TrimSpace(raw.RunID))
+	// 对号优先用 idempotencyKey：它是平台提交时带出去、AI 服务在终态回调里原样回显的值，
+	// 与本地任务主键一致。taskId/runId 是 AI 侧自己的号，只作兜底。
+	taskID = defaultString(strings.TrimSpace(raw.IdempotencyKey),
+		defaultString(strings.TrimSpace(raw.TaskID), strings.TrimSpace(raw.RunID)))
 	runID = strings.TrimSpace(raw.RunID)
 	if taskID == "" {
-		return "", "", "", "", "", errors.New("回调缺少 taskId/runId，无法对上分析任务")
+		return "", "", "", "", "", errors.New("回调缺少 idempotencyKey/taskId/runId，无法对上分析任务")
 	}
 	status = model.AIAnalysisTaskSucceeded
 	if normalizeOpenAPIStatus(raw.State, false) == modelStatusFailed {

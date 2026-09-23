@@ -39,8 +39,8 @@ type engineGuard interface {
 //  1. 出网白名单（security.outbound_whitelist）：服务不在名单里就不许问外部 AI；
 //  2. 脱敏：错误信息与堆栈在送出前先过一遍脱敏器（IP/手机号/邮箱/口令…）。
 type CodeAnalysisService struct {
-	cfg  *config.Config
-	mu   sync.RWMutex
+	cfg *config.Config
+	mu  sync.RWMutex
 	// client 由「AI 设置」保存时热替换，所以读写都要过 mu：
 	// 提交链路正在用旧客户端发请求时，管理员点了保存，不能让读方拿到半个新对象。
 	client   *AIAnalysisClient
@@ -280,7 +280,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	// ② 脱敏：错误信息与堆栈先过一遍脱敏器，再拼成问题。
 	question := s.buildQuestion(serviceName, message, stack)
 
-	// ③ 提交：平台先生成 task_id（本地主键），AI 服务不认就以它返回的为准。
+	// ③ 提交：平台先生成 task_id（本地主键）。
 	taskID := newAnalysisTaskID(in.EventID)
 	deadline := time.Now().UTC().Add(s.taskTimeout())
 	client := s.currentClient()
@@ -288,11 +288,21 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		return nil, apperr.New(apperr.CodeOutboundDenied,
 			"未配置外部 AI 分析服务：请在「AI 设置 → AI 代码分析」中填写服务地址并启用")
 	}
+	idemKey := analysisIdempotencyKey(in.EventID, eventSig, serviceName, message, stack)
+	// 本地主键必须取"提交时真正带出去的那个号"：
+	// 开放接口带出去的是 idempotencyKey，AI 服务会在终态回调里把它**原样回显**，
+	// 用它做主键才能保证"发出去的"与"回调查的"是同一个；
+	// 若改用 AI 返回的 taskId/runId，那是它自己的号（且与本平台主键不同），回调必然对不上号。
+	// generic 协议不发送 idempotencyKey，仍用 task_id（AI 侧原样回显）。
+	storeID := taskID
+	if client.isOpenAPI() && strings.TrimSpace(idemKey) != "" {
+		storeID = strings.TrimSpace(idemKey)
+	}
 	// 开放接口的 stacktrace / logs 是独立字段，必须各自脱敏后再送出，
 	// 不能只脱敏拼好的 question（否则等于把原始堆栈外发了）。
 	res, err := s.submitAnalysis(ctx, client, submitRequest{
 		TaskID:     taskID,
-		IdemKey:    analysisIdempotencyKey(in.EventID, eventSig, serviceName, message, stack),
+		IdemKey:    idemKey,
 		Service:    serviceName,
 		Question:   question,
 		Stacktrace: s.redact(stack),
@@ -303,16 +313,16 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		// 提交/等待阶段就失败（含同步模式超时、网络不可达）：写一条失败任务，
 		// 让事件明确标 failed 并带上原因，而不是永远停在"分析中"。
 		_ = s.tasks.Create(ctx, &model.AIAnalysisTask{
-			EventID: in.EventID, ServiceName: serviceName, TaskID: taskID,
+			EventID: in.EventID, ServiceName: serviceName, TaskID: storeID,
 			Status: model.AIAnalysisTaskSubmitted, Question: question, DeadlineAt: &deadline,
 		})
-		_, _ = s.tasks.Complete(ctx, taskID, model.AIAnalysisTaskFailed, "", err.Error(), time.Now().UTC())
+		_, _ = s.tasks.Complete(ctx, storeID, model.AIAnalysisTaskFailed, "", err.Error(), time.Now().UTC())
 		return nil, apperr.Wrap(apperr.CodeEngineFailed, err)
 	}
 	task := &model.AIAnalysisTask{
 		EventID:     in.EventID,
 		ServiceName: serviceName,
-		TaskID:      res.TaskID,
+		TaskID:      storeID,
 		RunID:       res.RunID,
 		Status:      model.AIAnalysisTaskSubmitted,
 		Question:    question,
@@ -323,7 +333,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	}
 
 	out := &SubmitOutcome{
-		TaskID:      res.TaskID,
+		TaskID:      storeID,
 		EventID:     in.EventID,
 		ServiceName: serviceName,
 		Async:       res.Status != modelStatusSucceeded,
@@ -331,7 +341,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 
 	// 提交响应里就带着结论：直接收尾，不进等待队列（同步模式必然走这里）。
 	if res.Status == modelStatusSucceeded {
-		completion, err := s.CompleteByTask(ctx, res.TaskID, "", model.AIAnalysisTaskSucceeded, res.Answer, "")
+		completion, err := s.CompleteByTask(ctx, storeID, "", model.AIAnalysisTaskSucceeded, res.Answer, "")
 		if err != nil {
 			return nil, err
 		}
@@ -347,7 +357,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	// 提交响应说"还在处理"：异步模式下正常，等回调/轮询即可；
 	// 同步模式下没有回调/轮询通道，等于没把结论给出来，按失败收尾并给出出路。
 	if s.callMode() == callModeSync {
-		completion, err := s.CompleteByTask(ctx, res.TaskID, "", model.AIAnalysisTaskFailed, "",
+		completion, err := s.CompleteByTask(ctx, storeID, "", model.AIAnalysisTaskFailed, "",
 			"同步模式下 AI 服务未在等待时间内返回结论（请改用异步回调模式，或确认该服务支持同步返回）")
 		if err != nil {
 			return nil, err
