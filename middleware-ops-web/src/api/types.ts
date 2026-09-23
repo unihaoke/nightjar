@@ -970,6 +970,8 @@ export interface AIAnalysisSetting {
   callback_url: string
   callback_token_set: boolean
   callback_token_masked: string
+  /** 多密钥表（X-Callback-Key-Id → callbackSecret）：仅回显 key-id 与掩码，secret 不暴露。 */
+  callback_key_map?: { key_id: string; set: boolean; masked: string }[]
   /** 形如 "15s"，空串沿用原值。 */
   timeout: string
   task_timeout: string
@@ -989,6 +991,8 @@ export interface AIAnalysisSetting {
   /** 仓库定位方式：service（用服务名当 host）| git_url（固定 git 地址）。 */
   repo_locator_mode: string
   repo_git_url: string
+  /** 「服务名 → git 地址 / repoId」映射：开放接口按服务名定位仓库时逐条匹配。 */
+  service_repo_map?: { service: string; git_url: string; repo_id?: string }[]
   /** 随任务提交的环境标识，如 prod。 */
   environment: string
   /** 任务优先级，0 表示不提交该字段。 */
@@ -1025,6 +1029,12 @@ export interface AIAnalysisInput {
   sync_submit_path: string
   repo_locator_mode: string
   repo_git_url: string
+  /** 「服务名 → git 地址 / repoId」映射：开放接口按服务名定位仓库时逐条匹配。 */
+  service_repo_map?: { service: string; git_url: string; repo_id?: string }[]
+  /** 「X-Callback-Key-Id → callbackSecret」映射（多密钥）：secret 空表示沿用已存的该 key 的 secret。 */
+  callback_key_map?: { key_id: string; secret: string }[]
+  /** 为 true 时清空整张回调密钥表。 */
+  clear_callback_key_map?: boolean
   environment: string
   priority: number
   auto_verify: boolean

@@ -108,10 +108,11 @@ type testCodeAnalysisInput struct {
 	AuthHeader      string `json:"auth_header"`
 	SubmitPath      string `json:"submit_path"`
 	SyncSubmitPath  string `json:"sync_submit_path"`
-	RepoLocatorMode string `json:"repo_locator_mode"`
-	RepoGitURL      string `json:"repo_git_url"`
-	Priority        int    `json:"priority"`
-	AutoVerify      bool   `json:"auto_verify"`
+	RepoLocatorMode string                      `json:"repo_locator_mode"`
+	RepoGitURL      string                      `json:"repo_git_url"`
+	ServiceRepoMap  *[]service.ServiceRepoItem  `json:"service_repo_map,omitempty"`
+	Priority        int                         `json:"priority"`
+	AutoVerify      bool                        `json:"auto_verify"`
 }
 
 // TestCodeAnalysisSettings 自测「AI 代码分析」外部服务的连通性，不落库、不改内存配置。
@@ -132,6 +133,7 @@ func (h *Handler) TestCodeAnalysisSettings(c *gin.Context) {
 		SyncSubmitPath:  in.SyncSubmitPath,
 		RepoLocatorMode: in.RepoLocatorMode,
 		RepoGitURL:      in.RepoGitURL,
+		ServiceRepoMap:  in.ServiceRepoMap,
 		Priority:        in.Priority,
 		AutoVerify:      in.AutoVerify,
 	})

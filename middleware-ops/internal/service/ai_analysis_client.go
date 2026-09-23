@@ -297,8 +297,9 @@ func (c *AIAnalysisClient) Query(ctx context.Context, taskID, runID string) (*Ta
 
 // setAuth 统一注入调用凭据。
 //
-// 头名可配（AuthHeader）：开放接口要求 X-API-Key: <key> 且不带 Bearer 前缀，
-// 而 generic 的历史实现是 Authorization: Bearer <key>，两者不能混用。
+// 头名可配（AuthHeader）：开放接口按《CodeAgent 接入文档》默认用 X-API-Key: <key>
+// （不带 Bearer 前缀），而 generic 的历史实现是 Authorization: Bearer <key>，两者不能混用。
+// 不显式配置 AuthHeader 时，按协议自动选择：openapi_v1 → X-API-Key，generic → Bearer。
 func (c *AIAnalysisClient) setAuth(req *http.Request) {
 	key := strings.TrimSpace(c.cfg.APIKey)
 	if key == "" {
@@ -306,6 +307,10 @@ func (c *AIAnalysisClient) setAuth(req *http.Request) {
 	}
 	header := strings.TrimSpace(c.cfg.AuthHeader)
 	if header == "" {
+		if c.isOpenAPI() {
+			req.Header.Set("X-API-Key", key)
+			return
+		}
 		req.Header.Set("Authorization", "Bearer "+key)
 		return
 	}
@@ -400,6 +405,8 @@ type openAPIRepoLocator struct {
 // 字段顺序按文档排列；可选字段一律 omitempty，避免把零值塞给服务端
 // （例如 priority=0 会被当成"最高优先级"而不是"不指定"）。
 type openAPISubmitPayload struct {
+	Mode           string              `json:"mode"`
+	RepoID         string              `json:"repoId,omitempty"`
 	RepoLocator    *openAPIRepoLocator `json:"repoLocator,omitempty"`
 	Stacktrace     string              `json:"stacktrace"`
 	Logs           string              `json:"logs,omitempty"`
@@ -415,15 +422,23 @@ type openAPISubmitPayload struct {
 // openAPIPayload 把平台侧的提交入参翻译成开放接口的正文。
 func (c *AIAnalysisClient) openAPIPayload(ctx context.Context, in SubmitInput) openAPISubmitPayload {
 	out := openAPISubmitPayload{
+		Mode:           openAPIModeAnalyze,
 		Stacktrace:     c.openAPIStacktrace(in),
 		Logs:           strings.TrimSpace(in.Message),
 		Environment:    strings.TrimSpace(defaultString(in.Environment, c.cfg.Environment)),
 		IdempotencyKey: defaultString(strings.TrimSpace(in.IdempotencyKey), in.TaskID),
 		CallbackURL:    strings.TrimSpace(in.CallbackURL),
 	}
-	// 仓库定位：默认把服务名当 host（要求 AI 侧注册仓库时填了 hostPatterns/keywords）；
-	// 单仓部署可改成固定 gitUrl。
-	if strings.EqualFold(strings.TrimSpace(c.cfg.RepoLocatorMode), repoLocatorModeGitURL) &&
+	// 仓库定位（开放接口）：
+	// 1) 服务名在「服务名 → git 地址」映射表命中 → 直接发该 gitUrl（按服务分流到各自仓库，最高优先级）；
+	// 2) 全局 git_url 模式且配了 RepoGitURL → 发固定 gitUrl（单仓场景）；
+	// 3) 否则把服务名当 host 提交，依赖 AI 侧 matchRules 匹配（hostPatterns/keywords）。
+	// 仓库定位（文档 §4，优先级 repoId > repoLocator）：repoId 命中直接用，否则回落 gitUrl/host 方案。
+	if repoID := c.resolveRepoID(strings.TrimSpace(in.Service)); repoID != "" {
+		out.RepoID = repoID
+	} else if gitURL := c.resolveRepoGitURL(strings.TrimSpace(in.Service)); gitURL != "" {
+		out.RepoLocator = &openAPIRepoLocator{GitURL: gitURL}
+	} else if strings.EqualFold(strings.TrimSpace(c.cfg.RepoLocatorMode), repoLocatorModeGitURL) &&
 		strings.TrimSpace(c.cfg.RepoGitURL) != "" {
 		out.RepoLocator = &openAPIRepoLocator{GitURL: strings.TrimSpace(c.cfg.RepoGitURL)}
 	} else if strings.TrimSpace(in.Service) != "" {
@@ -446,6 +461,26 @@ func (c *AIAnalysisClient) openAPIPayload(ctx context.Context, in SubmitInput) o
 		out.Timeout = &secs
 	}
 	return out
+}
+
+// openAPIModeAnalyze 是开放接口的提交模式（文档 §一 示例 mode=analyze）。
+const openAPIModeAnalyze = "analyze"
+
+// resolveRepoGitURL 在「服务名 → git 地址」映射表里查服务名；命中且地址非空时返回该地址。
+// 用于开放接口下按服务名定位仓库，避免依赖 AI 服务侧的 matchRules（hostPatterns/keywords）。
+func (c *AIAnalysisClient) resolveRepoGitURL(service string) string {
+	if strings.TrimSpace(service) == "" || c.cfg.ServiceRepoMap == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.cfg.ServiceRepoMap[service])
+}
+
+// resolveRepoID 在「服务名 → repoId」映射表里查服务名；命中且非空时返回该 repoId（文档 §4 优先级最高）。
+func (c *AIAnalysisClient) resolveRepoID(service string) string {
+	if strings.TrimSpace(service) == "" || c.cfg.ServiceRepoIDMap == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.cfg.ServiceRepoIDMap[service])
 }
 
 // openAPIStacktrace 取异常栈：栈为空时用错误信息顶上。

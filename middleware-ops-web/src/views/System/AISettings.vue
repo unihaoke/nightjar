@@ -190,6 +190,12 @@ async function load(): Promise<void> {
         sync_submit_path: ca.sync_submit_path || '',
         repo_locator_mode: ca.repo_locator_mode || 'service',
         repo_git_url: ca.repo_git_url || '',
+        service_repo_map: Array.isArray(ca.service_repo_map)
+          ? ca.service_repo_map.map((m: { service: string; git_url: string; repo_id?: string }) => ({ service: m.service, git_url: m.git_url, repo_id: m.repo_id || '' }))
+          : [],
+        callback_key_map: Array.isArray(ca.callback_key_map)
+          ? ca.callback_key_map.map((k: { key_id: string }) => ({ key_id: k.key_id, secret: '' }))
+          : [],
         environment: ca.environment || '',
         priority: ca.priority ?? 0,
         auto_verify: ca.auto_verify ?? false,
@@ -201,6 +207,7 @@ async function load(): Promise<void> {
     analysisKeyDraft.callback_token = ''
     analysisKeyClear.api_key = false
     analysisKeyClear.callback_token = false
+    callbackKeyClearAll.value = false
   } catch (error) {
     toastError(error)
   } finally {
@@ -241,6 +248,8 @@ const codeAnalysis = reactive({
   sync_submit_path: '',
   repo_locator_mode: 'service',
   repo_git_url: '',
+  service_repo_map: [] as { service: string; git_url: string; repo_id: string }[],
+  callback_key_map: [] as { key_id: string; secret: string }[],
   environment: '',
   priority: 0,
   auto_verify: false,
@@ -257,6 +266,8 @@ const caTestResult = ref<AITestResult | null>(null)
 const analysisKeyDraft = reactive({ api_key: '', callback_token: '' })
 /** 清除标记：点了「清除」才会在保存时下发 clear_*。 */
 const analysisKeyClear = reactive({ api_key: false, callback_token: false })
+/** 多密钥表「清空全部」标记。 */
+const callbackKeyClearAll = ref(false)
 /** 后端返回的掩码，仅用于 placeholder。 */
 const analysisKeyMasked = reactive({ api_key: '', callback_token: '' })
 
@@ -295,9 +306,18 @@ function buildCodeAnalysis(): AISettingsInput['code_analysis'] {
     sync_submit_path: codeAnalysis.sync_submit_path,
     repo_locator_mode: codeAnalysis.repo_locator_mode,
     repo_git_url: codeAnalysis.repo_git_url,
+    service_repo_map: codeAnalysis.service_repo_map.filter(
+      (m) => m.service.trim() && (m.git_url.trim() || m.repo_id.trim()),
+    ),
     environment: codeAnalysis.environment,
     priority: Number(codeAnalysis.priority) || 0,
     auto_verify: codeAnalysis.auto_verify,
+  }
+  if (codeAnalysis.callback_key_map.length > 0 || callbackKeyClearAll.value) {
+    payload.callback_key_map = codeAnalysis.callback_key_map
+      .filter((k) => k.key_id.trim())
+      .map((k) => ({ key_id: k.key_id.trim(), secret: k.secret }))
+    payload.clear_callback_key_map = callbackKeyClearAll.value
   }
   if (analysisKeyDraft.api_key.trim()) {
     payload.api_key = analysisKeyDraft.api_key.trim()
@@ -312,6 +332,16 @@ function buildCodeAnalysis(): AISettingsInput['code_analysis'] {
     payload.clear_callback_token = true
   }
   return payload
+}
+
+/** 新增一行「服务名 → git 地址」映射。 */
+function addRepoMapping(): void {
+  codeAnalysis.service_repo_map.push({ service: '', git_url: '', repo_id: '' })
+}
+
+/** 删除指定下标的映射。 */
+function removeRepoMapping(index: number): void {
+  codeAnalysis.service_repo_map.splice(index, 1)
 }
 
 /** 新填了密钥就不再请求清空（新值优先）。 */
@@ -773,6 +803,34 @@ onMounted(async () => {
                   {{ analysisKeyClear.callback_token ? '取消清除' : '清除' }}
                 </el-button>
               </div>
+              <p class="field-hint">
+                此处填 <b>CodeAgent 接入密钥的回调签名密钥 callbackSecret</b>（控制台创建密钥时一次性返回）。CodeAgent 终态回调会按文档签名：
+                头带 <span class="mono">X-Callback-Timestamp</span>（Unix 秒）、<span class="mono">X-Callback-Key-Id</span>、
+                <span class="mono">X-Callback-Signature = sha256= + URL-safe Base64 无填充(HMAC-SHA256(callbackSecret, timestamp + "." + 原始body))</span>；
+                平台据此防篡改防重放，时间窗口 300 秒。未带签名时仍可用明文令牌（<span class="mono">X-Callback-Token</span> 头或 <span class="mono">?token=</span>）降级校验。
+              </p>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
+            <el-form-item label="回调密钥表（多密钥 / X-Callback-Key-Id）">
+              <div class="row key-row" v-if="codeAnalysis.callback_key_map.length">
+                <span class="mono" v-for="(k, idx) in codeAnalysis.callback_key_map" :key="idx">
+                  {{ k.key_id }}<template v-if="idx < codeAnalysis.callback_key_map.length - 1">、</template>
+                </span>
+              </div>
+              <p class="field-hint">
+                配置后 CodeAgent 回调须携带匹配的 <span class="mono">X-Callback-Key-Id</span> 才能验签通过，实现多对端/环境密钥隔离与独立吊销。
+                留空（且下方不添加）则沿用上方「回调令牌」作为单一共享密钥（向后兼容）。
+              </p>
+              <div v-for="(k, idx) in codeAnalysis.callback_key_map" :key="idx" class="repo-map-row">
+                <el-input v-model="k.key_id" class="mono" placeholder="key-id（X-Callback-Key-Id）" />
+                <el-input v-model="k.secret" type="password" show-password class="mono" placeholder="callbackSecret（留空表示沿用已存）" />
+                <el-button @click="codeAnalysis.callback_key_map.splice(idx, 1)">删除</el-button>
+              </div>
+              <div class="row" style="margin-top:8px; gap:8px;">
+                <el-button @click="codeAnalysis.callback_key_map.push({ key_id: '', secret: '' })">添加密钥</el-button>
+                <el-checkbox v-model="callbackKeyClearAll">清空全部</el-checkbox>
+              </div>
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
@@ -793,7 +851,7 @@ onMounted(async () => {
           <el-col v-if="isOpenAPI" :xs="24" :sm="12">
             <el-form-item label="鉴权头">
               <el-input v-model="codeAnalysis.auth_header" class="mono" placeholder="X-API-Key" />
-              <p class="field-hint">留空表示 Authorization: Bearer &lt;key&gt;；开放接口请填 X-API-Key。</p>
+              <p class="field-hint">留空时：开放接口 v1 自动用 <span class="mono">X-API-Key: &lt;key&gt;</span>，通用协议自动用 <span class="mono">Authorization: Bearer &lt;key&gt;</span>；如需其它头名（如 <span class="mono">Authorization: ApiKey</span>）再显式填写。</p>
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
@@ -826,6 +884,21 @@ onMounted(async () => {
           <el-col v-if="isOpenAPI && codeAnalysis.repo_locator_mode === 'git_url'" :xs="24" :sm="12">
             <el-form-item label="仓库 git 地址">
               <el-input v-model="codeAnalysis.repo_git_url" class="mono" placeholder="https://git.x/order.git" />
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :span="24">
+            <el-form-item label="服务名 → Git 仓库映射">
+              <p class="field-hint">
+                按服务名定位仓库：命中后用对应 git 地址提交，不再依赖 AI 服务侧的 hostPatterns / keywords。
+                留空不填则回落为「用服务名当 host」。
+              </p>
+              <div v-for="(m, idx) in codeAnalysis.service_repo_map" :key="idx" class="repo-map-row">
+                <el-input v-model="m.service" class="mono" placeholder="服务名，如 jd-logs" />
+                <el-input v-model="m.git_url" class="mono" placeholder="https://git.x/jd-logs.git" />
+                <el-input v-model="m.repo_id" class="mono" placeholder="repoId（可选，优先级最高）" />
+                <el-button @click="removeRepoMapping(idx)">删除</el-button>
+              </div>
+              <el-button @click="addRepoMapping">添加映射</el-button>
             </el-form-item>
           </el-col>
           <el-col v-if="isOpenAPI" :xs="12" :sm="6">
@@ -1101,6 +1174,17 @@ onMounted(async () => {
 <style scoped>
 .mb {
   margin-bottom: 12px;
+}
+
+.repo-map-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.repo-map-row .el-input {
+  flex: 1;
 }
 
 .mb-top {

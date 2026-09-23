@@ -75,6 +75,10 @@ type AIAnalysisConfig struct {
 	CallbackURL string `mapstructure:"callback_url"`
 	// CallbackToken 为回调鉴权令牌：AI 服务回调时必须带上，否则拒收。
 	CallbackToken string `mapstructure:"callback_token"`
+	// CallbackKeyMap 是「X-Callback-Key-Id → callbackSecret」映射（多密钥支持，对齐文档 §2.4）。
+	// 配置后回调必须携带匹配的 key-id 才能验签通过（实现不同对端/环境密钥隔离与独立吊销）；
+	// 留空则回落到单密钥模式，使用 CallbackToken 作为共享验签密钥（向后兼容）。
+	CallbackKeyMap map[string]string `mapstructure:"callback_key_map"`
 	// Timeout 为提交/查询的单次 HTTP 超时（提交应该很快，真正慢的是分析本身）。
 	Timeout time.Duration `mapstructure:"timeout"`
 	// TaskTimeout 为任务级超时：从提交算起超过它仍没有结论就判定超时。
@@ -121,6 +125,14 @@ type AIAnalysisConfig struct {
 	RepoLocatorMode string `mapstructure:"repo_locator_mode"`
 	// RepoGitURL 为 RepoLocatorMode=git_url 时使用的仓库地址。
 	RepoGitURL string `mapstructure:"repo_git_url"`
+	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口下使用）。
+	// 提交分析时若能从该表查到 service 名对应的 git 地址，则直接用 repoLocator.gitUrl 发送，
+	// 不再依赖 AI 服务侧的 matchRules（hostPatterns/keywords）去匹配服务名；
+	// 查不到时回落到 service 模式（host=服务名）。该映射优先于全局 RepoGitURL。
+	ServiceRepoMap map[string]string `mapstructure:"service_repo_map"`
+	// ServiceRepoIDMap 是「服务名 → CodeAgent 内部 repoId」映射（开放接口按服务名定位仓库用）。
+	// 配置了的服务在提交时直接带 repoId（文档 §4 优先级最高），不再依赖 gitUrl/host 或 AI 侧 matchRules。
+	ServiceRepoIDMap map[string]string `mapstructure:"service_repo_id_map"`
 	// Environment 为随任务提交的环境标识（如 prod）；空表示不提交该字段。
 	Environment string `mapstructure:"environment"`
 	// Priority 为任务优先级；0 表示不提交该字段（由服务端决定）。

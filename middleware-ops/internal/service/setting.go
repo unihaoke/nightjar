@@ -156,6 +156,8 @@ type aiAnalysisPayload struct {
 	QueryPath       string `json:"query_path"`
 	CallbackURL     string `json:"callback_url"`
 	CallbackToken   string `json:"callback_token"`
+	// CallbackKeyMap 是「X-Callback-Key-Id → callbackSecret」映射（多密钥支持，对齐文档 §2.4）。
+	CallbackKeyMap []CallbackKeyItem `json:"callback_key_map"`
 	Timeout         string `json:"timeout"`
 	TaskTimeout     string `json:"task_timeout"`
 	PollInterval    string `json:"poll_interval"`
@@ -168,10 +170,34 @@ type aiAnalysisPayload struct {
 	AuthHeader      string `json:"auth_header"`
 	SyncSubmitPath  string `json:"sync_submit_path"`
 	RepoLocatorMode string `json:"repo_locator_mode"`
-	RepoGitURL      string `json:"repo_git_url"`
-	Environment     string `json:"environment"`
+	RepoGitURL      string             `json:"repo_git_url"`
+	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口按服务名定位仓库用）。
+	ServiceRepoMap  []ServiceRepoItem `json:"service_repo_map"`
+	Environment     string             `json:"environment"`
 	Priority        int    `json:"priority"`
 	AutoVerify      bool   `json:"auto_verify"`
+}
+
+// ServiceRepoItem 是「服务名 → git 地址」映射的一行。
+type ServiceRepoItem struct {
+	Service string `json:"service"`
+	GitURL  string `json:"git_url"`
+	// RepoID 是 CodeAgent 内部仓库 ID / repoKey（开放接口按服务名定位仓库用）。
+	// 配置后该服务提交时直接带 repoId（文档 §4 优先级最高），优先级高于 gitUrl/host。
+	RepoID string `json:"repo_id"`
+}
+
+// CallbackKeyItem 是「X-Callback-Key-Id → callbackSecret」映射的一行（多密钥支持）。
+type CallbackKeyItem struct {
+	KeyID  string `json:"key_id"`
+	Secret string `json:"secret"`
+}
+
+// CallbackKeyView 是回调密钥表对外展示形态：只暴露 key-id 与掩码，secret 明文不回显。
+type CallbackKeyView struct {
+	KeyID  string `json:"key_id"`
+	Set    bool   `json:"set"`
+	Masked string `json:"masked"`
 }
 
 // aiSettingsPayload 是 AI 设置的完整持久化形态。
@@ -239,9 +265,10 @@ type AIAnalysisView struct {
 	SubmitPath          string `json:"submit_path"`
 	QueryPath           string `json:"query_path"`
 	CallbackURL         string `json:"callback_url"`
-	CallbackTokenSet    bool   `json:"callback_token_set"`
-	CallbackTokenMasked string `json:"callback_token_masked"`
-	Timeout             string `json:"timeout"`
+	CallbackTokenSet    bool                `json:"callback_token_set"`
+	CallbackTokenMasked string              `json:"callback_token_masked"`
+	CallbackKeyMap      []CallbackKeyView   `json:"callback_key_map"`
+	Timeout             string              `json:"timeout"`
 	TaskTimeout         string `json:"task_timeout"`
 	PollInterval        string `json:"poll_interval"`
 	PollBatch           int    `json:"poll_batch"`
@@ -253,8 +280,10 @@ type AIAnalysisView struct {
 	AuthHeader      string `json:"auth_header"`
 	SyncSubmitPath  string `json:"sync_submit_path"`
 	RepoLocatorMode string `json:"repo_locator_mode"`
-	RepoGitURL      string `json:"repo_git_url"`
-	Environment     string `json:"environment"`
+	RepoGitURL      string             `json:"repo_git_url"`
+	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口按服务名定位仓库用）。
+	ServiceRepoMap  []ServiceRepoItem `json:"service_repo_map"`
+	Environment     string             `json:"environment"`
 	Priority        int    `json:"priority"`
 	AutoVerify      bool   `json:"auto_verify"`
 	// Configured 表示"现在真的能调用"（开关已开且地址非空）。
@@ -364,7 +393,11 @@ type AIAnalysisInput struct {
 	CallbackURL        string `json:"callback_url"`
 	CallbackToken      string `json:"callback_token"`
 	ClearCallbackToken bool   `json:"clear_callback_token"`
-	Timeout            string `json:"timeout"`
+	// CallbackKeyMap 是「X-Callback-Key-Id → callbackSecret」映射；指针区分「未传」与「传空数组（清空）」。
+	CallbackKeyMap *[]CallbackKeyItem `json:"callback_key_map,omitempty"`
+	// ClearCallbackKeyMap 为 true 时清空整张回调密钥表。
+	ClearCallbackKeyMap bool `json:"clear_callback_key_map"`
+	Timeout             string `json:"timeout"`
 	TaskTimeout        string `json:"task_timeout"`
 	PollInterval       string `json:"poll_interval"`
 	PollBatch          int    `json:"poll_batch"`
@@ -376,8 +409,10 @@ type AIAnalysisInput struct {
 	AuthHeader         string `json:"auth_header"`
 	SyncSubmitPath     string `json:"sync_submit_path"`
 	RepoLocatorMode    string `json:"repo_locator_mode"`
-	RepoGitURL         string `json:"repo_git_url"`
-	Environment        string `json:"environment"`
+	RepoGitURL         string             `json:"repo_git_url"`
+	// ServiceRepoMap 是「服务名 → git 地址」映射；用指针区分「未传」与「传空数组（清空）」。
+	ServiceRepoMap     *[]ServiceRepoItem `json:"service_repo_map,omitempty"`
+	Environment        string             `json:"environment"`
 	Priority           int    `json:"priority"`
 	AutoVerify         bool   `json:"auto_verify"`
 }
@@ -908,7 +943,10 @@ func (p aiSettingsPayload) applyCodeAnalysisTo(cfg *config.Config) {
 		SyncSubmitPath:  strings.TrimSpace(p.CodeAnalysis.SyncSubmitPath),
 		RepoLocatorMode: resolveRepoLocatorMode(p.CodeAnalysis.RepoLocatorMode),
 		RepoGitURL:      strings.TrimSpace(p.CodeAnalysis.RepoGitURL),
-		Environment:     strings.TrimSpace(p.CodeAnalysis.Environment),
+		ServiceRepoMap:   toServiceRepoMap(p.CodeAnalysis.ServiceRepoMap),
+		ServiceRepoIDMap: toServiceRepoIDMap(p.CodeAnalysis.ServiceRepoMap),
+		CallbackKeyMap:   toCallbackKeyMap(p.CodeAnalysis.CallbackKeyMap),
+		Environment:      strings.TrimSpace(p.CodeAnalysis.Environment),
 		Priority:        p.CodeAnalysis.Priority,
 		AutoVerify:      p.CodeAnalysis.AutoVerify,
 	}
@@ -938,6 +976,7 @@ func (p aiAnalysisPayload) view() AIAnalysisView {
 		CallbackURL:         p.CallbackURL,
 		CallbackTokenSet:    strings.TrimSpace(p.CallbackToken) != "",
 		CallbackTokenMasked: maskSecret(p.CallbackToken),
+		CallbackKeyMap:      toCallbackKeyView(p.CallbackKeyMap),
 		Timeout:             p.Timeout,
 		TaskTimeout:         p.TaskTimeout,
 		PollInterval:        p.PollInterval,
@@ -950,11 +989,65 @@ func (p aiAnalysisPayload) view() AIAnalysisView {
 		SyncSubmitPath:      p.SyncSubmitPath,
 		RepoLocatorMode:     p.RepoLocatorMode,
 		RepoGitURL:          p.RepoGitURL,
+		ServiceRepoMap:      p.ServiceRepoMap,
 		Environment:         p.Environment,
 		Priority:            p.Priority,
 		AutoVerify:          p.AutoVerify,
 		Configured:          p.Enabled && strings.TrimSpace(p.BaseURL) != "",
 	}
+}
+
+// toServiceRepoMap 把「服务名 → git 地址」数组转成查询用 map，并跳过 service / gitUrl 任一为空的行。
+func toServiceRepoMap(items []ServiceRepoItem) map[string]string {
+	out := make(map[string]string, len(items))
+	for _, it := range items {
+		s := strings.TrimSpace(it.Service)
+		g := strings.TrimSpace(it.GitURL)
+		if s != "" && g != "" {
+			out[s] = g
+		}
+	}
+	return out
+}
+
+// toServiceRepoIDMap 把「服务名 → repoId」数组转成查询用 map，跳过 service / repoId 任一为空的行。
+func toServiceRepoIDMap(items []ServiceRepoItem) map[string]string {
+	out := make(map[string]string, len(items))
+	for _, it := range items {
+		s := strings.TrimSpace(it.Service)
+		r := strings.TrimSpace(it.RepoID)
+		if s != "" && r != "" {
+			out[s] = r
+		}
+	}
+	return out
+}
+
+// toCallbackKeyMap 把回调密钥数组转成查询用 map（key_id → secret），跳过 key_id 为空的行。
+func toCallbackKeyMap(items []CallbackKeyItem) map[string]string {
+	out := make(map[string]string, len(items))
+	for _, it := range items {
+		k := strings.TrimSpace(it.KeyID)
+		s := strings.TrimSpace(it.Secret)
+		if k != "" && s != "" {
+			out[k] = s
+		}
+	}
+	return out
+}
+
+// toCallbackKeyView 把回调密钥数组转成对外展示形态（掩码 secret），供前端回显 key-id。
+func toCallbackKeyView(items []CallbackKeyItem) []CallbackKeyView {
+	out := make([]CallbackKeyView, 0, len(items))
+	for _, it := range items {
+		k := strings.TrimSpace(it.KeyID)
+		if k == "" {
+			continue
+		}
+		s := strings.TrimSpace(it.Secret)
+		out = append(out, CallbackKeyView{KeyID: k, Set: s != "", Masked: maskSecret(s)})
+	}
+	return out
 }
 
 // 协议常量与默认值（与 client 层同源，避免两处各写一套）。
@@ -1072,6 +1165,32 @@ func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayloa
 	out.APIKey = mergeSecret(old.APIKey, in.APIKey, in.ClearAPIKey)
 	out.CallbackToken = mergeSecret(old.CallbackToken, in.CallbackToken, in.ClearCallbackToken)
 
+	// 多密钥表：以 key_id 为主键做合并。
+	// - clear_callback_key_map=true → 清空整张表；
+	// - 否则若传了 callback_key_map（含 key_id 的行），按 key_id 覆盖：
+	//   新行带 secret 则更新；新行 key_id 已存在且 secret 为空 → 保留原 secret（不要求每次重填）。
+	if in.ClearCallbackKeyMap {
+		out.CallbackKeyMap = nil
+	} else if in.CallbackKeyMap != nil {
+		merged := make([]CallbackKeyItem, 0, len(*in.CallbackKeyMap))
+		oldByKey := make(map[string]string, len(old.CallbackKeyMap))
+		for _, k := range old.CallbackKeyMap {
+			oldByKey[strings.TrimSpace(k.KeyID)] = k.Secret
+		}
+		for _, k := range *in.CallbackKeyMap {
+			kid := strings.TrimSpace(k.KeyID)
+			if kid == "" {
+				continue
+			}
+			secret := strings.TrimSpace(k.Secret)
+			if secret == "" {
+				secret = oldByKey[kid] // 保留原 secret
+			}
+			merged = append(merged, CallbackKeyItem{KeyID: kid, Secret: secret})
+		}
+		out.CallbackKeyMap = merged
+	}
+
 	// 开放接口专有字段（非空即覆盖，与路径/时长同一套语义）。
 	if v := strings.TrimSpace(in.AuthHeader); v != "" {
 		out.AuthHeader = v
@@ -1084,6 +1203,9 @@ func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayloa
 	}
 	if v := strings.TrimSpace(in.RepoGitURL); v != "" {
 		out.RepoGitURL = v
+	}
+	if in.ServiceRepoMap != nil {
+		out.ServiceRepoMap = *in.ServiceRepoMap
 	}
 	if v := strings.TrimSpace(in.Environment); v != "" {
 		out.Environment = v
