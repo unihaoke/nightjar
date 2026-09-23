@@ -775,7 +775,8 @@ const (
 // 它把状态写在哪一个字段里没有统一约定；认不出状态就当"有结论了"，
 // 结论为空的情况由 CompleteByTask 再兜一道（转成失败并写明原因）。
 func ParseCallback(body []byte) (taskID, status, answer, errMsg string, err error) {
-	return ParseCallbackWithProtocol(body, ProtocolGeneric)
+	taskID, _, status, answer, errMsg, err = ParseCallbackWithProtocol(body, ProtocolGeneric)
+	return
 }
 
 // ParseCallbackWithProtocol 按协议解析回调正文。
@@ -784,19 +785,19 @@ func ParseCallback(body []byte) (taskID, status, answer, errMsg string, err erro
 // 它用 state 表示终态、用 summary + rootCause + patches 表示结论，
 // 既没有 answer 也没有 status/result。若沿用 generic 的宽松解析，
 // 结论会被判成"返回成功但没有内容"。
-func ParseCallbackWithProtocol(body []byte, protocol string) (taskID, status, answer, errMsg string, err error) {
+func ParseCallbackWithProtocol(body []byte, protocol string) (taskID, runID, status, answer, errMsg string, err error) {
 	if strings.EqualFold(strings.TrimSpace(protocol), ProtocolOpenAPIV1) {
 		return parseOpenAPICallback(body)
 	}
 	res := parseTaskResult(body)
 	if strings.TrimSpace(res.TaskID) == "" {
-		return "", "", "", "", errors.New("回调缺少 task_id，无法对上分析任务")
+		return "", "", "", "", "", errors.New("回调缺少 task_id，无法对上分析任务")
 	}
 	status = model.AIAnalysisTaskSucceeded
 	if res.Status == modelStatusFailed {
 		status = model.AIAnalysisTaskFailed
 	}
-	return res.TaskID, status, res.Answer, res.Error, nil
+	return res.TaskID, "", status, res.Answer, res.Error, nil
 }
 
 // openAPICallbackPayload 是开放接口的终态回调报文（文档 §6.4）。
@@ -816,15 +817,16 @@ type openAPICallbackPayload struct {
 }
 
 // parseOpenAPICallback 解析开放接口的回调。
-func parseOpenAPICallback(body []byte) (taskID, status, answer, errMsg string, err error) {
+func parseOpenAPICallback(body []byte) (taskID, runID, status, answer, errMsg string, err error) {
 	var raw openAPICallbackPayload
 	if e := json.Unmarshal(body, &raw); e != nil {
-		return "", "", "", "", errors.New("回调不是合法的开放接口报文：" + e.Error())
+		return "", "", "", "", "", errors.New("回调不是合法的开放接口报文：" + e.Error())
 	}
-	// 对号用 taskId（平台提交后存的就是它）；都没有就只能退回 runId。
+	// 对号优先 taskId（平台提交响应里存的就是它）；runId 单独带回，作为兜底对号手段。
 	taskID = defaultString(strings.TrimSpace(raw.TaskID), strings.TrimSpace(raw.RunID))
+	runID = strings.TrimSpace(raw.RunID)
 	if taskID == "" {
-		return "", "", "", "", errors.New("回调缺少 taskId/runId，无法对上分析任务")
+		return "", "", "", "", "", errors.New("回调缺少 taskId/runId，无法对上分析任务")
 	}
 	status = model.AIAnalysisTaskSucceeded
 	if normalizeOpenAPIStatus(raw.State, false) == modelStatusFailed {
@@ -845,5 +847,5 @@ func parseOpenAPICallback(body []byte) (taskID, status, answer, errMsg string, e
 	if strings.TrimSpace(answer) == "" && strings.TrimSpace(raw.Summary) != "" {
 		answer = strings.TrimSpace(raw.Summary)
 	}
-	return taskID, status, answer, strings.TrimSpace(raw.Error), nil
+	return taskID, runID, status, answer, strings.TrimSpace(raw.Error), nil
 }

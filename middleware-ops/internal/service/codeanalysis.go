@@ -331,7 +331,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 
 	// 提交响应里就带着结论：直接收尾，不进等待队列（同步模式必然走这里）。
 	if res.Status == modelStatusSucceeded {
-		completion, err := s.CompleteByTask(ctx, res.TaskID, model.AIAnalysisTaskSucceeded, res.Answer, "")
+		completion, err := s.CompleteByTask(ctx, res.TaskID, "", model.AIAnalysisTaskSucceeded, res.Answer, "")
 		if err != nil {
 			return nil, err
 		}
@@ -347,7 +347,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	// 提交响应说"还在处理"：异步模式下正常，等回调/轮询即可；
 	// 同步模式下没有回调/轮询通道，等于没把结论给出来，按失败收尾并给出出路。
 	if s.callMode() == callModeSync {
-		completion, err := s.CompleteByTask(ctx, res.TaskID, model.AIAnalysisTaskFailed, "",
+		completion, err := s.CompleteByTask(ctx, res.TaskID, "", model.AIAnalysisTaskFailed, "",
 			"同步模式下 AI 服务未在等待时间内返回结论（请改用异步回调模式，或确认该服务支持同步返回）")
 		if err != nil {
 			return nil, err
@@ -467,16 +467,27 @@ func (s *CodeAnalysisService) auditSubmit(ctx context.Context, out *SubmitOutcom
 // 幂等是关键：回调可能重复投递（AI 服务没收到 2xx 会重试），
 // 也可能与轮询撞在一起。仓储层的 Complete 用"当前状态必须是 submitted"做条件更新，
 // 第二个到达的调用者会拿到 applied=false，这里直接返回已存在的结论而不重复写报告。
-func (s *CodeAnalysisService) CompleteByTask(ctx context.Context, taskID, status, answer, errMsg string) (*Completion, error) {
+func (s *CodeAnalysisService) CompleteByTask(ctx context.Context, taskID, runID, status, answer, errMsg string) (*Completion, error) {
 	if s == nil || s.tasks == nil {
 		return nil, apperr.New(apperr.CodeInternal, "代码分析服务未装配")
 	}
 	task, err := s.tasks.GetByTaskID(ctx, taskID)
 	if err != nil {
-		if repository.EnsureNotFound(err) {
+		if !repository.EnsureNotFound(err) {
+			return nil, apperr.Wrap(apperr.CodeInternal, err)
+		}
+		// 开放接口下 runId 是提交响应/回调/轮询共用的稳定标识；部分实现里回调的 taskId
+		// 与提交响应返回的不一致，这里用 runId 再对一次号，避免误报"任务不存在"。
+		if strings.TrimSpace(runID) == "" {
 			return nil, apperr.New(apperr.CodeNotFound, "分析任务不存在："+taskID)
 		}
-		return nil, apperr.Wrap(apperr.CodeInternal, err)
+		task, err = s.tasks.GetByRunID(ctx, runID)
+		if err != nil {
+			if repository.EnsureNotFound(err) {
+				return nil, apperr.New(apperr.CodeNotFound, "分析任务不存在："+taskID)
+			}
+			return nil, apperr.Wrap(apperr.CodeInternal, err)
+		}
 	}
 	completion := &Completion{
 		EventID:     task.EventID,
@@ -492,7 +503,7 @@ func (s *CodeAnalysisService) CompleteByTask(ctx context.Context, taskID, status
 		status = model.AIAnalysisTaskFailed
 		errMsg = "AI 服务返回成功但没有结论内容"
 	}
-	applied, err := s.tasks.Complete(ctx, taskID, status, answer, errMsg, time.Now().UTC())
+	applied, err := s.tasks.Complete(ctx, task.TaskID, status, answer, errMsg, time.Now().UTC())
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, err)
 	}
@@ -625,10 +636,10 @@ func (s *CodeAnalysisService) RefreshTask(ctx context.Context, task model.AIAnal
 	}
 	switch res.Status {
 	case modelStatusSucceeded:
-		completion, err := s.CompleteByTask(ctx, task.TaskID, model.AIAnalysisTaskSucceeded, res.Answer, "")
+		completion, err := s.CompleteByTask(ctx, task.TaskID, "", model.AIAnalysisTaskSucceeded, res.Answer, "")
 		return completion, true, err
 	case modelStatusFailed:
-		completion, err := s.CompleteByTask(ctx, task.TaskID, model.AIAnalysisTaskFailed, "",
+		completion, err := s.CompleteByTask(ctx, task.TaskID, "", model.AIAnalysisTaskFailed, "",
 			defaultString(res.Error, "AI 服务报告分析失败"))
 		return completion, true, err
 	default:

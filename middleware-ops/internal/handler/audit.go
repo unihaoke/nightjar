@@ -249,12 +249,12 @@ func (h *Handler) AIAnalysisCallback(c *gin.Context) {
 	if h.deps.Config != nil {
 		protocol = h.deps.Config.AIAnalysis.Protocol
 	}
-	taskID, status, answer, errMsg, err := service.ParseCallbackWithProtocol(body, protocol)
+	taskID, runID, status, answer, errMsg, err := service.ParseCallbackWithProtocol(body, protocol)
 	if err != nil {
 		response.Fail(c, apperr.New(apperr.CodeInvalidParam, err.Error()))
 		return
 	}
-	if err := h.deps.LogAlertWorker.CompleteTask(c.Request.Context(), taskID, status, answer, errMsg); err != nil {
+	if err := h.deps.LogAlertWorker.CompleteTask(c.Request.Context(), taskID, runID, status, answer, errMsg); err != nil {
 		response.Fail(c, err)
 		return
 	}

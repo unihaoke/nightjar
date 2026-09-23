@@ -211,11 +211,11 @@ func (w *LogAlertWorker) ProcessEvent(ctx context.Context, eventID int64) error 
 // CompleteTask 是**回调入口**：AI 服务把结论送回来时调用。
 //
 // status 取 succeeded / failed；answer 为结论原文；errMsg 为 AI 侧的失败原因。
-func (w *LogAlertWorker) CompleteTask(ctx context.Context, taskID, status, answer, errMsg string) error {
+func (w *LogAlertWorker) CompleteTask(ctx context.Context, taskID, runID, status, answer, errMsg string) error {
 	if w == nil || w.analysis == nil {
 		return apperr.New(apperr.CodeInternal, "AI 分析能力未装配")
 	}
-	completion, err := w.analysis.CompleteByTask(ctx, taskID, status, answer, errMsg)
+	completion, err := w.analysis.CompleteByTask(ctx, taskID, runID, status, answer, errMsg)
 	if err != nil {
 		return err
 	}

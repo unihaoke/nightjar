@@ -172,7 +172,7 @@ func TestOpenAPICallback(t *testing.T) {
 		"patches":[{"filePath":"service/order.go","rationale":"增加空值保护"}],
 		"reportUrl":"https://console.x/r/rep_6"
 	}`)
-	taskID, status, answer, errMsg, err := ParseCallbackWithProtocol(body, ProtocolOpenAPIV1)
+	taskID, _, status, answer, errMsg, err := ParseCallbackWithProtocol(body, ProtocolOpenAPIV1)
 	if err != nil {
 		t.Fatalf("解析回调失败: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestOpenAPICallback(t *testing.T) {
 	}
 
 	// 只有 summary 没有 rootCause 时也不能丢结论。
-	_, _, answer2, _, err := ParseCallbackWithProtocol(
+	_, _, _, answer2, _, err := ParseCallbackWithProtocol(
 		[]byte(`{"taskId":"task_7","state":"succeeded","summary":"连接池耗尽"}`), ProtocolOpenAPIV1)
 	if err != nil {
 		t.Fatalf("解析回调失败: %v", err)
@@ -200,7 +200,7 @@ func TestOpenAPICallback(t *testing.T) {
 	}
 
 	// 失败终态要带出原因。
-	if _, st, _, msg, _ := ParseCallbackWithProtocol(
+	if _, _, st, _, msg, _ := ParseCallbackWithProtocol(
 		[]byte(`{"taskId":"task_8","state":"failed","error":"仓库定位失败"}`), ProtocolOpenAPIV1); st != "failed" || msg != "仓库定位失败" {
 		t.Fatalf("失败回调解析异常：status=%q err=%q", st, msg)
 	}

@@ -39,6 +39,15 @@ func (r *AIAnalysisTaskRepository) GetByTaskID(ctx context.Context, taskID strin
 	return &item, nil
 }
 
+// GetByRunID 按运行 ID 查询（开放接口下 runId 在提交响应/回调/轮询间是同一稳定标识）。
+func (r *AIAnalysisTaskRepository) GetByRunID(ctx context.Context, runID string) (*model.AIAnalysisTask, error) {
+	var item model.AIAnalysisTask
+	if err := r.withCtx(ctx).Where("run_id = ?", runID).First(&item).Error; err != nil {
+		return nil, wrap(err, "get ai analysis task by run id")
+	}
+	return &item, nil
+}
+
 // GetByEvent 取某条事件最近一次任务（页面展示"这条告警的 AI 任务在哪一步"）。
 func (r *AIAnalysisTaskRepository) GetByEvent(ctx context.Context, eventID int64) (*model.AIAnalysisTask, error) {
 	var item model.AIAnalysisTask
