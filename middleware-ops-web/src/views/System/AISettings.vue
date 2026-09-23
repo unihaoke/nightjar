@@ -185,6 +185,14 @@ async function load(): Promise<void> {
         call_mode: ca.call_mode || 'async',
         sync_timeout: ca.sync_timeout || '5m',
         notify_on_submit: ca.notify_on_submit ?? false,
+        protocol: ca.protocol || 'generic',
+        auth_header: ca.auth_header || '',
+        sync_submit_path: ca.sync_submit_path || '',
+        repo_locator_mode: ca.repo_locator_mode || 'service',
+        repo_git_url: ca.repo_git_url || '',
+        environment: ca.environment || '',
+        priority: ca.priority ?? 0,
+        auto_verify: ca.auto_verify ?? false,
       })
       analysisKeyMasked.api_key = ca.api_key_masked || ''
       analysisKeyMasked.callback_token = ca.callback_token_masked || ''
@@ -228,7 +236,22 @@ const codeAnalysis = reactive({
   call_mode: 'async',
   sync_timeout: '5m',
   notify_on_submit: false,
+  protocol: 'generic',
+  auth_header: '',
+  sync_submit_path: '',
+  repo_locator_mode: 'service',
+  repo_git_url: '',
+  environment: '',
+  priority: 0,
+  auto_verify: false,
 })
+
+/** 是否走「AI 代码分析接口文档 v1」协议：决定下面哪些字段需要暴露。 */
+const isOpenAPI = computed(() => codeAnalysis.protocol === 'openapi_v1')
+
+/** AI 代码分析的自测状态与结果（与两个提供方、全局测试各自独立，互不覆盖）。 */
+const caTesting = ref(false)
+const caTestResult = ref<AITestResult | null>(null)
 
 /** 两把密钥的草稿（明文永不回显，只用于"这次要不要改"）。 */
 const analysisKeyDraft = reactive({ api_key: '', callback_token: '' })
@@ -267,6 +290,14 @@ function buildCodeAnalysis(): AISettingsInput['code_analysis'] {
     call_mode: codeAnalysis.call_mode,
     sync_timeout: codeAnalysis.sync_timeout,
     notify_on_submit: codeAnalysis.notify_on_submit,
+    protocol: codeAnalysis.protocol,
+    auth_header: codeAnalysis.auth_header,
+    sync_submit_path: codeAnalysis.sync_submit_path,
+    repo_locator_mode: codeAnalysis.repo_locator_mode,
+    repo_git_url: codeAnalysis.repo_git_url,
+    environment: codeAnalysis.environment,
+    priority: Number(codeAnalysis.priority) || 0,
+    auto_verify: codeAnalysis.auto_verify,
   }
   if (analysisKeyDraft.api_key.trim()) {
     payload.api_key = analysisKeyDraft.api_key.trim()
@@ -350,6 +381,28 @@ async function save(): Promise<void> {
     toastError(error)
   } finally {
     saving.value = false
+  }
+}
+
+/**
+ * 自测「AI 代码分析」外部服务的连通性（不保存）。
+ *
+ * 密钥只在本次真的填了新值时才下发：留空表示沿用已存密钥，
+ * 与保存的三态语义一致——否则测的是一把空 key，必然 401。
+ */
+async function testCodeAnalysis(): Promise<void> {
+  caTesting.value = true
+  caTestResult.value = null
+  try {
+    const payload: AISettingsInput['code_analysis'] = { ...buildCodeAnalysis() }
+    if (analysisKeyDraft.api_key.trim()) {
+      payload.api_key = analysisKeyDraft.api_key.trim()
+    }
+    caTestResult.value = await settingApi.testCodeAnalysis(payload)
+  } catch (error) {
+    toastError(error)
+  } finally {
+    caTesting.value = false
   }
 }
 
@@ -639,6 +692,7 @@ onMounted(async () => {
     <div class="card">
       <h3 class="card-title">
         <span>AI 代码分析</span>
+        <el-tag v-if="!canWrite" size="small" type="info" effect="plain">只读：缺少 system:config:write</el-tag>
         <span class="muted head-note">日志告警用；平台是唯一来源，保存即生效</span>
       </h3>
       <p class="field-hint">
@@ -722,6 +776,27 @@ onMounted(async () => {
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12">
+            <el-form-item label="对接协议">
+              <el-select v-model="codeAnalysis.protocol" class="mobile-block">
+                <el-option label="通用协议（question / task_id）" value="generic" />
+                <el-option label="开放接口 v1（repoLocator / stacktrace）" value="openapi_v1" />
+              </el-select>
+              <p class="field-hint">
+                开放接口 v1 指《AI 代码分析接口文档 v1》：
+                <span class="mono">X-API-Key</span> 鉴权、按
+                <span class="mono">repoLocator</span> 定位仓库、
+                <span class="mono">stacktrace</span> 为必填主输入。
+                切换时「提交/查询路径」若还是通用协议的默认值会自动改写。
+              </p>
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :xs="24" :sm="12">
+            <el-form-item label="鉴权头">
+              <el-input v-model="codeAnalysis.auth_header" class="mono" placeholder="X-API-Key" />
+              <p class="field-hint">留空表示 Authorization: Bearer &lt;key&gt;；开放接口请填 X-API-Key。</p>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12">
             <el-form-item label="提交路径">
               <el-input v-model="codeAnalysis.submit_path" class="mono" placeholder="/v1/analyses" />
             </el-form-item>
@@ -729,6 +804,52 @@ onMounted(async () => {
           <el-col :xs="24" :sm="12">
             <el-form-item label="查询路径">
               <el-input v-model="codeAnalysis.query_path" class="mono" placeholder="/v1/analyses/{task_id}" />
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :xs="24" :sm="12">
+            <el-form-item label="同步提交路径">
+              <el-input v-model="codeAnalysis.sync_submit_path" class="mono" placeholder="/api/v1/openapi/analyze" />
+              <p class="field-hint">开放接口的同步与异步是两个端点，仅 call_mode=sync 时使用。</p>
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :xs="24" :sm="12">
+            <el-form-item label="仓库定位方式">
+              <el-select v-model="codeAnalysis.repo_locator_mode" class="mobile-block">
+                <el-option label="用服务名当 host（推荐）" value="service" />
+                <el-option label="固定 git 地址（单仓）" value="git_url" />
+              </el-select>
+              <p class="field-hint">
+                用服务名时，需要在 AI 服务控制台给仓库配好 hostPatterns / keywords。
+              </p>
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI && codeAnalysis.repo_locator_mode === 'git_url'" :xs="24" :sm="12">
+            <el-form-item label="仓库 git 地址">
+              <el-input v-model="codeAnalysis.repo_git_url" class="mono" placeholder="https://git.x/order.git" />
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :xs="12" :sm="6">
+            <el-form-item label="环境标识">
+              <el-input v-model="codeAnalysis.environment" class="mono" placeholder="prod" />
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :xs="12" :sm="6">
+            <el-form-item label="任务优先级">
+              <el-input-number
+                v-model="codeAnalysis.priority"
+                :min="0"
+                :max="999"
+                controls-position="right"
+                class="mobile-block"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col v-if="isOpenAPI" :xs="24" :sm="12">
+            <el-form-item label="沙箱验证">
+              <div class="row">
+                <el-switch v-model="codeAnalysis.auto_verify" active-text="提交时要求验证" />
+                <span class="muted">关闭表示不提交该字段，按服务端默认执行</span>
+              </div>
             </el-form-item>
           </el-col>
           <el-col :span="24">
@@ -739,7 +860,18 @@ onMounted(async () => {
                 placeholder="如 http://platform.example.com；反向代理后填对外域名"
               />
               <p class="field-hint">
-                AI 服务要能访问到这个地址；留空则不带 callback_url，结论只由轮询兜底。
+                <!-- 通用协议下留空可以只靠轮询；开放接口把 callbackUrl 定为异步模式的必填字段，
+                     留空会被服务端直接 400，所以这里的措辞必须按协议区分。 -->
+                <template v-if="isOpenAPI">
+                  开放接口的异步模式<b>必填</b>：留空会被服务端拒绝（HTTP 400）。
+                </template>
+                <template v-else>
+                  AI 服务要能访问到这个地址；留空则不带 callback_url，结论只由轮询兜底。
+                </template>
+                <template v-if="isOpenAPI">
+                  AI 服务要能访问到这个地址；需要自带校验参数时用 <span class="mono">{path}</span> 占位，例如
+                  <span class="mono">https://platform.example.com/{path}?token=xxx</span>。
+                </template>
               </p>
             </el-form-item>
           </el-col>
@@ -797,6 +929,38 @@ onMounted(async () => {
           </el-col>
         </el-row>
       </el-form>
+
+      <!-- 自测结果就地展示：连通性自检的目的就是把原因原样给配置人看，
+           而不是统一成"服务异常"——地址不通、密钥错、仓库没注册三种原因的处理方式完全不同。 -->
+      <el-alert
+        v-if="caTestResult"
+        class="mb-top"
+        :type="caTestResult.ok ? 'success' : 'error'"
+        :closable="false"
+        show-icon
+        :title="caTestResult.ok ? `连接成功：${caTestResult.engine}` : `连接失败：${caTestResult.engine}`"
+      >
+        <p class="field-hint">{{ caTestResult.message }}</p>
+        <p class="field-hint mono">耗时 {{ caTestResult.latency_ms }} ms</p>
+      </el-alert>
+
+      <!-- 保存按钮必须在这张卡片里就地出现：原来只有上方「AI Key 设置」卡片底部有，
+           填完往下滚动看不到，会以为改了没生效（实际没点保存就不会落库）。 -->
+      <div v-if="canWrite" class="row actions">
+        <el-button
+          :icon="'Connection'"
+          :loading="caTesting"
+          :disabled="!codeAnalysis.base_url"
+          @click="testCodeAnalysis"
+        >
+          测试连接
+        </el-button>
+        <el-button type="primary" :loading="saving" :icon="'Check'" @click="save">保存 AI 代码分析</el-button>
+      </div>
+      <p class="muted foot">
+        与「AI Key 设置」、额度共用一次保存请求（<span class="mono">PUT /api/settings/ai</span>），
+        密钥留空表示不修改。
+      </p>
     </div>
 
     <!-- 额度与消费 -->

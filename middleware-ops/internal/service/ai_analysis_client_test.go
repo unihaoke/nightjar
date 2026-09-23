@@ -76,7 +76,8 @@ func TestSubmitAndQueryAgainstFakeService(t *testing.T) {
 	}
 
 	// ② 查询：{task_id} 必须被替换，结论要能取回来。
-	q, err := client.Query(context.Background(), "t-1")
+	// generic 协议没有 runId，第二个参数传空串。
+	q, err := client.Query(context.Background(), "t-1", "")
 	if err != nil {
 		t.Fatalf("查询失败: %v", err)
 	}

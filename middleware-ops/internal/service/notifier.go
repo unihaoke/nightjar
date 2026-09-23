@@ -246,6 +246,11 @@ type AlertNotification struct {
 	Level     string              `json:"level"`
 	AlertID   int64               `json:"alert_id"`
 	DetailURL string              `json:"detail_url"`
+	// ReportURL 为外部 AI 服务给出的完整报告地址（日志告警的 AI 代码分析才有）。
+	//
+	// 为什么要单独一个字段而不是塞进 Fields：卡片里它要变成一个可点的按钮，
+	// 而 Fields 只能渲染成两列文本——链接放进去在手机上是一串点不动的长 URL。
+	ReportURL string              `json:"report_url,omitempty"`
 	Fields    []NotificationField `json:"fields,omitempty"`
 	// Sections 是正文之后逐段追加的长文本块（错误上下文、堆栈等）。
 	//
@@ -377,6 +382,8 @@ func (s *NotifierService) NotifyLogEvent(
 		strings.ToUpper(defaultString(event.Severity, "error")), event.ServiceName, logRuleName(rule))
 	// 正文放"到底报了什么错"：指纹是哈希、不可读，真正要看的是消息原文。
 	content, sections := logErrorBlocks(event)
+	// reportURL 由 AI 结论带出（没有结论时为空，卡片就只有一个"查看详情"按钮）。
+	reportURL := ""
 	fields := []NotificationField{
 		// 整行显示：规则名 + 命中条件 + 规则 ID，收消息的人据此判断"要不要改规则"。
 		{Key: "命中规则", Value: logRuleValue(rule)},
@@ -411,6 +418,13 @@ func (s *NotifierService) NotifyLogEvent(
 				Key: "分析引擎", Value: fmt.Sprintf("%s，置信度 %.0f%%", engine, brief.Confidence*100), Short: true,
 			})
 		}
+		// 完整报告 Markdown：卡片上只给截断后的片段，全文留给报告页。
+		// 有了它，值班同学在 IM 里就能看到"改哪个文件、为什么"，不必先跳一次平台。
+		if block := trimLogBlock(brief.Markdown, 20, 1200); block != "" {
+			sections = append(sections, "**AI 分析报告**：\n"+block)
+		}
+		// 报告地址单独走按钮（见 AlertNotification.ReportURL）。
+		reportURL = strings.TrimSpace(brief.ReportURL)
 	}
 
 	var failed []string
@@ -421,7 +435,7 @@ func (s *NotifierService) NotifyLogEvent(
 		err := s.sendSync(ctx, AlertNotification{
 			Channel: channel, Title: title, Content: content,
 			Level: defaultString(event.Severity, "error"), AlertID: event.ID,
-			DetailURL: detailURL, Fields: fields, Sections: sections,
+			DetailURL: detailURL, ReportURL: reportURL, Fields: fields, Sections: sections,
 		})
 		if err != nil {
 			failed = append(failed, channel+"："+err.Error())
@@ -601,7 +615,18 @@ func (s *NotifierService) sendFeishu(ctx context.Context, n AlertNotification) e
 		{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "查看详情 / 确认"},
 			"type": "primary", "url": n.DetailURL},
 	}
+	// 完整报告按钮：报告在外部 AI 服务那边（补丁、验证结果、完整 Markdown 都在上面），
+	// 卡片里放不下，必须给一个能点进去的入口，否则"看了结论却拿不到细节"。
+	if n.ReportURL != "" {
+		actions = append(actions, map[string]any{
+			"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "查看完整报告"},
+			"type": "default", "url": n.ReportURL,
+		})
+	}
 	note := "IM 卡片仅做通知与确认；高危操作请前往平台审批后执行"
+	if n.ReportURL != "" {
+		note = "AI 结论与补丁仅供参考，请人工复核后决策；高危操作需回平台走审批"
+	}
 	if n.Diagnosis != nil {
 		note = "诊断结论仅供参考，请人工复核后决策；高危操作需回平台走审批"
 	}
@@ -842,6 +867,10 @@ func (n AlertNotification) renderText() string {
 		}
 	}
 	b.WriteString(diagnosisText(n.Diagnosis))
+	// 无卡片渠道放链接而不是按钮（企微/钉钉/邮件都支持 markdown 链接或直接可点的 URL）。
+	if n.ReportURL != "" {
+		b.WriteString("\n\n完整报告：" + n.ReportURL)
+	}
 	return b.String()
 }
 

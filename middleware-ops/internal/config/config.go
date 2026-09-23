@@ -97,6 +97,36 @@ type AIAnalysisConfig struct {
 	// 结论到达后再发一条带结论的。默认关闭：一条告警变成两条消息容易打扰，
 	// 但对"告警必须秒到"的团队可以打开。
 	NotifyOnSubmit bool `mapstructure:"notify_on_submit"`
+
+	// ---- 以下为「开放接口 v1」协议（Protocol=openapi_v1）专用字段 ----
+	//
+	// 两套协议的字段几乎不重叠，因此不做"互相兼容的猜测"，而是显式开关 + 独立字段：
+	// generic 的老配置继续按老形状发，切到 openapi_v1 后才启用下面这些。
+
+	// Protocol 是对接协议，取值 generic（默认）| openapi_v1：
+	//   - generic：平台自研形状（question / service / task_id / callback_url + Bearer 鉴权）；
+	//   - openapi_v1：《AI 代码分析接口文档 v1》的形状：X-API-Key 鉴权、repoLocator 定位仓库、
+	//     stacktrace 为必填主输入、终态回 rootCause / patches / markdown / reportUrl。
+	Protocol string `mapstructure:"protocol"`
+	// AuthHeader 指定 API Key 放在哪个请求头里。
+	// 为空表示 Authorization: Bearer <key>（generic 的历史行为）；
+	// 填 X-API-Key 时原样带值、不加 Bearer 前缀（开放接口的要求）。
+	AuthHeader string `mapstructure:"auth_header"`
+	// SyncSubmitPath 为同步模式（call_mode=sync）的提交路径；留空时按 Protocol 推导。
+	// 开放接口的同步与异步是两个不同端点，必须分开配。
+	SyncSubmitPath string `mapstructure:"sync_submit_path"`
+	// RepoLocatorMode 决定开放接口下如何定位仓库：
+	//   - service（默认）：把服务名当作 repoLocator.host（要求 AI 侧配了 hostPatterns）；
+	//   - git_url：固定用 RepoGitURL 作为 repoLocator.gitUrl（单仓场景）。
+	RepoLocatorMode string `mapstructure:"repo_locator_mode"`
+	// RepoGitURL 为 RepoLocatorMode=git_url 时使用的仓库地址。
+	RepoGitURL string `mapstructure:"repo_git_url"`
+	// Environment 为随任务提交的环境标识（如 prod）；空表示不提交该字段。
+	Environment string `mapstructure:"environment"`
+	// Priority 为任务优先级；0 表示不提交该字段（由服务端决定）。
+	Priority int `mapstructure:"priority"`
+	// AutoVerify 为 true 时要求服务端跑沙箱验证；false 表示不提交该字段。
+	AutoVerify bool `mapstructure:"auto_verify"`
 }
 
 // KafkaConfig 是日志总线配置（「日志集成」：Filebeat → Kafka → 平台消费）。

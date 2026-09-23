@@ -325,6 +325,9 @@ CREATE TABLE IF NOT EXISTS ai_analysis_tasks (
     event_id         BIGINT,
     service_name     VARCHAR(128),
     task_id          VARCHAR(128) NOT NULL,
+    -- run_id：开放接口（openapi_v1）的运行 ID。回调对号用 task_id，
+    -- 而轮询与报告地址按 run_id 组织（GET /api/v1/runs/{run_id}），两者都要存。
+    run_id           VARCHAR(128),
     status           VARCHAR(16) DEFAULT 'submitted',
     question         TEXT,
     answer           TEXT,
@@ -334,6 +337,7 @@ CREATE TABLE IF NOT EXISTS ai_analysis_tasks (
     CONSTRAINT uni_ai_analysis_tasks_task_id UNIQUE (task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_event_id ON ai_analysis_tasks(event_id);
+CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_run_id ON ai_analysis_tasks(run_id);
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_service_name ON ai_analysis_tasks(service_name);
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_status ON ai_analysis_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_ai_analysis_tasks_deadline_at ON ai_analysis_tasks(deadline_at);
@@ -460,7 +464,9 @@ CREATE TABLE IF NOT EXISTS ai_code_analyses (
     cost_tokens     INTEGER,
     outbound_ok     BOOLEAN DEFAULT FALSE,
     -- 本次分析所用的代码版本（短 sha）：行号会随代码演进失效，事后复核必须能对上版本。
-    repo_revision   VARCHAR(64)
+    repo_revision   VARCHAR(64),
+    -- 外部 AI 服务的完整报告地址（开放接口的 reportUrl），平台只存结论摘要。
+    report_url      VARCHAR(512)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_code_analyses_event_id ON ai_code_analyses(event_id);
 CREATE INDEX IF NOT EXISTS idx_ai_code_analyses_event_key ON ai_code_analyses(event_key);

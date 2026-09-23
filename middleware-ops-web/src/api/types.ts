@@ -845,6 +845,8 @@ export interface CodeAnalysis {
   outbound_ok: boolean
   /** 本次分析所用的代码版本（短 sha）：行号会随代码演进失效，复核时要能对上版本。 */
   repo_revision: string
+  /** 外部 AI 服务的完整报告地址（开放接口才有，平台上只存结论摘要）。 */
+  report_url: string
   created_at: string
 }
 
@@ -978,6 +980,21 @@ export interface AIAnalysisSetting {
   /** 同步模式下的等待上限，形如 "5m"；仅 call_mode=sync 时生效。 */
   sync_timeout: string
   notify_on_submit: boolean
+  /** 对接协议：generic（平台自研形状）| openapi_v1（AI 代码分析接口文档 v1）。 */
+  protocol: string
+  /** API Key 的请求头名；空 = Authorization: Bearer，开放接口填 X-API-Key。 */
+  auth_header: string
+  /** 同步模式的提交路径（开放接口的同步与异步是两个端点）。 */
+  sync_submit_path: string
+  /** 仓库定位方式：service（用服务名当 host）| git_url（固定 git 地址）。 */
+  repo_locator_mode: string
+  repo_git_url: string
+  /** 随任务提交的环境标识，如 prod。 */
+  environment: string
+  /** 任务优先级，0 表示不提交该字段。 */
+  priority: number
+  /** 是否要求服务端跑沙箱验证。 */
+  auto_verify: boolean
   /** 是否真的具备调用条件（开关已开且地址非空）。 */
   configured: boolean
 }
@@ -1002,6 +1019,15 @@ export interface AIAnalysisInput {
   /** 同步模式下的等待上限，形如 "5m"。 */
   sync_timeout: string
   notify_on_submit: boolean
+  /** 对接协议：generic | openapi_v1。 */
+  protocol: string
+  auth_header: string
+  sync_submit_path: string
+  repo_locator_mode: string
+  repo_git_url: string
+  environment: string
+  priority: number
+  auto_verify: boolean
 }
 
 /** AI 设置视图（GET /api/settings/ai）。 */

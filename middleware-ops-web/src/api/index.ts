@@ -1,6 +1,7 @@
 /** 接口封装：与设计文档 8.2 接口总览一一对应。 */
 import { authHeaders, get, post, postSlow, put, del, withSignal, type PageResult } from './http'
 import type {
+  AIAnalysisInput,
   AISettingsInput,
   AISettingsView,
   AIProviderTestInput,
@@ -435,6 +436,8 @@ export const settingApi = {
   testAI: () => post<AITestResult>('/api/settings/ai/test'),
   /** 按提供方自测连接（不保存）：用当前合并配置验证调用是否正确。 */
   testAIProvider: (payload: AIProviderTestInput) => post<AITestResult>('/api/settings/ai/test-provider', payload),
+  /** 自测「AI 代码分析」外部服务连通性（不保存）：密钥留空沿用已存密钥。 */
+  testCodeAnalysis: (payload: AIAnalysisInput) => post<AITestResult>('/api/settings/ai/test-code-analysis', payload),
   /** 读取通知渠道设置。 */
   notify: () => get<NotifySettingsView>('/api/settings/notify'),
   /** 保存通知渠道设置：密钥/口令留空表示不修改。 */

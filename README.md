@@ -212,6 +212,7 @@ AI 不做苦力活：日志采集（目标机 Filebeat）、指标采集、规�
 **「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-ONBOARD.md`](docs/GUIDE-ONBOARD.md)（以某业务系统为例）**，
 **「集成中心」的字段对照与落地方式见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)**，
 **「日志集成（Filebeat → 平台 Kafka）」的拓扑、自检与配置见 [`docs/LOG_INTEGRATION.md`](docs/LOG_INTEGRATION.md)**，
+**「把日志告警的 AI 分析接到《AI 代码分析接口文档 v1》」的配置与验收清单见 [`docs/AI_ANALYSIS_OPENAPI.md`](docs/AI_ANALYSIS_OPENAPI.md)**，
 **「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**。
 
 ---

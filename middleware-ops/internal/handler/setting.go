@@ -96,6 +96,54 @@ func (h *Handler) TestAIProviderSettings(c *gin.Context) {
 	})
 }
 
+// testCodeAnalysisInput 是「AI 代码分析」自测连接的请求体（不保存，仅验证当前填写）。
+//
+// 只收探测真正需要的字段：路径、鉴权头、协议与定位方式决定报文形状，
+// 密钥走「已存 + 本次填写」的合并语义（与保存一致）。
+type testCodeAnalysisInput struct {
+	Enabled         bool   `json:"enabled"`
+	BaseURL         string `json:"base_url"`
+	APIKey          string `json:"api_key"`
+	Protocol        string `json:"protocol"`
+	AuthHeader      string `json:"auth_header"`
+	SubmitPath      string `json:"submit_path"`
+	SyncSubmitPath  string `json:"sync_submit_path"`
+	RepoLocatorMode string `json:"repo_locator_mode"`
+	RepoGitURL      string `json:"repo_git_url"`
+	Priority        int    `json:"priority"`
+	AutoVerify      bool   `json:"auto_verify"`
+}
+
+// TestCodeAnalysisSettings 自测「AI 代码分析」外部服务的连通性，不落库、不改内存配置。
+//
+// 失败返回 HTTP 200 + ok=false + message（原因），而不是 500：自检的目的就是把原因原样展示。
+func (h *Handler) TestCodeAnalysisSettings(c *gin.Context) {
+	var in testCodeAnalysisInput
+	if !bindJSON(c, &in) {
+		return
+	}
+	ok, engineName, message, latencyMs, err := h.deps.Settings.TestCodeAnalysis(c.Request.Context(), service.AIAnalysisInput{
+		Enabled:         in.Enabled,
+		BaseURL:         in.BaseURL,
+		APIKey:          in.APIKey,
+		Protocol:        in.Protocol,
+		AuthHeader:      in.AuthHeader,
+		SubmitPath:      in.SubmitPath,
+		SyncSubmitPath:  in.SyncSubmitPath,
+		RepoLocatorMode: in.RepoLocatorMode,
+		RepoGitURL:      in.RepoGitURL,
+		Priority:        in.Priority,
+		AutoVerify:      in.AutoVerify,
+	})
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{
+		"ok": ok, "engine": engineName, "message": message, "latency_ms": latencyMs,
+	})
+}
+
 // NotifySettings 读取通知渠道设置（webhook 只回掩码，secret/口令只回 bool）。
 func (h *Handler) NotifySettings(c *gin.Context) {
 	data, err := h.deps.Settings.NotifySettings(c.Request.Context())

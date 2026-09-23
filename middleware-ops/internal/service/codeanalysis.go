@@ -14,6 +14,7 @@ import (
 	"middleware-ops/internal/config"
 	"middleware-ops/internal/model"
 	"middleware-ops/internal/repository"
+	"middleware-ops/internal/utils"
 )
 
 // engineGuard 抽象成本记账，避免代码分析服务直接依赖护栏实现细节。
@@ -235,6 +236,9 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		serviceName = in.ServiceName
 		stack       = in.Stacktrace
 		message     = in.Message
+		// eventSig 为该事件的错误指纹：同一次错误重复触发时指纹不变，
+		// 用作开放接口的幂等键，避免告警风暴把同一条错误反复分析。
+		eventSig string
 	)
 	if in.EventID > 0 {
 		item, err := s.events.Get(ctx, in.EventID)
@@ -246,7 +250,10 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		}
 		serviceName = item.ServiceName
 		stack = item.RawStacktrace
-		message = item.ErrorSignature
+		// 取 ErrorMessage 而不是 ErrorSignature：后者是聚合用的哈希，
+		// 把它当"错误信息"送出去，AI 侧看到的是一串没有语义的指纹。
+		message = item.ErrorMessage
+		eventSig = item.ErrorSignature
 	}
 	if strings.TrimSpace(stack) == "" && strings.TrimSpace(message) == "" {
 		return nil, apperr.New(apperr.CodeInvalidParam, "必须提供 event_id 或错误信息/堆栈")
@@ -273,7 +280,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	// ② 脱敏：错误信息与堆栈先过一遍脱敏器，再拼成问题。
 	question := s.buildQuestion(serviceName, message, stack)
 
-	// ③ 提交：平台先生成 task_id（幂等键），AI 服务不认就以它返回的为准。
+	// ③ 提交：平台先生成 task_id（本地主键），AI 服务不认就以它返回的为准。
 	taskID := newAnalysisTaskID(in.EventID)
 	deadline := time.Now().UTC().Add(s.taskTimeout())
 	client := s.currentClient()
@@ -281,7 +288,17 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		return nil, apperr.New(apperr.CodeOutboundDenied,
 			"未配置外部 AI 分析服务：请在「AI 设置 → AI 代码分析」中填写服务地址并启用")
 	}
-	res, err := s.submitAnalysis(ctx, client, taskID, serviceName, question, in.EventID)
+	// 开放接口的 stacktrace / logs 是独立字段，必须各自脱敏后再送出，
+	// 不能只脱敏拼好的 question（否则等于把原始堆栈外发了）。
+	res, err := s.submitAnalysis(ctx, client, submitRequest{
+		TaskID:     taskID,
+		IdemKey:    analysisIdempotencyKey(in.EventID, eventSig, serviceName, message, stack),
+		Service:    serviceName,
+		Question:   question,
+		Stacktrace: s.redact(stack),
+		Message:    s.redact(message),
+		EventID:    in.EventID,
+	})
 	if err != nil {
 		// 提交/等待阶段就失败（含同步模式超时、网络不可达）：写一条失败任务，
 		// 让事件明确标 failed 并带上原因，而不是永远停在"分析中"。
@@ -296,6 +313,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		EventID:     in.EventID,
 		ServiceName: serviceName,
 		TaskID:      res.TaskID,
+		RunID:       res.RunID,
 		Status:      model.AIAnalysisTaskSubmitted,
 		Question:    question,
 		DeadlineAt:  &deadline,
@@ -370,18 +388,62 @@ func (s *CodeAnalysisService) syncTimeout() time.Duration {
 	return syncTimeoutDefault
 }
 
+// submitRequest 是提交外部 AI 服务所需的全部入参（含开放接口的专有字段）。
+type submitRequest struct {
+	TaskID     string
+	IdemKey    string
+	Service    string
+	Question   string
+	Stacktrace string
+	Message    string
+	EventID    int64
+}
+
 // submitAnalysis 按调用方式选择提交姿势：
 //   - async：短超时提交，只拿 task_id 就返回，结论交给回调/轮询；
 //   - sync ：长超时提交，原地等 AI 服务把结论一起返回（不依赖回调）。
-func (s *CodeAnalysisService) submitAnalysis(ctx context.Context, client *AIAnalysisClient, taskID, service, question string, eventID int64) (*TaskResult, error) {
+//
+// 开放接口专有字段（stacktrace / logs / environment / idempotencyKey）一并带上：
+// 客户端只在 Protocol=openapi_v1 时才会把它们序列化进正文，generic 协议不受影响。
+func (s *CodeAnalysisService) submitAnalysis(ctx context.Context, client *AIAnalysisClient, req submitRequest) (*TaskResult, error) {
 	in := SubmitInput{
-		TaskID: taskID, Service: service, Question: question,
-		CallbackURL: s.callbackURL(), EventID: eventID,
+		TaskID: req.TaskID, Service: req.Service, Question: req.Question,
+		CallbackURL:    s.callbackURL(),
+		EventID:        req.EventID,
+		Stacktrace:     req.Stacktrace,
+		Message:        req.Message,
+		Environment:    s.environment(),
+		IdempotencyKey: req.IdemKey,
+		Sync:           s.callMode() == callModeSync,
 	}
 	if s.callMode() == callModeSync {
 		return client.SubmitWithTimeout(ctx, in, s.syncTimeout())
 	}
 	return client.Submit(ctx, in)
+}
+
+// analysisIdempotencyKey 生成开放接口的幂等键（文档 §3）。
+//
+// 不能直接用 TaskID：它带纳秒时间戳，每次提交都是新号，
+// 服务端就复用不了同一分析任务，告警风暴下同一条错误会被反复分析。
+// 这里用「事件号 + 错误指纹」：同一条告警重复触发 → 同一个 key → 服务端复用。
+func analysisIdempotencyKey(eventID int64, signature, service, message, stack string) string {
+	if eventID > 0 && strings.TrimSpace(signature) != "" {
+		return fmt.Sprintf("mwo-%d-%s", eventID, signature)
+	}
+	fp := utils.Fingerprint(service, message, stack)
+	if len(fp) > 16 {
+		fp = fp[:16]
+	}
+	return fmt.Sprintf("mwo-%d-%s", eventID, fp)
+}
+
+// environment 返回随任务一起提交的环境标识（开放接口用）。
+func (s *CodeAnalysisService) environment() string {
+	if s == nil || s.cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.cfg.AIAnalysis.Environment)
 }
 
 // auditSubmit 记一条"提交分析"的审计（提交成功、会进等待或已同步收尾时调用）。
@@ -495,6 +557,9 @@ func (s *CodeAnalysisService) saveReport(ctx context.Context, task *model.AIAnal
 	if v, ok := report["located_line"].(float64); ok {
 		record.LocatedLine = int(v)
 	}
+	if v, ok := report["report_url"].(string); ok {
+		record.ReportURL = strings.TrimSpace(v)
+	}
 	return s.analyses.Create(ctx, record)
 }
 
@@ -513,6 +578,13 @@ func (s *CodeAnalysisService) buildBrief(task *model.AIAnalysisTask, answer stri
 	}
 	if v, ok := report["located_line"].(float64); ok {
 		brief.LocatedLine = int(v)
+	}
+	// 报告地址与完整 Markdown：由开放接口的响应/回调带出，供通知卡片直接呈现。
+	if v, ok := report["report_url"].(string); ok {
+		brief.ReportURL = strings.TrimSpace(v)
+	}
+	if v, ok := report["markdown"].(string); ok {
+		brief.Markdown = strings.TrimSpace(v)
 	}
 	// AI 给的不是结构化 JSON 时，把原文放进根因，避免通知里什么都没有。
 	if brief.RootCause == "" && strings.TrimSpace(answer) != "" {
@@ -546,7 +618,8 @@ func (s *CodeAnalysisService) RefreshTask(ctx context.Context, task model.AIAnal
 	if wait := s.pollInterval() / 2; wait > 0 && time.Since(task.CreatedAt) < wait {
 		return nil, false, nil
 	}
-	res, err := client.Query(ctx, task.TaskID)
+	// runID 也要传：开放接口的查询地址按 runId 组织，只带 taskId 会查不到。
+	res, err := client.Query(ctx, task.TaskID, task.RunID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -667,6 +740,10 @@ func (s *CodeAnalysisService) redact(text string) string {
 }
 
 // callbackURL 生成本平台接收结论的地址。
+//
+// 支持 {path} 占位（`https://platform.example.com/{path}?token=xxx`）：
+// 开放接口的回调不强制签名，文档建议由接收方自行加校验参数；
+// 没有占位符时平台只能把回调路径拼在末尾，token 就会跑进路径里。
 func (s *CodeAnalysisService) callbackURL() string {
 	if s.cfg == nil {
 		return ""
@@ -675,7 +752,14 @@ func (s *CodeAnalysisService) callbackURL() string {
 	if base == "" {
 		return ""
 	}
-	return strings.TrimRight(base, "/") + defaultCallbackPath
+	if strings.Contains(base, "{path}") {
+		return strings.ReplaceAll(base, "{path}", strings.TrimPrefix(defaultCallbackPath, "/"))
+	}
+	trimmed := strings.TrimRight(base, "/")
+	if strings.HasSuffix(trimmed, defaultCallbackPath) {
+		return trimmed
+	}
+	return trimmed + defaultCallbackPath
 }
 
 // taskTimeout 返回任务级超时（未配置时 30 分钟）。
@@ -723,6 +807,12 @@ func (c *Completion) report() map[string]any {
 	}
 	if c.Brief.LocatedLine > 0 {
 		out["located_line"] = c.Brief.LocatedLine
+	}
+	if c.Brief.ReportURL != "" {
+		out["report_url"] = c.Brief.ReportURL
+	}
+	if c.Brief.Markdown != "" {
+		out["markdown"] = c.Brief.Markdown
 	}
 	return out
 }

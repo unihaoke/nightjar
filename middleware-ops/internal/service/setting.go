@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -161,6 +162,15 @@ type aiAnalysisPayload struct {
 	CallMode        string `json:"call_mode"`
 	SyncTimeout     string `json:"sync_timeout"`
 	NotifyOnSubmit  bool   `json:"notify_on_submit"`
+	// ---- 开放接口 v1（Protocol=openapi_v1）专用 ----
+	Protocol        string `json:"protocol"`
+	AuthHeader      string `json:"auth_header"`
+	SyncSubmitPath  string `json:"sync_submit_path"`
+	RepoLocatorMode string `json:"repo_locator_mode"`
+	RepoGitURL      string `json:"repo_git_url"`
+	Environment     string `json:"environment"`
+	Priority        int    `json:"priority"`
+	AutoVerify      bool   `json:"auto_verify"`
 }
 
 // aiSettingsPayload 是 AI 设置的完整持久化形态。
@@ -237,6 +247,15 @@ type AIAnalysisView struct {
 	CallMode            string `json:"call_mode"`
 	SyncTimeout         string `json:"sync_timeout"`
 	NotifyOnSubmit      bool   `json:"notify_on_submit"`
+	// Protocol 为对接协议：generic（默认）| openapi_v1。
+	Protocol        string `json:"protocol"`
+	AuthHeader      string `json:"auth_header"`
+	SyncSubmitPath  string `json:"sync_submit_path"`
+	RepoLocatorMode string `json:"repo_locator_mode"`
+	RepoGitURL      string `json:"repo_git_url"`
+	Environment     string `json:"environment"`
+	Priority        int    `json:"priority"`
+	AutoVerify      bool   `json:"auto_verify"`
 	// Configured 表示"现在真的能调用"（开关已开且地址非空）。
 	// 页面据此提示"填了但没生效"，避免管理员以为配好了却在日志页看到"未装配"。
 	Configured bool `json:"configured"`
@@ -327,6 +346,15 @@ type AIAnalysisInput struct {
 	CallMode           string `json:"call_mode"`
 	SyncTimeout        string `json:"sync_timeout"`
 	NotifyOnSubmit     bool   `json:"notify_on_submit"`
+	// 开放接口 v1 专用；切回 generic 时这些字段被忽略但不清除（避免来回切换丢配置）。
+	Protocol           string `json:"protocol"`
+	AuthHeader         string `json:"auth_header"`
+	SyncSubmitPath     string `json:"sync_submit_path"`
+	RepoLocatorMode    string `json:"repo_locator_mode"`
+	RepoGitURL         string `json:"repo_git_url"`
+	Environment        string `json:"environment"`
+	Priority           int    `json:"priority"`
+	AutoVerify         bool   `json:"auto_verify"`
 }
 
 // AISettingsInput 是 PUT /api/settings/ai 的请求体。
@@ -673,6 +701,7 @@ func defaultAISettingsPayload() aiSettingsPayload {
 			Enabled: false, SubmitPath: defaultSubmitPath, QueryPath: defaultQueryPath,
 			Timeout: "15s", TaskTimeout: "30m", PollInterval: "60s", PollBatch: defaultPollBatch,
 			CallMode: defaultCallModeAsync, SyncTimeout: defaultSyncTimeout,
+			Protocol: defaultProtocol, RepoLocatorMode: repoLocatorModeService,
 		},
 		DailyTokenQuota: 0,
 		PerUserQuota:    0,
@@ -748,9 +777,17 @@ func (p aiSettingsPayload) applyCodeAnalysisTo(cfg *config.Config) {
 		TaskTimeout:    parseDurationOr(p.CodeAnalysis.TaskTimeout, cfg.AIAnalysis.TaskTimeout),
 		PollInterval:   parseDurationOr(p.CodeAnalysis.PollInterval, cfg.AIAnalysis.PollInterval),
 		PollBatch:      p.CodeAnalysis.PollBatch,
-		CallMode:       resolveCallMode(p.CodeAnalysis.CallMode),
-		SyncTimeout:    parseDurationOr(p.CodeAnalysis.SyncTimeout, cfg.AIAnalysis.SyncTimeout),
-		NotifyOnSubmit: p.CodeAnalysis.NotifyOnSubmit,
+		CallMode:        resolveCallMode(p.CodeAnalysis.CallMode),
+		SyncTimeout:     parseDurationOr(p.CodeAnalysis.SyncTimeout, cfg.AIAnalysis.SyncTimeout),
+		NotifyOnSubmit:  p.CodeAnalysis.NotifyOnSubmit,
+		Protocol:        resolveProtocol(p.CodeAnalysis.Protocol),
+		AuthHeader:      strings.TrimSpace(p.CodeAnalysis.AuthHeader),
+		SyncSubmitPath:  strings.TrimSpace(p.CodeAnalysis.SyncSubmitPath),
+		RepoLocatorMode: resolveRepoLocatorMode(p.CodeAnalysis.RepoLocatorMode),
+		RepoGitURL:      strings.TrimSpace(p.CodeAnalysis.RepoGitURL),
+		Environment:     strings.TrimSpace(p.CodeAnalysis.Environment),
+		Priority:        p.CodeAnalysis.Priority,
+		AutoVerify:      p.CodeAnalysis.AutoVerify,
 	}
 	if cfg.AIAnalysis.PollBatch <= 0 {
 		cfg.AIAnalysis.PollBatch = defaultPollBatch
@@ -785,8 +822,90 @@ func (p aiAnalysisPayload) view() AIAnalysisView {
 		CallMode:            p.CallMode,
 		SyncTimeout:         p.SyncTimeout,
 		NotifyOnSubmit:      p.NotifyOnSubmit,
+		Protocol:            p.Protocol,
+		AuthHeader:          p.AuthHeader,
+		SyncSubmitPath:      p.SyncSubmitPath,
+		RepoLocatorMode:     p.RepoLocatorMode,
+		RepoGitURL:          p.RepoGitURL,
+		Environment:         p.Environment,
+		Priority:            p.Priority,
+		AutoVerify:          p.AutoVerify,
 		Configured:          p.Enabled && strings.TrimSpace(p.BaseURL) != "",
 	}
+}
+
+// 协议常量与默认值（与 client 层同源，避免两处各写一套）。
+const (
+	protocolGeneric = "generic"
+	protocolOpenAPI = "openapi_v1"
+	defaultProtocol = protocolGeneric
+	// 开放接口要求 API Key 放在 X-API-Key 头里（不带 Bearer 前缀）。
+	defaultAuthHeaderOpenAPI = "X-API-Key"
+	// 开放接口的默认端点（文档 §5 / §6 / 轮询）。
+	defaultOpenAPISubmitPath = "/api/v1/openapi/tasks"
+	defaultOpenAPISyncPath   = "/api/v1/openapi/analyze"
+	defaultOpenAPIQueryPath  = "/api/v1/runs/{run_id}"
+	// 仓库定位方式：service（用服务名当 host）| git_url（固定 git 地址）。
+	repoLocatorModeService = "service"
+	repoLocatorModeGitURL  = "git_url"
+)
+
+// resolveProtocol 归一化协议：只认 generic / openapi_v1，其它一律回落 generic。
+//
+// 为什么不能让非法值透传：协议决定请求体与响应解析的整套形状，
+// 一个拼错的值会让链路以"AI 服务返回成功但没有结论"这种极难排查的方式失败。
+func resolveProtocol(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case protocolOpenAPI:
+		return protocolOpenAPI
+	default:
+		return protocolGeneric
+	}
+}
+
+// resolveRepoLocatorMode 归一化仓库定位方式（只认 service / git_url）。
+func resolveRepoLocatorMode(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), repoLocatorModeGitURL) {
+		return repoLocatorModeGitURL
+	}
+	return repoLocatorModeService
+}
+
+// applyProtocolDefaults 在协议切换时把"还没被改过的"路径改写成该协议的默认值。
+//
+// 关键场景：管理员把协议从 generic 切到 openapi_v1 时，页面上留着的历史默认值
+// /v1/analyses 会直接打到开放接口上，表现为 404。
+// 只在"仍是上一个协议的默认值"时才改写，用户自己填过的路径一律保留。
+func applyProtocolDefaults(p aiAnalysisPayload, prevProtocol string) aiAnalysisPayload {
+	if p.Protocol == prevProtocol {
+		return p
+	}
+	switch p.Protocol {
+	case protocolOpenAPI:
+		if p.SubmitPath == "" || p.SubmitPath == defaultSubmitPath {
+			p.SubmitPath = defaultOpenAPISubmitPath
+		}
+		if p.SyncSubmitPath == "" {
+			p.SyncSubmitPath = defaultOpenAPISyncPath
+		}
+		if p.QueryPath == "" || p.QueryPath == defaultQueryPath {
+			p.QueryPath = defaultOpenAPIQueryPath
+		}
+		if strings.TrimSpace(p.AuthHeader) == "" {
+			p.AuthHeader = defaultAuthHeaderOpenAPI
+		}
+	case protocolGeneric:
+		if p.SubmitPath == "" || p.SubmitPath == defaultOpenAPISubmitPath {
+			p.SubmitPath = defaultSubmitPath
+		}
+		if p.QueryPath == "" || p.QueryPath == defaultOpenAPIQueryPath {
+			p.QueryPath = defaultQueryPath
+		}
+	}
+	if p.RepoLocatorMode == "" {
+		p.RepoLocatorMode = repoLocatorModeService
+	}
+	return p
 }
 
 // mergeAIAnalysis 合并 AI 代码分析入参：非密钥字段按"非空即覆盖"，密钥走三态语义。
@@ -795,6 +914,12 @@ func (p aiAnalysisPayload) view() AIAnalysisView {
 // 整体覆盖会把没填的字段清空（SubmitPath 空了等于客户端拼不出地址）。
 func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayload {
 	out := old
+	// 协议是枚举且决定整套报文形状：只有明确传值才切换，
+	// 空值保持原样（否则前端漏传一次就会把开放接口悄悄改回 generic）。
+	prevProtocol := resolveProtocol(old.Protocol)
+	if v := strings.TrimSpace(in.Protocol); v != "" {
+		out.Protocol = resolveProtocol(v)
+	}
 	out.Enabled = in.Enabled
 	out.BaseURL = strings.TrimSpace(in.BaseURL)
 	out.CallbackURL = strings.TrimSpace(in.CallbackURL)
@@ -823,6 +948,30 @@ func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayloa
 	out.NotifyOnSubmit = in.NotifyOnSubmit
 	out.APIKey = mergeSecret(old.APIKey, in.APIKey, in.ClearAPIKey)
 	out.CallbackToken = mergeSecret(old.CallbackToken, in.CallbackToken, in.ClearCallbackToken)
+
+	// 开放接口专有字段（非空即覆盖，与路径/时长同一套语义）。
+	if v := strings.TrimSpace(in.AuthHeader); v != "" {
+		out.AuthHeader = v
+	}
+	if v := strings.TrimSpace(in.SyncSubmitPath); v != "" {
+		out.SyncSubmitPath = v
+	}
+	if v := strings.TrimSpace(in.RepoLocatorMode); v != "" {
+		out.RepoLocatorMode = resolveRepoLocatorMode(v)
+	}
+	if v := strings.TrimSpace(in.RepoGitURL); v != "" {
+		out.RepoGitURL = v
+	}
+	if v := strings.TrimSpace(in.Environment); v != "" {
+		out.Environment = v
+	}
+	if in.Priority > 0 {
+		out.Priority = in.Priority
+	} else if in.Priority < 0 {
+		out.Priority = 0
+	}
+	out.AutoVerify = in.AutoVerify
+
 	// 兜底：老记录里没有这两个路径时补默认值，避免客户端拼出空路径。
 	if strings.TrimSpace(out.SubmitPath) == "" {
 		out.SubmitPath = defaultSubmitPath
@@ -833,7 +982,7 @@ func mergeAIAnalysis(old aiAnalysisPayload, in AIAnalysisInput) aiAnalysisPayloa
 	if out.PollBatch <= 0 {
 		out.PollBatch = defaultPollBatch
 	}
-	return out
+	return applyProtocolDefaults(out, prevProtocol)
 }
 
 // providersActive 计算「真正会参与的提供方」标签。
@@ -1578,6 +1727,70 @@ func (s *SettingService) TestAIProvider(ctx context.Context, key string, in Prov
 	}
 	ok, message, latency := probeEngine(ctx, eng)
 	return ok, eng.Name(), message, latency, nil
+}
+
+// TestCodeAnalysis 用「AI 代码分析」当前的合并配置做一次连通性自检（不落库、不改内存配置）。
+//
+// 与 TestAIProvider 同一套语义：表单里只改了密钥还没保存时，测的是
+// "已存配置 + 本次填写"的合并结果，而不是把旧密钥清空后测一个空 key。
+//
+// 判定口径（关键取舍）：
+//   - 2xx         → 通；
+//   - 401 / 403   → 鉴权问题，失败；
+//   - 404 / 422   → **算通**：能走到仓库定位说明地址、密钥、报文形状都对，
+//                    探针服务名没注册是预期的（真实告警会带真实服务名）；
+//   - 其它 / 网络错误 → 失败，原因原样给出去。
+func (s *SettingService) TestCodeAnalysis(ctx context.Context, in AIAnalysisInput) (bool, string, string, int64, error) {
+	var existing aiSettingsPayload
+	_, _, found, err := s.loadSetting(ctx, SettingNameAI, &existing)
+	if err != nil {
+		return false, "", "", 0, err
+	}
+	if !found {
+		existing = defaultAISettingsPayload()
+	}
+	merged := mergeAIAnalysis(existing.CodeAnalysis, in)
+
+	// 借用当前内存配置作时长基线，再按合并结果覆盖（applyCodeAnalysisTo 只覆盖非空项）。
+	var probeCfg config.Config
+	if s.cfg != nil {
+		probeCfg.AIAnalysis = s.cfg.AIAnalysis
+	}
+	(aiSettingsPayload{CodeAnalysis: merged}).applyCodeAnalysisTo(&probeCfg)
+
+	name := protocolLabel(probeCfg.AIAnalysis.Protocol)
+	client := NewAIAnalysisClient(probeCfg.AIAnalysis, s.log)
+	if !client.Configured() {
+		return false, name, "未启用或服务地址为空：请先打开「启用」并填写 Base URL", 0, nil
+	}
+	res, err := client.Probe(ctx)
+	if err != nil {
+		return false, name, truncateMessage("连接失败：" + redactCredentials(err.Error())), 0, nil
+	}
+	openAPI := client.isOpenAPI()
+	if res.StatusCode >= 200 && res.StatusCode < 300 {
+		msg := "服务可达"
+		if res.Message != "" {
+			msg += "，本次探测状态：" + res.Message
+		}
+		return true, name, truncateMessage(msg), res.LatencyMS, nil
+	}
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusUnprocessableEntity {
+		if openAPI {
+			return true, name, "服务可达且鉴权通过（探针服务 " + probeServiceName +
+				" 未在该服务注册，属预期）；真实告警会带实际服务名去定位仓库，请确认控制台已配置 hostPatterns",
+				res.LatencyMS, nil
+		}
+	}
+	return false, name, truncateMessage(httpErrorHint(res.StatusCode, nil, openAPI)), res.LatencyMS, nil
+}
+
+// protocolLabel 把协议值翻成页面上看得懂的名字（测试结果标题用）。
+func protocolLabel(protocol string) string {
+	if strings.EqualFold(strings.TrimSpace(protocol), ProtocolOpenAPIV1) {
+		return "开放接口 v1"
+	}
+	return "通用协议"
 }
 
 // truncateMessage 截断过长的引擎返回，避免把整篇模型输出塞进设置页提示。

@@ -331,6 +331,12 @@ type AIAnalysisTask struct {
 	ServiceName string `gorm:"size:128;index" json:"service_name"`
 	// TaskID 为外部 AI 服务返回的任务号，也是幂等键（回调与轮询都靠它对上号）。
 	TaskID string `gorm:"size:128;uniqueIndex" json:"task_id"`
+	// RunID 为开放接口（openapi_v1）返回的运行 ID。
+	//
+	// 为什么两个号都要存：开放接口的回调报文里带的是 taskId（用它对号），
+	// 而轮询与报告地址是按 runId 组织的（GET /api/v1/runs/{runId}）。
+	// 只存 taskId 的话，回调一旦丢失，轮询就拿不到任何东西。
+	RunID string `gorm:"size:128;index" json:"run_id"`
 	// Status 取 submitted / succeeded / failed / timeout（见下面的状态常量）。
 	Status string `gorm:"size:16;index;default:submitted" json:"status"`
 	// Question 为提交给 AI 的问题（已脱敏），用于事后核对"到底问了什么"。
@@ -508,6 +514,11 @@ type AICodeAnalysis struct {
 	// 为什么必须落库：行号定位会随代码演进而失效，事后复核时要能回答
 	// "这条结论当时看的是哪一版代码"——没有它，"定位错了"与"代码已经改了"无法区分（INC-032）。
 	RepoRevision string `gorm:"size:64" json:"repo_revision"`
+	// ReportURL 是外部 AI 服务给出的完整报告地址（开放接口的 reportUrl）。
+	//
+	// 平台上只存结论摘要（补丁全文、验证结果、完整 Markdown 都在对方报告页），
+	// 没有这个字段，使用者在平台上看到结论后想看细节就只能去翻通知记录里的链接。
+	ReportURL string `gorm:"size:512" json:"report_url"`
 }
 
 // NotificationLog 通知记录。

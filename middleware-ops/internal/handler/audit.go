@@ -191,6 +191,17 @@ func (h *Handler) AIAnalysisCallback(c *gin.Context) {
 	if got == "" {
 		got = strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 	}
+	// 查询参数兜底：开放接口的回调**不强制签名**，文档建议接收方"自行校验来源 IP 或加自定义
+	// token 查询参数"。只认请求头的话，凡是只能在 URL 上带 token 的 AI 服务都会被 401 拒收，
+	// 整条链路退化成纯轮询（结论要等一个轮询周期才拿到）。与 hookAuth 同一套兜底顺序。
+	//
+	// 代价：URL 里的令牌会落进 Nginx 访问日志。优先用请求头；只有 AI 服务不支持自定义头时才用这招。
+	if got == "" {
+		got = strings.TrimSpace(c.Query("callback_token"))
+	}
+	if got == "" {
+		got = strings.TrimSpace(c.Query("token"))
+	}
 	if want == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 		response.Fail(c, apperr.New(apperr.CodeUnauthorized, "回调令牌无效或未配置（ai_analysis.callback_token）"))
 		return
@@ -200,7 +211,13 @@ func (h *Handler) AIAnalysisCallback(c *gin.Context) {
 		response.Fail(c, apperr.New(apperr.CodeInvalidParam, "读取回调内容失败"))
 		return
 	}
-	taskID, status, answer, errMsg, err := service.ParseCallback(body)
+	// 回调报文的形状由对接协议决定：开放接口用 state + summary + rootCause，
+	// 与 generic 的 task_id + answer 不是同一套字段，必须按协议解析。
+	protocol := ""
+	if h.deps.Config != nil {
+		protocol = h.deps.Config.AIAnalysis.Protocol
+	}
+	taskID, status, answer, errMsg, err := service.ParseCallbackWithProtocol(body, protocol)
 	if err != nil {
 		response.Fail(c, apperr.New(apperr.CodeInvalidParam, err.Error()))
 		return

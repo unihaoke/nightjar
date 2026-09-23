@@ -679,6 +679,13 @@ async function copyHookExample(): Promise<void> {
               <span class="field-label">代码版本</span>
               <span class="mono">{{ analysis.repo_revision }}</span>
             </div>
+            <!-- 完整报告：补丁全文与验证结果在外部 AI 服务那边，平台上只有三点式摘要。 -->
+            <div v-if="analysis?.report_url" class="analysis-row">
+              <span class="field-label">完整报告</span>
+              <el-link :href="analysis.report_url" target="_blank" rel="noopener" type="primary">
+                在 AI 服务查看
+              </el-link>
+            </div>
           </div>
           <pre v-if="analysis?.code_snippet" class="code-block">{{ analysis.code_snippet }}</pre>
         </template>

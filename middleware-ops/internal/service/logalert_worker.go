@@ -122,6 +122,12 @@ type LogAnalysisBrief struct {
 	ImpactScope   string  `json:"impact_scope"`
 	Confidence    float64 `json:"confidence"`
 	EngineUsed    string  `json:"engine_used"`
+	// ReportURL 为外部 AI 服务给出的完整报告地址（开放接口才有）。
+	// 卡片里渲染成「查看完整报告」按钮：分析结论在 IM 里只能给摘要，
+	// 完整报告（含补丁与验证结果）必须能一键跳过去看。
+	ReportURL string `json:"report_url"`
+	// Markdown 为 AI 服务产出的完整报告 Markdown（可能很长，展示时按渠道截断）。
+	Markdown string `json:"markdown"`
 	// Degraded 表示结论来自规则引擎降级（AI 不可用），提醒使用者人工复核。
 	Degraded bool `json:"degraded"`
 }
