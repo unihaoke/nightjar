@@ -288,7 +288,8 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 		return nil, apperr.New(apperr.CodeOutboundDenied,
 			"未配置外部 AI 分析服务：请在「AI 设置 → AI 代码分析」中填写服务地址并启用")
 	}
-	idemKey := analysisIdempotencyKey(in.EventID, eventSig, serviceName, message, stack)
+	// 重跑（「重新分析」）必须换号，否则本地撞唯一索引、对侧命中旧任务不回调。
+	idemKey := s.nextIdempotencyKey(ctx, in.EventID, eventSig, serviceName, message, stack)
 	// 本地主键必须取"提交时真正带出去的那个号"：
 	// 开放接口带出去的是 idempotencyKey，AI 服务会在终态回调里把它**原样回显**，
 	// 用它做主键才能保证"发出去的"与"回调查的"是同一个；
@@ -341,7 +342,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 
 	// 提交响应里就带着结论：直接收尾，不进等待队列（同步模式必然走这里）。
 	if res.Status == modelStatusSucceeded {
-		completion, err := s.CompleteByTask(ctx, storeID, "", model.AIAnalysisTaskSucceeded, res.Answer, "")
+		completion, err := s.CompleteByTask(ctx, CallbackIdentity{TaskID: storeID}, model.AIAnalysisTaskSucceeded, res.Answer, "")
 		if err != nil {
 			return nil, err
 		}
@@ -357,7 +358,7 @@ func (s *CodeAnalysisService) Submit(ctx context.Context, in CodeAnalysisRequest
 	// 提交响应说"还在处理"：异步模式下正常，等回调/轮询即可；
 	// 同步模式下没有回调/轮询通道，等于没把结论给出来，按失败收尾并给出出路。
 	if s.callMode() == callModeSync {
-		completion, err := s.CompleteByTask(ctx, storeID, "", model.AIAnalysisTaskFailed, "",
+		completion, err := s.CompleteByTask(ctx, CallbackIdentity{TaskID: storeID}, model.AIAnalysisTaskFailed, "",
 			"同步模式下 AI 服务未在等待时间内返回结论（请改用异步回调模式，或确认该服务支持同步返回）")
 		if err != nil {
 			return nil, err
@@ -437,15 +438,57 @@ func (s *CodeAnalysisService) submitAnalysis(ctx context.Context, client *AIAnal
 // 不能直接用 TaskID：它带纳秒时间戳，每次提交都是新号，
 // 服务端就复用不了同一分析任务，告警风暴下同一条错误会被反复分析。
 // 这里用「事件号 + 错误指纹」：同一条告警重复触发 → 同一个 key → 服务端复用。
-func analysisIdempotencyKey(eventID int64, signature, service, message, stack string) string {
+//
+// attempt 为重跑序号（1 表示首次）：开放接口下本地任务主键就是幂等键，
+// 「重新分析」不改变事件内容，只有换号才不会撞上自己的历史记录（详见 nextIdempotencyKey）。
+// 首次保持不带后缀，已在跑的任务与历史记录的键形不变，回调照旧对得上号。
+func analysisIdempotencyKey(eventID int64, signature, service, message, stack string, attempt int) string {
+	base := ""
 	if eventID > 0 && strings.TrimSpace(signature) != "" {
-		return fmt.Sprintf("mwo-%d-%s", eventID, signature)
+		base = fmt.Sprintf("mwo-%d-%s", eventID, signature)
+	} else {
+		fp := utils.Fingerprint(service, message, stack)
+		if len(fp) > 16 {
+			fp = fp[:16]
+		}
+		base = fmt.Sprintf("mwo-%d-%s", eventID, fp)
 	}
-	fp := utils.Fingerprint(service, message, stack)
-	if len(fp) > 16 {
-		fp = fp[:16]
+	if attempt > 1 {
+		return fmt.Sprintf("%s-r%d", base, attempt)
 	}
-	return fmt.Sprintf("mwo-%d-%s", eventID, fp)
+	return base
+}
+
+// nextIdempotencyKey 生成本次提交的幂等键，「重新分析」时换号。
+//
+// 为什么必须换号：开放接口下本地任务主键就是幂等键（TaskID 唯一索引），
+// 而「重新分析」不会改变事件内容 → 幂等键不变 → 撞唯一索引，提交直接失败；
+// 即便绕过本地冲突，对侧也会命中旧任务（幂等复用）而不回调，新任务只能干等到超时。
+// 带上"这条事件已提交过几次"，重跑在两侧都是新号：本地不冲突，对侧也当新任务重跑并回调。
+func (s *CodeAnalysisService) nextIdempotencyKey(ctx context.Context, eventID int64,
+	signature, service, message, stack string) string {
+	attempt := 1
+	if eventID > 0 && s.tasks != nil {
+		n, err := s.tasks.CountByEvent(ctx, eventID)
+		if err != nil {
+			if s.log != nil {
+				s.log.Warn("统计事件历史分析次数失败，本次按首次提交生成幂等键",
+					zap.Int64("event_id", eventID), zap.Error(err))
+			}
+		} else {
+			attempt = int(n) + 1
+		}
+	}
+	// 这次提交意味着"旧的不要了"：把仍未收尾的旧任务作废，
+	// 否则它的截止时间一到，会把事件改回 failed 并再发一条"分析失败"通知，
+	// 而新一次分析可能正在跑（用户先收到失败、再收到结论）。
+	if attempt > 1 && s.tasks != nil {
+		if _, err := s.tasks.AbandonUnfinishedByEvent(ctx, eventID, model.AIAnalysisTaskFailed,
+			"已被「重新分析」取代", time.Now().UTC()); err != nil && s.log != nil {
+			s.log.Warn("作废旧分析任务失败", zap.Int64("event_id", eventID), zap.Error(err))
+		}
+	}
+	return analysisIdempotencyKey(eventID, signature, service, message, stack, attempt)
 }
 
 // environment 返回随任务一起提交的环境标识（开放接口用）。
@@ -477,23 +520,27 @@ func (s *CodeAnalysisService) auditSubmit(ctx context.Context, out *SubmitOutcom
 // 幂等是关键：回调可能重复投递（AI 服务没收到 2xx 会重试），
 // 也可能与轮询撞在一起。仓储层的 Complete 用"当前状态必须是 submitted"做条件更新，
 // 第二个到达的调用者会拿到 applied=false，这里直接返回已存在的结论而不重复写报告。
-func (s *CodeAnalysisService) CompleteByTask(ctx context.Context, taskID, runID, status, answer, errMsg string) (*Completion, error) {
+func (s *CodeAnalysisService) CompleteByTask(ctx context.Context, ident CallbackIdentity, status, answer, errMsg string) (*Completion, error) {
 	if s == nil || s.tasks == nil {
 		return nil, apperr.New(apperr.CodeInternal, "代码分析服务未装配")
 	}
+	// 对号顺序：幂等键（= 本地主键）→ runId（提交时已入库）→ taskId（AI 侧号，平台不存）。
+	taskID, runID := ident.Lookup(), strings.TrimSpace(ident.RunID)
 	task, err := s.tasks.GetByTaskID(ctx, taskID)
 	if err != nil {
 		if !repository.EnsureNotFound(err) {
 			return nil, apperr.Wrap(apperr.CodeInternal, err)
 		}
-		// 开放接口下 runId 是提交响应/回调/轮询共用的稳定标识；部分实现里回调的 taskId
-		// 与提交响应返回的不一致，这里用 runId 再对一次号，避免误报"任务不存在"。
-		if strings.TrimSpace(runID) == "" {
+		// 开放接口下 runId 是提交响应/回调/轮询共用的稳定标识，任务表存了这一列，
+		// 用它再对一次号，避免误报"任务不存在"（回调的 taskId 未必与本地主键同源）。
+		if runID == "" || runID == taskID {
+			s.logIdentityMismatch(ident, taskID, "本地没有该任务，且无可用 runId 兜底")
 			return nil, apperr.New(apperr.CodeNotFound, "分析任务不存在："+taskID)
 		}
 		task, err = s.tasks.GetByRunID(ctx, runID)
 		if err != nil {
 			if repository.EnsureNotFound(err) {
+				s.logIdentityMismatch(ident, taskID, "本地既没有该幂等键/任务号，也查不到该 runId")
 				return nil, apperr.New(apperr.CodeNotFound, "分析任务不存在："+taskID)
 			}
 			return nil, apperr.Wrap(apperr.CodeInternal, err)
@@ -532,6 +579,22 @@ func (s *CodeAnalysisService) CompleteByTask(ctx context.Context, taskID, runID,
 		s.log.Warn("保存 AI 分析报告失败", zap.Error(err))
 	}
 	return completion, nil
+}
+
+// logIdentityMismatch 记一条"对号失败"的诊断日志，把回调带来的三个号全量打出来。
+//
+// 为什么必须全量：响应（4040）里只回一个号，光看报错无法判断是 AI 侧没回显幂等键、
+// 平台提交时没落库，还是两边协议版本不一致。三个号 + 实际用于查询的那个一次打全，
+// 下一次再对不上号，翻日志就能定位，不必抓包。
+func (s *CodeAnalysisService) logIdentityMismatch(ident CallbackIdentity, lookupID, why string) {
+	if s == nil || s.log == nil {
+		return
+	}
+	s.log.Warn("AI 分析回调对不上号："+why,
+		zap.String("idempotency_key", ident.IdempotencyKey),
+		zap.String("callback_run_id", ident.RunID),
+		zap.String("callback_task_id", ident.TaskID),
+		zap.String("lookup_id", lookupID))
 }
 
 // completionFromExisting 把已有任务记录翻译成 Completion（重复回调/已超时场景）。
@@ -646,10 +709,10 @@ func (s *CodeAnalysisService) RefreshTask(ctx context.Context, task model.AIAnal
 	}
 	switch res.Status {
 	case modelStatusSucceeded:
-		completion, err := s.CompleteByTask(ctx, task.TaskID, "", model.AIAnalysisTaskSucceeded, res.Answer, "")
+		completion, err := s.CompleteByTask(ctx, CallbackIdentity{TaskID: task.TaskID}, model.AIAnalysisTaskSucceeded, res.Answer, "")
 		return completion, true, err
 	case modelStatusFailed:
-		completion, err := s.CompleteByTask(ctx, task.TaskID, "", model.AIAnalysisTaskFailed, "",
+		completion, err := s.CompleteByTask(ctx, CallbackIdentity{TaskID: task.TaskID}, model.AIAnalysisTaskFailed, "",
 			defaultString(res.Error, "AI 服务报告分析失败"))
 		return completion, true, err
 	default:

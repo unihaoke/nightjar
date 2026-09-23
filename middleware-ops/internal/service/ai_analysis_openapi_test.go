@@ -172,12 +172,17 @@ func TestOpenAPICallback(t *testing.T) {
 		"patches":[{"filePath":"service/order.go","rationale":"增加空值保护"}],
 		"reportUrl":"https://console.x/r/rep_6"
 	}`)
-	taskID, _, status, answer, errMsg, err := ParseCallbackWithProtocol(body, ProtocolOpenAPIV1)
+	ident, status, answer, errMsg, err := ParseCallbackWithProtocol(body, ProtocolOpenAPIV1)
 	if err != nil {
 		t.Fatalf("解析回调失败: %v", err)
 	}
-	if taskID != "task_6" {
-		t.Fatalf("回调对号应用 taskId：%q", taskID)
+	// 没有幂等键时退到 runId：它提交时就写进了任务表，能命中；
+	// taskId 是 AI 侧逻辑任务的号，平台不存这一列，只能最后试。
+	if ident.Lookup() != "run_6" {
+		t.Fatalf("无幂等键时应按 runId 对号：%q", ident.Lookup())
+	}
+	if ident.IdempotencyKey != "" || ident.RunID != "run_6" || ident.TaskID != "task_6" {
+		t.Fatalf("三个号都应保留供诊断：%+v", ident)
 	}
 	if status != "succeeded" {
 		t.Fatalf("状态解析异常：%q", status)
@@ -190,7 +195,7 @@ func TestOpenAPICallback(t *testing.T) {
 	}
 
 	// 只有 summary 没有 rootCause 时也不能丢结论。
-	_, _, _, answer2, _, err := ParseCallbackWithProtocol(
+	_, _, answer2, _, err := ParseCallbackWithProtocol(
 		[]byte(`{"taskId":"task_7","state":"succeeded","summary":"连接池耗尽"}`), ProtocolOpenAPIV1)
 	if err != nil {
 		t.Fatalf("解析回调失败: %v", err)
@@ -200,9 +205,68 @@ func TestOpenAPICallback(t *testing.T) {
 	}
 
 	// 失败终态要带出原因。
-	if _, _, st, _, msg, _ := ParseCallbackWithProtocol(
+	if _, st, _, msg, _ := ParseCallbackWithProtocol(
 		[]byte(`{"taskId":"task_8","state":"failed","error":"仓库定位失败"}`), ProtocolOpenAPIV1); st != "failed" || msg != "仓库定位失败" {
 		t.Fatalf("失败回调解析异常：status=%q err=%q", st, msg)
+	}
+}
+
+// TestOpenAPICallbackIdentityFallback 钉住对号顺序：幂等键 → runId → taskId。
+//
+// 顺序由"本地存了什么"决定：幂等键就是本地任务主键；runId 提交时已写进任务表的 run_id 列；
+// taskId 是 AI 侧逻辑任务的号，平台没有这一列，只能最后试。
+// 曾经把 taskId 排在 runId 前面，回调一旦没带幂等键（旧版 AI 服务），
+// 就会拿一个本地根本不存在的号去查，直接报"分析任务不存在"。
+func TestOpenAPICallbackIdentityFallback(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"三号齐全用幂等键", `{"idempotencyKey":"mwo-1-abc","runId":"run_x","taskId":"task_x","state":"succeeded"}`, "mwo-1-abc"},
+		{"缺幂等键退到runId", `{"runId":"run_x","taskId":"task_x","state":"succeeded"}`, "run_x"},
+		{"只剩taskId时兜底", `{"taskId":"task_x","state":"succeeded"}`, "task_x"},
+	}
+	for _, tc := range cases {
+		ident, _, _, _, err := ParseCallbackWithProtocol([]byte(tc.body), ProtocolOpenAPIV1)
+		if err != nil {
+			t.Fatalf("%s：解析失败: %v", tc.name, err)
+		}
+		if ident.Lookup() != tc.want {
+			t.Errorf("%s：应对号 %q，实际 %q", tc.name, tc.want, ident.Lookup())
+		}
+	}
+	// 一个号都没有必须报错：拿空串去查库会命中"第一条"，把别的任务的结论写错。
+	if _, _, _, _, err := ParseCallbackWithProtocol([]byte(`{"state":"succeeded"}`), ProtocolOpenAPIV1); err == nil {
+		t.Fatal("回调缺少全部标识时应报错")
+	}
+}
+
+// TestAnalysisIdempotencyKeyRerun 钉住"重跑换号"。
+//
+// 开放接口下本地任务主键就是幂等键（TaskID 唯一索引），而「重新分析」不改变事件内容：
+// 键不变就会撞上自己的历史记录，提交直接失败；对侧也会命中旧任务而不回调。
+func TestAnalysisIdempotencyKeyRerun(t *testing.T) {
+	first := analysisIdempotencyKey(7, "sig-abc", "svc", "msg", "stack", 1)
+	if first != "mwo-7-sig-abc" {
+		t.Fatalf("首次提交的键应保持既有形态（已在跑的任务回调靠它对号）：%q", first)
+	}
+	second := analysisIdempotencyKey(7, "sig-abc", "svc", "msg", "stack", 2)
+	if second == first {
+		t.Fatalf("重跑必须换号，否则撞唯一索引：%q", second)
+	}
+	if !strings.HasPrefix(second, first+"-r2") {
+		t.Fatalf("重跑的键应带重跑序号：%q", second)
+	}
+	// 不同事件即使指纹相同也必须是不同的键：否则一条告警会把别的事件的分析顶掉。
+	if analysisIdempotencyKey(8, "sig-abc", "svc", "msg", "stack", 1) == first {
+		t.Fatal("不同事件的幂等键不能相同")
+	}
+	// 手工提交（没有事件号）走内容指纹，重跑同样换号。
+	manual1 := analysisIdempotencyKey(0, "", "svc", "msg", "stack", 1)
+	manual2 := analysisIdempotencyKey(0, "", "svc", "msg", "stack", 2)
+	if manual1 == "" || manual1 == manual2 {
+		t.Fatalf("手工提交的幂等键异常：%q / %q", manual1, manual2)
 	}
 }
 

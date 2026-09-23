@@ -249,16 +249,18 @@ func (h *Handler) AIAnalysisCallback(c *gin.Context) {
 	if h.deps.Config != nil {
 		protocol = h.deps.Config.AIAnalysis.Protocol
 	}
-	taskID, runID, status, answer, errMsg, err := service.ParseCallbackWithProtocol(body, protocol)
+	ident, status, answer, errMsg, err := service.ParseCallbackWithProtocol(body, protocol)
 	if err != nil {
 		response.Fail(c, apperr.New(apperr.CodeInvalidParam, err.Error()))
 		return
 	}
-	if err := h.deps.LogAlertWorker.CompleteTask(c.Request.Context(), taskID, runID, status, answer, errMsg); err != nil {
+	// 三个号（幂等键/runId/taskId）整体交给 worker：对号用哪个由服务层决定，
+	// 对不上时才能把"回调带了什么"完整留在日志里。
+	if err := h.deps.LogAlertWorker.CompleteTask(c.Request.Context(), ident, status, answer, errMsg); err != nil {
 		response.Fail(c, err)
 		return
 	}
-	response.OK(c, gin.H{"message": "ok", "task_id": taskID})
+	response.OK(c, gin.H{"message": "ok", "task_id": ident.Lookup()})
 }
 
 // callbackSignatureMaxAge 是回调签名时间戳允许的最大偏差（防重放窗口），对齐 CodeAgent 文档（§2.4）的 300 秒。

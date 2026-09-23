@@ -784,8 +784,32 @@ const (
 // 它把状态写在哪一个字段里没有统一约定；认不出状态就当"有结论了"，
 // 结论为空的情况由 CompleteByTask 再兜一道（转成失败并写明原因）。
 func ParseCallback(body []byte) (taskID, status, answer, errMsg string, err error) {
-	taskID, _, status, answer, errMsg, err = ParseCallbackWithProtocol(body, ProtocolGeneric)
-	return
+	var ident CallbackIdentity
+	ident, status, answer, errMsg, err = ParseCallbackWithProtocol(body, ProtocolGeneric)
+	return ident.Lookup(), status, answer, errMsg, err
+}
+
+// CallbackIdentity 回调报文里用于"对号"的三个号。
+//
+// IdempotencyKey 是平台提交时带出去、AI 服务在终态回调里原样回显的值，与本地任务主键一致，
+// 是对号的第一凭据；RunID 是提交响应里记下的 AI 侧运行号（任务表也存了这一列）；
+// TaskID 是 AI 侧逻辑任务的号，平台不存它，只作最后兜底。
+//
+// 三个号都保留而不是只留"选中的那一个"，是为了对号失败（404）时能把"回调到底带了什么"
+// 一次性打进日志：跨系统对接里报错只给一个号，排查只能去抓包猜。
+type CallbackIdentity struct {
+	IdempotencyKey string
+	RunID          string
+	TaskID         string
+}
+
+// Lookup 选出定位本地任务的号：幂等键 → 运行号 → 任务号。
+//
+// 顺序不能反：幂等键就是本地主键，必中；runId 在提交时已写进任务表的 run_id 列，也能命中；
+// taskId 是 AI 侧逻辑任务的号，平台根本没有这一列，只能最后试。
+func (id CallbackIdentity) Lookup() string {
+	return defaultString(strings.TrimSpace(id.IdempotencyKey),
+		defaultString(strings.TrimSpace(id.RunID), strings.TrimSpace(id.TaskID)))
 }
 
 // ParseCallbackWithProtocol 按协议解析回调正文。
@@ -794,19 +818,19 @@ func ParseCallback(body []byte) (taskID, status, answer, errMsg string, err erro
 // 它用 state 表示终态、用 summary + rootCause + patches 表示结论，
 // 既没有 answer 也没有 status/result。若沿用 generic 的宽松解析，
 // 结论会被判成"返回成功但没有内容"。
-func ParseCallbackWithProtocol(body []byte, protocol string) (taskID, runID, status, answer, errMsg string, err error) {
+func ParseCallbackWithProtocol(body []byte, protocol string) (ident CallbackIdentity, status, answer, errMsg string, err error) {
 	if strings.EqualFold(strings.TrimSpace(protocol), ProtocolOpenAPIV1) {
 		return parseOpenAPICallback(body)
 	}
 	res := parseTaskResult(body)
 	if strings.TrimSpace(res.TaskID) == "" {
-		return "", "", "", "", "", errors.New("回调缺少 task_id，无法对上分析任务")
+		return CallbackIdentity{}, "", "", "", errors.New("回调缺少 task_id，无法对上分析任务")
 	}
 	status = model.AIAnalysisTaskSucceeded
 	if res.Status == modelStatusFailed {
 		status = model.AIAnalysisTaskFailed
 	}
-	return res.TaskID, "", status, res.Answer, res.Error, nil
+	return CallbackIdentity{TaskID: strings.TrimSpace(res.TaskID)}, status, res.Answer, res.Error, nil
 }
 
 // openAPICallbackPayload 是开放接口的终态回调报文（文档 §6.4）。
@@ -830,18 +854,20 @@ type openAPICallbackPayload struct {
 }
 
 // parseOpenAPICallback 解析开放接口的回调。
-func parseOpenAPICallback(body []byte) (taskID, runID, status, answer, errMsg string, err error) {
+func parseOpenAPICallback(body []byte) (ident CallbackIdentity, status, answer, errMsg string, err error) {
 	var raw openAPICallbackPayload
 	if e := json.Unmarshal(body, &raw); e != nil {
-		return "", "", "", "", "", errors.New("回调不是合法的开放接口报文：" + e.Error())
+		return CallbackIdentity{}, "", "", "", errors.New("回调不是合法的开放接口报文：" + e.Error())
 	}
-	// 对号优先用 idempotencyKey：它是平台提交时带出去、AI 服务在终态回调里原样回显的值，
-	// 与本地任务主键一致。taskId/runId 是 AI 侧自己的号，只作兜底。
-	taskID = defaultString(strings.TrimSpace(raw.IdempotencyKey),
-		defaultString(strings.TrimSpace(raw.TaskID), strings.TrimSpace(raw.RunID)))
-	runID = strings.TrimSpace(raw.RunID)
-	if taskID == "" {
-		return "", "", "", "", "", errors.New("回调缺少 idempotencyKey/taskId/runId，无法对上分析任务")
+	// 三个号都收下来：idempotencyKey 是本地主键（AI 服务原样回显），runId 提交时已入库，
+	// taskId 只是 AI 侧逻辑任务号。选哪个去查由 Lookup 决定，失败时全量进日志。
+	ident = CallbackIdentity{
+		IdempotencyKey: strings.TrimSpace(raw.IdempotencyKey),
+		RunID:          strings.TrimSpace(raw.RunID),
+		TaskID:         strings.TrimSpace(raw.TaskID),
+	}
+	if ident.Lookup() == "" {
+		return CallbackIdentity{}, "", "", "", errors.New("回调缺少 idempotencyKey/runId/taskId，无法对上分析任务")
 	}
 	status = model.AIAnalysisTaskSucceeded
 	if normalizeOpenAPIStatus(raw.State, false) == modelStatusFailed {
@@ -862,5 +888,5 @@ func parseOpenAPICallback(body []byte) (taskID, runID, status, answer, errMsg st
 	if strings.TrimSpace(answer) == "" && strings.TrimSpace(raw.Summary) != "" {
 		answer = strings.TrimSpace(raw.Summary)
 	}
-	return taskID, runID, status, answer, strings.TrimSpace(raw.Error), nil
+	return ident, status, answer, strings.TrimSpace(raw.Error), nil
 }
