@@ -17,6 +17,15 @@
 
 本仓库是《[中间件智能问题解决平台 · 设计文档](docs/DESIGN.md)》的可执行实现：**后端 Go（Gin + GORM）+ 前端 Vue 3（Element Plus，移动端适配）**，模块化单体，可单机一键部署。
 
+## 在线演示
+
+无需部署即可体验完整功能：
+
+- 演示地址：<https://ops.aiapx.icu/>
+- 演示账号：`test` / `test123`
+
+> 演示环境为只读体验，部分高危操作（L2 执行、审批等）可能已禁用或仅返回预演结果。
+
 ---
 
 ## 一、功能特性
@@ -27,7 +36,7 @@
 | M2 AI 诊断 | AI 诊断中心 + 知识库 + 六道工程护栏 + 成本治理 | 已完整实现 |
 | M3 日志与代码分析 | 日志集成（Filebeat → 平台 Kafka）+ 日志告警规则 + 外部 AI 分析服务对接 + 高危执行审批闭环 | 已实现（执行器为预演实现，见「已知边界」） |
 
-一期核心能力：Redis / MySQL / PostgreSQL / Kafka / Elasticsearch 支持纳管、监控、阈值告警与 AI 诊断；Nginx 支持纳管、监控与告警（不做 AI 诊断）；RabbitMQ 当前仅纳管。
+核心能力：Redis / MySQL / PostgreSQL / Kafka / Elasticsearch 支持纳管、监控、阈值告警与 AI 诊断；Nginx 支持纳管、监控与告警；RabbitMQ 当前仅纳管。
 
 **集成中心**：在页面上选组件、填地址与账号即可完成「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」，对齐云厂商控制台的「数据采集 → 集成中心」。抓取目标走 Prometheus **HTTP 服务发现（http_sd，`GET /api/sd/integrations`，30 秒刷新）**，新增集成无需重启 Prometheus；可选挂载 `docker.sock` 由平台一键拉起 Exporter 容器。详见 [docs/INTEGRATION.md](docs/INTEGRATION.md)。
 

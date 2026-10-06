@@ -17,6 +17,15 @@
 
 This repository is the executable implementation of the [platform design document](docs/DESIGN.md): a **Go backend (Gin + GORM) plus a Vue 3 frontend (Element Plus, responsive for mobile)**. It is a modular monolith that can be deployed on a single host with one command.
 
+## Live Demo
+
+Try the full platform without deploying it yourself:
+
+- Demo URL: <https://ops.aiapx.icu/>
+- Demo account: `test` / `test123`
+
+> The demo is a read-only experience; some high-risk actions (L2 execution, approvals, etc.) may be disabled or return only dry-run results.
+
 ---
 
 ## 1. Features
