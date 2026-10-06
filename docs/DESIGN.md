@@ -1,7 +1,3 @@
-
-
-正式设计文档
-
 # 中间件智能问题解决平台 · 设计文档
 
 
@@ -30,6 +26,7 @@
 11. 里程碑、验收与成功指标
 12. 竞品与差异化
 13. 风险与待确认
+14. 架构与实现映射（实现现状注记）
 
 
 ## 一、项目概述
@@ -126,7 +123,7 @@
 ### 3.2 系统架构（模块化单体）
 
 
-![系统架构图（模块化单体）](architecture.svg)
+![系统架构图（模块化单体）](assets/architecture.svg)
 
 
 ### 3.3 演进条件（避免提前拆服务）
@@ -143,7 +140,7 @@
 - **数据流闭环（问题解决）：**见下图示意。
 
 
-![问题解决数据流闭环（示意）](flow.svg)
+![问题解决数据流闭环（示意）](assets/flow.svg)
 
 
 ## 四、功能模块设计
@@ -322,7 +319,7 @@ GET /api/audit/logs/:id        # 日志详情
 AI 相关能力内置六道工程护栏，全部在 engine 层实现，与业务代码解耦。管线见下图：
 
 
-![AI 能力工程护栏管线（示意）](guardrails.svg)
+![AI 能力工程护栏管线（示意）](assets/guardrails.svg)
 
 
 ### 5.1 能力边界：一期不做自主循环 Agent
@@ -504,14 +501,16 @@ AI 诊断中心定位为「**单轮诊断 + 工具预采集**」：用户提问 
 | ip_address, created_at             | VARCHAR(45) / TIMESTAMPTZ         | 来源与时间                   |
 | hash_prev, hash_self               | VARCHAR(64)                       | 新增：哈希链（每日快照校验） |
 
-#### 日志告警域（server_instances / code_repos / log_alert_events / ai_code_analyses / notification_logs）
+#### 日志告警域（server_instances / log_alert_events / ai_analysis_tasks / ai_code_analyses / notification_logs）
+
+> 实现现状注记：平台不持有代码仓库映射与本地代码缓存，无 `code_repos` 表；仓库定位由外部 AI 分析服务负责。
 
 | 表                | 关键字段                                                                                                                                                             | 说明                                   |
 |-------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|
 | server_instances  | name, ip, hostname, environment, group_name, status                                                                                                                  | 服务器实例                             |
-| code_repos        | service_name, repo_url, branch, local_path, last_pull_at                                                                                                             | 服务→仓库映射                          |
-| log_alert_events  | event_id, server_id, service_name, alert_type, error_signature, raw_stacktrace, error_count, first_seen_at, last_seen_at, status(pending/analyzing/resolved/ignored) | 应用日志告警事件（与 alerts 职责分离） |
-| ai_code_analyses  | event_id, located_file, located_line, code_snippet, root_cause, emergency_plan, fix_suggestion, impact_scope, confidence, cost_tokens, engine_used                   | 代码分析报告                           |
+| log_alert_events  | event_id, server_id, service_name, alert_type, error_signature, raw_stacktrace, error_count, first_seen_at, last_seen_at, analysis_state(pending/running/awaiting/done/failed/disabled), suppressed, cooldown_until | 应用日志告警事件（与 alerts 职责分离） |
+| ai_analysis_tasks | event_id, task_id, run_id, protocol, state(pending/running/awaiting/done/failed/disabled), analysis_error                                                            | 提交给外部 AI 分析服务的异步任务       |
+| ai_code_analyses  | event_id, located_file, located_line, code_snippet, root_cause, emergency_plan, fix_suggestion, impact_scope, confidence, cost_tokens, engine_used, repo_revision    | 代码分析报告（结论由外部服务返回）     |
 | notification_logs | event_id, channel, target, content, status, sent_at                                                                                                                  | 通知记录                               |
 
 ### 7.2 索引设计
@@ -559,21 +558,30 @@ CREATE INDEX idx_log_event_srv ON log_alert_events(server_id, last_seen_at DESC)
 
 ## 九、项目结构
 
+> 以下为当前代码库的实际结构（实现现状注记，随代码演进更新；设计正文第三~八章描述的是职责划分，包名以此节为准）。
+
 ### 9.1 后端（middleware-ops/，模块化单体）
 
 ```text
-cmd/server/main.go            # 入口
+cmd/
+  server/main.go              # 服务入口（单进程装配）
+  renderdump/main.go          # 集成渲染产物的本地调试工具
 internal/
-  config/                     # 配置（viper，ai_engine 策略）
-  model/                      # 数据模型（含 feedback/hash 字段）
-  repository/                 # 数据访问层
-  service/                    # 业务逻辑（域：resource/ai/control）
-    resource/                 # 纳管、监控、告警、日志告警
-    ai/                       # 诊断编排、知识库、代码分析
-    control/                  # 权限、执行、审批、审计、通知
+  apperr/                     # 业务错误码与错误类型
+  config/                     # 配置（viper，ai_engine 策略、AI 分析服务设置）
+  model/                      # 数据模型（含 feedback/hash 字段、日志告警、AI 分析任务）
+  repository/                 # 数据访问层（审计表仅追加）
+  service/                    # 业务逻辑（resource / ai / control 三域，同包按文件划分）
+    scheduler.go              # 定时任务（日志告警后处理等）
+    codeanalysis.go           # AI 代码分析：提交外部 AI 服务 + 收回调/轮询结论
+    ai_analysis_client.go     # 外部 AI 分析服务客户端
+    logalert.go · logalertrule.go · logalert_worker.go
+    logpipeline.go            # Kafka 日志消费编排
+    ai/                       # 诊断 Prompt 与上下文束（bundle/prompt）
   engine/                     # AI 引擎抽象（核心）
     engine.go                 # 引擎接口定义
     factory.go                # 引擎工厂（配置创建）
+    http_provider.go · hybrid.go · rule_engine.go
     guardrail/                # 六道护栏实现
       budget.go               # ① 上下文预算
       loop_guard.go           # ② 防死循环
@@ -581,26 +589,36 @@ internal/
       permscope.go            # ④ 权限隔离
       quality.go              # ⑤ 质量护栏（结构/评测）
       cost.go                 # ⑥ 成本治理
-    third_party.go / self_hosted.go / hybrid.go
   monitor/                    # Prometheus 集成（查询封装，无自有采集器）
-  log_collector/              # 日志采集（agent/hook/offset）
-  notifier/                   # 通知（feishu/wecom/dingtalk/email + 卡片）
-  handler/ · router/ · scheduler/ · db/ · utils/
+  logpipe/                    # Filebeat/Kafka 事件解析与映射
+  integration/                # 集成中心：Ansible/Filebeat 渲染、模板、校验
+  handler/                    # HTTP 处理器（参数绑定、权限点声明、统一响应）
+  router/                     # 路由表（权限点 + 操作级别显式声明）
+  middleware/                 # 追踪/恢复/限流/认证/数据权限
+  db/                         # 数据库连接与迁移（pgvector 适配）
+  docker/ · pkg/cache/ · response/ · logger/ · utils/
 ```
+
+> 说明：日志采集在被管侧由 Filebeat 自洽运行，平台侧没有独立采集器包；通知（feishu/wecom/dingtalk/email + 卡片）由 `service/notifier.go` 承载；定时任务集中在 `service/scheduler.go`。平台**不 clone、不缓存任何业务代码仓库**，AI 代码分析通过外部 AI 分析服务完成（见第十四章）。
 
 ### 9.2 前端（middleware-ops-web/，Vue 3）
 
 ```text
 src/
-  api/                        # 接口封装（auth/middleware/monitor/ai/alert/knowledge/fix/audit/...）
-  components/                 # CodeEditor / ResultTable / Terminal(xterm) / MetricChart / AIDiagnosisReport
+  api/                        # 接口封装（http 客户端 + 资源 API + 类型定义）
+  components/                 # StatCard / MetricChart / DiagnosisReport / LevelTag / EmptyGuide ...
+  composables/                # useListPage / useViewport（列表页与响应式复用逻辑）
+  layouts/                    # AppShell / SideNav（含移动端抽屉导航）
+  router/ · stores/ · styles/ # 路由、Pinia、主题令牌（CSS 变量）
   views/
     Dashboard.vue             # 全局大盘
     Middleware/ Monitor/      # 纳管、监控
-    AICenter/                 # AI 诊断中心（Diagnose/History）
-    Alert/ Knowledge/         # 告警治理、知识库
-    LogAlert/ Server/         # 日志告警中心、服务器
-    Audit/ System/            # 审计、系统（Users/Roles/Approvals）
+    Integration/              # 集成中心（Exporter/Filebeat 接入）
+    AICenter/                 # AI 诊断中心（Diagnose/History/Quality）
+    Alert/ LogAlert/          # 指标告警、日志告警（事件/规则）
+    Knowledge/ Fix/ Audit/    # 知识库、修复执行、审计
+    System/                   # 系统设置（用户/审批/通知渠道/AI 设置/安全）
+    Login.vue · NotFound.vue
 ```
 
 ## 十、非功能需求
@@ -688,5 +706,172 @@ src/
 
 
 本文档为研发可执行基线：数值均为建议初始值并标注调整条件；「示意」图以正文描述为准。与 v0.2 的差异已在前置评审意见中逐项确认，本版为自洽的最终设计。
+
+---
+
+## 十四、架构与实现映射（实现现状注记）
+
+> 本章说明「设计文档条目 → 代码落点」的对应关系，便于评审与后续演进时快速定位。
+> 本章以当前代码（代码分析协议修订 r17）为准；如与前文章节描述不一致，以本章为准。
+
+### 14.1 模块化单体分层
+
+```text
+handler（HTTP 语义：参数绑定、权限点声明、统一响应）
+   │
+router（路由表：权限点 + 操作级别的显式声明）
+   │
+middleware（追踪/恢复/限流/认证/数据权限）
+   │
+service（业务编排：resource / ai / control 三域）
+   ├── resource：纳管、监控、告警、日志告警（规则 + 后处理编排 + Kafka 采集链路）
+   ├── ai      ：诊断编排、知识库、代码分析（外部 AI 服务异步任务）、上下文与 Prompt
+   └── control ：认证授权、修复执行、审批、审计、通知
+   │
+engine（AI 引擎抽象 + 六道护栏；与业务解耦，可整体替换）
+   │
+repository（数据访问；审计表仅追加）
+   │
+model / db（实体与迁移，pgvector 适配）
+```
+
+依赖方向单向向下，`engine` 与 `service` 之间只通过接口交互，便于替换引擎与独立测试护栏。
+
+平台侧**不 clone、不缓存任何业务代码仓库**：AI 代码分析通过 `service/codeanalysis.go`
+把脱敏后的错误信息提交给**外部 AI 分析服务**（异步任务：Submit → awaiting → 回调/轮询 → done），
+平台不再需要 git，也不再持有任何代码副本。对接协议详见
+[AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md)。
+
+### 14.2 日志集成的数据流（Filebeat → 平台 Kafka）
+
+日志采集在被管侧自洽运行（旧的「反查 docker 卷 + 平台起采集容器」实现已整体删除，
+见 [LOG_INTEGRATION.md](LOG_INTEGRATION.md)）。通路是：
+
+```text
+目标服务器（被管侧）                       平台（nightjar）
+─────────────────────                     ─────────────────────────────────────────
+应用日志 /var/log/app/*.log
+      │
+      ▼
+filebeat（平台用 Ansible 幂等部署：已装则复用、配置内容变化才重启）
+      │  output.kafka（JSON 编码）
+      ▼
+                                  ┌──────────────────────────────────────┐
+       Kafka EXTERNAL :9092 ─────▶│ kafka 容器（KRaft 单节点）            │
+      （KAFKA_ADVERTISED_HOST）   │  INTERNAL :29092 ← 平台内部消费       │
+                                  │  topic: mwops-logs                   │
+                                  └───────────────┬──────────────────────┘
+                                                  │ consumer group: mwops-log-ingest
+                                                  ▼
+                                  internal/logpipe（解析 Filebeat 事件）
+                                                  ▼
+                                  service/logpipeline.go（消费编排 + 链路状态/探测）
+                                                  ▼
+                                  service/logalert.go Ingest（错误指纹 /
+                                  匹配 log_alert_rules：窗口去重 + 冷却抑制）
+                                                  ▼
+                                  log_alert_events（analysis_state=pending）
+                                                  ▼
+                                  定时任务（log_alert.worker_interval_seconds）
+                                                  ▼
+                                  service/logalert_worker.go 后处理：
+                                  ① 外发通知渠道（写 notified_at）
+                                  ② 提交外部 AI 分析服务（事件置 awaiting）
+                                  ③ 回调/轮询收回结论后写三点式分析并通知
+```
+
+要点：
+
+- 平台只提供 **Kafka 端口 + 消费链路**，采集在被管侧自洽运行，平台重启不影响采集（位点在 Filebeat 注册表）；
+- 消费位点**只在 Ingest 成功后提交**；解析失败的消息计入 `dropped` 并照常提交，避免一条脏消息堵住分区；
+- 平台自检 `POST /api/integrations/:id/selfcheck` 对日志类型返回三段环节：
+  平台 → Kafka / 被管机接入地址（Kafka EXTERNAL）/ 日志是否真的进来了；
+- 回退通路只有一条：`POST /api/hooks/logs`（应用直推，零侵入兜底），字段与 Filebeat 路径统一映射。
+
+### 14.3 日志事件的数据流（规则 → 窗口/冷却 → 后处理）
+
+落库之后的那一段值得单独记住：**“这条告警为什么没通知我”全靠这条链上的字段解释**。
+
+```text
+日志事件 ──▶ ① 规则匹配（service/logalertrule.go）
+                 按「服务 + 错误指纹 + 级别」匹配 log_alert_rules：
+                 priority 数字小者优先、同优先级按 id 升序，取第一条 enabled 的规则；
+                 没命中 → 事件不入库（系统无默认规则，需先在「日志告警-规则」中配置）
+             ──▶ ② 窗口去重（命中规则的 dedup_window，分钟）
+                 窗口内同指纹【合并计数】、不新增事件（error_count 累加、last_seen_at 刷新）
+             ──▶ ③ 冷却抑制（命中规则的 cooldown，分钟）
+                 冷却内不重复通知、不重复提交 AI，但【事件照常记录】
+                 （suppressed=true + cooldown_until；冷却过后再次合并才重新通知，且不重跑 AI）
+             ──▶ ④ 后处理（service/logalert_worker.go）
+                 定时任务扫 analysis_state=pending：
+                 通知渠道（写 notified_at）→ 提交外部 AI 分析服务（置 awaiting）
+                 → 回调/轮询收回三点式结论（定位文件行 / 根因 / 应急处置 / 修复建议），
+                 失败或跳过原因写 analysis_error（disabled=规则关了 AI 或未配置 AI 分析服务）
+```
+
+AI 分析任务状态机：`pending → running → awaiting（已提交外部服务，等回调/轮询）→ done / failed / disabled`。
+
+三个结构性保证：
+
+- **状态在数据库**（`analysis_state` / `notified_at` / `cooldown_until`）：进程重启不丢，页面能解释每条事件的下场；
+- **多副本安全**：`ClaimForAnalysis` 用带条件的 UPDATE（`pending → running`）抢占，一条事件只被处理一次；
+- **平台无代码副本**：代码定位由外部 AI 分析服务基于它自己持有的代码与上下文完成，
+  平台只送问题、收结论，天然不存在脏缓存导致错误行号的问题（接入方式见
+  [INTEGRATION.md](INTEGRATION.md) 的 AI 代码分析部分）。
+
+### 14.4 设计文档条目映射
+
+| 设计文档条目 | 代码落点 | 关键实现说明 |
+|--------------|----------|--------------|
+| 2.1 技术栈（Gin/GORM/go-redis/cron/viper/zap/JWT） | `internal/router`、`internal/repository`、`internal/pkg/cache`、`internal/service/scheduler.go`、`internal/config`、`internal/logger`、`internal/utils/jwt.go` | 全部按选型落地；Redis 缺省降级为内存实现 |
+| 2.2 前端（Vue3/Vite/Element Plus/Pinia/ECharts/markdown-it/SSE） | `middleware-ops-web/src` | SSE 用 fetch + ReadableStream（需携带认证头）；ECharts 按需引入 |
+| 3.2 模块化单体 | `cmd/server/main.go` | 单进程装配：DB → 缓存 → 引擎 → 服务 → 路由 → 调度 |
+| 3.4 关键机制（引擎插拔/任务队列/并发≤4） | `engine/factory.go`、`engine/hybrid.go`、`service/container.go`、`engine/guardrail/timeout.go` | `ai_engine.strategy` 三态；并发额度由护栏信号量控制 |
+| 4.1 纳管 + 能力矩阵 | `service/middleware.go`、`internal/monitor/profile.go`、`handler/system.go: capabilityMatrix` | 能力矩阵由代码声明并在 `/api/system/info` 透出，声明与实现一致 |
+| 4.2 统一监控（PromQL，不建自有指标表） | `internal/monitor/prometheus.go`、`service/metrics.go` | 无 `metric_snapshots` 表；指标目录由 `profile.go` 定义 |
+| 4.3 AI 诊断中心 | `service/diagnose.go`、`service/ai/{bundle,prompt}.go` | 固定管线：解析目标 → 权限 → 缓存 → 预采集 → 一次调用 → 结构化 → 落库 |
+| 4.4 告警治理（规则级/语义聚类/因果收敛） | `service/alert.go` | 指纹 + 窗口去重 + 冷却；聚类仅合并展示；因果收敛未实现（二期） |
+| 4.5 知识库质量闭环 | `service/knowledge.go`、`service/diagnose.go: sinkKnowledge` | 诊断沉淀 `status=draft`；采纳率参与检索加权 |
+| 4.6 操作分级与执行 | `service/fix.go`、`service/approval.go` | L0/L1/L2 判定；L2 转工单；结果回填复核 |
+| 4.7 审计（只追加 + 哈希链） | `repository/audit.go`、`service/audit.go` | 仓储无 Update/Delete；`hash_self = SHA256(hash_prev\|内容)` |
+| 4.8 日志告警与代码分析 | `service/logalert.go`、`service/logalertrule.go`、`service/logalert_worker.go`、`service/codeanalysis.go`、`service/ai_analysis_client.go`、`internal/logpipe`、`service/logpipeline.go` | 错误指纹归并；日志告警规则（`log_alert_rules`：去重窗口/冷却期/优先级/通知渠道/AI 开关）由 `logalertrule.go` 匹配与读写，**无内置默认规则**；落库后的通知 + AI 三点式分析由 `logalert_worker.go` 定时编排；代码分析为外部 AI 服务异步任务（Submit→awaiting→回调/轮询→done），平台不持有代码副本；出网白名单 + 脱敏仍然保留；日志集成由 `logpipe` 消费 Kafka 并把 Filebeat 事件映射成日志事件 |
+| 5.1 不做自主循环 Agent | `service/diagnose.go` | 单轮采集 + 一次 LLM 调用；护栏②为二期 Agent 预留 |
+| 5.2 上下文预算 | `engine/guardrail/budget.go` | 截断维度透出；`SummarizeSeries` 做降采样摘要 |
+| 5.3 防死循环 | `engine/guardrail/loop_guard.go` | 步数/指纹/白名单/决策卡；工具失败不重试 |
+| 5.4 超时与降级链 | `engine/guardrail/timeout.go`、`engine/hybrid.go` | 工具/任务超时；熔断 + 三级降级 |
+| 5.5 权限隔离 | `engine/guardrail/permscope.go`、`service/middleware.go: GuardScope` | 只读工具集类型约束；数据权限落库过滤；SQL 规则校验 |
+| 5.6 质量护栏 | `engine/guardrail/quality.go`、`web/src/components/DiagnosisReport.vue` | 结构化 schema、证据引用、推测标注、24 条评测集 |
+| 5.7 成本治理 | `engine/guardrail/cost.go` | 确定性缓存键、日预算、并发、突增熔断 |
+| 6.1 RBAC 与数据权限 | `service/auth.go`、`handler/auth.go` | 四内置角色 + 权限点目录；环境/分组隔离 |
+| 6.2 操作分级与 IM 边界 | `service/fix.go`、`service/notifier.go` | 卡片不含执行动作，仅「查看详情 / 确认 / 驳回」 |
+| 6.3 凭据与密钥管理 | `utils/crypto.go` | AES-256-GCM；主密钥文件 0600；接口不回传密文 |
+| 6.4 审计可验证 | `repository/audit.go: CreateSnapshot/VerifyChain` | 每日快照落盘 + 周期校验；断链可定位 |
+| 6.5 出网合规 | `service/redact.go`、`service/codeanalysis.go` | 默认关闭出网；正则脱敏；送外部 AI 前脱敏错误信息与堆栈 |
+| 6.6 传输与存储安全 | `middleware/middleware.go`、`utils/password.go`、`router/router.go` | CSP/X-Frame-Options/SameSite；bcrypt；GORM 参数化 |
+| 7.1 表结构 | `internal/model/model.go` | 含 v0.2 新增字段（feedback/engine_status/hash_prev/hash_self/status/adopt_count）；日志告警含 `log_alert_events` / `log_alert_rules`，AI 异步任务含 `ai_analysis_tasks` / `ai_code_analyses` |
+| 7.2 索引 | `db/vector_plain.go`、`db/vector_pgvector.go`、`docs/SCHEMA.sql` | 按方言分别建立；HNSW 仅在 pgvector 构建下创建 |
+| 八、接口设计 | `router/router.go`、[API.md](API.md) | 统一响应/错误码分段/SSE 事件/权限点标注 |
+| 十、非功能需求 | `configs/config.yaml`、`service/scheduler.go` | 采集与评估周期、保留策略、限流与并发上限可配 |
+
+### 14.5 关键取舍与理由
+
+1. **不做自研采集器**：指标来自 Prometheus + 官方 Exporter，平台只做 PromQL 查询与语义化封装（阈值、状态判定、指标目录），避免重复造轮子并降低运维面。
+2. **引擎层承载护栏**：六道护栏全部放在 `engine/guardrail`，业务代码只调接口。这样切换模型、调整预算或更换评测集都不需要改动诊断编排。
+3. **规则引擎作为降级链末端**：规则引擎输出与 LLM 完全同构的结构化报告，使上层解析、展示、落库逻辑无需分支处理；同时保证「AI 不可用时诊断链路不中断」。
+4. **审计只追加**：从 handler 到 repository 都不提供修改/删除接口，配合哈希链与每日快照，把「可验证」做成结构性保证而非流程约定。
+5. **执行默认预演**：平台不假装能执行未接入的操作。`dryRunExecutor` 明确拒绝 L2 动作，避免「显示成功但实际未执行」的误导；接入真实客户端只需实现 `Executor` 接口。
+6. **代码分析外移给专门服务**：平台不再 clone/缓存业务代码，代码定位与上下文由外部 AI 分析服务负责；平台侧消除了 git 依赖、磁盘缓存与「代码片段外发」合规面，只保留出网白名单与脱敏两条规矩。
+7. **移动端优先的响应式**：`AppShell` 在 <768px 切换为抽屉导航，列表页切换为卡片形态，表格统一置于横向滚动容器中；输入控件在窄屏占满整行，触控目标 ≥38px。
+8. **主题令牌化**：深浅主题只切换 CSS 变量（含 Element Plus 变量映射），组件样式不做分支，避免两套样式漂移。
+
+### 14.6 二期演进建议
+
+| 方向 | 可复用基础 | 需要新增 |
+|------|------------|----------|
+| 自主排障 Agent（设计文档 5.1 探索项） | 护栏②的 `LoopGuard`、护栏④的只读工具注册表 `ToolRegistry` | Agent 编排器、决策卡展示、人工确认中断点 |
+| 因果收敛（4.4 二期） | 告警指纹与聚类结果 | 服务拓扑数据模型与依赖推断 |
+| 代码分析能力增强 | 外部 AI 分析服务异步任务协议与回调链路 | 与外部服务约定更丰富的上下文/索引协议；如转自建则引入 AST 解析、知识图谱、向量检索 + Rerank |
+| 多租户与微服务拆分（3.3） | 服务容器与仓储接口 | 租户维度注入、按域拆进程与独立部署 |
+| VictoriaMetrics / MinIO（2.3 可选组件） | `pkg/cache` 的接口抽象方式 | 对应的队列与存储适配器 |
 
 

@@ -6,7 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // AIAnalysisTaskRepository 提供异步 AI 分析任务的数据访问。

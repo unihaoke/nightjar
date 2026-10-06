@@ -6,12 +6,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/engine/guardrail"
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine/guardrail"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // Overview 全局大盘。

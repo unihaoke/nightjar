@@ -1,0 +1,55 @@
+<svg viewbox="0 0 1000 600" width="100%" xmlns="http://www.w3.org/2000/svg">
+<rect fill="#eff6ff" height="66" rx="10" stroke="#93c5fd" width="940" x="30" y="20"></rect>
+<text fill="#1e40af" font-size="15" font-weight="700" text-anchor="middle" x="500" y="46">前端层 Vue 3 + ECharts</text>
+<text fill="#3b82f6" font-size="12" text-anchor="middle" x="500" y="70">管理台 · 大盘 · AI 诊断中心 · 日志告警中心 · 知识库 · 审计</text>
+<line stroke="#9ca3af" stroke-width="2" x1="500" x2="500" y1="86" y2="104"></line>
+<rect fill="#f8fafc" height="44" rx="10" stroke="#94a3b8" width="940" x="30" y="104"></rect>
+<text fill="#334155" font-size="13.5" font-weight="700" text-anchor="middle" x="500" y="131">Nginx：静态资源 · 反向代理 · 限流 · WSS 代理（不引入 Kong/APISIX）</text>
+<line stroke="#9ca3af" stroke-width="2" x1="500" x2="500" y1="148" y2="166"></line>
+<rect fill="#fff" height="232" rx="10" stroke="#93c5fd" width="940" x="30" y="166"></rect>
+<text fill="#1e40af" font-size="15" font-weight="700" text-anchor="middle" x="500" y="192">后端单体（Go + Gin）— 模块化分包，单进程部署</text>
+<g fill="#374151" font-size="12.5">
+<rect fill="#f0fdf4" height="52" rx="8" stroke="#86efac" width="285" x="55" y="206"></rect>
+<text fill="#15803d" font-weight="700" text-anchor="middle" x="197" y="225">资源域</text>
+<text text-anchor="middle" x="197" y="244">纳管/监控 · 告警治理 · 日志告警</text>
+<rect fill="#f0fdf4" height="52" rx="8" stroke="#86efac" width="285" x="360" y="206"></rect>
+<text fill="#15803d" font-weight="700" text-anchor="middle" x="502" y="225">智能域</text>
+<text text-anchor="middle" x="502" y="244">AI 诊断引擎 · 知识库/RAG · 代码分析</text>
+<rect fill="#f0fdf4" height="52" rx="8" stroke="#86efac" width="285" x="665" y="206"></rect>
+<text fill="#15803d" font-weight="700" text-anchor="middle" x="807" y="225">管控域</text>
+<text text-anchor="middle" x="807" y="244">权限/执行引擎 · 审计 · 通知</text>
+<rect fill="#eff6ff" height="44" rx="8" stroke="#93c5fd" width="285" x="55" y="272"></rect>
+<text text-anchor="middle" x="197" y="299">Prometheus 采集 · Exporter 接入</text>
+<rect fill="#eff6ff" height="44" rx="8" stroke="#93c5fd" width="285" x="360" y="272"></rect>
+<text text-anchor="middle" x="502" y="299">engine 接口：third_party / self_hosted / hybrid</text>
+<rect fill="#eff6ff" height="44" rx="8" stroke="#93c5fd" width="285" x="665" y="272"></rect>
+<text text-anchor="middle" x="807" y="299">RBAC · 操作分级 · 审批流</text>
+<rect fill="#f8fafc" height="52" rx="8" stroke="#cbd5e1" width="285" x="55" y="330"></rect>
+<text fill="#475569" text-anchor="middle" x="197" y="349">任务队列（Redis Stream）</text>
+<text fill="#64748b" text-anchor="middle" x="197" y="368">诊断/分析任务异步执行，并发 ≤ 4</text>
+<rect fill="#f8fafc" height="52" rx="8" stroke="#cbd5e1" width="285" x="360" y="330"></rect>
+<text fill="#475569" text-anchor="middle" x="502" y="349">定时任务（cron）</text>
+<text fill="#64748b" text-anchor="middle" x="502" y="368">采集调度 · 巡检 · 快照 · 日志扫描</text>
+<rect fill="#f8fafc" height="52" rx="8" stroke="#cbd5e1" width="285" x="665" y="330"></rect>
+<text fill="#475569" text-anchor="middle" x="807" y="349">AI 六道护栏（引擎层内置）</text>
+<text fill="#64748b" text-anchor="middle" x="807" y="368">预算 · 循环 · 超时 · 权限 · 质量 · 成本</text>
+</g>
+<line stroke="#9ca3af" stroke-width="2" x1="500" x2="500" y1="398" y2="416"></line>
+<rect fill="#f8fafc" height="164" rx="10" stroke="#cbd5e1" width="940" x="30" y="416"></rect>
+<text fill="#334155" font-size="15" font-weight="700" text-anchor="middle" x="500" y="442">数据与基础设施层</text>
+<g fill="#374151" font-size="12.5">
+<rect fill="#eff6ff" height="52" rx="8" stroke="#93c5fd" width="280" x="55" y="456"></rect>
+<text fill="#1d4ed8" font-weight="700" text-anchor="middle" x="195" y="475">PostgreSQL 15 + pgvector</text>
+<text text-anchor="middle" x="195" y="494">元数据 · 告警 · 知识向量（必装）</text>
+<rect fill="#eff6ff" height="52" rx="8" stroke="#93c5fd" width="280" x="360" y="456"></rect>
+<text fill="#1d4ed8" font-weight="700" text-anchor="middle" x="500" y="475">Redis 单机/哨兵</text>
+<text text-anchor="middle" x="500" y="494">缓存 · 队列 · 去重指纹（必装）</text>
+<rect fill="#eff6ff" height="52" rx="8" stroke="#93c5fd" width="280" x="665" y="456"></rect>
+<text fill="#1d4ed8" font-weight="700" text-anchor="middle" x="805" y="475">Prometheus 单机</text>
+<text text-anchor="middle" x="805" y="494">指标存储 · 告警规则（必装）</text>
+<rect fill="#f3f4f6" height="44" rx="8" stroke="#d1d5db" stroke-dasharray="4" width="280" x="55" y="522"></rect>
+<text fill="#6b7280" text-anchor="middle" x="195" y="548">Kafka（可选）· MinIO/S3（可选）· VictoriaMetrics（可选）</text>
+<rect fill="#f3f4f6" height="44" rx="8" stroke="#d1d5db" stroke-dasharray="4" width="280" x="665" y="522"></rect>
+<text fill="#6b7280" text-anchor="middle" x="805" y="548">LLM API：DeepSeek / Claude / 本地 LLM</text>
+</g>
+</svg>

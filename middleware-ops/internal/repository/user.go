@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // UserRepository 提供用户与角色的数据访问。

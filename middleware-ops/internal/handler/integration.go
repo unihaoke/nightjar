@@ -5,9 +5,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // IntegrationOverview 返回集成中心概览（组件模板 + 已集成数量）。

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件钉住「AI 代码分析」纳入平台设置后的两条关键语义：

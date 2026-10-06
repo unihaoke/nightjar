@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // httpProvider 实现 OpenAI 兼容协议的第三方 / 自托管引擎。

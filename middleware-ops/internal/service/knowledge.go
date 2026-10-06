@@ -8,9 +8,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
 )
 
 // KnowledgeService 提供知识库能力（4.5）。

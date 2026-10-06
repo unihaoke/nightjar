@@ -9,7 +9,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // Deps 是缓存与队列的组合依赖。

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // ruleEngine 是最终降级层：不依赖任何外部 LLM，用确定性规则从采集上下文产出结论。

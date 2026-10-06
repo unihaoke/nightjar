@@ -9,13 +9,13 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // AlertService 提供告警治理能力（4.4）。

@@ -38,3 +38,9 @@ Thumbs.db
 
 # 临时文件
 *.tmp
+
+# Go 测试与覆盖率
+*.test
+*.out
+coverage/
+coverage.out

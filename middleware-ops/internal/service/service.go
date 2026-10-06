@@ -6,13 +6,13 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/engine/guardrail"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine/guardrail"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // Deps 是全部服务的依赖集合与应用服务容器。
@@ -35,28 +35,28 @@ type Deps struct {
 	StartedAt     int64
 
 	// 仓储
-	Instances     *repository.InstanceRepository
-	Users         *repository.UserRepository
-	Roles         *repository.RoleRepository
-	Diagnoses     *repository.DiagnosisRepository
-	Rules         *repository.AlertRuleRepository
-	Alerts        *repository.AlertRepository
-	AlertVec      *repository.AlertEmbeddingRepository
-	Knowledge     *repository.KnowledgeRepository
-	Audits        *repository.AuditRepository
-	Approvals     *repository.ApprovalRepository
-	Fixes         *repository.FixRepository
-	Servers       *repository.ServerRepository
-	LogEvents     *repository.LogEventRepository
+	Instances *repository.InstanceRepository
+	Users     *repository.UserRepository
+	Roles     *repository.RoleRepository
+	Diagnoses *repository.DiagnosisRepository
+	Rules     *repository.AlertRuleRepository
+	Alerts    *repository.AlertRepository
+	AlertVec  *repository.AlertEmbeddingRepository
+	Knowledge *repository.KnowledgeRepository
+	Audits    *repository.AuditRepository
+	Approvals *repository.ApprovalRepository
+	Fixes     *repository.FixRepository
+	Servers   *repository.ServerRepository
+	LogEvents *repository.LogEventRepository
 	// AIAnalysisTasks 为异步 AI 分析任务仓储（提交—回调—超时）。
 	AIAnalysisTasks *repository.AIAnalysisTaskRepository
 	// KafkaStats 为日志消费链路的累计计数仓储（跨重启、跨副本累加）。
-	KafkaStats *repository.KafkaConsumeStatRepository
+	KafkaStats    *repository.KafkaConsumeStatRepository
 	LogAlertRules *repository.LogAlertRuleRepository
 	// LogAlertExclusions 为日志告警屏蔽项仓储（"这类错误不告警"）。
 	LogAlertExclusions *repository.LogAlertExclusionRepository
-	CodeAnalyses  *repository.CodeAnalysisRepository
-	Notifies      *repository.NotificationLogRepository
+	CodeAnalyses       *repository.CodeAnalysisRepository
+	Notifies           *repository.NotificationLogRepository
 
 	// 领域服务
 	Auth         *AuthService

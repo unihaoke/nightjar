@@ -13,8 +13,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件实现「远程服务器一键安装 Exporter」。

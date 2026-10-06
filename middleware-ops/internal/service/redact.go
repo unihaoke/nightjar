@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // Redactor 负责出网内容脱敏（6.5）。

@@ -6,7 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // AlertRuleRepository 提供告警规则的数据访问。

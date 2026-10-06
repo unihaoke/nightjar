@@ -9,12 +9,12 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // LogAlertService 实现日志告警域（4.8.1 / 4.8.2）。

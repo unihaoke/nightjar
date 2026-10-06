@@ -10,8 +10,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // AuditFilter 是审计日志检索条件。

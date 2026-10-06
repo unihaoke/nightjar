@@ -8,13 +8,13 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/engine/guardrail"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine/guardrail"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // ContainerOptions 是服务容器构造参数。

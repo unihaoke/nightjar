@@ -8,8 +8,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件实现「日志告警屏蔽项」：把"这类错误我不想收到"从"改代码/改配置"搬到页面上。

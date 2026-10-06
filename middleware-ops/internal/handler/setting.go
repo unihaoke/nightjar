@@ -3,9 +3,9 @@ package handler
 import (
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // AISettings 读取 AI 设置（管理员）。
@@ -80,11 +80,11 @@ func (h *Handler) TestAIProviderSettings(c *gin.Context) {
 		return
 	}
 	ok, engineName, message, latencyMs, err := h.deps.Settings.TestAIProvider(c.Request.Context(), in.Provider, service.ProviderSettingsInput{
-		Enabled:  in.Enabled,
-		Kind:     in.Kind,
-		BaseURL:  in.BaseURL,
-		APIKey:   in.APIKey,
-		Model:    in.Model,
+		Enabled:   in.Enabled,
+		Kind:      in.Kind,
+		BaseURL:   in.BaseURL,
+		APIKey:    in.APIKey,
+		Model:     in.Model,
 		MaxTokens: in.MaxTokens,
 	})
 	if err != nil {
@@ -101,16 +101,16 @@ func (h *Handler) TestAIProviderSettings(c *gin.Context) {
 // 只收探测真正需要的字段：路径、鉴权头、协议与定位方式决定报文形状，
 // 密钥走「已存 + 本次填写」的合并语义（与保存一致）。
 type testCodeAnalysisInput struct {
-	Enabled         bool   `json:"enabled"`
-	BaseURL         string `json:"base_url"`
-	APIKey          string `json:"api_key"`
-	Protocol        string `json:"protocol"`
-	AuthHeader      string `json:"auth_header"`
-	SubmitPath      string `json:"submit_path"`
-	SyncSubmitPath  string `json:"sync_submit_path"`
-	ServiceRepoMap  *[]service.ServiceRepoItem  `json:"service_repo_map,omitempty"`
-	Priority        int                         `json:"priority"`
-	AutoVerify      bool                        `json:"auto_verify"`
+	Enabled        bool                       `json:"enabled"`
+	BaseURL        string                     `json:"base_url"`
+	APIKey         string                     `json:"api_key"`
+	Protocol       string                     `json:"protocol"`
+	AuthHeader     string                     `json:"auth_header"`
+	SubmitPath     string                     `json:"submit_path"`
+	SyncSubmitPath string                     `json:"sync_submit_path"`
+	ServiceRepoMap *[]service.ServiceRepoItem `json:"service_repo_map,omitempty"`
+	Priority       int                        `json:"priority"`
+	AutoVerify     bool                       `json:"auto_verify"`
 }
 
 // TestCodeAnalysisSettings 自测「AI 代码分析」外部服务的连通性，不落库、不改内存配置。
@@ -122,16 +122,16 @@ func (h *Handler) TestCodeAnalysisSettings(c *gin.Context) {
 		return
 	}
 	ok, engineName, message, latencyMs, err := h.deps.Settings.TestCodeAnalysis(c.Request.Context(), service.AIAnalysisInput{
-		Enabled:         in.Enabled,
-		BaseURL:         in.BaseURL,
-		APIKey:          in.APIKey,
-		Protocol:        in.Protocol,
-		AuthHeader:      in.AuthHeader,
-		SubmitPath:      in.SubmitPath,
-		SyncSubmitPath:  in.SyncSubmitPath,
-		ServiceRepoMap:  in.ServiceRepoMap,
-		Priority:        in.Priority,
-		AutoVerify:      in.AutoVerify,
+		Enabled:        in.Enabled,
+		BaseURL:        in.BaseURL,
+		APIKey:         in.APIKey,
+		Protocol:       in.Protocol,
+		AuthHeader:     in.AuthHeader,
+		SubmitPath:     in.SubmitPath,
+		SyncSubmitPath: in.SyncSubmitPath,
+		ServiceRepoMap: in.ServiceRepoMap,
+		Priority:       in.Priority,
+		AutoVerify:     in.AutoVerify,
 	})
 	if err != nil {
 		response.Fail(c, err)

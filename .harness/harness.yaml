@@ -1,0 +1,179 @@
+spec: repository-harness/0.2
+
+repository:
+  name: nightjar
+  description: 中间件智能问题解决平台（Go + Vue 3 模块化单体），含集成中心、日志告警与外部 AI 代码分析对接
+
+entrypoint: README.md
+
+routing:
+  strategy: first-match
+  on_no_match: report
+
+documents:
+  - id: readme
+    path: README.md
+    purpose: 项目总览、快速开始、已知边界（中文）
+  - id: readme-en
+    path: README.en.md
+    purpose: 项目总览（英文）
+  - id: docs-index
+    path: docs/README.md
+    purpose: 文档索引与按角色阅读路径，新增文档必须在此登记
+  - id: design
+    path: docs/DESIGN.md
+    purpose: 设计基线；第十四章是架构与实现现状映射，改代码前先读
+  - id: api
+    path: docs/API.md
+    purpose: 平台 HTTP 接口清单与错误码，与 router.go 对齐
+  - id: integration
+    path: docs/INTEGRATION.md
+    purpose: 集成中心接入教程、落地方式、自备 Prometheus/Exporter 专题与排查
+  - id: log-integration
+    path: docs/LOG_INTEGRATION.md
+    purpose: Filebeat → 平台 Kafka 日志链路权威说明与配置项
+  - id: ai-api
+    path: docs/AI_CODE_ANALYSIS_API.md
+    purpose: 外部 AI 分析服务 OpenAPI v1 契约、回调 HMAC（附录 A）、平台侧验收（附录 B）
+  - id: operations
+    path: docs/OPERATIONS.md
+    purpose: 部署拓扑、配置项速查、备份恢复、升级与值班排查
+  - id: postmortem
+    path: docs/POSTMORTEM.md
+    purpose: 历史故障复盘档案，只追加不改写
+  - id: schema
+    path: docs/SCHEMA.sql
+    purpose: 数据库结构参考（以 GORM AutoMigrate 为权威）
+  - id: backend-config
+    path: middleware-ops/configs/config.yaml
+    purpose: 后端默认配置与全部配置项注释
+  - id: contributing
+    path: CONTRIBUTING.md
+    purpose: 贡献流程与约定
+  - id: security-policy
+    path: SECURITY.md
+    purpose: 安全漏洞私密上报政策
+  - id: code-of-conduct
+    path: CODE_OF_CONDUCT.md
+    purpose: 社区行为准则
+  - id: changelog
+    path: CHANGELOG.md
+    purpose: 版本变更记录
+
+scopes:
+  - id: backend
+    description: Go 后端（Gin + GORM 模块化单体）
+    paths: [middleware-ops]
+  - id: frontend
+    description: Vue 3 + Vite + TS 前端
+    paths: [middleware-ops-web]
+  - id: deployment
+    description: 部署编排、采集配置与运维脚本
+    paths: [deploy, scripts, docker-compose.yml, .env.example]
+
+concerns:
+  - id: backend-go
+    description: Go 后端业务逻辑、接口、模型、测试
+    signals: [Go, Gin/GORM, middleware-ops/internal]
+  - id: frontend-vue
+    description: Vue 3 页面、组件、状态与构建
+    signals: [Vue 3, TypeScript, middleware-ops-web/src]
+  - id: deployment
+    description: Docker Compose 部署、配置项、Prometheus/Grafana/Ansible
+    signals: [docker compose, deploy/, 环境变量]
+  - id: documentation
+    description: docs 下设计、接口、运维文档与交叉引用
+    signals: [docs/, Markdown, 文档链接]
+  - id: ai-analysis
+    description: 外部 AI 分析服务对接、回调、任务状态机
+    signals: [外部 AI 分析, 回调, OpenAPI]
+  - id: logging
+    description: Filebeat/Kafka 日志链路、日志告警规则与后处理
+    signals: [Filebeat, Kafka, 日志告警]
+  - id: security
+    description: RBAC、审批、审计哈希链、凭据加密、出网白名单
+    signals: [RBAC, 审计, 凭据脱敏]
+
+commands:
+  - id: all-check
+    run: make all-check
+    description: 提交前全量自检（后端 lint/test + 前端 build/smoke）
+    availability: { executables: [make], on_unavailable: report }
+  - id: backend-lint
+    run: gofmt -l . && go vet ./...
+    working_directory: middleware-ops
+    description: Go 格式检查与静态检查，必须无输出且通过
+    availability: { executables: [go, gofmt], on_unavailable: fail }
+  - id: backend-test
+    run: go test ./... -count=1
+    working_directory: middleware-ops
+    description: 运行后端全部单元测试
+    availability: { executables: [go], on_unavailable: fail }
+  - id: backend-fmt
+    run: gofmt -w .
+    working_directory: middleware-ops
+    description: 就地格式化后端 Go 代码
+    mutates: true
+    availability: { executables: [gofmt], on_unavailable: fail }
+  - id: frontend-build
+    run: npm run build
+    working_directory: middleware-ops-web
+    description: 前端类型检查与生产构建
+    availability: { executables: [npm], on_unavailable: fail }
+  - id: frontend-smoke
+    run: npm run smoke
+    working_directory: middleware-ops-web
+    description: 无头浏览器加载产物，捕获白屏等运行时问题
+    availability: { executables: [npm], on_unavailable: fail }
+  - id: e2e-smoke
+    run: pwsh -File scripts/smoke-test.ps1
+    description: 端到端冒烟（需后端已在 8080 运行）
+    availability: { executables: [pwsh], on_unavailable: report }
+
+validation_rules:
+  - match:
+      scopes: { any: [backend] }
+    commands: [backend-lint, backend-test]
+  - match:
+      scopes: { any: [frontend] }
+    commands: [frontend-build, frontend-smoke]
+
+routes:
+  - id: backend-context
+    description: Go 后端改动先看设计现状与接口契约，按关注点追加 AI/日志/安全文档
+    match:
+      scopes: { any: [backend] }
+    context:
+      required: [design, api]
+      conditional:
+        - document: ai-api
+          when: { concerns: { any: [ai-analysis] } }
+        - document: log-integration
+          when: { concerns: { any: [logging, ai-analysis] } }
+        - document: backend-config
+          when: { concerns: { any: [deployment] } }
+        - document: security-policy
+          when: { concerns: { any: [security] } }
+  - id: frontend-context
+    description: 前端改动对照接口契约与项目总览
+    match:
+      scopes: { any: [frontend] }
+    context:
+      required: [readme, api]
+  - id: deployment-context
+    description: 部署与采集改动先读运维与集成文档
+    match:
+      scopes: { any: [deployment] }
+    context:
+      required: [operations, integration]
+      conditional:
+        - document: log-integration
+          when: { concerns: { any: [logging] } }
+        - document: ai-api
+          when: { concerns: { any: [ai-analysis] } }
+  - id: docs-context
+    description: 文档改动从索引入手，保证登记与无死链
+    match:
+      concerns: { any: [documentation] }
+    context:
+      required: [docs-index, contributing]

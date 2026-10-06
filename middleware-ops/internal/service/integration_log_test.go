@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件锁定「日志集成」服务层与集成模板之间的**参数键契约**。

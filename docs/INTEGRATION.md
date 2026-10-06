@@ -6,6 +6,9 @@
 >
 > 差别只有一处：云上由厂商托管 Exporter 容器与抓取配置，本平台把这两件事
 > **在本机 docker 环境内自己完成**——页面点选、填参数、保存即接入。
+>
+> 本文档同时覆盖：端到端接入教程（第四章）与「自备 Prometheus / 自建 Exporter」
+> 接入专题（第十二章）。日志链路的权威说明见 [LOG_INTEGRATION.md](LOG_INTEGRATION.md)。
 
 ---
 
@@ -134,12 +137,127 @@ INTEGRATION_DOCKER_ENABLED=true
 
 ---
 
-## 4. 三种落地方式（按推荐度）
+## 4. 端到端接入教程（平台托管监控 · 被管项目零配置）
+
+> 适用形态：**监控栈统一在 nightjar**。被管项目只跑业务，不装 Exporter、不装 Agent、
+> 不跑 Prometheus/Grafana；平台负责建只读账号、拉起 Exporter、自动接入对方网络、抓取、出大盘，
+> 日志则由平台用 Ansible 在目标机部署 Filebeat 推到平台自带 Kafka（见 [LOG_INTEGRATION.md](LOG_INTEGRATION.md)）。
+
+### 4.1 职责边界
+
+```
+┌──────── nightjar（唯一监控栈）──────────────────────────┐
+│ mwops-prometheus   抓取全部 Exporter                    │
+│ mwops-grafana      大盘（数据源已自动配好）              │
+│ mwops-backend      纳管/查询/告警/AI 诊断/日志接收        │
+│ mwops-exporter-*   按「集成」创建，自动接入两张网         │
+│ mwops-kafka        日志总线：Filebeat 推送日志            │
+└──────────┬─────────────────────────────────────────────┘
+           │ 平台用 Docker API 自己发现目标容器所在网络并接入（被管项目零改动）
+┌──────────┴─ 被管项目（零监控配置）───────────────────────────┐
+│ mysql / redis / backend / frontend                     │
+│ 只需要提供：容器名（app-mysql / app-redis）             │
+└────────────────────────────────────────────────────────┘
+```
+
+| 事项 | 谁负责 | 被管项目需要做什么 |
+|---|---|---|
+| 只读监控账号 | 平台（勾选后自动建号，prod 走审批） | 集成时填一次管理凭据 |
+| Exporter | 平台（Docker API 创建） | 无 |
+| 网络接入 | 平台（`ResolveTarget` 反查容器所在网络并自动接入） | **无**（不建网络、不加别名、不改 compose） |
+| 指标抓取 | 平台自带 Prometheus | 无 |
+| 大盘 | 平台自带 Grafana | 无（可选：按编号导入官方大盘） |
+| 日志集成 | 平台用 Ansible 在目标机部署 Filebeat → 平台 Kafka（`mwops-kafka`） | 目标机能被平台 SSH 到、且能访问平台 Kafka 的对外地址 |
+| 告警规则 | 平台按模板自动创建 | 无 |
+
+### 4.2 被管项目侧：什么都不用做
+
+被管项目侧只有一个日常动作：把业务起起来。旧版本要求被管项目自带
+Prometheus/Grafana/Exporter 与各种监控环境变量，**现在全部不再需要**。
+
+### 4.3 平台侧：一条命令 + 三次点击
+
+```bash
+cd <nightjar>
+./scripts/onboard.sh --dry-run    # ① 预览：打印将要改的 .env 与启动命令
+./scripts/onboard.sh              # ② 执行：写 .env → 起平台 → 自检 → 打印下一步
+```
+
+脚本只动平台自己：生成缺失密钥（十六进制，免转义）、打开 `INTEGRATION_DOCKER_ENABLED`、
+**自动放开 `docker-compose.yml` 里 docker.sock 的注释**（自动发现网络的前提）、
+写 `MWOPS_PROMETHEUS_BASE_URL=http://prometheus:9090`，
+然后用普通的 `docker compose up -d --build` 启动平台——**不再需要任何 overlay 或互联网络**。
+
+然后在浏览器完成三次集成（**被管项目无需再改任何东西**）：
+
+| 步骤 | 集成中心操作 |
+|---|---|
+| ③ 集成 MySQL | 名称 `legacy-mysql`、地址 `app-mysql:3306`；**只读账号自动创建**（默认 `mwops_exporter`、口令平台生成），只需填一次 root 管理凭据 |
+| ④ 集成 Redis | 名称 `legacy-redis`、地址 `app-redis:6379`、口令填被管项目的 Redis 密码（Redis 不需要建号） |
+| ⑤ 日志集成 | 集成中心 → **日志 / Filebeat** 选 `log` 类型 → 集成名 `order-app-log`、目标机、日志路径 `/app/data/logs/*.log`、服务名 `app-review-api`、级别 `ERROR` → 保存后点**自检**，三段环节（平台 → Kafka / 被管机接入地址 / 日志是否真的进来了）全绿 |
+
+日志接入之后还有两步配置（第 ⑥ 步不配也能跑通；第 ⑦ 步要 AI 代码结论才需要）：
+
+| 步骤 | 操作 | 为什么 |
+|---|---|---|
+| ⑥ **配日志告警规则（可选）** | 日志告警 → **日志告警规则** → 新建：`service_name` 填 `app-review-api`（留空 = 任意服务）、`signature_pattern` 填**日志消息里的一段原文**（如 `NullPointerException`；留空 = 任意消息，写 `/正则/` 则按正则匹配）、`min_severity` 选 `ERROR`，再定 **去重窗口**（默认 5 分钟）、**冷却期**（默认 10 分钟）、**通知渠道**（留空 = 平台已启用的渠道）与 **AI 分析**开关 | 决定“多久打扰人一次”以及要不要自动出代码结论。匹配按「priority 数字小者优先、同优先级按 id 升序取第一条命中的**启用**规则」；**一条都没命中**时**不产生告警**（不入库、不通知、不分析）——平台没有默认规则兜底。建完规则记得确认它是**启用**状态 |
+| ⑦ **配置外部 AI 分析服务（要 AI 代码结论才需要）** | 系统设置 → **AI 设置 → AI 代码分析**：启用并填写服务地址、API Key、对接协议（开放接口 v1 / 通用协议）、回调地址与回调令牌；再把服务名加入出网白名单 `MWOPS_SECURITY_OUTBOUND_WHITELIST`（默认空 = 禁止任何外发） | AI 代码分析由**外部 AI 分析服务**完成：平台把脱敏后的错误信息提交出去（事件置 `awaiting`），服务端分析完成后回调或由平台轮询取回三点式结论。**平台不 clone、不缓存任何业务代码**，也不需要配置“服务→仓库映射”。对接协议与验收清单见 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md) 附录 B |
+
+账号相关补充：
+
+- **不需要提前建号**：MySQL/PostgreSQL 默认由平台代建（`CREATE USER IF NOT EXISTS` + `ALTER USER` + 最小授权），
+  口令 24 字节十六进制、加密存储；未填管理凭据时集成照常保存，只在备注里提示“填凭据后点重新应用”；
+- **账号管理**：集成中心右上角「监控账号」可查看来源/权限/最近轮换，
+  支持**轮换口令**（账号改自己的口令，不需要管理员凭据）与**删除账号**（破坏性，需管理员凭据；prod 转审批工单）；
+- 生产环境（`env=prod`）建号/删号只创建审批工单，不直接执行。
+
+保存集成的瞬间，平台会自己完成网络接入：反查 `app-mysql` / `app-redis`
+命中的容器 → 取得真实网络名 `app_data` → 把 Exporter 接成
+「`middleware-ops_mwops`（Prometheus 抓它）+ `app_data`（它连数据库）」两张网，
+并把平台自身也接进 `app_data` 以便做 TCP 健康探测。这些都发生在平台侧，
+被管项目的网络、别名、compose 文件一个字节都不动（集成卡片会写明“已发现目标容器…所在网络…”）。
+
+> 地址填**容器名**最稳（`app-mysql`）；填 compose 服务名（`mysql`）平台也会换算成容器名。
+> 填一个 docker 里不存在的名字时，报错会列出候选容器名。
+
+集成保存后平台会自动核验：抓取目标 `up` 就标记「已应用」；失败则把 Prometheus 的
+`lastError` 翻译后写回列表（不必再去 `/targets` 页面翻）。
+
+### 4.4 验收
+
+```bash
+cd <nightjar>
+./scripts/doctor.sh     # 平台容器 / docker.sock / 目标容器网络 / Exporter 网络 / 抓取状态
+```
+
+页面验收：**统一监控**能看到 `legacy-redis` / `legacy-mysql` 的曲线（趋势图 Y 轴按数据自适应）；
+**日志告警 → 事件**能看到 `app-review-api` 的 ERROR 事件；
+**Grafana**（`http://<主机>:3000`）数据源已就绪，大盘按集成卡片给的编号导入。
+
+### 4.5 回滚
+
+```bash
+# 平台侧：删掉集成（同时移除抓取目标与 Exporter 容器）
+#   「集成中心 → 该行 → 删除」
+# 日志集成：删除集成**不会**卸载目标机上的 Filebeat，需要就手工收尾——
+#   systemctl disable --now filebeat && rm -f /etc/filebeat/filebeat.yml   （package 模式）
+#   docker rm -f mwops-filebeat                                            （docker 模式）
+cd <nightjar> && docker compose down            # 平台下线（保留数据卷）
+
+# 被管项目侧：本来就什么都没改，停掉业务即可
+```
+
+> 平台的自动接入只体现在“平台容器多了一张网卡”上；`docker compose down` 后即消失，
+> 被管项目的网络、容器配置、compose 文件都不存在需要还原的改动。
+
+---
+
+## 5. 三种落地方式（按推荐度）
 
 | 方式 | 适用 | 操作 |
 |---|---|---|
 | **http_sd（推荐，平台内置）** | 平台自带 Prometheus（`deploy/prometheus/prometheus.yml` 已内置 `middleware-integration` job） | 无：保存后 30 秒内自动生效 |
-| **http_sd（外部 Prometheus）** | 复用 被管项目自带的 app-prometheus 等外部 Prometheus | 在其 `scrape_configs` 加一个 job，`http_sd_configs.url: http://mwops-backend:8080/api/sd/integrations`（该 Prometheus 需能访问 `mwops-backend`，例如与平台同网络） |
+| **http_sd（外部 Prometheus）** | 复用被管项目自带的 app-prometheus 等外部 Prometheus | 在其 `scrape_configs` 加一个 job，`http_sd_configs.url: http://mwops-backend:8080/api/sd/integrations`（该 Prometheus 需能访问 `mwops-backend`，例如与平台同网络） |
 | **显式 scrape job** | 外部 Prometheus 无法访问平台接口（例如跨主机且未放通 8000） | 抽屉 →「Prometheus(显式 job)」→ 复制片段并入 `scrape_configs` → reload/重启 |
 | **人工 compose** | 平台未启用 Docker 一键部署 | 抽屉 →「Exporter(compose)」→ 合并进 compose → `docker compose up -d` |
 
@@ -160,7 +278,7 @@ job="middleware-integration",instance_name="<集成名称>"
 
 ---
 
-## 5. 组件模板矩阵
+## 6. 组件模板矩阵
 
 | 组件 | Exporter 镜像 | 端口 | 参数形态 | 推荐告警 | Grafana 大盘 |
 |---|---|---|---|---|---|
@@ -171,7 +289,7 @@ job="middleware-integration",instance_name="<集成名称>"
 | Elasticsearch | `prometheuscommunity/elasticsearch-exporter:v1.7.0` | 9114 | 命令行 `--es.uri` / `--es.username` | 非 green、堆 > 85% | 2322 |
 | Nginx | `nginx/nginx-prometheus-exporter:1.3.0` | 9113 | 命令行 `--nginx.scrape-uri` | 5xx > 2% | 9614 |
 
-### 5.1 统一监控页可选指标（按画像顺序，**第一条是切换实例后的默认指标**）
+### 6.1 统一监控页可选指标（按画像顺序，**第一条是切换实例后的默认指标**）
 
 | 组件 | 指标（下拉顺序，共 N 项） |
 |---|---|
@@ -201,7 +319,7 @@ job="middleware-integration",instance_name="<集成名称>"
 
 ---
 
-## 6. 与被管项目（跨主机 / 跨 compose）的组合
+## 7. 与被管项目（跨主机 / 跨 compose）的组合
 
 被管项目的 MySQL / Redis 在 `app-data`（internal）网络里，不发布宿主端口，也不为监控做任何改动。
 平台创建 Exporter 时会**自己发现**目标容器所在的网络（`app_data`），然后把 Exporter
@@ -229,7 +347,7 @@ INTEGRATION_EXPORTER_NETWORK=middleware-ops_mwops
 
 ---
 
-## 6.1 反向接网（可选项，默认关闭）
+### 7.1 反向接网（可选项，默认关闭）
 
 上面是默认方向：**平台动自己**。有些环境反过来更合适——例如目标容器在网络命名空间上受限，
 或运维要求"所有被管容器都挂在平台网络上"。此时可在集成表单勾选
@@ -249,7 +367,7 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 
 ---
 
-## 6.2 监控账号：默认由平台代建 + 账号管理
+### 7.2 监控账号：默认由平台代建 + 账号管理
 
 **默认策略：需要账号的组件（MySQL / PostgreSQL）由平台自动建号**，使用者不必提前建号、
 也不必自己想账号名与口令：
@@ -318,7 +436,8 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 
 ---
 
-## 7. 权限、安全与审计
+## 8. 权限、安全与审计
+
 - **权限**：与「中间件纳管」共用 `middleware:read`（查看/预览）与 `middleware:write`（增删改/应用）——
   集成产物本身就是一个纳管实例，不额外引入权限点。
 - **口令**：AES-256-GCM 加密存储（复用平台主密钥）；**生成的任何配置里都不出现明文**，
@@ -331,7 +450,7 @@ docker network connect <平台网络> <目标容器>      # 例如 middleware-op
 - **操作级别**：L1（低危，直接执行并留痕）。生产环境若要更严的管控，
   可把 `deploy` 关掉，只允许平台渲染配置、由人工执行。
 
-### 7.1 docker.sock：权限与收敛（部署必读）
+### 8.1 docker.sock：权限与收敛（部署必读）
 
 平台容器以**非 root 用户**（镜像里的 `mwops`）运行，而宿主 socket 通常是 `root:docker 0660`，
 因此只把 socket 挂进容器还不够，会报：
@@ -354,22 +473,33 @@ dial unix /var/run/docker.sock: connect: permission denied
 
 ---
 
-## 8. 排查
+## 9. 排查
+
 | 现象 | 排查 |
 |---|---|
 | 集成保存成功但监控页没有数据 | 实例详情 → **接入自检**：`job_up=null` 说明没有该 job（检查 Prometheus 配置里是否有 `middleware-integration`）；`job_up=1` 且 `matched=0` 说明标签对不上（检查集成名称是否被改过） |
 | 服务发现不生效 | 后端容器内 `curl -s http://127.0.0.1:8080/api/sd/integrations`；Prometheus 容器内 `wget -qO- http://backend:8080/api/sd/integrations`；Prometheus 的 /targets 页看 `middleware-integration` 下的 target（`refresh_interval` 默认 30s） |
-| Exporter 容器起来了但 up=0 | Exporter 连不上被管实例：核对地址/账号口令、网络是否两张都挂上（`docker inspect <容器> | grep -A5 Networks`） |
+| Exporter 容器起来了但 up=0 | Exporter 连不上被管实例：核对地址/账号口令、网络是否两张都挂上（`docker inspect <容器> \| grep -A5 Networks`） |
+| **Redis：指标全无、`redis_up=0`，Exporter 认证报 WRONGPASS** | 集成里填了「用户名」，而被管 Redis 只配了 `requirepass`（default 用户，没有该 ACL 用户）。编辑集成，把**用户名清空**、只填口令，保存后平台自动重建 Exporter |
 | **Redis：Exporter 日志写 `Couldn't connect to redis instance (redis://<公网IP>:6379)`、`redis_up 0`** | Exporter 打的是自己的**公网 IP**：被管实例与 Exporter 同机时应填 `127.0.0.1`（公网 IP 要走 hairpin + 安全组，云上常被拦）。平台 r5 起会在「地址主机 == 目标机」时自动改用回环并写进部署说明；也可直接检查容器拿到的变量：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' <容器>` 里 `REDIS_ADDR` 应是 `127.0.0.1:6379` |
 | **Redis：`redis_up 0` 且 `last_scrape_error` 形如 `dial redis: unknown network redis`** | **这是马甲，不是根因**：redis_exporter 先用 `redis://` 连接，失败后按 `://` 拆开重试（`Dial("redis", "host:port")`），于是把 scheme 当成了网络类型，**真正的失败原因被吞掉**。真实原因通常是：① 地址/端口不通（端口只绑在 `127.0.0.1` 却填了公网 IP）；② 口令不一致，或目标没设口令却传了口令（`ERR Client sent AUTH, but no password is set`）；③ 多填了 ACL 用户名。拿真实原因：给容器加 `REDIS_EXPORTER_DEBUG=true` 看日志里的 `DialURL() failed, err:`，或在被管机上 `redis-cli -h <地址> -p <端口> [-a <口令>] ping`。平台从 r4 起按不带 scheme 的 `host:port` 注入，兜底路径会走回 tcp 分支，真实错误不再被吞 |
 | **容器在跑，但 `docker ps` 的 PORTS 列是空的** | **正常现象，不是故障**：只有做端口映射（`-p`/NAT）的容器才在这一列显示端口。远程安装与主机监控都用 `--network host`，容器直接使用宿主网络命名空间、Exporter 绑的就是宿主端口，因此没有映射可显示。按下面三条确认它真的在听：<br>`docker inspect -f '{{.HostConfig.NetworkMode}}' <容器>` → `host`<br>`ss -ltnp \| grep <Exporter端口>` → 看到 `redis_exporter`/`mysqld_exporter` 在听<br>`curl -s http://127.0.0.1:<Exporter端口>/metrics \| grep -E '^redis_up\|^mysql_up'` → `1` 才算真的通 |
 | 远程安装 Ansible 成功但平台报"探测失败" | 平台从**平台侧**探目标机的 Exporter 端口：云主机要在安全组/防火墙对平台出口 IP 放通该端口（9121/9104/9187/9100） |
-| 一键部署报错 | 集成列表里该行会显示「待处理」与失败原因；`INTEGRATION_DOCKER_ENABLED` 与 socket 挂载是否都就绪 |
+| 一键部署报错 `dial ... docker.sock: no such file or directory` | 平台容器里没有 docker.sock：compose 挂载还是注释状态，或容器早于该改动启动。重跑 `./scripts/onboard.sh`（会自动放开注释）后 `docker compose up -d --force-recreate backend`；rootless Docker 把 `INTEGRATION_DOCKER_HOST` 指向 `/run/user/<uid>/docker.sock` 并挂载该路径 |
+| 一键部署报错（permission denied） | socket 已挂载但 GID 不对，见 8.1；`INTEGRATION_DOCKER_ENABLED` 与 socket 挂载是否都就绪 |
+| 集成报「无法确定目标所在网络」 | 地址里的名字与 docker 里的容器名/服务名/别名都不匹配，或平台没挂 docker.sock；报错里会列出候选容器名，`./scripts/onboard.sh` 会自动放开 docker.sock |
 | MySQL 某个采集项"关了没关掉" | 开关是否渲染成 `--no-collect.xxx`（抽屉里看 compose 片段） |
+| MySQL 报 `Access denied for user 'exporter'` / `invalid DSN` | 账号不存在或口令不一致：用「监控账号 → 重试建号/测试连接」；`invalid DSN` 是旧版拼 `DATA_SOURCE_NAME` 的残留，重建 Exporter 即可（现已改为官方 flag `--mysqld.username` + `MYSQLD_EXPORTER_PASSWORD`） |
 | 想彻底重来 | 列表行 →「重新应用」（重写服务发现 + 重建容器），或删除后重新集成 |
-| **不确定到底是哪一环的问题** | 列表行 →「**自检**」：按环节给出结论，不用翻日志（见下） |
+| 后端启动报 `password authentication failed for user "mwo" (SQLSTATE 28P01)` | Postgres 只在数据卷为空时应用 `POSTGRES_PASSWORD`；卷早就初始化过、`.env` 的 `DB_PASSWORD` 又被轮换。重跑 `./scripts/onboard.sh` 对齐库内口令，详见 [OPERATIONS.md](OPERATIONS.md) 5.8 |
+| **日志集成：Filebeat 连上又断开**，报 `dial tcp 127.0.0.1:9092: connect: connection refused` | `.env` 的 `KAFKA_ADVERTISED_HOST` 填成了回环/容器名：Filebeat 握手成功后被 broker 元数据引导去连它自己那台机器。改成**被管机能访问到的平台宿主机 IP 或域名**，重建 kafka 容器；目标机 `nc -vz <host> 9092` + `filebeat test output` 复验 |
+| **日志集成：Filebeat 显示已发送，但平台一条日志都没有** | 目标机时钟偏移过大，消息被 Kafka 以 `InvalidTimestampException` 丢弃。目标机 `timedatectl` / `chronyc tracking` 确认 NTP 已同步，偏差大的先修 NTP 再重启 Filebeat |
+| **日志集成自检第 1 段红（平台 → Kafka）** | `kafka` 容器没起来，或 `KAFKA_BROKERS` 被改错（平台侧填容器网络的 `kafka:29092`，不是宿主端口）。`docker exec mwops-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list` 应列出 `mwops-logs` |
+| **日志收到了但不通知、也不分析** | ① 规则没命中或没启用（**平台没有默认规则**，未命中 = 不入库、不通知、不分析），屏蔽规则优先命中也会直接丢弃；② 冷却中（`suppressed=true` + `cooldown_until`，事件已记录）；③ 看「AI 分析」列：`disabled` = 规则关了 AI / 服务不在出网白名单 / 未配置外部 AI 服务；`awaiting` 久不结束 = 回调不通（见第十一章与 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md) 附录 B）；`failed` = 外部服务错误或超时，原因都在 `analysis_error`。要立刻重跑点「**重新分析**」（清冷却立即重跑通知与 AI） |
+| 趋势图是一条直线 / 某指标报 `Cannot read properties of undefined (reading 'series')` | 指标本身波动极小属正常（Y 轴已按数据自适应）；后一种是旧版 NaN 破坏 JSON 编码的问题（见 [POSTMORTEM.md](POSTMORTEM.md) INC-004），升级后端 + 前端产物即可 |
+| **不确定到底是哪一环的问题** | 列表行 →「**自检**」：按环节给出结论，不用翻日志（见 9.1） |
 
-### 8.1 集成自检（一次点击，按环节给结论）
+### 9.1 集成自检（一次点击，按环节给结论）
 
 点集成列表行或待处理横幅上的「自检」，平台按链路顺序检查四段，每段给 状态 + 依据 + 下一步：
 
@@ -388,10 +518,10 @@ dial unix /var/run/docker.sock: connect: permission denied
 
 ---
 
-## 8.5 集成后"直接能跑"的边界（自动化矩阵）
+## 10. 集成后“直接能跑”的边界（自动化矩阵）
 
-一次集成要真正产出指标，需要四个环节都成立。下表说明每个环节今天由谁完成、
-以及全自动化的前置条件——**跨栈接入时，"平台能否写被管系统"决定了自动化上限**。
+一次集成要真正产出指标，需要多个环节都成立。下表说明每个环节由谁完成、
+以及全自动化的前置条件——**跨栈接入时，“平台能否写被管系统”决定了自动化上限**。
 
 | 环节 | 今天的状态 | 能否全自动 | 前置条件 / 风险 |
 |---|---|---|---|
@@ -399,12 +529,11 @@ dial unix /var/run/docker.sock: connect: permission denied
 | ② 网络接入（监控面 + 数据面） | ✅ 按 `integration.exporter_network` 多网络接入；`onboard.sh` 会自动写进 `.env` | 能 | 需 `docker.sock`；也可手工把网络名写进 `.env` |
 | ③ 抓取目标注册（`instance_name` 标签） | ✅ http_sd，保存后 30s 内生效，无需重启 | 能 | 无 |
 | ④ 实例纳管 / 命名一致 / 告警规则 | ✅ 自动（集成即纳管；relabel 由 `实例名相关环境变量` 同步） | 能 | 无 |
-| ⑤ 凭据注入（口令含特殊字符） | ✅ 改为官方 flag + 环境变量（`--mysqld.username` / `MYSQLD_EXPORTER_PASSWORD`），不拼 DSN | 能 | 无（本轮修复） |
-| ⑥ 「到底跑没跑起来」的核验 | ✅ 保存后**异步核验**：抓取目标 up 则标记已应用，失败则把 Prometheus 的 `lastError` 翻译后写回集成 | 能 | 无（本轮新增） |
-| **⑦ 只读监控账号的创建** | ✅ **平台可代劳**：集成表单勾选「由平台创建/更新只读监控账号」并填一次管理凭据 | 能 | 属写操作 → 需显式授权；平台只执行内置模板 SQL（幂等 + 最小权限 + `MAX_USER_CONNECTIONS`），口令由平台生成，审计不含口令 |
-| ⑧ 账号存在性预检 | ✅ 由 ⑦ 覆盖（建号后立刻核验；未建号时核验阶段会报 `Access denied`） | 能 | 无 |
+| ⑤ 凭据注入（口令含特殊字符） | ✅ 改为官方 flag + 环境变量（`--mysqld.username` / `MYSQLD_EXPORTER_PASSWORD`），不拼 DSN | 能 | 无 |
+| ⑥ 「到底跑没跑起来」的核验 | ✅ 保存后**异步核验**：抓取目标 up 则标记已应用，失败则把 Prometheus 的 `lastError` 翻译后写回集成 | 能 | 无 |
+| ⑦ 只读监控账号的创建 | ✅ **平台可代劳**：集成表单勾选「由平台创建/更新只读监控账号」并填一次管理凭据 | 能 | 属写操作 → 需显式授权；平台只执行内置模板 SQL（幂等 + 最小权限 + `MAX_USER_CONNECTIONS`），口令由平台生成，审计不含口令 |
 
-**结论**：①②③④⑤⑥⑦⑧ 现在都能在平台上一次配置完成——**对被管项目零侵入**：
+**结论**：①~⑦ 现在都能在平台上一次配置完成——**对被管项目零侵入**：
 
 - 账号：平台用一次性 client 容器执行固定模板 SQL 建号，不需要登录被管库手工建；
 - 网络：平台按**别名自动发现**目标所在的 docker 网络（跨 compose 项目也行），
@@ -412,32 +541,24 @@ dial unix /var/run/docker.sock: connect: permission denied
 - Exporter：平台拉起（同时接入监控面与数据面）；
 - 抓取与大盘：平台自带的 Prometheus + Grafana，被管项目**不再需要自带监控栈**。
 
-> 日志是**另一条独立链路**，且已不再需要被管项目配合：集成中心的「日志集成」
-> （`mw_type=log`）由平台用 Ansible 在目标机装 Filebeat，推送到平台自带的 Kafka，
-> 再由后端消费成日志事件并做规则化告警与 AI 代码定位，详见 `docs/LOG_INTEGRATION.md`。
-> 注意它在**纳管与监控域之外**：不会出现在中间件列表、统一监控下拉、指标告警的实例选择与大盘统计里。
-> （`category=log`）用 Ansible 在目标服务器上部署 Filebeat、把日志推到平台自带的 Kafka，
-> 既不需要共享日志卷、也不读对方的 docker 配置，更不需要 `docker.sock`——
-> 详见 §8.6 与 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)。
-
-**结论**：①②③④⑤⑥ 已经做到"配置即接入"；**唯一的硬缺口是 ⑦**——
-没有只读账号，mysqld_exporter 必然 `up=0`（表现为 `Access denied`）。
-这正是 `docs/GUIDE-ONBOARD.md` §8.4 里最常见的那一类。
-
 给使用者的两条路（**现已默认走平台托管**）：
 
 - **路径 A（平台托管，推荐）**：集成表单勾选「由平台创建/更新只读监控账号」，
-  填一次管理凭据 → 平台执行固定模板 SQL 建号（详见上表 ⑦），
-  口令留空则由平台生成十六进制随机串。**被管项目零配置**。
-- **路径 B（自行预置）**：不勾选该选项，账号由被管系统侧预置
-  （模板 SQL 见组件说明；被管项目的 `onboard.sh` 也会执行 initdb）。
+  填一次管理凭据 → 平台执行固定模板 SQL 建号，口令留空则由平台生成十六进制随机串。**被管项目零配置**。
+- **路径 B（自行预置）**：不勾选该选项，账号由被管系统侧预置（模板 SQL 见组件说明）。
   适合不便提供管理凭据的环境（如生产库由 DBA 管控）。
+
+> 日志是**另一条独立链路**，且同样不需要被管项目配合：集成中心的「日志集成」
+> （`mw_type=log`）由平台用 Ansible 在目标机装 Filebeat，推送到平台自带的 Kafka，
+> 再由后端消费成日志事件并做规则化告警与外部 AI 代码分析，详见第十一章与
+> [LOG_INTEGRATION.md](LOG_INTEGRATION.md)。它在**纳管与监控域之外**：不会出现在中间件列表、
+> 统一监控下拉、指标告警的实例选择与大盘统计里。
 
 ---
 
-## 8.6 日志集成（Filebeat → 平台 Kafka）
+## 11. 日志集成摘要（Filebeat → 平台 Kafka）
 
-> 本节是摘要，**权威说明见 [`LOG_INTEGRATION.md`](LOG_INTEGRATION.md)**（拓扑、幂等部署规则、自检环节、配置项速查）。
+> 本节是摘要，**权威说明见 [LOG_INTEGRATION.md](LOG_INTEGRATION.md)**（拓扑、幂等部署规则、自检环节、配置项速查）。
 
 集成中心除 `monitor` 类组件外，还有 `log` 类（模板 `type: "log"`、`category: "log"`，
 名为「日志 / Filebeat」）。它与中间件集成的**根本区别**：不装 Exporter、不经过 Prometheus、
@@ -462,8 +583,9 @@ Filebeat 把日志推到**平台自带的 Kafka**。
 ⑥ 后端 internal/logpipe 解析事件 → LogAlertService.Ingest 按规则处理
    （去重窗口合并 + 冷却抑制）→ 落 log_alert_events
         ↓
-⑦ 后处理（service/logalert_worker.go，定时任务）：拉取/更新代码仓库 → AI 定位代码（三点式结论）
-   → 带结论外发通知渠道；页面可对单条事件「重新分析」（会打破冷却抑制）
+⑦ 后处理（service/logalert_worker.go，定时任务）：外发通知 → 提交外部 AI 分析服务（事件置 awaiting）
+   → 回调/轮询取回三点式结论（定位文件行 / 根因 / 应急处置 / 修复建议）→ 带结论通知；
+   页面可对单条事件「重新分析」（会打破冷却抑制）
 ```
 
 要点：
@@ -473,8 +595,6 @@ Filebeat 把日志推到**平台自带的 Kafka**。
   **不会**出现在「中间件纳管」列表、统一监控的实例下拉、指标告警规则的实例选择、
   大盘的实例统计与健康探测里。这个边界由 `service.MiddlewareDomainTypes()` 统一收口
   （白名单 = 手工纳管的中间件类型 ∪ 有指标画像的集成类型），并有守卫测试钉住。
-  历史问题：这几个入口各自查同一张表且没排除 `mw_type=log`，结果是日志集成混进监控域，
-  还会被健康探测标成"离线"（它根本没有实例端口）。
 - **目标机出网与接入地址**：被管机必须能访问 `.env` 里的 `KAFKA_ADVERTISED_HOST:KAFKA_PORT`。
   这个值写 `localhost`/`127.0.0.1` 时，Filebeat 会**握手成功、随后立刻断开**并报
   `dial tcp 127.0.0.1:9092: connect: connection refused`——它被 broker 元数据引导去了自己那台机器。
@@ -484,7 +604,7 @@ Filebeat 把日志推到**平台自带的 Kafka**。
   打开后则重新拉取安装包/镜像并**强制覆盖安装**（`apt-get --reinstall` / `dnf reinstall` /
   重新 `docker pull` + 重建容器），用于升级版本或修复装坏的 Filebeat。
   `filebeat.yml` **不受这个开关控制**：它由平台配置推导，始终按渲染内容同步（内容没变不重启），
-  所以改日志路径或 Kafka 地址不必打开它。显式选定的 `package`/`docker` 优先于"复用"（INC-029）。
+  所以改日志路径或 Kafka 地址不必打开它。显式选定的 `package`/`docker` 优先于“复用”（INC-029）。
 - **不需要 `docker.sock`**：日志集成走 SSH + Ansible 到目标机，采集在被管侧自洽运行；
   平台侧即使关掉 Docker 通道（`INTEGRATION_DOCKER_ENABLED=false`）它依然可用。
 - **平台重启不影响采集**：Filebeat 有本地缓冲与断点续传（注册表），
@@ -494,18 +614,385 @@ Filebeat 把日志推到**平台自带的 Kafka**。
   它不再检查 Exporter 端口与 Prometheus 抓取。
 - **兜底通路**：`POST /api/hooks/logs`（应用直推）保留，用于不能装 Filebeat 的场景，
   字段与 Filebeat 路径统一映射（`log_path` ↔ `log.file.path`）。
+- **AI 代码分析外移**：平台不持有代码副本，后处理把脱敏后的错误信息提交给外部 AI 分析服务
+  （状态机 pending → running → awaiting → done/failed/disabled）；
+  对接与验收见 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md)。
 
 > `environment=prod` 时的审批语义与中间件集成一致：写操作先建审批工单，审批通过后再由「重新应用」执行。
 
 ---
 
-## 9. 已知边界
+## 12. 专题：自备 Prometheus / 自建 Exporter 接入
+
+> 集成中心覆盖的是「平台托管 Exporter」路径。如果中间件在别的机器、已有 Prometheus 体系，
+> 或要接入自研组件，按本章操作。本章是原《中间件接入与采集操作文档》的收敛版，
+> 去掉了与第三~十一章重复的部署细节。
+
+### 12.1 平台边界：做什么、不做什么
+
+平台**刻意不做**中间件协议级采集器，避免与 Prometheus 生态重复建设。
+
+| 能力 | 平台是否具备 | 真实实现方式 | 代码位置 |
+|------|--------------|--------------|----------|
+| 中间件指标采集 | ❌ 平台不直连中间件取指标 | 由 **官方 Exporter** 暴露，平台通过 **PromQL 查询 Prometheus** | `internal/monitor/prometheus.go` |
+| 连接可用性探测 | ⚠️ 仅 **TCP 端口连通性** | `net.DialTimeout` 探测 host:port，非协议级握手 | `internal/service/middleware.go: probe()` |
+| 应用日志集成 | ✅ | **Filebeat（平台用 Ansible 部署到目标机）→ 平台 Kafka**；应用也可 HTTP Hook 直推 | `internal/logpipe`、`internal/service/logpipeline.go`、`/api/hooks/logs` |
+| 中间件运行态配置 | ⚠️ 读的是**平台侧登记的配置**，不是从中间件实时读取 | 诊断时读取实例的 `config` 字段（纳管时填写） | `internal/service/diagnose.go: collectConfig()` |
+| 阈值告警 | ✅ | 平台按 PromQL 取当前值 → 比对规则阈值 → 指纹收敛 → 通知/触发 AI | `internal/service/alert.go` |
+| AI 根因分析 | ✅ | 采集上下文（指标摘要 + 日志指纹 + 登记配置 + 知识库）→ 一次 LLM 调用 → 结构化报告 | `internal/service/diagnose.go` |
+
+**硬性前置条件：被管中间件必须能通过 Exporter 暴露指标，并被某个 Prometheus 抓到。**
+若某中间件没有官方 Exporter（例如自研组件），平台无法凭空获得它的指标——可按 12.7 自行适配。
+
+> 「连接测试」`POST /api/middlewares/:id/test` 只验证 **TCP 可达性与耗时**，
+> 不会用账号密码做协议级登录校验。密码 AES-256-GCM 加密存储，但目前仅用于存储，
+> 验收时请勿按「已校验凭据」理解。
+
+### 12.2 五类数据从哪里来
+
+```text
+                    ┌─────────────── ① 指标（主链路） ───────────────┐
+其他项目的中间件 ──▶ 官方 Exporter ──▶ Prometheus ──PromQL──▶ 平台监控/告警
+ (Redis/Kafka/…)      :9121/:9308/…      :9090                  │
+                                                                ▼
+应用服务 ──② 日志(Filebeat → Kafka / HTTP Hook)──▶ 平台消费/接收 ──▶ 指纹收敛 ──▶ 日志告警
+                                                    │  按「日志告警规则」做窗口去重 + 冷却抑制
+                                                    └─▶ 后处理：通知渠道 + 提交外部 AI 分析服务
+                                                                │
+平台纳管记录 ──③ 登记配置(config 字段)──────────────────────────┼──▶ AI 诊断上下文
+知识库 ──────④ 历史案例(向量检索)───────────────────────────────┤   （六道护栏约束）
+平台侧 ──────⑤ 平台自身指标(/metrics，由平台 Prometheus 抓)─────┘
+```
+
+| 编号 | 数据 | 来源 | 采集方式 | 是否需要 Exporter |
+|------|------|------|----------|-------------------|
+| ① | 性能/资源/可靠性指标 | 中间件官方 Exporter | 平台拉 Prometheus（PromQL） | **需要** |
+| ② | 应用 ERROR 日志、堆栈、GC | 应用所在服务器上的日志文件 | 日志集成（Ansible + Filebeat → 平台 Kafka）；或 HTTP Hook 直推 | 不需要 |
+| ③ | 连接信息、关键配置项 | 纳管表单 | 人工登记（`config` 字段） | 不需要 |
+| ④ | 历史相似故障案例 | 平台知识库 | 诊断沉淀 + 人工录入 | 不需要 |
+| ⑤ | 平台自检指标 | 平台后端 | Prometheus 抓 `/metrics` | 不需要 |
+
+### 12.3 部署拓扑与网络要求
+
+| 场景 | 适用 | Exporter 部署位置 | Prometheus | 说明 |
+|------|------|-------------------|------------|------|
+| **A. 同机共栈**（最快验证） | 单机/测试 | 与平台同一 compose | 平台自带 | 用 `deploy/compose.middleware-exporters.yml` 直接起 |
+| **B. 中间件在别的机器**（最常见） | 生产 | 部署在**中间件所在主机**（或能访问它的机器） | 平台自带 Prometheus 抓取 Exporter | 确保 Prometheus 能访问 Exporter 的 `:9121` 等端口 |
+| **C. 已有 Prometheus**（推荐生产） | 已建成监控体系 | 复用既有 Exporter | **复用既有 Prometheus** | 平台只需把 `prometheus.base_url` 指向它，无需新起 |
+
+场景 A 一条命令起齐全套 Exporter：
+
+```bash
+# 前提：平台已用根目录 compose 起好
+docker compose -f docker-compose.yml -f deploy/compose.middleware-exporters.yml up -d
+# 被管中间件地址通过 REDIS_TARGET_ADDR / REDIS_TARGET_PASSWORD / REDIS_INSTANCE_NAME 等环境变量指定
+```
+
+场景 B/C 在**中间件所在主机**部署 Exporter（不要暴露到公网），并在 Prometheus 增加抓取任务：
+
+```bash
+docker run -d --name redis-exporter --restart unless-stopped \
+  -p 9121:9121 \
+  -e REDIS_ADDR=redis://127.0.0.1:6379 \
+  -e REDIS_PASSWORD='<只读账号密码>' \
+  oliver006/redis_exporter:v1.66.0
+```
+
+```yaml
+  - job_name: middleware-exporter-redis       # 命名约定：<prometheus.exporter_job_prefix>-<类型>
+    static_configs:
+      - targets: ['10.0.0.11:9121']
+        labels:
+          instance_name: redis-prod-order      # 平台按此匹配实例
+```
+
+- `oliver006/redis_exporter` 可加 `--redis-only-metrics` 让指标集合贴近平台画像；
+- `danielqsj/kafka-exporter` **不提供** `instance_name` 标签，必须在 Prometheus 里用
+  `relabel_configs` 补上（`deploy/prometheus/prometheus.with-exporters.yml` 有示例）。
+
+网络与端口要求：Prometheus → Exporter（9121/9308/9104/9187/9114/9113）；
+Exporter → 中间件（6379/9092/3306/5432/9200/80）；平台后端 → Prometheus `:9090`；
+应用 → 平台 `:8080`（Hook）；目标机 Filebeat → 平台 Kafka `:9092`；平台 → 目标机 SSH 22（Ansible）。
+平台**不需要**直连中间件端口（TCP 健康探测除外，可关）。
+
+### 12.4 手工纳管：标签必须对上
+
+「纳管」= 告诉平台「这个中间件叫什么、在哪、指标在 Prometheus 里怎么找」（中间件纳管 → 新增实例）。
+关键字段：实例名称（默认 `instance_name` 匹配值，建议与 Exporter 上报名一致）、中间件类型、
+连接地址/端口（TCP 探测用）、环境、分组、Prometheus job（可选，精确匹配）、
+Prometheus instance（推荐填，最稳）、配置 config（进入 AI 诊断上下文，见 12.6）。
+
+平台构造 PromQL 标签匹配串的逻辑（`internal/monitor/profile.go: buildSelector`）：
+
+| 你填写的字段 | 生成的匹配条件 | 结果 |
+|---|---|---|
+| job + instance | `job="你的job",instance="10.0.0.11:6379"` | 最精确 |
+| 只填 instance | `job="<前缀>-<类型>",instance="..."` | 精确（job 走默认） |
+| 只填 job | `job="你的job",instance_name="<实例名>"` | 依赖实例名一致 |
+| 都没填 | `job="<前缀>-<类型>",instance_name="<实例名>"` | 依赖 Exporter 上报名 |
+
+**排查口诀**：监控页显示「无数据源」= 没连上 Prometheus；
+显示指标但全是 `unknown`/`0` = 连上了但**标签没匹配到序列**，拿同样的标签去 Prometheus 查一次。
+
+```yaml
+# configs/config.yaml 或环境变量 MWOPS_PROMETHEUS_BASE_URL
+prometheus:
+  base_url: http://prometheus:9090        # 留空则使用内置确定性模拟器
+  exporter_job_prefix: middleware-exporter
+  cache_ttl: 15s
+```
+
+### 12.5 指标契约：类型 → Exporter → 平台指标
+
+**平台按固定指标名与 PromQL 模板查询**，Exporter 需提供下表中的指标名。
+
+<details>
+<summary><b>Redis</b>（oliver006/redis_exporter）</summary>
+
+| 平台指标名 | 展示名 | PromQL 模板 | 状态方向 |
+|---|---|---|---|
+| `memory_usage_percent` | 内存使用率 | `redis_memory_used_bytes / redis_memory_max_bytes * 100` | 越高越差（警 70/严 85） |
+| `connected_clients` | 连接数 | `redis_connected_clients` | 越高越差（800/1000） |
+| `instantaneous_ops_per_sec` | QPS | `rate(redis_commands_processed_total[5m])` | 越高越差（20000/40000） |
+| `keyspace_hit_rate` | 命中率 | `rate(hits)/(rate(hits)+rate(misses))*100` | 越低越差（<90 警 / <80 严） |
+| `db_keys` | key 数量 | `sum(redis_db_keys)` | 越高越差（500w/1000w） |
+| `slowlog_length` | 慢查询数 | `redis_slowlog_length` | 越高越差（10/50） |
+| `evicted_keys` | 淘汰 key 数 | `rate(redis_evicted_keys_total[5m])` | 越高越差（1/20） |
+| `blocked_clients` | 阻塞客户端 | `redis_blocked_clients` | 越高越差（1/5） |
+</details>
+
+<details>
+<summary><b>Kafka</b>（danielqsj/kafka-exporter）</summary>
+
+| 平台指标名 | 展示名 | PromQL 模板 | 状态方向 |
+|---|---|---|---|
+| `broker_up` | Broker 状态 | `up` | 正常/异常（0=down 判严重） |
+| `partition_count` | Topic 分区数 | `sum(kafka_topic_partitions)` | 纯观测 |
+| `consumer_lag` | 消费者组 Lag | `sum(kafka_consumergroup_lag)` | 越高越差（1w/10w） |
+| `produce_rate` | 生产速率 | `sum(rate(kafka_topic_partition_current_offset[5m]))` | 纯观测 |
+| `consume_rate` | 消费速率 | `sum(rate(kafka_consumergroup_current_offset[5m]))` | 纯观测 |
+| `under_replicated_partitions` | ISR 副本不足分区 | `sum(kafka_topic_partition_under_replicated_partition)` | 越高越差（1/10） |
+</details>
+
+<details>
+<summary><b>MySQL</b>（prom/mysqld-exporter）</summary>
+
+| 平台指标名 | 展示名 | PromQL 模板 | 状态方向 |
+|---|---|---|---|
+| `qps` | QPS | `rate(mysql_global_status_queries[5m])` | 越高越差（8000/15000） |
+| `tps` | TPS | `rate(mysql_global_status_questions[5m])` | 纯观测 |
+| `threads_connected` | 连接数 | `mysql_global_status_threads_connected` | 越高越差（400/500） |
+| `slow_queries` | 慢查询数 | `rate(mysql_global_status_slow_queries[5m])` | 越高越差（5/30） |
+| `buffer_pool_hit_rate` | 缓冲池命中率 | `(1 - reads/read_requests)*100` | 越低越差（<95 警 / <90 严） |
+| `replication_lag_seconds` | 主从延迟 | `mysql_slave_status_seconds_behind_master` | 越高越差（5/30） |
+</details>
+
+<details>
+<summary><b>PostgreSQL</b>（prometheuscommunity/postgres-exporter，需 <code>pg_monitor</code> 角色）</summary>
+
+| 平台指标名 | 展示名 | PromQL 模板 | 状态方向 |
+|---|---|---|---|
+| `qps` | QPS | `rate(pg_stat_database_xact_commit[5m])` | 越高越差（6000/12000） |
+| `tps` | TPS | `rate(pg_stat_database_xact_rollback[5m])` | 纯观测 |
+| `connections` | 连接数 | `pg_stat_activity_count` | 越高越差（150/200） |
+| `slow_queries` | 慢查询数 | `rate(pg_stat_statements_mean_time_seconds_count[5m])` | 越高越差（5/30） |
+| `cache_hit_rate` | 缓存命中率 | `blks_hit/(blks_hit+blks_read)*100` | 越低越差（<95 警 / <90 严） |
+| `lock_waits` | 锁等待 | `pg_locks_count` | 越高越差（5/20） |
+</details>
+
+<details>
+<summary><b>Elasticsearch</b>（prometheuscommunity/elasticsearch-exporter）</summary>
+
+| 平台指标名 | 展示名 | PromQL 模板 | 状态方向 |
+|---|---|---|---|
+| `cluster_status` | 集群健康状态 | `elasticsearch_cluster_health_status` | 越低越差（≤1 警 / ≤0 严），2=green 正常 |
+| `node_count` | 节点数 | `elasticsearch_cluster_health_number_of_nodes` | 越低越差（≤1 警 / ≤0 严） |
+| `index_count` | 索引数量 | `elasticsearch_cluster_health_number_of_indices` | 纯观测 |
+| `search_rate` | 搜索速率 | `rate(elasticsearch_indices_search_query_total[5m])` | 纯观测 |
+| `indexing_rate` | 索引速率 | `rate(elasticsearch_indices_indexing_index_total[5m])` | 纯观测 |
+| `jvm_heap_used_percent` | JVM 堆使用率 | `jvm_memory_used_bytes{area="heap"}/max*100` | 越高越差（75/85） |
+| `unassigned_shards` | 未分配分片 | `elasticsearch_cluster_health_unassigned_shards` | 越高越差（1/20） |
+</details>
+
+<details>
+<summary><b>Nginx</b>（nginx/nginx-prometheus-exporter，需开启 stub_status；仅监控不含 AI 诊断）</summary>
+
+| 平台指标名 | 展示名 | PromQL 模板 | 状态方向 |
+|---|---|---|---|
+| `active_connections` | 活跃连接数 | `nginx_connections_active` | 越高越差（3000/5000） |
+| `request_rate` | 请求速率 | `rate(nginx_http_requests_total[5m])` | 纯观测 |
+| `error_rate_5xx` | 错误率(5xx) | `5xx 速率 / 总速率 * 100` | 越高越差（0.5/2） |
+| `upstream_response_time` | 响应时间(P95) | `histogram_quantile(0.95, rate(..._bucket[5m]))` | 越高越差（500/2000） |
+</details>
+
+**状态判定语义**（配规则时会用到）：平台按 **阈值模式（`threshold_mode`）** 判定指标状态：
+
+| 模式 | 语义 | 示例 |
+|------|------|------|
+| `higher_worse` | `≥ 严重线` → critical；`≥ 警戒线` → warning | 内存使用率、连接数、延迟 |
+| `lower_worse` | `≤ 警戒线` → warning；`≤ 严重线` → critical（**含边界**） | 命中率（警 90/严 80）、ES 集群状态（警 1/严 0） |
+| `bool_down` | `≤ 严重线` → critical，否则 ok | Broker up（严 0） |
+| 空 | 纯观测，不判定 | QPS、TPS、速率类 |
+
+指标目录接口 `GET /api/metrics/catalog?mw_type=redis` 会返回每项的
+`threshold_mode`、`warning_threshold`、`critical_threshold`。
+
+**阈值告警的两种落地方式**：
+
+1. **平台内规则**（推荐，默认）：新增「告警规则」→ 选实例 + 指标 + 操作符 + 阈值，
+   平台按 `scheduler.metric_rule_eval_interval`（默认 30s）评估。规则用**你填的操作符**比较当前值，
+   可以直接写 `keyspace_hit_rate < 90` 这类语义。
+2. **Prometheus 规则**：用 `deploy/prometheus/rules/middleware.yml` 在指标侧先拦截，
+   适合已有 Alertmanager 体系的团队；两套共用同一收敛策略，不会重复告警。
+
+### 12.6 让 AI 诊断「有据可依」：注入关键配置
+
+AI 诊断的上下文**只有四个来源**（受上下文预算约束）：指标摘要、日志指纹、**登记的 config**、知识库参考案例。
+其中指标与日志自动获得，而「中间件关键配置」需要你在纳管时填写——这直接决定根因分析的准确度。
+
+**操作路径**：中间件纳管 → 编辑实例 → 配置（JSON）。建议按类型填写：
+
+```jsonc
+// Redis：诊断内存/淘汰类问题必需
+{ "maxmemory": "4gb", "maxmemory-policy": "allkeys-lru", "appendonly": "yes",
+  "save": "900 1 300 10", "cluster-enabled": "no" }
+
+// Kafka：诊断积压/副本问题必需
+{ "num.partitions": "12", "default.replication.factor": "3", "min.insync.replicas": "2",
+  "auto.offset.reset": "latest", "log.retention.hours": "168" }
+
+// MySQL / PostgreSQL
+{ "max_connections": "500", "innodb_buffer_pool_size": "8G",
+  "slow_query_log": "ON", "long_query_time": "1" }
+```
+
+> AI 的每条结论必须引用证据（`evidence`），无证据的结论会被质量护栏标注为「推测」。
+> 若 `config` 为空，像「maxmemory-policy 与业务写入模式不匹配」这类根因就只能给推测结论。
+
+### 12.7 没有官方 Exporter 怎么办
+
+平台靠「Prometheus 里存在符合约定的指标名」获取数据，因此你有三条路：
+
+1. **自研 Exporter**（推荐）：按 12.5 表格里的指标名暴露 `/metrics`。
+   实现要点：命名与单位一致；带 `job`/`instance_name` 标签；`instance_name` 与平台纳管实例名一致。
+2. **Prometheus recording rules 做映射**：已有其他指标名时，用 recording rule 计算出平台期望的名字。
+   若无法产生平台画像依赖的原始指标名，需按第 3 条改画像。
+3. **扩展指标画像**（需改代码）：在 `internal/monitor/profile.go` 的 `profiles` 中为该类型
+   增加 `MetricSpec`（含 `Expr`、`Mode`、`threshold_mode`、阈值、模拟器参数）。这是设计上预留的扩展点，
+   改完 `go test ./internal/monitor/` 会校验阈值方向是否自洽。
+
+### 12.8 日志通路（简述）
+
+- **主路径**：集成中心新建 `log` 类型集成（Filebeat → 平台 Kafka），字段、幂等部署与排障见
+  [LOG_INTEGRATION.md](LOG_INTEGRATION.md) 与本文第十一章；
+- **兜底路径 HTTP Hook 直推**（不能装 Filebeat 时）：
+
+```bash
+curl -X POST http://<平台地址>/api/hooks/logs \
+  -H 'Content-Type: application/json' \
+  -H 'X-Hook-Token: <MWOPS_HOOK_TOKEN>' \
+  -d '{
+    "server_name": "order-app-01",
+    "service": "order-service",
+    "level": "ERROR",
+    "message": "Order 10086 处理失败",
+    "stacktrace": "java.lang.NullPointerException\n\tat com.demo.OrderService.process(OrderService.java:42)",
+    "log_path": "/var/log/order-service/error.log"
+  }'
+```
+
+`service` / `level` / `message` 必填。响应中 `signature` 为错误指纹，
+`merged=true` 表示与去重窗口内既有事件合并，`suppressed=true` 表示处于冷却期。
+两条通路字段统一映射（`log_path` ↔ `log.file.path`，`service` ↔ `fields.service`）。
+规则匹配、去重与冷却语义见 [LOG_INTEGRATION.md](LOG_INTEGRATION.md) 5.1：
+**平台没有默认规则，未命中已启用规则的日志不入库、不通知、不分析。**
+
+### 12.9 验证：三步确认链路
+
+```bash
+# 第 1 步：Exporter 自己有数据吗？
+curl -s http://<exporter-host>:9121/metrics | grep -E '^redis_(memory_used_bytes|connected_clients)'
+
+# 第 2 步：Prometheus 抓到了吗？（用平台的标签约定查）
+curl -s 'http://<prometheus>:9090/api/v1/query' \
+  --data-urlencode 'query=redis_memory_used_bytes{job="middleware-exporter-redis",instance_name="redis-prod-order"}'
+
+# 第 3 步：平台查得到吗？
+TOKEN=<登录后的 JWT>
+curl -s -H "Authorization: Bearer $TOKEN" 'http://<平台>/api/metrics/1' | jq '.data.source, .data.metrics[0]'
+```
+
+端到端冒烟脚本：
+
+```powershell
+pwsh -File scripts/smoke-test.ps1 -BaseUrl http://127.0.0.1:8080        # PowerShell 7+
+powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1 -BaseUrl http://127.0.0.1:8080   # PS 5.1
+```
+
+| 现象 | 定位 | 处理 |
+|------|------|------|
+| 监控页「无数据源」/指标「无数据」 | `prometheus.base_url` 为空或连不通 | 配置平台 Prometheus 地址；确认平台容器能访问 `:9090` |
+| 有指标但值为 0 / `unknown` | PromQL 标签没匹配到序列 | 用第 2 步查询核对 `job` / `instance` / `instance_name` 是否与纳管字段一致 |
+| 只有部分指标有值 | Exporter 未暴露该指标 | 核对 12.5 的指标名；`curl exporter/metrics` 搜索 |
+| Kafka 全部无数据 | kafka-exporter 无 `instance_name` 标签 | 在 Prometheus 抓取配置里用 `relabel_configs` 补标签 |
+| 连接测试通过但监控无数据 | 两者独立：前者是 TCP 探测，后者依赖 Exporter | 正常现象，按上表排查指标链路 |
+
+### 12.10 安全与权限要点
+
+| 项 | 要求 |
+|----|------|
+| 中间件账号 | **只读最小权限**。MySQL：`PROCESS, REPLICATION CLIENT, SELECT`；PG：`pg_monitor`；Redis：ACL 只读 + 禁用 `FLUSHALL/KEYS` 等 |
+| Exporter 暴露面 | 只监听内网，不要发布到公网（`deploy/compose.middleware-exporters.yml` 的端口映射仅便于验证，生产建议去掉 `ports`） |
+| 连接密码 | 平台侧 AES-256-GCM 加密存储，主密钥来自环境变量或 0600 密钥文件 |
+| 数据权限 | 纳管时填好「环境 + 分组」，平台在**仓储查询层**强制过滤，跨环境不可见 |
+| 日志脱敏 | 上报前建议在应用侧先脱敏；平台提交外部 AI 前对错误信息/堆栈自带 IP/手机号/邮箱/口令脱敏 |
+| 出网合规 | 默认**禁止**向外部 AI 分析服务外发；在 `security.outbound_whitelist` 按服务显式放行 |
+| 高危操作 | L2（清理 key / 重启 / 改配置 / SQL 写）一律走审批，30 分钟未审批自动拒绝 |
+
+### 12.11 接入检查清单
+
+纳管一个中间件实例时，按此清单逐项确认：
+
+- [ ] Exporter 已部署，且能 `curl :<exporter-port>/metrics` 看到指标
+- [ ] Exporter 到中间件的网络与只读账号可用（Exporter 自身上报 up=1）
+- [ ] Prometheus 抓取任务已加，`job` 命名与 `prometheus.exporter_job_prefix` 约定一致
+- [ ] 抓取任务带 `instance_name` 标签（kafka-exporter 需 relabel）
+- [ ] 平台 `prometheus.base_url` 指向正确的 Prometheus
+- [ ] 平台纳管实例名 = Exporter 的 `instance_name` 上报名
+- [ ] 纳管时填写了「Prometheus instance」（最稳）或确认 job 兜底可用
+- [ ] 正确选择环境与分组（影响数据权限与审批强制）
+- [ ] 填写了 `config`（关键配置项）供 AI 诊断使用
+- [ ] 实例详情页能看到指标、状态与阈值判定
+- [ ] 按需创建告警规则，并点通知渠道标签发送自检消息
+- [ ] 应用日志已通过**日志集成（Filebeat → 平台 Kafka）**接入并自检通过，或已用 Hook 直推，日志页能看到事件
+- [ ] 在「日志告警规则」页为不同重要性的服务配规则（去重窗口 / 冷却期 / 通知渠道 / AI 开关）；
+      **没有默认规则，不配规则 = 不产生告警**
+- [ ] 想要 AI 代码结论：在「AI 设置」配置外部 AI 分析服务（协议、密钥、回调）并把服务加入出网白名单；
+      否则事件会是 `analysis_state=disabled`（对接验收见 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md) 附录 B）
+- [ ] 造一条错误日志验证：事件出现 → 数秒内「AI 分析」列从 pending 变成 awaiting 再到 done / disabled / failed，
+      且 `analysis_error` 能解释原因；冷却期内的重复日志只累加 `error_count` 且 `suppressed=true`
+
+---
+
+## 13. 已知边界
 
 1. **一键部署依赖 docker.sock**：默认关闭；平台不会（也无法）在无 Docker 的环境里拉起 Exporter 容器，
-   此时只渲染配置。**日志集成不受此限制**：它走 SSH + Ansible（见 §8.6），关掉 Docker 通道后依然可用。
+   此时只渲染配置。**日志集成不受此限制**：它走 SSH + Ansible（见第十一章），关掉 Docker 通道后依然可用。
 2. **容器重建策略**：每次「应用」都会删除并重建同名 Exporter 容器（保证 env/参数与页面一致），
    因此容器内的历史状态不会保留——Exporter 本身无状态，这是有意的取舍。
 3. **Kafka SASL/ACL、ES 自签证书、MySQL `my.cnf` 挂载** 等复杂场景未做成表单字段，
    请用「配置」抽屉复制片段后手工补充。
 4. **Grafana 大盘**只提供大盘编号，需要 Grafana 自行导入（平台不托管 Grafana）。
 5. **告警规则**为模板预置阈值，落库后可在「告警规则」页继续调整。
+
+---
+
+## 14. 相关文档
+
+| 文档 | 内容 |
+|---|---|
+| [LOG_INTEGRATION.md](LOG_INTEGRATION.md) | 日志集成权威说明：Kafka 拓扑、Filebeat 幂等部署、自检与配置项 |
+| [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md) | 外部 AI 分析服务 OpenAPI v1 契约、回调 HMAC 验签、平台侧接入验收 |
+| [API.md](API.md) | 接口清单（集成、日志集成、服务发现、接入自检） |
+| [OPERATIONS.md](OPERATIONS.md) | 平台运维（备份、升级、审计校验、后处理排查） |
+| [POSTMORTEM.md](POSTMORTEM.md) | 交付期真实故障记录（含指标 NaN、白屏、建表冲突） |

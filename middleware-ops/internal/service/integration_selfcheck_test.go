@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 锁定「集成自检」里那些"结论性"的纯逻辑（真实反馈：排查不该只能靠翻日志）。

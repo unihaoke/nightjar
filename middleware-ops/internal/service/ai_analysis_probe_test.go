@@ -8,7 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件钉住「AI 代码分析」的连通性探测。

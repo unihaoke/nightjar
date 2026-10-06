@@ -13,9 +13,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件实现「日志集成」（docs/LOG_INTEGRATION.md）：平台用 Ansible 在目标服务器上

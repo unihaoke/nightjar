@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件锁定「填错了该提示什么」的排序逻辑。

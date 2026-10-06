@@ -1,0 +1,21 @@
+# 前端镜像构建上下文排除项（上下文根即本目录）。
+node_modules
+dist
+.vite
+*.tsbuildinfo
+*.log
+
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+.env
+.env.local
+.env.*.local
+
+# 文档与编辑器杂项
+*.md
+.idea
+.vscode
+.DS_Store

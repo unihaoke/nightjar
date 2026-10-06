@@ -9,11 +9,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // 权限点定义（6.1 RBAC 权限模型）。

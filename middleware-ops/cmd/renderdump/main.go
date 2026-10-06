@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
 )
 
 func main() {

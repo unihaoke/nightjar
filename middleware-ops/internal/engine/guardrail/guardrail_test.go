@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
 )
 
 // TestSQLGuardValidate 覆盖 AI 生成 SQL 的只读安全校验（5.5）。

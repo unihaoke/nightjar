@@ -6,8 +6,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/logpipe"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/logpipe"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // KafkaConsumeStatRepository 持久化日志消费链路的累计计数（按 topic + 消费组一行）。

@@ -30,8 +30,8 @@ type Config struct {
 	// AIAnalysis 为外部 AI 分析服务的对接参数（异步任务 + 回调，见类型注释）。
 	AIAnalysis AIAnalysisConfig `mapstructure:"ai_analysis"`
 	Guardrail  GuardrailConfig  `mapstructure:"guardrail"`
-	Scheduler   SchedulerConfig   `mapstructure:"scheduler"`
-	Log         LogConfig         `mapstructure:"log"`
+	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
+	Log        LogConfig        `mapstructure:"log"`
 }
 
 // LogAlertConfig 是日志告警后处理的运行参数。
@@ -213,14 +213,14 @@ type AppConfig struct {
 
 // ServerConfig HTTP 服务参数。
 type ServerConfig struct {
-	Host            string        `mapstructure:"host"`
-	Port            int           `mapstructure:"port"`
+	Host string `mapstructure:"host"`
+	Port int    `mapstructure:"port"`
 	// PublicURL 为 IM 卡片回跳用的**对外**基础地址（如 https://platform.example.com）。
 	//
 	// 为什么必须单独配：监听地址是 0.0.0.0:8080（容器内），拿它拼出来的回跳链接是
 	// http://0.0.0.0:8080/... ——值班同学在飞书里点开就是"打不开"。
 	// 留空时退回 host:port（并把通配监听地址换成 127.0.0.1，至少是个能访问的本机地址）。
-	PublicURL string `mapstructure:"public_url"`
+	PublicURL       string        `mapstructure:"public_url"`
 	ReadTimeout     time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout    time.Duration `mapstructure:"write_timeout"`
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`

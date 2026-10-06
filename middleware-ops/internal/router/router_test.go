@@ -6,8 +6,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // TestSettingsRoutesRegistered 锁定「平台自管设置」的 7 个接口路径。

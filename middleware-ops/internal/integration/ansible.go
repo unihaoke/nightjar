@@ -152,21 +152,21 @@ func NormalizeInstallMode(value string) string { return normalizeInstallMode(val
 
 // remotePlaybookInput 是 playbook 模板的渲染入参。
 type remotePlaybookInput struct {
-	Name       string
-	Component  string
-	Image      string
-	Container  string
-	Unit       string
-	EnvFile    string
+	Name      string
+	Component string
+	Image     string
+	Container string
+	Unit      string
+	EnvFile   string
 	// Port 为宿主端口（Prometheus 抓取 / wait_for 用）。
 	Port int
 	// ContainerPort 为 Exporter 容器内监听端口（模板定义，如 9104）。
 	ContainerPort int
-	Network    string
-	InstallDir string
-	Mode       string
-	Become     bool
-	Args       []string
+	Network       string
+	InstallDir    string
+	Mode          string
+	Become        bool
+	Args          []string
 	// Release 为二进制安装所需的官方发布信息（binary 模式必填）。
 	Release     *ReleaseSpec
 	BinaryPath  string
@@ -355,7 +355,7 @@ func dockerRunLine(in remotePlaybookInput) string {
 //
 // 为什么需要这个参数：systemd 单元的 ExecStart 必须是**绝对路径**，
 // 写裸 `docker` 时 systemd 会以 "Executable path is not absolute" 拒绝加载单元
-//（而在 shell 任务里用裸 `docker` 走 PATH 是正常的）。
+// （而在 shell 任务里用裸 `docker` 走 PATH 是正常的）。
 func dockerRunLineWith(bin string, in remotePlaybookInput) string {
 	line := bin + " run -d --name {{ exporter_container }} --restart unless-stopped --network " + networkOrDefault(in.Network)
 	line += hostModeDockerFlags(in)
@@ -388,7 +388,7 @@ func exporterArgs(in remotePlaybookInput) []string {
 //
 // 为什么必须单独处理：node_exporter 采集的是**宿主机**指标，
 // 容器里若不共享 PID 命名空间、不把宿主 / 只读挂到 /host，读到的全是容器自身的数字
-//（CPU/内存/磁盘全错，而且看起来"有数据"，最难发现）。
+// （CPU/内存/磁盘全错，而且看起来"有数据"，最难发现）。
 func hostModeDockerFlags(in remotePlaybookInput) string {
 	var b strings.Builder
 	if in.HostPID {

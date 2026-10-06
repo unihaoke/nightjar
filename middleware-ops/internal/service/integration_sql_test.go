@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
 )
 
 // 本文件锁定「平台代为创建只读监控账号」的模板 SQL。

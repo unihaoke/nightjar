@@ -12,12 +12,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/handler"
-	mw "middleware-ops/internal/middleware"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/handler"
+	mw "github.com/unihaoke/nightjar/middleware-ops/internal/middleware"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // Options 是路由构造参数。

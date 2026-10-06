@@ -13,8 +13,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件是「外部 AI 分析服务」的 HTTP 客户端，采用主流的**异步任务 + 回调**模型：

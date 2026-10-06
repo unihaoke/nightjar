@@ -11,11 +11,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // ContextSessionKey 是会话在 gin.Context 中的键。

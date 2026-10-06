@@ -3,9 +3,9 @@ package service
 import (
 	"testing"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 本文件锁定「日志集成不属于中间件纳管与监控域」这条边界。

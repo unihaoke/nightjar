@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件锁定「日志集成」服务层里那些**纯函数判定**：

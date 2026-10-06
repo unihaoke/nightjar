@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件锁定「日志告警屏蔽项」的判定语义与入参校验。

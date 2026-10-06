@@ -7,9 +7,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/logpipe"
-	"middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/logpipe"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
 )
 
 // LogPipeline 是「日志集成」的平台侧接收链路：Kafka 消费 → 平台日志事件。
@@ -114,7 +114,7 @@ type LogPipelineStatus struct {
 	DroppedTotal  int64 `json:"dropped_total"`
 	FailedTotal   int64 `json:"failed_total"`
 	// Persistent 表示累计值是否落库；false 时页面应说明"仅本次启动以来"。
-	Persistent   bool   `json:"persistent"`
+	Persistent    bool   `json:"persistent"`
 	LastMessageAt string `json:"last_message_at"`
 	LastError     string `json:"last_error"`
 	// Note 用一句话解释"为什么现在收不到日志"：未启用 / 未运行 / 最近的错误。

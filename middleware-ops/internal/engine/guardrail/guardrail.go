@@ -13,7 +13,7 @@ package guardrail
 import (
 	"time"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // Defaults 是六道护栏的统一参数载体（由配置派生）。

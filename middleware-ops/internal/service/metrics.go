@@ -10,10 +10,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
 )
 
 // MetricsService 提供统一监控查询能力（4.2）。

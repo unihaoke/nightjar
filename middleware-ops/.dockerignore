@@ -1,0 +1,27 @@
+# 后端镜像构建上下文排除项（上下文根即本目录）。
+# 运行阶段仍需从上下文取 configs/config.yaml，故不要忽略 configs/。
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# 文档与本地开发杂项
+*.md
+.env
+.env.*
+*.key
+*.pem
+
+# 测试与覆盖率（go build 不依赖 *_test.go）
+*_test.go
+**/testdata/
+coverage/
+coverage.out
+*.test
+*.out
+
+# 编译产物与本地运行数据
+middleware-ops
+*.exe
+data/
+.gocache/

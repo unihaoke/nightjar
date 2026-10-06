@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
 )
 
 // Scope 是护栏④：权限隔离（防权限溢出）。

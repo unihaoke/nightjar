@@ -16,11 +16,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
 )
 
 // NotifierService 实现多渠道通知（4.4）。
@@ -240,12 +240,12 @@ func levelLabel(level string) string {
 
 // AlertNotification 是一条通知内容。
 type AlertNotification struct {
-	Channel   string              `json:"channel"`
-	Title     string              `json:"title"`
-	Content   string              `json:"content"`
-	Level     string              `json:"level"`
-	AlertID   int64               `json:"alert_id"`
-	DetailURL string              `json:"detail_url"`
+	Channel   string `json:"channel"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	Level     string `json:"level"`
+	AlertID   int64  `json:"alert_id"`
+	DetailURL string `json:"detail_url"`
 	// DetailLabel 覆盖卡片上「查看详情」按钮的文案。
 	//
 	// 指标告警可以点进去"确认/驳回"，所以默认文案是「查看详情 / 确认」；
@@ -445,7 +445,7 @@ func (s *NotifierService) NotifyLogEvent(
 			Level: defaultString(event.Severity, "error"), AlertID: event.ID,
 			// 日志告警在 IM 上没有"确认"动作（忽略要在平台上做），文案只说查看详情。
 			DetailLabel: "查看详情",
-			DetailURL: detailURL, ReportURL: reportURL, Fields: fields, Sections: sections,
+			DetailURL:   detailURL, ReportURL: reportURL, Fields: fields, Sections: sections,
 		})
 		if err != nil {
 			failed = append(failed, channel+"："+err.Error())

@@ -3,8 +3,8 @@ package service
 import (
 	"testing"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 本文件锁定「推荐告警规则只能引用真实存在的指标」。

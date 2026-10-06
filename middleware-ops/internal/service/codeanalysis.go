@@ -10,11 +10,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // engineGuard 抽象成本记账，避免代码分析服务直接依赖护栏实现细节。
@@ -124,7 +124,7 @@ func (s *CodeAnalysisService) Ready() bool {
 //  2. 服务在出网白名单里（security.outbound_whitelist）。
 //
 // 抽成纯函数的原因：它是整条链路里最敏感的一条判定，必须能被单测逐格钉住
-//（真实缺陷 INC-030 就是"算了但没用"，所以连"给使用者看的告警文案"一起钉）。
+// （真实缺陷 INC-030 就是"算了但没用"，所以连"给使用者看的告警文案"一起钉）。
 func thirdPartyAllowedFor(forceLocal, whitelisted bool, serviceName string) (allowed bool, warn string) {
 	if forceLocal {
 		return false, ""

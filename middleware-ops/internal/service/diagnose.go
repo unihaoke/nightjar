@@ -10,14 +10,14 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/engine/guardrail"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/service/ai"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine/guardrail"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service/ai"
 )
 
 // DiagnoseService 是 AI 诊断中心的编排实现（4.3 + 第五章六道护栏）。

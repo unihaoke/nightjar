@@ -100,7 +100,9 @@ func TestFlushRestoresPendingOnFailure(t *testing.T) {
 type failingStore struct{}
 
 func (failingStore) Load(context.Context, string, string) (Stats, error) { return Stats{}, nil }
-func (failingStore) Add(context.Context, string, string, Stats) error     { return context.DeadlineExceeded }
+func (failingStore) Add(context.Context, string, string, Stats) error {
+	return context.DeadlineExceeded
+}
 
 // TestStatusWithoutStoreNoPersistence 未配置存储时如实说明"仅本次启动以来"。
 func TestStatusWithoutStoreNoPersistence(t *testing.T) {

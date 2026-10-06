@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件用一个假的 AI 服务跑通"提交 → 查询"这两步真实 HTTP 交互。

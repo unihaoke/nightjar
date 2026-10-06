@@ -16,13 +16,13 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/docker"
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/docker"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
 )
 
 // IntegrationService 实现「集成中心」：在页面上选组件、填参数，平台自动完成

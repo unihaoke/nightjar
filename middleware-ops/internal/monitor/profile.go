@@ -285,19 +285,19 @@ var profiles = map[string]Profile{
 				Expr:             `up{selector}`,
 				WarningThreshold: 0, CriticalThreshold: 0},
 			{Name: "cpu_usage_percent", DisplayName: "CPU 使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
-				Expr: `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance_name) * 100)`,
+				Expr:             `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance_name) * 100)`,
 				WarningThreshold: 80, CriticalThreshold: 92},
 			{Name: "memory_usage_percent", DisplayName: "内存使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
-				Expr: `(1 - node_memory_MemAvailable_bytes{selector} / node_memory_MemTotal_bytes{selector}) * 100`,
+				Expr:             `(1 - node_memory_MemAvailable_bytes{selector} / node_memory_MemTotal_bytes{selector}) * 100`,
 				WarningThreshold: 85, CriticalThreshold: 93},
 			{Name: "disk_usage_percent", DisplayName: "磁盘使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
-				Expr: `max(100 - (node_filesystem_avail_bytes{selector, fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{selector, fstype!~"tmpfs|overlay"} * 100))`,
+				Expr:             `max(100 - (node_filesystem_avail_bytes{selector, fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{selector, fstype!~"tmpfs|overlay"} * 100))`,
 				WarningThreshold: 85, CriticalThreshold: 93},
 			{Name: "load1", DisplayName: "1 分钟负载", Unit: "", Category: "performance", Mode: ThresholdHigherWorse,
 				Expr:             `node_load1{selector}`,
 				WarningThreshold: 8, CriticalThreshold: 16},
 			{Name: "filesystem_inodes_used_percent", DisplayName: "inode 使用率", Unit: "%", Category: "resource", Mode: ThresholdHigherWorse,
-				Expr: `max(100 - (node_filesystem_files_free{selector, fstype!~"tmpfs|overlay"} / node_filesystem_files{selector, fstype!~"tmpfs|overlay"} * 100))`,
+				Expr:             `max(100 - (node_filesystem_files_free{selector, fstype!~"tmpfs|overlay"} / node_filesystem_files{selector, fstype!~"tmpfs|overlay"} * 100))`,
 				WarningThreshold: 85, CriticalThreshold: 95},
 			{Name: "network_receive_bytes_rate", DisplayName: "入向流量", Unit: "B/s", Category: "performance", Mode: ThresholdNone,
 				Expr:             `sum(rate(node_network_receive_bytes_total{selector, device!="lo"}[5m]))`,
@@ -308,6 +308,7 @@ var profiles = map[string]Profile{
 		},
 	},
 }
+
 // ProfileOf 返回中间件类型的指标画像，未知类型返回空画像。
 func ProfileOf(mwType string) Profile {
 	if p, ok := profiles[strings.ToLower(mwType)]; ok {

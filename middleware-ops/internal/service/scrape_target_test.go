@@ -3,7 +3,7 @@ package service
 import (
 	"testing"
 
-	"middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
 )
 
 // 本文件锁定「Prometheus 抓取目标」的选择规则。

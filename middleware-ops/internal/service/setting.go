@@ -13,12 +13,12 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/engine/guardrail"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine/guardrail"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
 )
 
 // SettingService 实现「平台自管设置」：AI 提供方与通知渠道改由平台界面管理，改完即时生效。
@@ -149,31 +149,31 @@ type aiProviderPayload struct {
 // 时长字段用字符串（如 "30m"）而不是纳秒数字：它要被界面编辑、也要被人读，
 // 写 1800000000000 这种数字谁都看不出是多久。解析失败时保留原值。
 type aiAnalysisPayload struct {
-	Enabled         bool   `json:"enabled"`
-	BaseURL         string `json:"base_url"`
-	APIKey          string `json:"api_key"`
-	SubmitPath      string `json:"submit_path"`
-	QueryPath       string `json:"query_path"`
-	CallbackURL     string `json:"callback_url"`
-	CallbackToken   string `json:"callback_token"`
+	Enabled       bool   `json:"enabled"`
+	BaseURL       string `json:"base_url"`
+	APIKey        string `json:"api_key"`
+	SubmitPath    string `json:"submit_path"`
+	QueryPath     string `json:"query_path"`
+	CallbackURL   string `json:"callback_url"`
+	CallbackToken string `json:"callback_token"`
 	// CallbackKeyMap 是「X-Callback-Key-Id → callbackSecret」映射（多密钥支持，对齐文档 §2.4）。
 	CallbackKeyMap []CallbackKeyItem `json:"callback_key_map"`
-	Timeout         string `json:"timeout"`
-	TaskTimeout     string `json:"task_timeout"`
-	PollInterval    string `json:"poll_interval"`
-	PollBatch       int    `json:"poll_batch"`
-	CallMode        string `json:"call_mode"`
-	SyncTimeout     string `json:"sync_timeout"`
-	NotifyOnSubmit  bool   `json:"notify_on_submit"`
+	Timeout        string            `json:"timeout"`
+	TaskTimeout    string            `json:"task_timeout"`
+	PollInterval   string            `json:"poll_interval"`
+	PollBatch      int               `json:"poll_batch"`
+	CallMode       string            `json:"call_mode"`
+	SyncTimeout    string            `json:"sync_timeout"`
+	NotifyOnSubmit bool              `json:"notify_on_submit"`
 	// ---- 开放接口 v1（Protocol=openapi_v1）专用 ----
-	Protocol        string `json:"protocol"`
-	AuthHeader      string `json:"auth_header"`
-	SyncSubmitPath  string `json:"sync_submit_path"`
+	Protocol       string `json:"protocol"`
+	AuthHeader     string `json:"auth_header"`
+	SyncSubmitPath string `json:"sync_submit_path"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口按服务名定位仓库用）。
-	ServiceRepoMap  []ServiceRepoItem `json:"service_repo_map"`
-	Environment     string             `json:"environment"`
-	Priority        int    `json:"priority"`
-	AutoVerify      bool   `json:"auto_verify"`
+	ServiceRepoMap []ServiceRepoItem `json:"service_repo_map"`
+	Environment    string            `json:"environment"`
+	Priority       int               `json:"priority"`
+	AutoVerify     bool              `json:"auto_verify"`
 }
 
 // ServiceRepoItem 是「服务名 → git 地址」映射的一行。
@@ -256,32 +256,32 @@ type ProviderSettingsView struct {
 
 // AIAnalysisView 是「AI 代码分析」的展示形态：两把密钥只以「是否已配置 + 掩码」出现。
 type AIAnalysisView struct {
-	Enabled             bool   `json:"enabled"`
-	BaseURL             string `json:"base_url"`
-	APIKeySet           bool   `json:"api_key_set"`
-	APIKeyMasked        string `json:"api_key_masked"`
-	SubmitPath          string `json:"submit_path"`
-	QueryPath           string `json:"query_path"`
-	CallbackURL         string `json:"callback_url"`
-	CallbackTokenSet    bool                `json:"callback_token_set"`
-	CallbackTokenMasked string              `json:"callback_token_masked"`
-	CallbackKeyMap      []CallbackKeyView   `json:"callback_key_map"`
-	Timeout             string              `json:"timeout"`
-	TaskTimeout         string `json:"task_timeout"`
-	PollInterval        string `json:"poll_interval"`
-	PollBatch           int    `json:"poll_batch"`
-	CallMode            string `json:"call_mode"`
-	SyncTimeout         string `json:"sync_timeout"`
-	NotifyOnSubmit      bool   `json:"notify_on_submit"`
+	Enabled             bool              `json:"enabled"`
+	BaseURL             string            `json:"base_url"`
+	APIKeySet           bool              `json:"api_key_set"`
+	APIKeyMasked        string            `json:"api_key_masked"`
+	SubmitPath          string            `json:"submit_path"`
+	QueryPath           string            `json:"query_path"`
+	CallbackURL         string            `json:"callback_url"`
+	CallbackTokenSet    bool              `json:"callback_token_set"`
+	CallbackTokenMasked string            `json:"callback_token_masked"`
+	CallbackKeyMap      []CallbackKeyView `json:"callback_key_map"`
+	Timeout             string            `json:"timeout"`
+	TaskTimeout         string            `json:"task_timeout"`
+	PollInterval        string            `json:"poll_interval"`
+	PollBatch           int               `json:"poll_batch"`
+	CallMode            string            `json:"call_mode"`
+	SyncTimeout         string            `json:"sync_timeout"`
+	NotifyOnSubmit      bool              `json:"notify_on_submit"`
 	// Protocol 为对接协议：generic（默认）| openapi_v1。
-	Protocol        string `json:"protocol"`
-	AuthHeader      string `json:"auth_header"`
-	SyncSubmitPath  string `json:"sync_submit_path"`
+	Protocol       string `json:"protocol"`
+	AuthHeader     string `json:"auth_header"`
+	SyncSubmitPath string `json:"sync_submit_path"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射（开放接口按服务名定位仓库用）。
-	ServiceRepoMap  []ServiceRepoItem `json:"service_repo_map"`
-	Environment     string             `json:"environment"`
-	Priority        int    `json:"priority"`
-	AutoVerify      bool   `json:"auto_verify"`
+	ServiceRepoMap []ServiceRepoItem `json:"service_repo_map"`
+	Environment    string            `json:"environment"`
+	Priority       int               `json:"priority"`
+	AutoVerify     bool              `json:"auto_verify"`
 	// Configured 表示"现在真的能调用"（开关已开且地址非空）。
 	// 页面据此提示"填了但没生效"，避免管理员以为配好了却在日志页看到"未装配"。
 	Configured bool `json:"configured"`
@@ -392,23 +392,23 @@ type AIAnalysisInput struct {
 	// CallbackKeyMap 是「X-Callback-Key-Id → callbackSecret」映射；指针区分「未传」与「传空数组（清空）」。
 	CallbackKeyMap *[]CallbackKeyItem `json:"callback_key_map,omitempty"`
 	// ClearCallbackKeyMap 为 true 时清空整张回调密钥表。
-	ClearCallbackKeyMap bool `json:"clear_callback_key_map"`
+	ClearCallbackKeyMap bool   `json:"clear_callback_key_map"`
 	Timeout             string `json:"timeout"`
-	TaskTimeout        string `json:"task_timeout"`
-	PollInterval       string `json:"poll_interval"`
-	PollBatch          int    `json:"poll_batch"`
-	CallMode           string `json:"call_mode"`
-	SyncTimeout        string `json:"sync_timeout"`
-	NotifyOnSubmit     bool   `json:"notify_on_submit"`
+	TaskTimeout         string `json:"task_timeout"`
+	PollInterval        string `json:"poll_interval"`
+	PollBatch           int    `json:"poll_batch"`
+	CallMode            string `json:"call_mode"`
+	SyncTimeout         string `json:"sync_timeout"`
+	NotifyOnSubmit      bool   `json:"notify_on_submit"`
 	// 开放接口 v1 专用；切回 generic 时这些字段被忽略但不清除（避免来回切换丢配置）。
-	Protocol           string `json:"protocol"`
-	AuthHeader         string `json:"auth_header"`
-	SyncSubmitPath     string `json:"sync_submit_path"`
+	Protocol       string `json:"protocol"`
+	AuthHeader     string `json:"auth_header"`
+	SyncSubmitPath string `json:"sync_submit_path"`
 	// ServiceRepoMap 是「服务名 → git 地址」映射；用指针区分「未传」与「传空数组（清空）」。
-	ServiceRepoMap     *[]ServiceRepoItem `json:"service_repo_map,omitempty"`
-	Environment        string             `json:"environment"`
-	Priority           int    `json:"priority"`
-	AutoVerify         bool   `json:"auto_verify"`
+	ServiceRepoMap *[]ServiceRepoItem `json:"service_repo_map,omitempty"`
+	Environment    string             `json:"environment"`
+	Priority       int                `json:"priority"`
+	AutoVerify     bool               `json:"auto_verify"`
 }
 
 // AISettingsInput 是 PUT /api/settings/ai 的请求体。
@@ -918,29 +918,29 @@ func (p aiSettingsPayload) applyTo(cfg *config.AIEngineConfig) {
 // applyCodeAnalysisTo 把「AI 代码分析」落到根配置上（它不在 AIEngine 之下，是独立的一段）。
 func (p aiSettingsPayload) applyCodeAnalysisTo(cfg *config.Config) {
 	cfg.AIAnalysis = config.AIAnalysisConfig{
-		Enabled:        p.CodeAnalysis.Enabled,
-		BaseURL:        p.CodeAnalysis.BaseURL,
-		APIKey:         p.CodeAnalysis.APIKey,
-		SubmitPath:     defaultString(p.CodeAnalysis.SubmitPath, defaultSubmitPath),
-		QueryPath:      defaultString(p.CodeAnalysis.QueryPath, defaultQueryPath),
-		CallbackURL:    p.CodeAnalysis.CallbackURL,
-		CallbackToken:  p.CodeAnalysis.CallbackToken,
-		Timeout:        parseDurationOr(p.CodeAnalysis.Timeout, cfg.AIAnalysis.Timeout),
-		TaskTimeout:    parseDurationOr(p.CodeAnalysis.TaskTimeout, cfg.AIAnalysis.TaskTimeout),
-		PollInterval:   parseDurationOr(p.CodeAnalysis.PollInterval, cfg.AIAnalysis.PollInterval),
-		PollBatch:      p.CodeAnalysis.PollBatch,
-		CallMode:        resolveCallMode(p.CodeAnalysis.CallMode),
-		SyncTimeout:     parseDurationOr(p.CodeAnalysis.SyncTimeout, cfg.AIAnalysis.SyncTimeout),
-		NotifyOnSubmit:  p.CodeAnalysis.NotifyOnSubmit,
-		Protocol:        resolveProtocol(p.CodeAnalysis.Protocol),
-		AuthHeader:      strings.TrimSpace(p.CodeAnalysis.AuthHeader),
-		SyncSubmitPath:  strings.TrimSpace(p.CodeAnalysis.SyncSubmitPath),
+		Enabled:          p.CodeAnalysis.Enabled,
+		BaseURL:          p.CodeAnalysis.BaseURL,
+		APIKey:           p.CodeAnalysis.APIKey,
+		SubmitPath:       defaultString(p.CodeAnalysis.SubmitPath, defaultSubmitPath),
+		QueryPath:        defaultString(p.CodeAnalysis.QueryPath, defaultQueryPath),
+		CallbackURL:      p.CodeAnalysis.CallbackURL,
+		CallbackToken:    p.CodeAnalysis.CallbackToken,
+		Timeout:          parseDurationOr(p.CodeAnalysis.Timeout, cfg.AIAnalysis.Timeout),
+		TaskTimeout:      parseDurationOr(p.CodeAnalysis.TaskTimeout, cfg.AIAnalysis.TaskTimeout),
+		PollInterval:     parseDurationOr(p.CodeAnalysis.PollInterval, cfg.AIAnalysis.PollInterval),
+		PollBatch:        p.CodeAnalysis.PollBatch,
+		CallMode:         resolveCallMode(p.CodeAnalysis.CallMode),
+		SyncTimeout:      parseDurationOr(p.CodeAnalysis.SyncTimeout, cfg.AIAnalysis.SyncTimeout),
+		NotifyOnSubmit:   p.CodeAnalysis.NotifyOnSubmit,
+		Protocol:         resolveProtocol(p.CodeAnalysis.Protocol),
+		AuthHeader:       strings.TrimSpace(p.CodeAnalysis.AuthHeader),
+		SyncSubmitPath:   strings.TrimSpace(p.CodeAnalysis.SyncSubmitPath),
 		ServiceRepoMap:   toServiceRepoMap(p.CodeAnalysis.ServiceRepoMap),
 		ServiceRepoIDMap: toServiceRepoIDMap(p.CodeAnalysis.ServiceRepoMap),
 		CallbackKeyMap:   toCallbackKeyMap(p.CodeAnalysis.CallbackKeyMap),
 		Environment:      strings.TrimSpace(p.CodeAnalysis.Environment),
-		Priority:        p.CodeAnalysis.Priority,
-		AutoVerify:      p.CodeAnalysis.AutoVerify,
+		Priority:         p.CodeAnalysis.Priority,
+		AutoVerify:       p.CodeAnalysis.AutoVerify,
 	}
 	if cfg.AIAnalysis.PollBatch <= 0 {
 		cfg.AIAnalysis.PollBatch = defaultPollBatch
@@ -1065,8 +1065,6 @@ func resolveProtocol(raw string) string {
 		return protocolGeneric
 	}
 }
-
-
 
 // applyProtocolDefaults 在协议切换时把"还没被改过的"路径改写成该协议的默认值。
 //
@@ -1295,12 +1293,12 @@ func (s *SettingService) SaveAISettings(ctx context.Context, in AISettingsInput,
 		"per_user_daily_quota":    next.PerUserQuota,
 		"providers_active":        next.providersActive(),
 		// AI 代码分析：只记开关、地址（脱敏）与"密钥是否被改过"，不记任何密钥。
-		"code_analysis_enabled":        next.CodeAnalysis.Enabled,
-		"code_analysis_base_url":       redactCredentials(next.CodeAnalysis.BaseURL),
-		"code_analysis_key_changed":    analysisSecretChanged(existing.CodeAnalysis, in.CodeAnalysis),
-		"code_analysis_call_mode":      next.CodeAnalysis.CallMode,
-		"code_analysis_task_timeout":   next.CodeAnalysis.TaskTimeout,
-		"code_analysis_notify_submit":  next.CodeAnalysis.NotifyOnSubmit,
+		"code_analysis_enabled":       next.CodeAnalysis.Enabled,
+		"code_analysis_base_url":      redactCredentials(next.CodeAnalysis.BaseURL),
+		"code_analysis_key_changed":   analysisSecretChanged(existing.CodeAnalysis, in.CodeAnalysis),
+		"code_analysis_call_mode":     next.CodeAnalysis.CallMode,
+		"code_analysis_task_timeout":  next.CodeAnalysis.TaskTimeout,
+		"code_analysis_notify_submit": next.CodeAnalysis.NotifyOnSubmit,
 	})
 
 	return s.AISettings(ctx)
@@ -1349,8 +1347,8 @@ func analysisSecretChanged(old aiAnalysisPayload, in AIAnalysisInput) map[string
 	keyChanged, keyCleared := secretChange(old.APIKey, in.APIKey, in.ClearAPIKey)
 	tokenChanged, tokenCleared := secretChange(old.CallbackToken, in.CallbackToken, in.ClearCallbackToken)
 	return map[string]any{
-		"api_key_changed":    keyChanged,
-		"api_key_cleared":    keyCleared,
+		"api_key_changed":        keyChanged,
+		"api_key_cleared":        keyCleared,
 		"callback_token_changed": tokenChanged,
 		"callback_token_cleared": tokenCleared,
 	}
@@ -1931,7 +1929,7 @@ func (s *SettingService) TestAIProvider(ctx context.Context, key string, in Prov
 		defer cancel()
 		start := time.Now()
 		_, e := eng.Chat(ctx, engine.ChatRequest{
-			Messages: []engine.Message{{Role: engine.RoleUser, Content: "ping"}},
+			Messages:  []engine.Message{{Role: engine.RoleUser, Content: "ping"}},
 			MaxTokens: 8, Temperature: 0,
 		})
 		latency := time.Since(start).Milliseconds()
@@ -1955,7 +1953,7 @@ func (s *SettingService) TestAIProvider(ctx context.Context, key string, in Prov
 //   - 2xx         → 通；
 //   - 401 / 403   → 鉴权问题，失败；
 //   - 404 / 422   → **算通**：能走到仓库定位说明地址、密钥、报文形状都对，
-//                    探针服务名没注册是预期的（真实告警会带真实服务名）；
+//     探针服务名没注册是预期的（真实告警会带真实服务名）；
 //   - 其它 / 网络错误 → 失败，原因原样给出去。
 func (s *SettingService) TestCodeAnalysis(ctx context.Context, in AIAnalysisInput) (bool, string, string, int64, error) {
 	var existing aiSettingsPayload
@@ -1995,7 +1993,7 @@ func (s *SettingService) TestCodeAnalysis(ctx context.Context, in AIAnalysisInpu
 	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusUnprocessableEntity {
 		if openAPI {
 			return true, name, "服务可达且鉴权通过（探针服务 " + probeServiceName +
-				" 未在该服务注册，属预期）；真实告警会带实际服务名去定位仓库，请确认控制台已配置 hostPatterns",
+					" 未在该服务注册，属预期）；真实告警会带实际服务名去定位仓库，请确认控制台已配置 hostPatterns",
 				res.LatencyMS, nil
 		}
 	}

@@ -9,7 +9,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // InstanceFilter 是中间件实例的检索条件。

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // RuleEngineName 是规则引擎（最终降级层）的名称。

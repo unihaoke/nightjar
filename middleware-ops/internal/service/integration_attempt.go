@@ -6,7 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件处理「一次尝试的开始/结束」语义，以及"下一步该点哪个按钮"的判定。

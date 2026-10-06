@@ -188,12 +188,13 @@ kafka-go Reader（consumer group=mwops-log-ingest）
 
 ### 5.1 规则：去重窗口与冷却期（页面可配）
 
-`log_alert_rules` 决定"多久打扰人一次"，没有命中任何规则时用 `log_alert.default_*` 兜底：
+`log_alert_rules` 决定"多久打扰人一次"。**平台没有内置默认规则**：一条日志没有命中任何
+**已启用**规则时，事件**不入库、不通知、不分析**——告警只能来自页面上新增过的规则。
 
 | 概念 | 语义 | 默认 |
 |---|---|---|
 | 去重窗口 `dedup_window` | 窗口内**同指纹合并为一条事件**（计数累加），不新增记录 | 5 分钟 |
-| 冷却期 `cooldown` | 冷却内**不重复通知、不重复触发 AI**，但**事件照常记录**（列表里标「冷却中」） | 10 分钟 |
+| 冷却期 `cooldown` | 冷却内**不重复通知、不重复提交 AI**，但**事件照常记录**（列表里标「冷却中」） | 10 分钟 |
 | 通知渠道 `notify_channels` | 留空用平台「通知渠道」里已启用的渠道 | 空 |
 | AI 开关 `ai_enabled` | 关掉就不做代码分析（省额度；也可只对少量服务开） | 开 |
 | 优先级 `priority` | 数字**小**的优先；多条命中取第一条，便于"特例压过通用" | 100 |
@@ -206,45 +207,43 @@ kafka-go Reader（consumer group=mwops-log-ingest）
 
 Ingest 只做"记录与判定"，**通知与 AI 分析放在定时任务里异步执行**（默认 15 秒扫一轮）：
 
-- 为什么不同步做：AI 分析要拉代码、调 LLM，耗时几十秒；放在采集路径上会把 Kafka 消费拖慢
+- 为什么不同步做：AI 分析要把问题提交给外部服务并等待结论，耗时几十秒；放在采集路径上会把 Kafka 消费拖慢
   （位点积压 → 整条链路延迟）；
-- 为什么不丢：状态落在 `log_alert_events.analysis_state`（pending → running → done/failed/disabled），
+- 为什么不丢：状态落在 `log_alert_events.analysis_state`
+  （pending → running → awaiting（已提交外部服务，等回调/轮询）→ done/failed/disabled），
   重启后由定时任务按队列继续，**不依赖内存里的 goroutine**；
 - 为什么不重复：多副本部署时用「带条件的 UPDATE 抢占」（`pending→running`，影响行数=1 才算抢到）；
 - 限流：每轮批量 `worker_batch`（默认 10） + 事件之间错开 + 单条 `analyze_timeout`（默认 2 分钟）；
 - 页面可以直接看到"为什么没有结论"：`analysis_state=disabled/failed` 时 `analysis_error` 写明原因
-  （规则关了 AI / 服务没配代码仓库 / 拉代码失败 / LLM 报错）。
+  （规则关了 AI / 未配置 AI 分析服务 / 服务不在出网白名单 / 外部服务返回的错误）。
 
-### 5.3 代码仓库本地缓存（首次 clone，之后只做更新）
+### 5.3 AI 代码分析：提交外部 AI 分析服务（平台不持有代码副本）
 
-AI 要回答"这条日志对应哪一行代码"，就必须先有代码。`internal/repo` 负责这件事：
+平台**不再 clone、缓存任何业务代码仓库**：代码分析这件事交给专门的外部 AI 分析服务
+（它自己持有代码与上下文），平台只负责把"问题"问出去、把"答案"收回来并送到通知里。
+平台侧因此没有 git 依赖、没有磁盘缓存目录，也不再有"把代码片段外发"这个合规面。
 
-- **首次** `git clone`（按 `CodeRepo.branch` 指定分支；不指定则用远端默认分支）到
-  `code_repo.cache_dir`（默认 `./data/repos`，落在 `backend-data` 卷里，容器重建不丢）；
-- **之后**只做更新：分支非空时 `git fetch --prune` + `git checkout -B <branch> origin/<branch>`
-  （等价于把缓存重置到远端——它是**缓存不是工作区**，手工改动不该被保留），
-  分支为空时 `git pull --ff-only`；
-- 同一服务并发分析只会跑一次 git（进程内互斥），并有**最小拉取间隔**
-  （`code_repo.refresh_interval_seconds`，默认 300 秒）避免风暴期反复拉远端；
-- 拉取结果写回 `code_repos.local_path` 与 `last_pull_at`（页面上看得到"什么时候拉的、拉到哪了"）；
-- 错误翻译成可操作的中文（认证失败 / 分支不存在 / 域名解析失败 / 磁盘满），
-  URL 里的凭据（userinfo、token 参数）在日志与错误里一律脱敏；
-- **凭据与地址分开存放**：入库的 `repo_url` 不含任何凭据，令牌单独加密保存在
-  `code_repos.credential_encrypted`，只在执行 git 的那一刻拼回 URL；克隆/更新后会把缓存里的
-  `origin` 改写成干净地址，因此 `.git/config` 里没有令牌。页面与接口只回 `has_credential` 布尔量，
-  表单里的令牌框**永不回显**（留空=不修改、`clear_credential`=清除）。旧数据里内嵌的凭据
-  在第一次读取时自动迁移（见 OPERATIONS §5.10）。
-- **轮换令牌立即生效**：缓存里的 `origin` 会对齐成配置里的地址，不必进容器删缓存目录。
-- **重启不重复拉取**：最小间隔同时看进程内记忆与数据库 `last_pull_at`，
-  容器重建后不会把所有仓库重新 fetch 一遍。
-- **定位用的候选来自 git 索引**（`git ls-files`），并按堆栈的路径线索打分
-  （依赖/产物/测试目录扣分，不跟随软链指向仓库外的文件）；结果里记录
-  `repo_revision`（本次所用提交），便于事后复核。
-- **合规上有两个开关，别混**：`code_repo.allow_outbound` 管"平台能否 git clone/pull"；
-  `CodeRepo.allow_third_party` 管"能否把代码片段发给第三方 AI"（6.5 出网白名单）。
-  合成一个开关的后果是：不想用第三方 AI 的团队会连内网仓库都拉不下来，整个功能形同虚设。
-  注意后者是**硬拦截**：平台引擎若是第三方提供方，未勾选/不在白名单时**不会调用引擎**，
-  该事件记为 `analysis_state=disabled` 并在原因里写明三种出路（见 OPERATIONS §5.10）。
+链路（异步任务模型，`service/codeanalysis.go` + `service/ai_analysis_client.go`）：
+
+- **提交**：worker 把**脱敏后**的错误信息/堆栈通过 HTTP 提交给外部 AI 分析服务，拿到任务 ID，
+  事件置 `awaiting`；提交前先过脱敏器（IP / 手机号 / 邮箱 / 口令等）；
+- **收结论**：外部服务完成后回调平台 `POST /api/ai/analysis/callback`
+  （X-Callback-Token / Bearer / `?token=` 鉴权，幂等条件更新），
+  或平台按 `poll_interval`（默认 60s）轮询 `GET /api/v1/runs/{run_id}` 兜底；
+- **落库与通知**：三点式结论（定位文件行 / 根因 / 应急处置 / 修复建议）写入
+  `ai_code_analyses`（含外部服务返回的 `repo_revision`，便于事后复核），随后外发通知渠道；
+- **超时**：回调与轮询都不通时，任务在 `task_timeout`（默认 30 分钟）后判 `failed`，
+  原因写入 `analysis_error`。
+
+仍然保留的两条合规规矩：
+
+- **出网白名单**（`security.outbound_whitelist`，默认空 = 全禁）：AI 服务地址/服务名不在名单里就不许提交，
+  事件记为 `analysis_state=disabled`，原因写明"服务 X 不在出网白名单内"；
+- **脱敏**：错误信息与堆栈在送出前一律过脱敏器。
+
+对接的两档协议（开放接口 v1：`repoLocator` / `stacktrace` / `X-API-Key`；通用协议：
+`question` / `task_id` / `Authorization: Bearer`）、回调验签与平台侧验收清单，见
+[AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md)。
 
 ### 5.4 字段映射（Filebeat JSON → 平台日志事件）
 

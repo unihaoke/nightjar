@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件锁定「集成地址的两种视角」（真实反馈：Exporter 打了自己的公网 IP）。

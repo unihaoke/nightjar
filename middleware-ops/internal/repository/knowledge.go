@@ -5,7 +5,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // KnowledgeFilter 是知识库检索条件。

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // FactoryOptions 构造引擎所需的依赖。

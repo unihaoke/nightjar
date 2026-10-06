@@ -3,8 +3,8 @@ package monitor
 import (
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
 )
 
 // New 依据配置创建监控客户端。

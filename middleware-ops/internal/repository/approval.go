@@ -6,7 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // ApprovalRepository 提供审批工单数据访问（6.2）。

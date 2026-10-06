@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件处理「集成地址的两种视角」。

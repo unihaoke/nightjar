@@ -3,10 +3,10 @@ package handler
 import (
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // ListAlerts 告警历史列表。

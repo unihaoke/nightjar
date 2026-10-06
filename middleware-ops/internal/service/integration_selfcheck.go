@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 本文件实现「集成自检」：一次点击，按**环节**给出结论，而不是让使用者去翻日志。

@@ -1,0 +1,41 @@
+<svg viewbox="0 0 1000 340" width="100%" xmlns="http://www.w3.org/2000/svg">
+<rect fill="#eff6ff" height="56" rx="10" stroke="#93c5fd" width="190" x="30" y="20"></rect>
+<text fill="#1d4ed8" font-size="13" font-weight="700" text-anchor="middle" x="125" y="43">诊断任务入口</text>
+<text fill="#3b82f6" font-size="11.5" text-anchor="middle" x="125" y="62">用户提问 / 告警触发</text>
+<line stroke="#9ca3af" stroke-width="2" x1="220" x2="255" y1="48" y2="48"></line>
+<rect fill="#fff7ed" height="56" rx="10" stroke="#fdba74" width="170" x="255" y="20"></rect>
+<text fill="#c2410c" font-size="13" font-weight="700" text-anchor="middle" x="340" y="41">① 上下文预算</text>
+<text fill="#ea580c" font-size="11.5" text-anchor="middle" x="340" y="60">降采样 · 截断 · 告知</text>
+<line stroke="#9ca3af" stroke-width="2" x1="425" x2="460" y1="48" y2="48"></line>
+<rect fill="#fff7ed" height="56" rx="10" stroke="#fdba74" width="170" x="460" y="20"></rect>
+<text fill="#c2410c" font-size="13" font-weight="700" text-anchor="middle" x="545" y="41">② 防死循环</text>
+<text fill="#ea580c" font-size="11.5" text-anchor="middle" x="545" y="60">步数 · 幂等 · 白名单</text>
+<line stroke="#9ca3af" stroke-width="2" x1="630" x2="665" y1="48" y2="48"></line>
+<rect fill="#fff7ed" height="56" rx="10" stroke="#fdba74" width="170" x="665" y="20"></rect>
+<text fill="#c2410c" font-size="13" font-weight="700" text-anchor="middle" x="750" y="41">③ 超时熔断</text>
+<text fill="#ea580c" font-size="11.5" text-anchor="middle" x="750" y="60">分层超时 · 降级链</text>
+<line stroke="#9ca3af" stroke-width="2" x1="835" x2="870" y1="48" y2="48"></line>
+<rect fill="#fef2f2" height="56" rx="10" stroke="#fca5a5" width="190" x="30" y="106"></rect>
+<text fill="#b91c1c" font-size="13" font-weight="700" text-anchor="middle" x="125" y="129">④ 权限隔离</text>
+<text fill="#dc2626" font-size="11.5" text-anchor="middle" x="125" y="148">只读工具集 · 数据域下沉</text>
+<line stroke="#9ca3af" stroke-width="2" x1="220" x2="255" y1="134" y2="134"></line>
+<rect fill="#fef2f2" height="56" rx="10" stroke="#fca5a5" width="170" x="255" y="106"></rect>
+<text fill="#b91c1c" font-size="13" font-weight="700" text-anchor="middle" x="340" y="129">⑤ 质量护栏</text>
+<text fill="#dc2626" font-size="11.5" text-anchor="middle" x="340" y="148">证据链 · 置信度 · 评测集</text>
+<line stroke="#9ca3af" stroke-width="2" x1="425" x2="460" y1="134" y2="134"></line>
+<rect fill="#fef2f2" height="56" rx="10" stroke="#fca5a5" width="170" x="460" y="106"></rect>
+<text fill="#b91c1c" font-size="13" font-weight="700" text-anchor="middle" x="545" y="129">⑥ 成本治理</text>
+<text fill="#dc2626" font-size="11.5" text-anchor="middle" x="545" y="148">预算 · 缓存 · 配额</text>
+<line stroke="#9ca3af" stroke-width="2" x1="630" x2="665" y1="134" y2="134"></line>
+<rect fill="#eff6ff" height="56" rx="10" stroke="#93c5fd" width="170" x="665" y="106"></rect>
+<text fill="#1d4ed8" font-size="13" font-weight="700" text-anchor="middle" x="750" y="129">只读工具执行</text>
+<text fill="#3b82f6" font-size="11.5" text-anchor="middle" x="750" y="148">指标/日志/配置/代码检索</text>
+<line stroke="#9ca3af" stroke-width="2" x1="500" x2="500" y1="162" y2="184"></line>
+<rect fill="#f0fdf4" height="56" rx="10" stroke="#86efac" width="500" x="250" y="184"></rect>
+<text fill="#15803d" font-size="13.5" font-weight="700" text-anchor="middle" x="500" y="207">LLM 调用（第三方 / 本地，hybrid 降级）</text>
+<text fill="#16a34a" font-size="11.5" text-anchor="middle" x="500" y="226">结构化输出：根因 / 证据 / 置信度 / 建议 / 影响范围</text>
+<line stroke="#9ca3af" stroke-width="2" x1="500" x2="500" y1="240" y2="262"></line>
+<rect fill="#eff6ff" height="56" rx="10" stroke="#93c5fd" width="500" x="250" y="262"></rect>
+<text fill="#1d4ed8" font-size="13" font-weight="700" text-anchor="middle" x="500" y="285">结果出口</text>
+<text fill="#3b82f6" font-size="11.5" text-anchor="middle" x="500" y="304">流式报告 → 审计留痕 → 知识库「草稿」（人工确认后生效）</text>
+</svg>

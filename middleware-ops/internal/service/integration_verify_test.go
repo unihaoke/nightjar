@@ -3,9 +3,9 @@ package service
 import (
 	"testing"
 
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 锁定「周期自愈清谁的待处理」的匹配规则（INC-015 / INC-025）。

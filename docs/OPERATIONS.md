@@ -85,19 +85,17 @@
 | `kafka.filebeat_version` | `8.16.0` | 目标机安装的 Filebeat 版本（`FILEBEAT_VERSION`） |
 | `log_alert.worker_interval_seconds` | `15` | 日志告警**后处理**（通知 + AI）的扫描间隔（秒） |
 | `log_alert.worker_batch` | `10` | 每轮最多处理的事件数（AI 很贵，靠它与间隔限流） |
-| `log_alert.analyze_timeout` | `2m` | 单条事件的 AI 分析超时 |
-| `code_repo.cache_dir` | `./data/repos` | 代码仓库本地缓存根目录（容器内落 `backend-data` 卷，每个服务一个子目录） |
-| `code_repo.clone_timeout` | `10m` | **首次 clone** 的超时（仓库大就调大） |
-| `code_repo.pull_timeout` | `2m` | 之后 `fetch`/`checkout`/`pull` 的超时 |
-| `code_repo.refresh_interval_seconds` | `300` | 同一仓库两次拉取的**最小间隔**（秒），风暴期避免反复拉远端 |
-| `code_repo.allow_outbound` | `true` | 平台**能否 `git clone/pull` 代码**；`false` 时不执行任何 git 命令（详见 5.10） |
+| `log_alert.analyze_timeout` | `2m` | 单条事件的 AI 分析提交/等待超时 |
 
-> 环境变量名按同一规则拼：`log_alert.worker_interval_seconds` → `MWOPS_LOG_ALERT_WORKER_INTERVAL_SECONDS`，
-> `code_repo.cache_dir` → `MWOPS_CODE_REPO_CACHE_DIR`。
-> **这两组已支持环境变量覆盖**（后端启动时显式读取，不依赖 viper 对嵌套键的自动覆盖），
+> AI 代码分析的对接参数（服务地址、API Key、协议、提交/查询路径、回调地址与令牌、轮询间隔、任务超时等）
+> **不在配置文件里**：统一在「系统设置 → AI 设置 → AI 代码分析」界面管理，密钥 AES-256-GCM 加密落库、
+> 保存即生效，平台库是唯一来源（详见 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md#附录-b平台侧接入验收清单)）。
+>
+> 环境变量名按同一规则拼：`log_alert.worker_interval_seconds` → `MWOPS_LOG_ALERT_WORKER_INTERVAL_SECONDS`。
+> **该组已支持环境变量覆盖**（后端启动时显式读取，不依赖 viper 对嵌套键的自动覆盖），
 > 改 `.env` 后 `docker compose up -d backend` 即可生效，不必重建镜像。
-> 注意**只有**写进 `docker-compose.yml` 的那几项能这样传（`clone_timeout`
-> 等未注入的项请直接改 `middleware-ops/configs/config.yaml`）。
+> 注意**只有**写进 `docker-compose.yml` 的那几项能这样传，未注入的项请直接改
+> `middleware-ops/configs/config.yaml`。
 > 日志告警的**去重窗口 / 冷却期 / 通知渠道 / AI 开关一律在页面「日志告警规则」里配**（保存即生效，不需要重启）；
 > 平台没有默认规则兜底：没命中任何规则的日志不入库、不通知、不分析。
 > 想让某类错误彻底不告警，在页面「屏蔽规则」里加一条（按日志原文匹配，支持多条）。
@@ -297,10 +295,10 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/audit/verify
 | 监控页面显示「无数据源」/指标显示「无数据」 | 未配置或连不上 `prometheus.base_url`；检查 Prometheus 容器与 `/-/healthy` |
 | AI 诊断为「规则引擎」结论 | 第三方/本地引擎均不可用；检查 `ai_engine.*` 配置、API Key、出网连通性、熔断状态（`/api/system/info`） |
 | 诊断报 4033（需要审批） | 目标动作是 L2；到「审批管理」创建/审批工单后凭 `ticket_id` 执行 |
-| 代码分析提示「不在出网白名单」 | 需在「服务器与仓库」中为该服务开启 `allow_third_party`，并在 `security.outbound_whitelist` 中加入服务名 |
-| 日志收到了但**不通知 / 不分析** | 见 5.10：① 规则没命中 → 看「日志告警规则」页顶部给出的平台默认值；② 冷却中 → 看事件的 `cooldown_until` / `suppressed`；③ `analysis_state=disabled/failed` → 看 `analysis_error` |
-| 日志事件 `analysis_state=failed`，`analysis_error` 以「拉取代码失败：repo: git …」开头 | 平台拉代码失败：认证过期 / 分支不存在 / 出网或 DNS 不通 / 磁盘满 / `code_repo.allow_outbound=false`。中文结论就在 `analysis_error` 里（见 5.10） |
-| 日志事件 `analysis_state=disabled`，`analysis_error` 写「服务 X 未配置代码仓库映射」 | 该服务没在「服务器与仓库」里登记映射（服务名要与日志的 `service` 完全一致）；补上后对该条点「重新分析」 |
+| AI 分析事件 `analysis_state=disabled`，原因是「不在出网白名单」 | 把 AI 服务地址/服务名加入 `security.outbound_whitelist`（`MWOPS_SECURITY_OUTBOUND_WHITELIST`，默认空 = 全禁）后对该事件点「重新分析」 |
+| 日志收到了但**不通知 / 不分析** | 见 5.10：① 规则没命中（平台没有默认规则）→ 看「日志告警规则」里是否有匹配且已启用的规则；② 冷却中 → 看事件的 `cooldown_until` / `suppressed`；③ `analysis_state=disabled/failed` → 看 `analysis_error` |
+| 日志事件长时间停在 `awaiting`（AI 分析中） | 外部 AI 服务的回调没到、轮询也查不到：确认 AI 服务能访问平台回调地址、回调令牌一致；超过 `task_timeout`（默认 30m）会判超时。详见 5.10 与 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md#附录-b平台侧接入验收清单) 附录 B |
+| 日志事件 `analysis_state=disabled` | 三种原因（`analysis_error` 会写明）：规则关了 AI；服务不在出网白名单；未在「AI 设置」启用外部 AI 分析服务或地址为空。按提示处理后点「重新分析」 |
 | 上报 Hook 返回 401 | `X-Hook-Token` 与后端 `MWOPS_HOOK_TOKEN` 不一致 |
 | 前端刷新 404 | Nginx 未启用 history 回退（确认 `try_files $uri $uri/ /index.html`） |
 | SSE 诊断被截断 | 反向代理开启了缓冲；确认 `proxy_buffering off;` 且 `server.write_timeout=0` |
@@ -512,15 +510,33 @@ docker exec mwops-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-serv
 - 这与「指标集成的一键拉起 Exporter」是两条独立通道：后者需要 `docker.sock`，前者不需要。
   只有平台侧仍要一键拉起 Exporter 时才需要挂 socket（见 `.env.example` 的 `INTEGRATION_DOCKER_ENABLED` 说明）。
 
-### 5.10 日志告警后处理与代码仓库缓存
+### 5.10 日志告警后处理与外部 AI 分析服务
 
 日志事件的落库只是第一步：**通知渠道与 AI 代码分析由后处理（`LogAlertWorker`）完成**，
 它由定时任务驱动（间隔 `log_alert.worker_interval_seconds`，默认 15s；每轮 `log_alert.worker_batch`，默认 10），
-扫描 `analysis_state=pending` 的事件，先外发通知（写 `notified_at`），再按事件的服务名拉代码 + 做 AI 三点式分析。
+扫描 `analysis_state=pending` 的事件，先外发通知（写 `notified_at`），再把脱敏后的错误信息
+**提交给外部 AI 分析服务**并等待三点式结论。
 
-**为什么是定时任务而不是采集路径上同步做**：AI 要拉代码、调 LLM，耗时几十秒；放同步路径会把 Kafka
+> 平台不 clone、不缓存任何业务代码仓库（旧的 `internal/repo` 与 `code_repo.*` 配置已整体移除）。
+> 代码定位由外部 AI 分析服务基于它自己持有的代码完成，平台只送问题、收结论。
+
+**为什么是定时任务而不是采集路径上同步做**：提交外部服务并等待结论耗时几十秒；放同步路径会把 Kafka
 消费拖慢（位点积压 → 整条日志链路延迟）。状态落在数据库（`analysis_state`）里，所以**进程重启不丢**；
 多副本部署时用「带条件的 UPDATE 抢占」（`pending → running`）保证一条事件只被处理一次。
+
+任务状态机：
+
+```text
+pending → running → awaiting（已提交外部服务，等回调/轮询）→ done / failed / disabled
+```
+
+- **提交**：worker 调用外部 AI 分析服务提交接口拿到任务 ID（`ai_analysis_tasks.run_id`），事件置 `awaiting`；
+- **收回调**：外部服务完成后 `POST /api/ai/analysis/callback`（公开路由，回调令牌鉴权 + 幂等条件更新）；
+- **轮询兜底**：按 `poll_interval`（默认 60s）查 `GET {query_path}/{run_id}`，回调丢失也能收尾；
+- **超时**：超过 `task_timeout`（默认 30 分钟）仍无结论 → `failed`，原因写 `analysis_error`。
+
+对接参数（地址、密钥、协议、路径、回调、轮询）全部在「系统设置 → AI 设置 → AI 代码分析」页面配置，
+协议契约与逐环节验收清单见 [AI_CODE_ANALYSIS_API.md](AI_CODE_ANALYSIS_API.md)。
 
 #### 排查：日志收到了但不通知 / 不分析
 
@@ -528,9 +544,17 @@ docker exec mwops-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-serv
 
 | 现象 | 看哪里 | 含义与处理 |
 |---|---|---|
-| 没通知 | 「日志告警规则」页顶部的**屏蔽规则**卡片与规则列表 | 平台没有默认规则：日志必须命中一条**已启用**的规则才会产生告警，否则不入库、不通知、不分析（先确认该服务/指纹有规则且 `enabled=true`）；其次看是否被「屏蔽规则」命中（屏蔽优先于所有规则）。规则匹配是「priority 小者优先、同优先级按 id 升序、取第一条命中」——最常见的错是规则建了但 `enabled=false` |
+| 没通知 | 「日志告警规则」页的**屏蔽规则**卡片与规则列表 | 平台没有默认规则：日志必须命中一条**已启用**的规则才会产生告警，否则不入库、不通知、不分析（先确认该服务有规则且 `enabled=true`）；其次看是否被「屏蔽规则」命中（屏蔽优先于所有规则）。规则匹配是「priority 小者优先、同优先级按 id 升序、取第一条命中」——最常见的错是规则建了但 `enabled=false` |
 | 没通知 | 事件列表的「抑制 / 通知」列：`suppressed=true` + `cooldown_until` | 处于**冷却期**：事件已记录，只是不重复打扰。想立刻拿到结论，对该条点「**重新分析**」（会清掉冷却记录，立即重跑通知与 AI） |
-| 没分析 | 事件列表 / 详情的「AI 分析」列：`analysis_state` 与 `analysis_error` | `disabled` = 规则关了 AI、或该服务没配仓库映射（原因写在 `analysis_error`，照做即可）；`failed` = 拉代码或调用 AI 失败（原因写在 `analysis_error`）；`pending/running` 停留过久 = 后处理没在跑（见下）；`done` = 已有结论 |
+| 没分析 | 事件列表 / 详情的「AI 分析」列：`analysis_state` 与 `analysis_error` | `disabled` = 规则关了 AI / 服务不在出网白名单 / 未配置 AI 分析服务（原因写在 `analysis_error`，照做即可）；`awaiting` 停留过久 = 回调不通（见下）；`failed` = 外部服务返回错误或超时（原因写在 `analysis_error`）；`done` = 已有结论 |
+
+回调不通的三点核查（事件卡在 `awaiting` 直到 `task_timeout`）：
+
+1. **AI 服务能访问到平台回调地址**：回调地址必须是外部可达的平台基础地址（不是 `localhost`），
+   平台自动补 `/api/ai/analysis/callback`；
+2. **回调令牌一致**：AI 服务回调携带的 `X-Callback-Token`（或 Bearer / `?token=`）与页面「回调令牌」一致；
+   平台未配置令牌时**拒收所有回调**，只靠轮询兜底；
+3. **看 Nginx 限流**：`/api/` 有 `limit_req 10r/s burst=20 nodelay`，告警风暴 + 回调重试叠加时偶发被限。
 
 数据库直查（排查"是不是只卡了某几条"）：
 
@@ -547,103 +571,17 @@ docker exec mwops-postgres psql -U mwo -d middleware_ops -c \
 
 `pending` 数量长期不降 = 后处理没在跑或跑不动：`docker compose logs backend | grep -i "日志告警后处理"`
 （正常每轮处理完会打一条 `日志告警后处理完成 processed=N`）；`processed=0` 且 `pending` 不减，
-查数据库连通性与 `log_alert.worker_*` 配置；AI 分析慢就调大间隔/减小批量，别让它与诊断抢并发。
+查数据库连通性与 `log_alert.worker_*` 配置；外部分析慢就调大轮询间隔/任务超时，别让它与诊断抢并发。
 
-#### 代码仓库缓存目录：磁盘占用与清理
+#### 出网白名单与脱敏（仅存的两条合规规矩）
 
-平台为了回答「这条日志对应哪一行代码」，必须持有一份**与服务当前版本一致**的代码：
-首次分析 **clone** 到本地缓存，之后每次分析只**更新到远端**，不重复 clone
-（`internal/repo`：分支非空走 `fetch --prune` + `checkout --force -B <branch> origin/<branch>`，
-分支为空走 `pull --ff-only`）。
-
-| 项 | 说明 |
-|---|---|
-| 目录 | `code_repo.cache_dir`（默认 `./data/repos`），容器内即 `/app/data/repos`，落在 **`backend-data` 卷**里 |
-| 布局 | `<cache_dir>/<服务名>`，每个服务一个子目录（服务名会被净化为单层安全目录名） |
-| 增长 | 与「仓库数 × 仓库体积 × 分支历史深度」成正比：缓存是**全量克隆**（不做浅克隆），大仓库很占空间 |
-| 观察占用 | `docker system df -v \| grep -i backend-data`，或 `docker exec mwops-backend du -sh /app/data/repos/*` |
-| 清理单个服务 | `docker exec mwops-backend rm -rf /app/data/repos/<服务名>`；**下次分析会自动重新 clone**（不影响数据库里的映射与历史事件） |
-| 清理全部 | 删掉整个 `repos` 目录即可；注意**不要**用 `docker compose down -v`（会连库一起删，见 5.6 / 5.8） |
-| 空间不足的报错 | `analysis_error` 里会出现「磁盘空间不足：请清理仓库缓存目录…」 |
-| 目录已存在但不是 git 仓库 | 平台**拒绝覆盖**并报错（可能是别人的目录）：确认可清理后手工删除该子目录再重试 |
-
-#### git 凭据与脱敏
-
-- 私有仓库用 **HTTPS + 只读访问令牌**（令牌填在「访问令牌」框里，形如 `oauth2:<token>`），
-  或用 **SSH 部署密钥**；令牌只需 `read_repository` 之类的读权限，并纳入轮换。
-- **地址与令牌是分开的两件事**（重要）：`repo_url` 入库前会被净化成**不含凭据**的地址，
-  令牌单独加密保存在 `code_repos.credential_encrypted`（AES-GCM，主密钥见 6.3）。
-  因此接口与页面**看不到令牌**，只有 `has_credential` 这个布尔量；表单里的令牌框**永不回显**，
-  留空 = 不修改，要删除请勾「清除已保存的令牌」（与 AI 设置的密钥同一套规矩）。
-- **令牌不再落进缓存目录**：git 命令才用它拼出带凭据的地址，克隆/更新之后平台会把缓存里的
-  `origin` 改写成干净地址。因此 `.git/config` 里没有令牌（早期版本会留一份）。
-  剩余暴露面只有进程命令行（`git fetch <url>`，同容器内可读 `/proc/<pid>/cmdline`）。
-- **令牌轮换立即生效**：缓存里的 `origin` 会被对齐成配置里的地址，
-  不需要（也不应该）再进容器手工删缓存目录。
-- **旧数据自动迁移**：`repo_url` 里内嵌的令牌（早期版本的填写方式）在第一次被读取时
-  自动拆出来加密保存、地址同时净化；迁移失败时**保持原样**（绝不把唯一的凭据副本弄丢）。
-- **URL 内的凭据在任何输出里都脱敏**：userinfo 段（`user:token@`）与 `?token=` / `?access_token=` /
-  `?private_token=` 这类查询参数统一替换为 `***`（`internal/repo/redact.go`），
-  连 git 回显的 stderr 也先脱敏再截断（≤400 字符）后才落库/打日志。
-- 平台以服务方式运行、**关闭了交互式输入**：凭据不对时 git 不会弹窗等待，而是直接失败并给出
-  「认证失败：请检查凭据是否有效/未过期…」的中文结论。
-
-#### 代码定位的依据、版本与成本
-
-- **候选来自 git 索引**（`git ls-files`）而不是遍历文件系统：工作区里还有依赖目录（`node_modules`、
-  `vendor`）、构建产物（`target`、`dist`）与未跟踪残留，逐个遍历会按顺序撞上第一个同名文件，
-  给出一个"来自依赖目录、却很自信"的错行。索引读不到时退化为带排除目录的遍历。
-- **按堆栈的路径线索打分**：Java 的 `a.b.OrderService` → `a/b/OrderService.java`，
-  Python/Go 用堆栈里的路径逐级后缀匹配；依赖/产物目录扣分、测试目录扣分，取分最高者。
-  降权不等于排除——源码确实缺失时仍会给出候选取代"什么都找不到"。
-- **不跟随符号链接**：指向仓库外的软链不会被读取（否则一个 `Foo.java -> /etc/passwd`
-  就能把任意文件内容带进报告、通知甚至第三方 AI）。
-- **结论绑定代码版本**：报告的 `repo_revision` 记录了本次定位所用的提交（短 sha），
-  页面「代码分析报告」里能看到。行号会随代码演进失效，没有版本号就无法判断
-  "当初定位错了"还是"代码后来改了"。
-- **重启不会重复拉取**：最小拉取间隔同时参考进程内记忆与数据库的 `last_pull_at`，
-  容器重建/滚动升级后不会把所有仓库重新 fetch 一遍（缓存卷里的代码本来就是新的）。
-
-#### 合规开关的**硬**语义（`allow_third_party` / `outbound_whitelist`）
-
-这两个开关现在**真正拦截出网**，而不只是打标（早期版本只记录不生效，见 INC-030）：
-
-- 平台当前的 AI 引擎若是**第三方提供方**（`ai_engine.third_party`，混合链含它也算），
-  而该服务没勾「允许第三方 AI」或不在白名单里 → **不调用引擎**，
-  该条事件的 `analysis_state=disabled`（不是 failed），原因里写清三种出路。
-- 平台给出的**本地定位结果照常记录**（文件、行号、片段、代码版本）：片段留在平台内部，
-  排障时依然有用，也让人看得出"定位是成功的，只是没发给外部 AI"。
-- 引擎是**自建**（`self_hosted`，内网 vLLM/Ollama）或降级成**规则引擎**时不受此限制：
-  这两种情况内容不出网。判定由引擎自己声明（`engine.Status.External`），
-  而不是读配置字符串——工厂可能因缺配置把第三方降级成规则引擎，那种情况下确实不会出网。
-
-**未在本仓库环境验证的部分**（如实说明）：上述守卫都由 Go 单测覆盖
-（`TestOutboundGate` / `TestApplyCodeRepoInputSanitizesAndEncrypts` / `TestLocateCode*` /
-`repo.TestCloneInjectsCredentialButKeepsConfigClean` 等），并且逐个用"注入故障看测试是否变红"
-确认过有效性；但以下三件事**没有真实环境证据**，交付后请在 Linux/容器里补一次：
-
-1. **软链守卫**：`Foo.java -> /etc/passwd` 这类候选必须被跳过。本机（Windows，无建软链权限）
-   该用例会 skip，而"候选是目录"那一段不能替代它（读目录本身就会失败）；
-2. **真实代码托管的认证与轮换**：令牌拆分/加密/`remote set-url` 都是用假执行器逐字断言的命令行契约，
-   没有对着真实的 GitLab/Gitea 跑过"配令牌 → 克隆 → 轮换令牌 → 再拉取"；
-3. **查询参数形式的凭据**（`?token=` / `?private_token=`）在真实服务上的可用性——
-   平台按约定把它原样追加回地址，但各家服务的接受方式并不统一。
-
-#### `code_repo.allow_outbound=false` 的后果
-
-这是"平台能否访问代码托管"的总开关（`CodeRepo.allow_third_party` 管的是另一件事：**能否把代码片段
-发给第三方 AI**，两者刻意分开）。设为 `false` 后：
-
-- 平台**不执行任何 git 命令**（连路径都不解析，零副作用），日志里会出现
-  「拒绝拉取远端代码：出网许可未开启（合规开关）」；
-- 命中的日志事件**照常记录、照常外发通知、照常累加计数**，只是 `analysis_state=failed`，
-  `analysis_error` 写明「拉取代码失败：…未开启第三方代码出网许可…」；
-- AI 代码定位**不可能产出结论**（没有代码就无法定位行）；修复建议/根因这类只在代码上下文里有意义的
-  结论随之中断——但中间件指标诊断、告警、通知完全不受影响。
-
-所以：**只有当合规上不允许平台访问代码托管时才关它**；只是不想用第三方 AI 时，
-请保持 `allow_outbound=true` 并让 `allow_third_party` / `security.outbound_whitelist` 保持关闭
-（此时走本地分析），否则内网仓库也拉不下来，AI 代码分析功能会整体形同虚设。
+- **出网白名单**（`security.outbound_whitelist` / `MWOPS_SECURITY_OUTBOUND_WHITELIST`，默认空 = 全禁）：
+  AI 服务地址或事件服务名不在名单里时**不发起提交**，事件记为 `analysis_state=disabled`（不是 failed），
+  `analysis_error` 写明“服务 X 不在出网白名单内”。通知、指纹归并、去重冷却不受影响。
+- **脱敏**：错误信息与堆栈在送出前一律经过脱敏器（IP / 手机号 / 邮箱 / 口令等），
+  外部服务收到的内容不含明文敏感信息。
+- **结论绑定代码版本**：外部服务返回的 `repo_revision` 记录在 `ai_code_analyses` 中，
+  页面「代码分析报告」可见——行号会随代码演进失效，版本号用于判断“当初定位错了”还是“代码后来改了”。
 
 ---
 

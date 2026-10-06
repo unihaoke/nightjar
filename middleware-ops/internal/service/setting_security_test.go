@@ -3,7 +3,7 @@ package service
 import (
 	"testing"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件钉住「合规设置（出网白名单）」的平台托管行为。

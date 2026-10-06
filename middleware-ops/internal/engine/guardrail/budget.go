@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // boolToInt 把截断标记转换为数量（用于 Truncation.Dropped 的粗略计数）。

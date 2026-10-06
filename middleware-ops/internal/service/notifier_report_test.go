@@ -10,8 +10,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件钉住「AI 结论要能被顺着点到完整报告」这件事。

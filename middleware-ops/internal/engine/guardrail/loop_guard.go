@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // LoopGuard 是护栏②：防死循环 / 任务失控。

@@ -7,7 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
 )
 
 // Body 是统一响应结构（设计文档 8.1）。

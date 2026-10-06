@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
 )
 
 // 本文件锁定「平台自管设置」里最容易出错、也最容易泄露密钥的那几个判定：

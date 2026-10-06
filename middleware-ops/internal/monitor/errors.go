@@ -152,7 +152,7 @@ func DescribeTargetError(lastError string) string {
 		return "原因：TLS 证书校验失败（自签证书场景）。在 Exporter 侧信任该 CA 或改用非 TLS 连接。"
 
 	default:
-		return "原因见上面的 lastError 原文；对照 docs/GUIDE-ONBOARD.md 的「up=0 排查」表逐条排除。"
+		return "原因见上面的 lastError 原文；对照 docs/INTEGRATION.md 第 9 章「排查」表逐条排除。"
 	}
 }
 

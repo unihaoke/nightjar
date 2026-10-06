@@ -62,9 +62,9 @@ type Stats struct {
 // 不每条消息都写库：日志风暴下那等于把每条日志变成一次额外的 UPDATE；
 // 周期 + 批量已经足够准确（最坏情况是进程被 kill -9 时丢掉最后几秒的计数）。
 const (
-	flushEvery  = 5 * time.Second
-	flushBatch  = 100
-	flushStale  = 30 * time.Second
+	flushEvery   = 5 * time.Second
+	flushBatch   = 100
+	flushStale   = 30 * time.Second
 	flushTimeout = 5 * time.Second
 )
 
@@ -97,9 +97,9 @@ type Consumer struct {
 
 	// session 是**本次进程**的计数（页面"本次启动以来"用它）。
 	// counters 用原子计数：Status 会在 HTTP 请求里读，与消费 goroutine 并发。
-	session     counters
+	session       counters
 	lastMessageAt atomic.Int64 // UnixNano，0 表示还没收到过
-	lag         atomic.Int64
+	lag           atomic.Int64
 
 	// base 是启动时从库里读回的历史累计（多副本时是整组共享的累计）。
 	base     counters
@@ -219,7 +219,7 @@ func (c *Consumer) Status() Status {
 		ConsumedTotal: base.Consumed + session.Consumed,
 		DroppedTotal:  base.Dropped + session.Dropped,
 		FailedTotal:   base.Failed + session.Failed,
-		Lag: c.lag.Load(), LastMessage: last, LastError: lastError,
+		Lag:           c.lag.Load(), LastMessage: last, LastError: lastError,
 		Persistent: c.opts.Store != nil,
 	}
 }
@@ -534,11 +534,11 @@ func (c *Consumer) Close() error {
 // ProbeResult 是「测试 Kafka 连接」的结果。
 type ProbeResult struct {
 	OK         bool   `json:"ok"`
-	Message    string   `json:"message"`
-	Address    string   `json:"address"`
-	Topic      string   `json:"topic"`
-	Partitions int      `json:"partitions"`
-	LatencyMS  int64    `json:"latency_ms"`
+	Message    string `json:"message"`
+	Address    string `json:"address"`
+	Topic      string `json:"topic"`
+	Partitions int    `json:"partitions"`
+	LatencyMS  int64  `json:"latency_ms"`
 }
 
 // Probe 探测 Kafka 可达性与日志主题是否存在（页面「测试连接」与自检第 1 步共用）。

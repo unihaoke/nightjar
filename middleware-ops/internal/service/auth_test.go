@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // stubSession 构造带权限点与级别的测试会话。

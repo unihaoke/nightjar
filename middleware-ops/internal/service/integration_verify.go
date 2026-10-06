@@ -7,8 +7,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 本文件实现「重新核验」与周期自愈。

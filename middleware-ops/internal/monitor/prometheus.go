@@ -16,8 +16,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
 )
 
 // errEmptyResult 表示 Prometheus 正常响应、但选择器没有匹配到任何时序。

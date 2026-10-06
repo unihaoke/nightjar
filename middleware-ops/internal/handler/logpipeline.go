@@ -3,7 +3,7 @@ package handler
 import (
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
 )
 
 // LogPipelineStatus 返回日志集成（Kafka）接收链路状态。

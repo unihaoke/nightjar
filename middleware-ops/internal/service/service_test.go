@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/engine/guardrail"
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/service/ai"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine/guardrail"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service/ai"
 )
 
 // TestGuardScopeDeniesOutOfScope 校验数据权限在服务层的强制生效（5.5）。

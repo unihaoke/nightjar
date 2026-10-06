@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
 )
 
 // 本文件锁定「日志告警规则」与「冷却抑制」的判定语义。

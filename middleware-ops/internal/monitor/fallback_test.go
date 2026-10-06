@@ -10,7 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件锁定「接入排障」的语义边界，防止回归成"看不见的假数据"。

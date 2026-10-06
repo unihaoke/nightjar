@@ -18,16 +18,16 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/db"
-	"middleware-ops/internal/engine"
-	"middleware-ops/internal/integration"
-	"middleware-ops/internal/logger"
-	"middleware-ops/internal/monitor"
-	"middleware-ops/internal/pkg/cache"
-	"middleware-ops/internal/router"
-	"middleware-ops/internal/service"
-	"middleware-ops/internal/utils"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/db"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/engine"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/integration"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/logger"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/router"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/utils"
 )
 
 // version 为构建期注入的版本号（可通过 -ldflags 覆盖）。
@@ -172,7 +172,7 @@ func run(configPath string) error {
 		Monitor:       mon,
 		// 回跳地址必须用对外地址：监听地址是 0.0.0.0:8080（容器内），
 		// 直接拿它拼会把 IM 卡片上的「查看详情」指向一个谁都打不开的链接。
-		AppURL:        cfg.Server.PublicBaseURL(),
+		AppURL: cfg.Server.PublicBaseURL(),
 	})
 	if err != nil {
 		return fmt.Errorf("装配服务: %w", err)

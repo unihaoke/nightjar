@@ -9,8 +9,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 本文件实现「日志告警规则」：把"谁能触发、合并多久、冷却多久、要不要通知/分析"从代码里

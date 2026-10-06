@@ -7,7 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件锁定「平台自管设置」上线时新引入的两个不变量（此前配置只在启动时读一次，不存在这两类问题）：

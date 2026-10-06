@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"middleware-ops/internal/model"
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // 本文件负责把「查不到指标」翻译成「你该填什么」。

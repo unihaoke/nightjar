@@ -54,9 +54,9 @@ func TestDescribeErrorFallsBackToRaw(t *testing.T) {
 func TestHostOfParsesBaseURL(t *testing.T) {
 	cases := map[string]string{
 		"http://legacy-prometheus:9090": "legacy-prometheus",
-		"https://prom.example.com":  "prom.example.com",
-		"10.0.0.9:9090":             "10.0.0.9",
-		"":                          "",
+		"https://prom.example.com":      "prom.example.com",
+		"10.0.0.9:9090":                 "10.0.0.9",
+		"":                              "",
 	}
 	for input, want := range cases {
 		if got := HostOf(input); got != want {

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // TestRuleEngineReportIsStructured 校验规则引擎输出满足质量护栏要求的 JSON 结构。

@@ -41,7 +41,7 @@ type ContainerSpec struct {
 	// Restart 为重启策略；留空时 create() 用 unless-stopped（适合常驻的 Exporter/采集容器）。
 	// **一次性容器不要依赖这个默认值**：RunOnce 会强制设为 "no"。
 	Restart string
-	Labels   map[string]string
+	Labels  map[string]string
 	// Binds 为容器挂载，docker 语法："<命名卷或宿主路径>:<容器内路径>[:ro]"。
 	//
 	// 日志采集就靠它：平台把被管容器的日志卷按名字挂进自己的采集容器，

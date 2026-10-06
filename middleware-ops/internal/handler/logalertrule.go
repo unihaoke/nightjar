@@ -3,8 +3,8 @@ package handler
 import (
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // ListLogAlertRules 分页检索日志告警规则。

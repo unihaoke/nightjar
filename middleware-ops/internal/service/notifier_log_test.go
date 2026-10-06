@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"middleware-ops/internal/model"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/model"
 )
 
 // 日志告警通知的可读性必须有单测钉住：正文发的是"哈希指纹"还是"错误消息原文"，

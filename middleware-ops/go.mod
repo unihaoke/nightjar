@@ -1,4 +1,4 @@
-module middleware-ops
+module github.com/unihaoke/nightjar/middleware-ops
 
 go 1.23.0
 

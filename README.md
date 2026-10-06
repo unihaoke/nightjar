@@ -1,49 +1,41 @@
-# 中间件智能问题解决平台
+# nightjar · 中间件智能问题解决平台
 
-> 轻量级、AI 驱动的中间件问题诊断与解决平台。覆盖 Redis / Kafka / MySQL / PostgreSQL / Elasticsearch / Nginx 的统一纳管、监控、告警治理、AI 诊断与分级执行，向上扩展到应用层日志告警与 AI 代码分析。
+<p align="center">
+  <a href="https://github.com/unihaoke/nightjar/actions/workflows/ci.yml"><img src="https://github.com/unihaoke/nightjar/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white" alt="Go"></a>
+  <a href="https://vuejs.org"><img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" alt="Vue"></a>
+  <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white" alt="TypeScript"></a>
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+</p>
 
-本仓库是《中间件智能问题解决平台 · 设计文档 v1.0》的可执行实现：**后端 Go（Gin + GORM）+ 前端 Vue 3（Element Plus，移动端适配）**，模块化单体，可单机一键部署。
+<p align="center">
+  简体中文 · <a href="README.en.md">English</a>
+</p>
+
+> 轻量级、AI 驱动的中间件问题诊断与解决平台。覆盖 Redis / Kafka / MySQL / PostgreSQL / Elasticsearch / Nginx 的统一纳管、监控、告警治理、AI 诊断与分级执行，并向上扩展到应用层日志告警与 AI 代码分析。
+
+本仓库是《[中间件智能问题解决平台 · 设计文档](docs/DESIGN.md)》的可执行实现：**后端 Go（Gin + GORM）+ 前端 Vue 3（Element Plus，移动端适配）**，模块化单体，可单机一键部署。
 
 ---
 
-## 一、交付范围
+## 一、功能特性
 
-| 里程碑 | 内容 | 本仓库状态 |
-|--------|------|------------|
-| M1 基础闭环 | 纳管 + 监控 + 告警规则/通知 + RBAC + 审计 | ✅ 完整实现 |
-| M2 AI 诊断 | AI 诊断中心 + 知识库 + 六道工程护栏 + 成本治理 | ✅ 完整实现 |
-| M3 代码分析 | 日志告警（日志集成 Filebeat → 平台 Kafka）+ 日志告警规则 + AI 代码分析（第三方 + 本地兜底）+ 高危执行审批闭环 | ✅ 实现（执行器为预演实现，见下文「已知边界」） |
+| 里程碑 | 内容 | 状态 |
+|--------|------|------|
+| M1 基础闭环 | 纳管 + 监控 + 告警规则/通知 + RBAC + 审计 | 已完整实现 |
+| M2 AI 诊断 | AI 诊断中心 + 知识库 + 六道工程护栏 + 成本治理 | 已完整实现 |
+| M3 日志与代码分析 | 日志集成（Filebeat → 平台 Kafka）+ 日志告警规则 + 外部 AI 分析服务对接 + 高危执行审批闭环 | 已实现（执行器为预演实现，见「已知边界」） |
 
-**一期核心能力（与设计文档 4.1 能力矩阵一致）**：Redis / MySQL / PostgreSQL / Kafka / Elasticsearch 支持纳管、监控、阈值告警与 AI 诊断；Nginx 支持纳管、监控与告警（不做 AI 诊断）；RabbitMQ 本版本仅纳管。
+一期核心能力：Redis / MySQL / PostgreSQL / Kafka / Elasticsearch 支持纳管、监控、阈值告警与 AI 诊断；Nginx 支持纳管、监控与告警（不做 AI 诊断）；RabbitMQ 当前仅纳管。
 
-**集成中心（M3 增强）**：在页面上选组件、填地址与账号即可完成「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」，
-对齐云厂商 Prometheus 控制台的「数据采集 → 集成中心」。抓取目标走 `file_sd`，新增集成无需重启 Prometheus；
-可选挂载 `docker.sock` 由平台一键拉起 Exporter 容器。详见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)。
+**集成中心**：在页面上选组件、填地址与账号即可完成「Exporter 暴露 → Prometheus 抓取 → 实例纳管 → 推荐告警规则」，对齐云厂商控制台的「数据采集 → 集成中心」。抓取目标走 Prometheus **HTTP 服务发现（http_sd，`GET /api/sd/integrations`，30 秒刷新）**，新增集成无需重启 Prometheus；可选挂载 `docker.sock` 由平台一键拉起 Exporter 容器。详见 [docs/INTEGRATION.md](docs/INTEGRATION.md)。
 
-**日志集成（M3 增强）**：集成中心另有**日志类型集成**（模板 `type: "log"`、`category: "log"`）——平台用 **Ansible 在目标服务器幂等部署 Filebeat**
-（默认幂等：已安装则跳过安装、镜像已在本地也不重新拉取；需要升级/修复时打开表单里的**「覆盖 Filebeat」**开关，
-平台会重新下载安装包或重新 `docker pull` 并覆盖安装。配置始终按渲染内容同步，内容变化才重启），
-Filebeat 把日志推到**平台自带的 Kafka**（compose 里的 `kafka` 服务，KRaft 单节点），
-后端按消费组 `mwops-log-ingest` 消费 topic `mwops-logs`，复用既有日志事件链路（错误指纹 / 通知 / AI 代码分析入口）。
-它不装 Exporter、不经过 Prometheus、也不需要 `docker.sock`。详见 [`docs/LOG_INTEGRATION.md`](docs/LOG_INTEGRATION.md)。
+**日志集成**：集成中心提供日志类型集成——平台用 **Ansible 在目标服务器幂等部署 Filebeat**（已安装则跳过；需要升级/修复时显式打开「覆盖 Filebeat」开关），Filebeat 把日志推到**平台自带 Kafka**（KRaft 单节点），后端按消费组 `mwops-log-ingest` 消费 topic `mwops-logs`，复用日志事件链路（错误指纹 / 通知 / AI 分析入口）。它不装 Exporter、不经过 Prometheus、不需要 `docker.sock`。详见 [docs/LOG_INTEGRATION.md](docs/LOG_INTEGRATION.md)。
 
-**日志告警规则与 AI 代码定位（M3 增强）**：日志事件的处理参数不写死在代码里，而由**日志告警规则**
-（页面「日志告警 → 日志告警规则」，表 `log_alert_rules`）按「服务 + 错误指纹 + 级别」逐条配置——
-**去重窗口**（窗口内同指纹只合并计数）、**冷却期**（冷却内不重复通知、不重复触发 AI，事件照常记录）、
-**通知渠道**、**AI 开关**与**优先级**（数字小者优先，让特例规则压过通用规则）。
-平台**没有任何内置默认规则**：只有命中页面上新增过的规则，日志才会产生告警
-（未命中的日志不入库、不通知、不分析），因此每条告警都能追溯到一条明确的规则。
+**日志告警规则与 AI 代码分析**：日志事件的处理参数由**日志告警规则**（页面「日志告警 → 日志告警规则」，表 `log_alert_rules`）按「服务 + 错误指纹 + 级别」逐条配置——去重窗口、冷却期、通知渠道、AI 开关与优先级（数字小者优先）。平台**没有任何内置默认规则**：只有命中已启用规则，日志才会产生告警（未命中不入库、不通知、不分析）。另有屏蔽规则（`log_alert_exclusions`）按日志原文（子串或 `/正则/`）优先屏蔽框架噪音。
 
-**日志告警屏蔽项**：同一页面还提供屏蔽规则（`log_alert_exclusions`），按日志原文（子串或 `/正则/`）
-屏蔽指定错误，支持多条；命中的日志**完全不告警**（不入库、不通知、不分析），优先于所有规则生效——
-用于屏蔽框架噪音（如 `Request method 'GET' is not supported`）。
-落库后的通知与 AI 由**后处理**（`service/logalert_worker.go`，定时扫描 `analysis_state=pending`，
-状态落库、重启不丢、多副本用条件更新抢占）完成：先外发通知，再按服务名拉取代码
-（`internal/repo`：**首次 clone、之后只更新到远端**，缓存目录 `code_repo.cache_dir`），
-最后产出**三点式代码结论**（定位文件行 / 根因 / 应急处置 / 修复建议）。
-「服务 → 代码仓库」映射没配时事件是 `analysis_state=disabled`，拉取或调用失败则是 `failed` +
-`analysis_error`（页面直接可读的中文原因），并可点「重新分析」打破冷却立即重跑。
-详见 [`docs/COLLECTOR.md`](docs/COLLECTOR.md) 6.5 / 6.6。
+命中规则的事件由后处理 worker（[logalert_worker.go](middleware-ops/internal/service/logalert_worker.go)，定时扫描 `analysis_state=pending`，多副本用条件更新抢占）完成通知与 AI 分析：**平台本身不 clone、不缓存任何业务代码**，而是把**脱敏后的错误信息**提交给在「AI 设置」页配置的**外部 AI 分析服务**，分析完成后由服务端**回调**（`POST /api/ai/analysis/callback`，令牌鉴权、天然幂等）或平台轮询取回三点式结论（定位文件行 / 根因 / 应急处置 / 修复建议）。任务状态机为 `pending → running → awaiting → done / failed / disabled`。协议契约与平台侧验收清单见 [docs/AI_CODE_ANALYSIS_API.md](docs/AI_CODE_ANALYSIS_API.md)。
 
 ---
 
@@ -59,17 +51,15 @@ docker compose up -d --build
 
 启动后访问 `http://<主机>:8000`，使用 `.env` 中的管理员账号登录（默认 `admin`），**登录后请立即修改密码**。
 
-包含组件：PostgreSQL 15 + pgvector、Redis 7、**Kafka（日志总线，默认启用）**、Prometheus、**Grafana（统一监控大盘）**、后端（Go）、Nginx + 前端静态资源。
+包含组件：PostgreSQL 15 + pgvector、Redis 7、Kafka（日志总线，默认启用）、Prometheus、Grafana（统一监控大盘）、后端（Go）、Nginx + 前端静态资源。
 
-> **监控栈统一在本平台**：被管项目（如某业务系统）不再需要自带 Prometheus / Grafana / Exporter——
-> 平台按「集成中心」的配置创建只读监控账号、拉起 Exporter、自动接入对方网络并抓取；
-> 数据源已由 provisioning 自动注入 Grafana，大盘按集成卡片给出的编号导入即可。
+> 监控栈统一在本平台：被管项目不再需要自带 Prometheus / Grafana / Exporter——平台按集成中心配置创建只读监控账号、拉起 Exporter、自动接入对方网络并抓取；Grafana 数据源由 provisioning 自动注入，大盘按集成卡片给出的编号导入即可。
 
-> 表结构由后端 `GORM AutoMigrate` 在启动时创建（`database.auto_migrate=true`）；`deploy/postgres/init/` 下的初始化脚本**只创建扩展与数据库参数，不建表**。请勿手工先建表：PostgreSQL 会把内联 `UNIQUE` 命名为 `users_username_key`，而 GORM 迁移列唯一性时期望 `uni_users_username`，`DropConstraint` 会报 `SQLSTATE 42704` 导致启动失败。需要手工建库的 DBA 场景请使用 `docs/SCHEMA.sql`（约束名已按 GORM 策略显式命名），并同时把 `auto_migrate` 置为 `false`。修复办法见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) 第 5.6 节。
+> 表结构由后端 GORM AutoMigrate 在启动时创建（`database.auto_migrate=true`）；`deploy/postgres/init/` 下的初始化脚本只创建扩展与数据库参数，不建表。请勿手工先建表（约束命名不一致会导致迁移失败）。需要手工建库的 DBA 场景请使用 [docs/SCHEMA.sql](docs/SCHEMA.sql)（约束名已按 GORM 策略显式命名），并同时把 `auto_migrate` 置为 `false`。
 
 ### 2.2 本地开发
 
-前置：Go 1.23+、Node 20+、PostgreSQL 15（Redis / Prometheus 可缺省）。
+前置：Go 1.23+、Node.js 20+（CI 使用 22）、PostgreSQL 15（Redis / Prometheus 可缺省）。
 
 ```bash
 # 1) 准备数据库
@@ -93,176 +83,142 @@ npm run dev                                          # 监听 :5173
 | 外部依赖 | 缺省行为 | 如何接入真实组件 |
 |----------|----------|------------------|
 | Redis | `redis.addr` 为空 → 进程内缓存 + 内存队列 | 填写 `redis.addr`（支持密码/DB） |
-| Prometheus | `prometheus.base_url` 为空 → 内置**确定性**指标模拟器 | 填写 `prometheus.base_url` |
+| Prometheus | `prometheus.base_url` 为空 → 内置确定性指标模拟器 | 填写 `prometheus.base_url` |
 | 第三方 LLM | 未启用 → 规则引擎生成结构化半自动结论 | 配置 `ai_engine.third_party.*` |
 | 本地 LLM | `kind: mock` → 进程内确定性引擎 | `kind: ollama` + `base_url` |
 | pgvector | 未启用 → 向量以文本存储，检索走应用层余弦相似度 | 以 `-tags pgvector` 构建并按需 `CREATE EXTENSION vector` |
 
-> 指标模拟器是**确定性**的（同一实例 + 同一指标 + 同一时间桶 → 同一数值），因此趋势图、规则评估与 AI 上下文三者始终自洽，可完整跑通告警与诊断链路。
+指标模拟器是确定性的（同一实例 + 同一指标 + 同一时间桶 → 同一数值），趋势图、规则评估与 AI 上下文始终自洽，可完整跑通告警与诊断链路。
 
 ---
 
-## 三、仓库结构
+## 三、文档
+
+完整文档索引见 **[docs/README.md](docs/README.md)**。常用入口：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/DESIGN.md](docs/DESIGN.md) | 设计基线；第十四章为架构与实现现状映射 |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | 集成中心：端到端接入教程、落地方式、自建 Exporter 专题、排查 |
+| [docs/LOG_INTEGRATION.md](docs/LOG_INTEGRATION.md) | 日志链路权威说明：Filebeat → Kafka 拓扑、幂等部署、自检、配置项 |
+| [docs/AI_CODE_ANALYSIS_API.md](docs/AI_CODE_ANALYSIS_API.md) | 外部 AI 分析服务 OpenAPI v1 契约、回调 HMAC 验签（附录 A）、平台侧验收（附录 B） |
+| [docs/API.md](docs/API.md) | 平台 HTTP 接口清单与错误码速查 |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 部署、配置项速查、备份恢复、升级与值班排查 |
+| [docs/POSTMORTEM.md](docs/POSTMORTEM.md) | 交付期真实故障复盘档案（历史记录保持原貌） |
+
+---
+
+## 四、仓库结构
 
 ```text
 .
-├── middleware-ops/                 # 后端（Go，模块化单体）
-│   ├── cmd/server/                 # 入口：配置→日志→DB→缓存→引擎→服务→路由→调度
-│   ├── configs/config.yaml         # 默认配置（含全部注释说明）
+├── .github/                        # CI、Issue/PR 模板、Dependabot
+├── docs/                           # 设计 / 接口 / 运维文档（索引见 docs/README.md，图示在 docs/assets/）
+├── middleware-ops/                 # 后端（Go 1.23，模块化单体）
+│   ├── cmd/server/                 # 主入口：配置→日志→DB→缓存→引擎→服务→路由→调度
+│   ├── cmd/renderdump/             # 调试工具：导出 Ansible 渲染产物
+│   ├── configs/config.yaml         # 默认配置（含注释说明）
 │   └── internal/
 │       ├── config/                 # viper 配置 + 环境变量覆盖 + 启动期校验
-│       ├── model/                  # 实体（含 feedback/hash_prev/hash_self 等 v0.2 字段）
-│       ├── db/                     # GORM 连接、迁移、pgvector 构建标签适配
+│       ├── model/ · db/            # 实体与 GORM 连接、迁移、pgvector 构建标签适配
 │       ├── repository/             # 数据访问层（审计表仅追加，无 Update/Delete）
-│       ├── engine/                 # AI 引擎抽象 + 降级链
-│       │   ├── engine.go           # 引擎接口（Chat/ChatStream/Embed/Status）
-│       │   ├── factory.go          # 策略装配（third_party/self_hosted/hybrid）
-│       │   ├── http_provider.go    # OpenAI 兼容协议（含超时/熔断）
-│       │   ├── rule_engine.go      # 规则引擎（降级链末端，结构化输出）
-│       │   ├── hybrid.go           # 降级链实现
-│       │   └── guardrail/          # 六道护栏
-│       │       ├── budget.go       # ① 上下文预算 + 时序降采样摘要
-│       │       ├── loop_guard.go   # ② 防死循环（步数/指纹白名单/决策卡）
-│       │       ├── timeout.go      # ③ 超时熔断 + 并发额度 + 指数退避
-│       │       ├── permscope.go    # ④ 权限隔离 + 只读工具集 + SQL 规则校验
-│       │       ├── quality.go      # ⑤ 质量护栏（结构化/证据/推测标注/评测集）
-│       │       └── cost.go         # ⑥ 成本治理（确定性缓存/配额/熔断）
-│       ├── monitor/                # Prometheus 查询封装（不含自研采集器）+ 模拟器
-│       ├── logpipe/                # 日志集成：Kafka 消费（消费组 mwops-log-ingest）+ Filebeat 事件解析
-│       ├── repo/                   # 服务代码仓库本地缓存：首次 clone、之后更新到远端（路径越界防护 + 凭据脱敏 + git 错误中文翻译）
-│       ├── integration/            # 集成中心：组件模板 + 采集配置渲染（纯函数，可单测）
+│       ├── engine/guardrail/       # 六道护栏：budget / loop_guard / timeout / permscope / quality / cost
+│       ├── monitor/                # Prometheus 查询封装（不含自研采集器）+ 确定性模拟器
+│       ├── logpipe/                # Kafka 消费（消费组 mwops-log-ingest）+ Filebeat 事件解析
+│       ├── integration/            # 集成中心：组件模板 + 采集配置/Ansible 渲染（纯函数，可单测）
 │       ├── docker/                 # Docker Engine API 最小客户端（一键拉起 Exporter）
-│       ├── pkg/cache/              # 缓存与任务队列抽象（Redis / 内存双实现）
-│       ├── service/                # 业务服务（域：resource/ai/control）
-│       │   ├── ai/                 # 上下文组装与固定 Prompt 模板
-│       │   ├── diagnose.go         # AI 诊断编排（六道护栏落点）
-│       │   ├── alert.go            # 告警收敛（窗口去重/冷却/语义聚类）
-│       │   ├── logpipeline.go      # 日志集成：Kafka 消费编排、链路状态与探测
-│       │   ├── logalertrule.go     # 日志告警规则：按服务/指纹/级别匹配（priority 小者优先），没命中即不告警
-│       │   ├── logalertexclusion.go# 日志告警屏蔽项：按日志原文屏蔽指定错误，命中即丢弃（优先于所有规则）
-│       │   ├── logalert_worker.go  # 日志告警后处理：定时扫 pending → 通知渠道 + 拉代码 + AI 三点式分析
-│       │   ├── repo_adapter.go     # 把 internal/repo 的 Fetcher 适配成服务层的 RepoFetcher（进程级配置一次注入）
-│       │   ├── fix.go / approval.go# 操作分级、审批链路、结果回填
-│       │   ├── audit.go            # 审计哈希链与每日快照
-│       │   └── codeanalysis.go     # 三点式代码分析 + 出网合规
-│       ├── middleware/             # Gin 中间件（追踪/恢复/限流/认证/数据权限）
+│       ├── service/                # 业务服务：诊断、告警收敛、日志后处理、外部 AI 分析对接等
 │       ├── handler/ · router/      # 接口层（权限点与操作级别在路由显式声明）
-│       └── scheduler/…             # 定时任务（健康巡检/规则评估/聚类/快照/审批超时）
-├── middleware-ops-web/             # 前端（Vue 3 + Vite + TS）
-│   ├── src/api/                    # 接口封装 + 统一响应处理 + SSE 客户端
-│   ├── src/components/             # StatCard / MetricChart(ECharts) / DiagnosisReport / LevelTag
-│   ├── src/layouts/                # AppShell（桌面侧栏 ↔ 移动抽屉）
-│   ├── src/views/                  # 16 个页面（大盘/纳管/监控/AI/告警/知识库/…）
-│   └── src/styles/                 # 设计令牌 + 全局基础样式（深浅双主题）
-├── deploy/                         # Postgres 初始化（仅扩展/参数）、Prometheus 抓取与告警规则
-│   ├── postgres/init/              # 只建扩展与数据库参数，不建表
-│   ├── prometheus/                 # prometheus.yml / prometheus.with-exporters.yml / rules
-│   ├── grafana/                    # 统一大盘：provisioning（数据源+加载器）与 dashboards 目录
-│   └── compose.middleware-exporters.yml  # override：一键起 6 个官方 Exporter
+│       ├── middleware/             # Gin 中间件（追踪/恢复/限流/认证/数据权限）
+│       └── pkg/cache/ · utils/     # 缓存双实现（Redis/内存）、JWT/加密/口令工具
+├── middleware-ops-web/             # 前端（Vue 3 + Vite + TS + Element Plus，深浅双主题、移动端适配）
+├── deploy/                         # postgres 初始化、prometheus 抓取与告警规则、grafana provisioning、ansible 工具
+├── scripts/                        # onboard.sh（接入/修复）、doctor.sh（跨栈体检）、smoke-test.ps1（端到端冒烟）
 ├── docker-compose.yml              # 一键部署编排
-├── scripts/smoke-test.ps1          # 端到端冒烟验证（含权限越权与护栏用例）
-├── scripts/onboard.sh        # 一键接入/修复：只维护 .env，其余全自动
-├── scripts/doctor.sh       # 跨栈体检：平台/网络/别名/Exporter/日志集成/抓取
-└── Makefile                        # 常用开发/部署命令
+├── Makefile                        # 常用开发/部署命令（make help）
+├── CONTRIBUTING.md · SECURITY.md · CODE_OF_CONDUCT.md · CHANGELOG.md
+└── LICENSE
 ```
 
 ---
 
-## 四、核心设计落点
+## 五、核心设计
 
-### 4.1 AI 能力六道工程护栏（设计文档第五章）
+### 5.1 AI 能力六道工程护栏
 
 | 护栏 | 实现位置 | 关键行为 |
 |------|----------|----------|
-| ① 上下文预算 | `engine/guardrail/budget.go` | 输入 8K / 输出 2K 可配；超预算**告知被截断的维度**；时序指标降采样为「均值/P95/斜率/拐点/异常片段」 |
-| ② 防死循环 | `loop_guard.go` | 步数上限、同工具同参数指纹重复 2 次即终止、工具白名单、每步决策卡；**工具失败不自动重试** |
+| ① 上下文预算 | `engine/guardrail/budget.go` | 输入 8K / 输出 2K 可配；超预算告知被截断的维度；时序指标降采样为「均值/P95/斜率/拐点/异常片段」 |
+| ② 防死循环 | `loop_guard.go` | 步数上限、同工具同参数指纹重复 2 次即终止、工具白名单、每步决策卡；工具失败不自动重试 |
 | ③ 超时与降级 | `timeout.go` | 工具 10s / 任务 120s；超时放弃数据源并标注缺失维度；第三方→本地→规则引擎三级降级 + 熔断 |
-| ④ 权限隔离 | `permscope.go` | AI 仅挂载**只读工具集**（类型层面无写方法）；数据权限在仓储查询上强制生效；AI 生成 SQL 强制只读 + 强制 LIMIT + 禁多语句/注释 + 表白名单 |
+| ④ 权限隔离 | `permscope.go` | AI 仅挂载只读工具集（类型层面无写方法）；数据权限在仓储查询上强制生效；AI 生成 SQL 强制只读 + 强制 LIMIT + 禁多语句 + 表白名单 |
 | ⑤ 质量护栏 | `quality.go` | 强制结构化输出（根因/证据/置信度/建议/影响/待确认）；无硬证据标注「推测」；24 条典型故障评测集 |
 | ⑥ 成本治理 | `cost.go` | 同实例 + 同问题签名 24h 确定性缓存；按用户/平台日预算；并发 ≤4；异常突增自动熔断 |
 
-### 4.2 安全设计（第六章）
+### 5.2 安全设计
 
 - **RBAC**：admin / ops / dev / readonly 四内置角色 + 自定义角色；权限点在路由层显式声明，服务端强制校验。
-- **数据权限**：按环境（dev/staging/prod）与分组隔离，直接落到仓储查询条件，**不依赖 Prompt 约束**。
-- **操作分级**：L0 只读 / L1 低危 / L2 高危；L2 一律走审批（生产环境强制，30 分钟超时自动拒绝），且**申请人与审批人不得为同一人**。
+- **数据权限**：按环境（dev/staging/prod）与分组隔离，直接落到仓储查询条件，不依赖 Prompt 约束。
+- **操作分级**：L0 只读 / L1 低危 / L2 高危；L2 一律走审批（生产环境强制，30 分钟超时自动拒绝），申请人与审批人不得为同一人。
 - **审计可验证**：`audit_logs` 从 API 到仓储层均无更新/删除方法；哈希链 `hash_self = SHA256(hash_prev | 规范化内容)`，每日快照落盘并校验，断链可定位。
 - **凭据管理**：连接密码 AES-256-GCM 加密存储，主密钥来自环境变量或 0600 权限密钥文件（首次启动自动生成），接口永不回传密文。
-- **出网合规**：默认**禁止**任何第三方分析；需按服务显式开启白名单，堆栈/代码强制脱敏（IP/手机号/请求 ID/路径/邮箱/凭据）且 ≤200 行/文件。
+- **出网合规**：默认禁止任何外发；需按服务显式加入出网白名单，堆栈信息强制脱敏（IP/手机号/请求 ID/路径/邮箱/凭据）。
 
-### 4.3 事件驱动闭环
-
-```text
-埋点/阈值 → 去重收敛（指纹 + 窗口 + 冷却） → AI 按需介入 → 结构化诊断 → 多渠道通知 → 知识草稿沉淀 → 人工确认转正
-```
-
-AI 不做苦力活：日志采集（目标机 Filebeat）、指标采集、规则评估全部由集成部署的采集组件与调度器完成（`scheduler` 承载健康巡检、规则评估、语义聚类、审计快照、审批超时五类任务）。
-
----
-
-## 五、接口与认证
+### 5.3 接口与认证约定
 
 - 统一响应：`{code, message, data}`；分页 `page` / `page_size`（默认 20，上限 100）。
 - 错误码分段：400x 参数、401x 认证、403x 权限、404x 不存在、500x 系统。
-- 认证：`Authorization: Bearer <JWT>`，同时写入 `SameSite` Cookie；每次请求从数据库重建权限，角色变更即时生效。
-- 流式：`POST /api/ai/diagnose` 走 SSE，事件类型 `meta` / `data` / `done` / `error`（前端用 fetch + ReadableStream 以便携带认证头）。
-- 上报 Hook：`POST /api/hooks/logs`、`POST /api/hooks/alerts`，使用 `X-Hook-Token` 与服务令牌，与用户 JWT 分离。
+- 认证：`Authorization: Bearer <JWT>`，同时写入 SameSite Cookie；每次请求从数据库重建权限，角色变更即时生效。
+- 流式：`POST /api/ai/diagnose` 走 SSE，事件类型 `meta` / `data` / `done` / `error`。
+- 上报 Hook：`POST /api/hooks/logs`、`POST /api/hooks/alerts`，使用 `X-Hook-Token` 服务令牌，与用户 JWT 分离。
 
-完整接口清单见 [`docs/API.md`](docs/API.md)，接入与运维说明见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)，
-**「把某个具体项目接进来」的端到端操作指南见 [`docs/GUIDE-ONBOARD.md`](docs/GUIDE-ONBOARD.md)（以某业务系统为例）**，
-**「集成中心」的字段对照与落地方式见 [`docs/INTEGRATION.md`](docs/INTEGRATION.md)**，
-**「日志集成（Filebeat → 平台 Kafka）」的拓扑、自检与配置见 [`docs/LOG_INTEGRATION.md`](docs/LOG_INTEGRATION.md)**，
-**「把日志告警的 AI 分析接到《AI 代码分析接口文档 v1》」的配置与验收清单见 [`docs/AI_ANALYSIS_OPENAPI.md`](docs/AI_ANALYSIS_OPENAPI.md)**，
-**「如何把其他项目的中间件接进来」请看 [`docs/COLLECTOR.md`](docs/COLLECTOR.md)**。
+完整接口清单见 [docs/API.md](docs/API.md)。
 
 ---
 
 ## 六、验证
 
 ```bash
-# 后端：格式 / 静态检查 / 单元测试
-cd middleware-ops && gofmt -l . && go vet ./... && go test ./...
+# 一条命令完成提交前自检（后端格式/vet/测试 + 前端构建/冒烟）
+make all-check
 
-# 前端：响应式检查 + 类型检查 + 构建（build 已内置前两步）
-cd middleware-ops-web && npm run build
-# 只跑「按 key 绑定的表单是否响应式」这一条静态检查（捕获"控件点不动/选了没反应"，见 INC-020）
-cd middleware-ops-web && npm run check:reactivity
-# 前端运行时冒烟（无头浏览器加载产物，捕获白屏/TDZ 这类只在运行时暴露的问题）
-cd middleware-ops-web && npm run smoke
+# 也可分项执行
+make backend-lint     # gofmt -l + go vet
+make backend-test     # go test ./...
+make frontend-build   # 类型检查 + 构建
+make frontend-smoke   # 无头浏览器加载产物，捕获白屏等运行时问题
 
 # 端到端冒烟（需后端已在 8080 运行；PS 7 用 pwsh，Windows 自带 PS 5.1 用 powershell）
-pwsh -File scripts/smoke-test.ps1
+make verify
 ```
 
-`scripts/smoke-test.ps1` 覆盖：健康检查、登录与会话、未认证访问拦截、实例纳管与连接测试、指标采集、
-AI 同步/流式诊断与结构化输出校验、确定性缓存命中、告警规则评估与确认、日志 Hook 与错误指纹归并、
-代码分析出网合规、修复预览 L2 判定、SQL 只读校验（含拒绝写操作）、审计哈希链校验、大盘与能力矩阵。
+Windows 未安装 make 时，可在 `middleware-ops/` 下直接执行 `gofmt -l . && go vet ./... && go test ./...`，在 `middleware-ops-web/` 下执行 `npm run build` / `npm run smoke`。
 
-单元测试重点覆盖**越权用例**（RBAC 权限点/级别、数据权限过滤、只读工具集强制）、**告警去重指纹**、
-**六道护栏**（预算截断、防死循环、SQL 校验、质量推测标注、成本缓存与配额）、**出网脱敏**
-以及**数据库 schema 不变量**（唯一约束命名必须与 GORM 命名策略一致、模型列名不得命中 PostgreSQL
-保留关键字，防止 AutoMigrate 建表/迁移在部署时失败回归）。
+单元测试重点覆盖越权用例（RBAC 权限点/级别、数据权限过滤、只读工具集强制）、告警去重指纹、六道护栏、出网脱敏、外部 AI 分析对接（协议适配/回调幂等）以及数据库 schema 不变量（唯一约束命名与 GORM 命名策略一致、列名不得命中 PostgreSQL 保留关键字）。
 
 ---
 
-## 七、已知边界（避免误解）
+## 七、已知边界
 
-1. **修复执行器为预演实现**：`service/dryRunExecutor` 只返回影响预览与参数校验，**不对被管中间件产生副作用**；接入真实执行需实现 `service.Executor` 接口并注入，L2 动作在审批通过后按预演方案人工执行并回填结果。
-2. **一期不做自研代码索引**：代码分析采用「第三方 API + 本地简单检索（堆栈定位文件行 → 上下文切片）」，AST/知识图谱/向量 Rerank 为二期项。
-3. **因果收敛不做**：告警收敛仅实现规则级（实时）与语义聚类（离线、仅合并展示），依赖服务拓扑的因果收敛列为二期。
+1. **修复执行器为预演实现**：`service/dryRunExecutor` 只返回影响预览与参数校验，不对被管中间件产生副作用；接入真实执行需实现 `service.Executor` 接口并注入，L2 动作在审批通过后按预演方案人工执行并回填结果。
+2. **代码分析依赖外部 AI 分析服务**：平台不 clone、不缓存业务代码，也不做 AST/代码知识图谱/向量 Rerank；它只负责按规则触发、脱敏外发、回调收敛三点式结论。深度代码索引为后续方向。
+3. **因果收敛不做**：告警收敛仅实现规则级（实时）与语义聚类（离线、仅合并展示），依赖服务拓扑的因果收敛列为后续方向。
 4. **通知渠道需外部配置**：飞书/企微/钉钉/邮件在未配置 webhook 时仅记录通知日志，不影响主链路。
-5. **默认构建未启用 pgvector 原生类型**：向量以文本存储并在应用层做余弦检索，规模 ≤200 实例可接受；需要 ANN 索引时以 `-tags pgvector` 构建。
-6. **前端不做手工分包**：`vite.config.ts` 刻意不使用 `manualChunks`。element-plus 与 dayjs 互相引用，强行分包会形成 chunk 循环依赖并触发 ES module TDZ（表现为白屏），详见 [`docs/POSTMORTEM.md`](docs/POSTMORTEM.md) INC-003。
+5. **默认构建未启用 pgvector 原生类型**：向量以文本存储并在应用层做余弦检索，≤200 实例规模可接受；需要 ANN 索引时以 `-tags pgvector` 构建。
+6. **前端不做手工分包**：`vite.config.ts` 刻意不使用 `manualChunks`。element-plus 与 dayjs 互相引用，强行分包会形成 chunk 循环依赖并触发 ES module TDZ（表现为白屏），详见 [docs/POSTMORTEM.md](docs/POSTMORTEM.md) INC-003。
 
 ---
 
-## 八、故障记录
+## 八、参与贡献
 
-交付过程中在部署阶段真实暴露的 3 个问题（两套建表来源、保留字列名、前端白屏）的现象、根因、
-修复与防复发措施，记录在 [`docs/POSTMORTEM.md`](docs/POSTMORTEM.md)，并各配有回归测试或冒烟脚本。
+欢迎提交 Issue 与 Pull Request。提交前请确认：
 
----
+- 后端代码 `gofmt` 干净、`go vet ./...` 与 `go test ./...` 通过；提交前跑一遍 `make all-check`。
+- 遵循 [Conventional Commits](https://www.conventionalcommits.org/) 风格的提交信息：`<type>(<scope>): <subject>`。
+- 新增/变更行为请同步更新 `docs/` 下对应文档，并在 [docs/README.md](docs/README.md) 登记，避免死链。
 
-## 九、许可与致谢
+更多约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，参与社区请遵守 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)，安全漏洞请按 [SECURITY.md](SECURITY.md) 私密上报。交付过程中的真实故障复盘见 [docs/POSTMORTEM.md](docs/POSTMORTEM.md)。
 
-内部技术方案实现。指标采集依赖 Prometheus 生态与各中间件官方 Exporter（本仓库不包含采集器）。
+## 九、许可
+
+本项目基于 [MIT 许可证](LICENSE) 开源。指标采集依赖 Prometheus 生态与各中间件官方 Exporter（本仓库不包含采集器二进制）。

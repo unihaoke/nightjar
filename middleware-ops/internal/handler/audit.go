@@ -13,11 +13,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"middleware-ops/internal/apperr"
-	"middleware-ops/internal/config"
-	"middleware-ops/internal/repository"
-	"middleware-ops/internal/response"
-	"middleware-ops/internal/service"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/apperr"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/repository"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/response"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/service"
 )
 
 // ListAuditLogs 审计日志列表（admin/运维）。
@@ -336,5 +336,3 @@ func (h *Handler) ListCodeAnalyses(c *gin.Context) {
 	}
 	response.OKPage(c, items, total, pageNo, pageSize)
 }
-
-

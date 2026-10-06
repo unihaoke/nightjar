@@ -10,7 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"middleware-ops/internal/config"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/config"
 )
 
 // 本文件钉住《AI 代码分析接口文档 v1》的对接形状。

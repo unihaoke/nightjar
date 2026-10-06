@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"middleware-ops/internal/pkg/cache"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/pkg/cache"
 )
 
 // cooldownTracker 用 Redis 记录"某个指纹最近一次外发的时间"，实现冷却期。

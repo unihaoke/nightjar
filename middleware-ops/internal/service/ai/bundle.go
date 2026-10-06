@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"middleware-ops/internal/monitor"
+	"github.com/unihaoke/nightjar/middleware-ops/internal/monitor"
 )
 
 // MetricSummary 是指标摘要（降采样后），不携带原始序列（5.2）。
